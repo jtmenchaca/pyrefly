@@ -308,6 +308,7 @@ use crate::lsp::non_wasm::protocol::Response;
 use crate::lsp::non_wasm::queue::HeavyTaskQueue;
 use crate::lsp::non_wasm::queue::LspEvent;
 use crate::lsp::non_wasm::queue::LspQueue;
+use crate::lsp::non_wasm::refinedpy;
 use crate::lsp::non_wasm::safe_delete_file::safe_delete_file_code_action;
 use crate::lsp::non_wasm::stdlib::should_show_stdlib_error;
 use crate::lsp::non_wasm::transaction_manager::TransactionManager;
@@ -1503,6 +1504,7 @@ pub fn lsp_loop(
     thread_count: ThreadCount,
     lsp_start_time: Instant,
 ) -> anyhow::Result<()> {
+    refinedpy::configure_kernel_dylib();
     info!("Reading messages");
     let lsp_queue = LspQueue::new();
     let from = telemetry.surface();
@@ -3116,6 +3118,7 @@ impl Server {
         Self::append_unused_parameter_diagnostics(transaction, handle, diagnostics);
         Self::append_unused_import_diagnostics(transaction, handle, diagnostics);
         Self::append_unused_variable_diagnostics(transaction, handle, diagnostics);
+        refinedpy::append_refinedpy_diagnostics(transaction, handle, diagnostics);
     }
 
     /// Publish diagnostics & send a semantic token refresh for the given handles
