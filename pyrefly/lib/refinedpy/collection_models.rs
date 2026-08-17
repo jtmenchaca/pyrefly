@@ -6,10 +6,13 @@
  */
 
 //! Container VALUE states: `list`/`tuple`/`dict` literals, subscript
-//! reads (`s[i]`, `d[key]`), `len()`, and `dict.get`. Mutating methods
-//! (`append`, `pop`, `add`, `update`, `clear`) decline — write effects
-//! belong to the walk's World, not this pure-value layer (see
-//! `mutating_method_result`'s own doc).
+//! reads (`s[i]`, `d[key]`), `len()`, `dict.get`, and the mutation
+//! contract (`mutated_receiver`, `dict_with_item`, `list_with_item`)
+//! the walk's World calls to thread a write's new receiver value
+//! through. Every mutation row answers `None` the moment the receiver
+//! or an argument is not fully known — an unknown write is silently
+//! dropped only by returning no new state, never guessed at (see
+//! `mutated_receiver`'s own doc).
 //!
 //! ## How the domain carries a container
 //!
@@ -290,20 +293,358 @@ pub fn dict_get_result(
     })
 }
 
-/// Mutating container methods (`list.append`/`list.pop`, `set.add`,
-/// `dict.update`, `.clear`, and their kin) always answer `None` —
-/// declined, not "not yet modeled." A mutating call's INTERESTING
-/// effect is not its return value (several of these return `None`/the
-/// popped element themselves) but the WRITE it performs on the
-/// receiver's own state, and this file's functions are pure value
-/// readers with no receiver to write back into — there is no `World`
-/// or environment parameter here for a write to land in. Modeling a
-/// mutating method's write effect is the walk's job (AGENT-BRIEF: "a
-/// later unit"), not this file's; answering only the return value
-/// while silently dropping the write would be unsound (a caller could
-/// read `xs.append(1)`'s `None` return and never learn `xs` grew).
-pub fn mutating_method_result(_method: &str, _receiver: &AbstractValue) -> Option<AbstractValue> {
-    None
+/// `dict[key] = value` — the written-through dict, known shapes only:
+/// a known `Kind::Object` receiver and a known String-sorted key. The
+/// new entry overwrites a same-named existing entry (an ordinary
+/// assignment, not the dict-DISPLAY's own duplicate-literal-key rule,
+/// but the same last-value-wins effect); an absent key appends a new
+/// entry in insertion order, matching `dict.__setitem__`'s own
+/// behavior (library/stdtypes.rst, "Mapping Types — dict": "`d[key] =
+/// value` — Set `d[key]` to *value*"). `None` for any other receiver
+/// or a non-String key — the write is not modeled, so the caller must
+/// not assume the container is unchanged.
+pub fn dict_with_item(receiver: &AbstractValue, key: &AbstractValue, value: &AbstractValue) -> Option<AbstractValue> {
+    if receiver.kind != Kind::Object {
+        return None;
+    }
+    let key_text = known_string_key(key)?;
+    let mut entries = receiver.keys.clone();
+    if let Some(existing) = entries.iter_mut().find(|entry| entry.name == key_text) {
+        existing.value = value.clone();
+    } else {
+        entries.push(ObjectKey {
+            name: key_text,
+            value: value.clone(),
+        });
+    }
+    Some(known_object(entries, None, true, TrustProved, false))
+}
+
+/// `list[index] = value` — the written-through list, known shapes
+/// only: a known `Kind::List` receiver and a known Integer index that
+/// (after the same negative-index adjustment `list_index_read` reads
+/// by) lands inside the list's current bounds (expressions.rst,
+/// "Subscriptions" — item assignment on a sequence follows the same
+/// negative-index rule as a read; an index past the end raises
+/// `IndexError`, which this domain has no channel for, so it declines
+/// rather than silently extending the list the way `append` would).
+pub fn list_with_item(receiver: &AbstractValue, index: &AbstractValue, value: &AbstractValue) -> Option<AbstractValue> {
+    if receiver.kind != Kind::List {
+        return None;
+    }
+    let position = known_integer_index(index)?;
+    let length = receiver.items.len() as i64;
+    let adjusted = if position < 0 { position + length } else { position };
+    if adjusted < 0 || adjusted >= length {
+        return None;
+    }
+    let mut items = receiver.items.clone();
+    items[adjusted as usize] = value.clone();
+    Some(list_literal_value(&items))
+}
+
+/// A mutating container-method call's (new receiver, call result) pair
+/// — the walk's own write channel: `check.rs`/`loops.rs` write the
+/// returned receiver back into the environment binding the method was
+/// called on, and use the call result the same way any other
+/// expression value is used. `None` means "not modeled" (the call is
+/// silently NOT threaded as a write — the caller must not assume the
+/// receiver is unchanged, matching every other decline in this file);
+/// every row below requires the receiver AND every argument fully
+/// known, per the mission's own scope — a receiver or argument this
+/// file cannot read never answers a guessed write.
+///
+/// Modeled, each cited against library/stdtypes.rst's own method
+/// entry:
+/// - list: `append(x)` ("appends *x* to the end of the sequence"),
+///   `extend(t)` ("extends *s* with the contents of *t*"),
+///   `insert(i, x)` ("inserts *x* into *s* at the index given by *i*"
+///   — clamped to `[0, len]`, matching `list.insert`'s own
+///   out-of-range-index clamping rather than `IndexError`), `pop()`/
+///   `pop(i)` ("retrieves the item at *i* and also removes it from
+///   *s*" — no-arg defaults to the LAST item), `clear()` ("removes all
+///   items from *s*"), `remove(x)` ("removes the first item from *s*
+///   where `s[i]` is equal to *x*" — an ABSENT element declines rather
+///   than mutate on the real call's `ValueError`).
+/// - set: `add(elem)` ("Add element *elem* to the set"), `discard(elem)`
+///   ("Remove element *elem* from the set if it is present" — silent
+///   no-op on a miss), `remove(elem)` ("Remove element *elem* from the
+///   set. Raises `KeyError` if *elem* is not contained in the set" —
+///   an ABSENT element declines the whole call, since the real call
+///   raises rather than mutates; `provable_raise` is the raise
+///   channel), `update(other)` ("Update the set, adding elements from
+///   all others" — the two-arg union-in-place, skipping a duplicate),
+///   `clear()`.
+/// - dict: `update(other)` ("Update the dictionary with the key/value
+///   pairs from *other*, overwriting existing keys" — merges a known
+///   dict argument entry by entry), `clear()`, `setdefault(key,
+///   default=None)` ("If *key* is in the dictionary, return its
+///   value. If not, insert *key* with a value of *default* and return
+///   *default*" — the ONE row whose receiver AND call result both
+///   change: an absent key both extends the receiver and answers
+///   `default`), `pop(key)`/`pop(key, default)` ("If *key* is in the
+///   dictionary, remove it and return its value, else return
+///   *default*. If *default* is not given and *key* is not in the
+///   dictionary, a `KeyError` is raised" — a missing key with no
+///   default declines the whole call, matching `set.remove`'s same
+///   raise-not-mutate honesty), `popitem()` ("Remove and return a
+///   `(key, value)` pair... in LIFO order" — the LAST inserted entry).
+///
+/// `list.sort`/`list.reverse` are NOT modeled: they reorder without
+/// changing the multiset of elements, which the mission's own row list
+/// does not name and this file does not invent. `list`/`set` share the
+/// identical `Kind::List` receiver shape (this file's own module doc),
+/// so `add`/`discard`/`remove`/`update` on a plain-list receiver would
+/// also answer through the same rows — this domain has no separate set
+/// Kind to gate that on, and the method NAME is the only signal that a
+/// call is set-shaped.
+pub fn mutated_receiver(method: &str, receiver: &AbstractValue, arguments: &[AbstractValue]) -> Option<(AbstractValue, AbstractValue)> {
+    match receiver.kind {
+        Kind::List => list_mutated_receiver(method, receiver, arguments),
+        Kind::Object => dict_mutated_receiver(method, receiver, arguments),
+        _ => None,
+    }
+}
+
+/// `list.append`/`extend`/`insert`/`pop`/`clear`, PLUS the set-only
+/// method names `add`/`discard`/`remove`/`update` — see
+/// `mutated_receiver`'s own doc for the cited row-by-row contract. Both
+/// families dispatch through this one function because a set and a
+/// list share the identical `Kind::List` receiver shape in this domain
+/// (this file's own module doc) — there is no separate set Kind to
+/// route on, so the METHOD NAME alone tells a set call apart from a
+/// list call, and both live in the same match.
+fn list_mutated_receiver(method: &str, receiver: &AbstractValue, arguments: &[AbstractValue]) -> Option<(AbstractValue, AbstractValue)> {
+    match method {
+        "append" => {
+            let [element] = arguments else { return None };
+            let mut items = receiver.items.clone();
+            items.push(element.clone());
+            Some((list_literal_value(&items), null_value()))
+        }
+        "extend" | "update" => {
+            let [other] = arguments else { return None };
+            if other.kind != Kind::List {
+                return None;
+            }
+            let mut items = receiver.items.clone();
+            for candidate in &other.items {
+                // `update`'s own set-union-in-place semantics skip a
+                // duplicate; `extend`'s own list semantics do not — the
+                // method name itself decides which rule applies
+                if method == "update" && element_contains(&items, candidate)? {
+                    continue;
+                }
+                items.push(candidate.clone());
+            }
+            Some((list_literal_value(&items), null_value()))
+        }
+        "insert" => {
+            let [index, element] = arguments else { return None };
+            let position = known_integer_index(index)?;
+            let length = receiver.items.len() as i64;
+            // out-of-range clamps to the nearest end rather than raising
+            // (stdtypes.rst's `s.insert(i, x)` row states no bounds check,
+            // matching CPython's own clamp-not-raise behavior)
+            let clamped = if position < 0 {
+                (length + position).max(0)
+            } else {
+                position.min(length)
+            } as usize;
+            let mut items = receiver.items.clone();
+            items.insert(clamped, element.clone());
+            Some((list_literal_value(&items), null_value()))
+        }
+        "pop" if arguments.is_empty() => {
+            let popped = receiver.items.last().cloned()?;
+            let mut items = receiver.items.clone();
+            items.pop();
+            Some((list_literal_value(&items), popped))
+        }
+        "pop" => {
+            let [index] = arguments else { return None };
+            let position = known_integer_index(index)?;
+            let popped = list_index_read(&receiver.items, position)?;
+            let length = receiver.items.len() as i64;
+            let adjusted = if position < 0 { position + length } else { position } as usize;
+            let mut items = receiver.items.clone();
+            items.remove(adjusted);
+            Some((list_literal_value(&items), popped))
+        }
+        "clear" if arguments.is_empty() => Some((list_literal_value(&[]), null_value())),
+        // set.add(elem) — "Add element *elem* to the set." A duplicate
+        // (already-present) element is a silent no-op (set membership,
+        // not list append).
+        "add" => {
+            let [element] = arguments else { return None };
+            if element_contains(&receiver.items, element)? {
+                return Some((receiver.clone(), null_value()));
+            }
+            let mut items = receiver.items.clone();
+            items.push(element.clone());
+            Some((list_literal_value(&items), null_value()))
+        }
+        // set.discard(elem) — "Remove element *elem* from the set if it
+        // is present." A MISSING element is a silent no-op (unlike
+        // `remove`, which raises on a miss). `remove_first_element`
+        // removes only the FIRST match, which is exactly "the one
+        // occurrence" for a set (no duplicates by construction) and
+        // also the correct `list.remove`/`list.discard`-shaped
+        // behavior if this receiver happens to be a plain list with
+        // duplicate elements.
+        "discard" => {
+            let [element] = arguments else { return None };
+            let items = remove_first_element(&receiver.items, element)?;
+            Some((list_literal_value(&items), null_value()))
+        }
+        // `list.remove(x)`/`set.remove(elem)` — stdtypes.rst's
+        // Mutable-Sequence-Types table: "removes the first item from
+        // *s* where `s[i]` is equal to *x*"; the set section: "Remove
+        // element *elem* from the set. Raises KeyError if *elem* is not
+        // contained in the set." An ABSENT element declines the whole
+        // call rather than mutate on a raise (`provable_raise` is the
+        // raise channel, not this function) — sound for BOTH receiver
+        // shapes, since a list `.remove` on a missing element raises
+        // `ValueError` the same way a set `.remove` raises `KeyError`.
+        "remove" => {
+            let [element] = arguments else { return None };
+            if !element_contains(&receiver.items, element)? {
+                return None;
+            }
+            let items = remove_first_element(&receiver.items, element)?;
+            Some((list_literal_value(&items), null_value()))
+        }
+        _ => None,
+    }
+}
+
+/// Whether `needle` is a member of `items` by exact-value equality —
+/// scalar values (`Kind::Values`) compare by their `values`/`kind_tag`
+/// pair; every other shape declines (`None`) rather than guess at
+/// equality for a shape this file has no comparison row for. This is
+/// the SAME membership question `expressions.rs`'s own `set_contains`
+/// answers for the read-side set methods, kept as a separate small copy
+/// here rather than reaching across the module boundary for one helper
+/// (this file owns no dependency on `expressions.rs`, and adding one
+/// would invert the existing `expressions.rs -> collection_models.rs`
+/// direction into a cycle).
+fn element_contains(items: &[AbstractValue], needle: &AbstractValue) -> Option<bool> {
+    if needle.kind != Kind::Values {
+        return None;
+    }
+    for element in items {
+        if element.kind != Kind::Values {
+            return None;
+        }
+        if element.kind_tag != needle.kind_tag {
+            continue;
+        }
+        if element.values == needle.values {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+/// `items` with the FIRST element EQUAL to `needle` removed — correct
+/// for a set (there is at most one match, no duplicates by
+/// construction) and for a plain list's own `.remove`/`.discard`
+/// semantics ("removes the first item... where `s[i]` is equal to
+/// *x*," stdtypes.rst's Mutable-Sequence-Types table). `None` the
+/// moment `element_contains`'s own equality question cannot be decided
+/// for some element scanned before the match.
+fn remove_first_element(items: &[AbstractValue], needle: &AbstractValue) -> Option<Vec<AbstractValue>> {
+    if needle.kind != Kind::Values {
+        return None;
+    }
+    let mut kept = Vec::with_capacity(items.len());
+    let mut removed_one = false;
+    for element in items {
+        if element.kind != Kind::Values {
+            return None;
+        }
+        if !removed_one && element.kind_tag == needle.kind_tag && element.values == needle.values {
+            removed_one = true;
+            continue;
+        }
+        kept.push(element.clone());
+    }
+    Some(kept)
+}
+
+/// `dict.update`/`clear`/`setdefault`/`pop`/`popitem` — see
+/// `mutated_receiver`'s own doc for the cited row-by-row contract.
+fn dict_mutated_receiver(method: &str, receiver: &AbstractValue, arguments: &[AbstractValue]) -> Option<(AbstractValue, AbstractValue)> {
+    match method {
+        "update" => {
+            let [other] = arguments else { return None };
+            if other.kind != Kind::Object {
+                return None;
+            }
+            let mut entries = receiver.keys.clone();
+            for incoming in &other.keys {
+                if let Some(existing) = entries.iter_mut().find(|entry| entry.name == incoming.name) {
+                    existing.value = incoming.value.clone();
+                } else {
+                    entries.push(incoming.clone());
+                }
+            }
+            Some((known_object(entries, None, true, TrustProved, false), null_value()))
+        }
+        "clear" if arguments.is_empty() => Some((known_object(Vec::new(), None, true, TrustProved, false), null_value())),
+        "setdefault" => {
+            let (key_expr, default) = match arguments {
+                [key] => (key, None),
+                [key, default] => (key, Some(default)),
+                _ => return None,
+            };
+            let key_text = known_string_key(key_expr)?;
+            if let Some(found) = dict_key_read(&receiver.keys, &key_text) {
+                return Some((receiver.clone(), found));
+            }
+            let default_value = default.cloned().unwrap_or_else(null_value);
+            let mut entries = receiver.keys.clone();
+            entries.push(ObjectKey {
+                name: key_text,
+                value: default_value.clone(),
+            });
+            Some((known_object(entries, None, true, TrustProved, false), default_value))
+        }
+        "pop" => {
+            let (key_expr, default) = match arguments {
+                [key] => (key, None),
+                [key, default] => (key, Some(default)),
+                _ => return None,
+            };
+            let key_text = known_string_key(key_expr)?;
+            if let Some(found) = dict_key_read(&receiver.keys, &key_text) {
+                let entries: Vec<ObjectKey> = receiver.keys.iter().filter(|entry| entry.name != key_text).cloned().collect();
+                return Some((known_object(entries, None, true, TrustProved, false), found));
+            }
+            // an absent key with no default RAISES KeyError — this row
+            // declines the whole call rather than mutate on a raise
+            // (provable_raise is the raise channel, not this function)
+            let default_value = default?;
+            Some((receiver.clone(), default_value.clone()))
+        }
+        "popitem" if arguments.is_empty() => {
+            let last = receiver.keys.last()?.clone();
+            let entries: Vec<ObjectKey> = receiver.keys[..receiver.keys.len() - 1].to_vec();
+            let pair = list_literal_value(&[string_key_value(&last.name), last.value]);
+            Some((known_object(entries, None, true, TrustProved, false), pair))
+        }
+        _ => None,
+    }
+}
+
+/// A String-sorted AbstractValue spelling `text` — the same code-point
+/// encoding `string_literal_value` builds (this file is out-of-crate
+/// from `string_models.rs`, so the conversion is repeated here rather
+/// than reaching into that file's own constructor for one caller,
+/// matching the existing `known_string_key` note above).
+fn string_key_value(text: &str) -> AbstractValue {
+    let code_points: Vec<f64> = text.chars().map(|c| c as u32 as f64).collect();
+    known_values(code_points, PrimitiveKind::String, TrustProved)
 }
 
 #[cfg(test)]
@@ -454,15 +795,205 @@ mod tests {
         assert_eq!(got, fallback);
     }
 
-    // --- mutating methods decline ---
+    // --- dict_with_item / list_with_item (the written-through container) ---
 
     #[test]
-    fn mutating_methods_decline() {
+    fn dict_with_item_overwrites_an_existing_key() {
+        let dict = dict_literal_value(&[Some("a".to_string())], &[integer(1.0)]);
+        let written = dict_with_item(&dict, &string("a"), &integer(9.0)).expect("write must decide");
+        assert_eq!(subscript_read(&written, &string("a")), Some(integer(9.0)));
+    }
+
+    #[test]
+    fn dict_with_item_appends_a_new_key() {
+        let dict = dict_literal_value(&[Some("a".to_string())], &[integer(1.0)]);
+        let written = dict_with_item(&dict, &string("b"), &integer(2.0)).expect("write must decide");
+        assert_eq!(written.keys.len(), 2);
+        assert_eq!(subscript_read(&written, &string("b")), Some(integer(2.0)));
+    }
+
+    #[test]
+    fn list_with_item_writes_a_positive_index() {
+        let list = list_literal_value(&[integer(1.0), integer(2.0)]);
+        let written = list_with_item(&list, &integer(0.0), &integer(9.0)).expect("write must decide");
+        assert_eq!(written.items, vec![integer(9.0), integer(2.0)]);
+    }
+
+    #[test]
+    fn list_with_item_out_of_range_declines() {
         let list = list_literal_value(&[integer(1.0)]);
-        assert_eq!(mutating_method_result("append", &list), None);
-        assert_eq!(mutating_method_result("pop", &list), None);
-        assert_eq!(mutating_method_result("add", &list), None);
-        assert_eq!(mutating_method_result("update", &list), None);
-        assert_eq!(mutating_method_result("clear", &list), None);
+        assert_eq!(list_with_item(&list, &integer(5.0), &integer(9.0)), None);
+    }
+
+    // --- mutated_receiver: list ---
+
+    #[test]
+    fn mutated_receiver_list_append() {
+        let list = list_literal_value(&[integer(1.0)]);
+        let (new_receiver, result) = mutated_receiver("append", &list, &[integer(2.0)]).expect("append must decide");
+        assert_eq!(new_receiver.items, vec![integer(1.0), integer(2.0)]);
+        assert_eq!(result.kind, Kind::Null);
+    }
+
+    #[test]
+    fn mutated_receiver_list_extend() {
+        let list = list_literal_value(&[integer(1.0)]);
+        let other = list_literal_value(&[integer(2.0), integer(3.0)]);
+        let (new_receiver, _) = mutated_receiver("extend", &list, &[other]).expect("extend must decide");
+        assert_eq!(new_receiver.items, vec![integer(1.0), integer(2.0), integer(3.0)]);
+    }
+
+    #[test]
+    fn mutated_receiver_list_insert() {
+        let list = list_literal_value(&[integer(1.0), integer(3.0)]);
+        let (new_receiver, _) =
+            mutated_receiver("insert", &list, &[integer(1.0), integer(2.0)]).expect("insert must decide");
+        assert_eq!(new_receiver.items, vec![integer(1.0), integer(2.0), integer(3.0)]);
+    }
+
+    #[test]
+    fn mutated_receiver_list_pop_no_arg_removes_the_last_element() {
+        let list = list_literal_value(&[integer(1.0), integer(2.0)]);
+        let (new_receiver, popped) = mutated_receiver("pop", &list, &[]).expect("pop must decide");
+        assert_eq!(new_receiver.items, vec![integer(1.0)]);
+        assert_eq!(popped, integer(2.0));
+    }
+
+    #[test]
+    fn mutated_receiver_list_pop_empty_receiver_declines() {
+        let list = list_literal_value(&[]);
+        assert_eq!(mutated_receiver("pop", &list, &[]), None);
+    }
+
+    #[test]
+    fn mutated_receiver_list_clear() {
+        let list = list_literal_value(&[integer(1.0)]);
+        let (new_receiver, _) = mutated_receiver("clear", &list, &[]).expect("clear must decide");
+        assert_eq!(new_receiver.items.len(), 0);
+    }
+
+    // --- mutated_receiver: set (the same Kind::List shape as list) ---
+
+    #[test]
+    fn mutated_receiver_set_add_appends_a_new_element() {
+        let set = list_literal_value(&[integer(1.0)]);
+        let (new_receiver, _) = mutated_receiver("add", &set, &[integer(2.0)]).expect("add must decide");
+        assert_eq!(new_receiver.items, vec![integer(1.0), integer(2.0)]);
+    }
+
+    #[test]
+    fn mutated_receiver_set_add_a_duplicate_is_a_no_op() {
+        let set = list_literal_value(&[integer(1.0)]);
+        let (new_receiver, _) = mutated_receiver("add", &set, &[integer(1.0)]).expect("add must decide");
+        assert_eq!(new_receiver.items, vec![integer(1.0)]);
+    }
+
+    #[test]
+    fn mutated_receiver_set_discard_present_element_removes_it() {
+        let set = list_literal_value(&[integer(1.0), integer(2.0)]);
+        let (new_receiver, _) = mutated_receiver("discard", &set, &[integer(1.0)]).expect("discard must decide");
+        assert_eq!(new_receiver.items, vec![integer(2.0)]);
+    }
+
+    #[test]
+    fn mutated_receiver_set_discard_absent_element_is_a_no_op() {
+        let set = list_literal_value(&[integer(2.0)]);
+        let (new_receiver, _) = mutated_receiver("discard", &set, &[integer(1.0)]).expect("discard must decide");
+        assert_eq!(new_receiver.items, vec![integer(2.0)]);
+    }
+
+    #[test]
+    fn mutated_receiver_set_remove_present_element_removes_it() {
+        let set = list_literal_value(&[integer(1.0), integer(2.0)]);
+        let (new_receiver, _) = mutated_receiver("remove", &set, &[integer(1.0)]).expect("remove must decide");
+        assert_eq!(new_receiver.items, vec![integer(2.0)]);
+    }
+
+    #[test]
+    fn mutated_receiver_set_remove_absent_element_declines() {
+        // remove RAISES KeyError on a miss — this row does not mutate
+        // on a raise, matching dict.pop's own no-default row
+        let set = list_literal_value(&[integer(2.0)]);
+        assert_eq!(mutated_receiver("remove", &set, &[integer(1.0)]), None);
+    }
+
+    #[test]
+    fn mutated_receiver_set_update_unions_in_place_skipping_duplicates() {
+        let set = list_literal_value(&[integer(1.0)]);
+        let other = list_literal_value(&[integer(1.0), integer(2.0)]);
+        let (new_receiver, _) = mutated_receiver("update", &set, &[other]).expect("update must decide");
+        assert_eq!(new_receiver.items, vec![integer(1.0), integer(2.0)]);
+    }
+
+    // --- mutated_receiver: dict ---
+
+    #[test]
+    fn mutated_receiver_dict_update_merges_and_overwrites() {
+        let dict = dict_literal_value(&[Some("a".to_string())], &[integer(1.0)]);
+        let other = dict_literal_value(
+            &[Some("a".to_string()), Some("b".to_string())],
+            &[integer(9.0), integer(2.0)],
+        );
+        let (new_receiver, _) = mutated_receiver("update", &dict, &[other]).expect("update must decide");
+        assert_eq!(subscript_read(&new_receiver, &string("a")), Some(integer(9.0)));
+        assert_eq!(subscript_read(&new_receiver, &string("b")), Some(integer(2.0)));
+    }
+
+    #[test]
+    fn mutated_receiver_dict_clear() {
+        let dict = dict_literal_value(&[Some("a".to_string())], &[integer(1.0)]);
+        let (new_receiver, _) = mutated_receiver("clear", &dict, &[]).expect("clear must decide");
+        assert_eq!(new_receiver.keys.len(), 0);
+    }
+
+    #[test]
+    fn mutated_receiver_dict_setdefault_present_key_leaves_the_dict_unchanged() {
+        let dict = dict_literal_value(&[Some("a".to_string())], &[integer(1.0)]);
+        let (new_receiver, result) =
+            mutated_receiver("setdefault", &dict, &[string("a"), integer(0.0)]).expect("setdefault must decide");
+        assert_eq!(new_receiver.keys.len(), 1);
+        assert_eq!(result, integer(1.0));
+    }
+
+    #[test]
+    fn mutated_receiver_dict_setdefault_absent_key_extends_and_answers_the_default() {
+        let dict = dict_literal_value(&[Some("a".to_string())], &[integer(1.0)]);
+        let (new_receiver, result) =
+            mutated_receiver("setdefault", &dict, &[string("b"), integer(0.0)]).expect("setdefault must decide");
+        assert_eq!(new_receiver.keys.len(), 2);
+        assert_eq!(result, integer(0.0));
+    }
+
+    #[test]
+    fn mutated_receiver_dict_pop_present_key_removes_it() {
+        let dict = dict_literal_value(&[Some("a".to_string())], &[integer(1.0)]);
+        let (new_receiver, popped) = mutated_receiver("pop", &dict, &[string("a")]).expect("pop must decide");
+        assert_eq!(new_receiver.keys.len(), 0);
+        assert_eq!(popped, integer(1.0));
+    }
+
+    #[test]
+    fn mutated_receiver_dict_pop_absent_key_with_no_default_declines() {
+        let dict = dict_literal_value(&[Some("a".to_string())], &[integer(1.0)]);
+        // an absent key with no default RAISES KeyError at runtime — this
+        // function does not mutate on a raise, matching set.remove's row
+        assert_eq!(mutated_receiver("pop", &dict, &[string("missing")]), None);
+    }
+
+    #[test]
+    fn mutated_receiver_dict_popitem_removes_the_last_inserted_entry() {
+        let dict = dict_literal_value(
+            &[Some("a".to_string()), Some("b".to_string())],
+            &[integer(1.0), integer(2.0)],
+        );
+        let (new_receiver, pair) = mutated_receiver("popitem", &dict, &[]).expect("popitem must decide");
+        assert_eq!(new_receiver.keys.len(), 1);
+        assert_eq!(pair.items, vec![string("b"), integer(2.0)]);
+    }
+
+    #[test]
+    fn mutated_receiver_unmodeled_method_declines() {
+        let list = list_literal_value(&[integer(1.0)]);
+        assert_eq!(mutated_receiver("sort", &list, &[]), None);
     }
 }

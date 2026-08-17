@@ -17,10 +17,13 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 
+use refined_sets::codepoint_sets::strings;
+use refined_sets::regex_compiler::format_grammar;
 use refined_sets::refinement_forms::{
     Refinement, RefinedSet, above, at_least, at_most, below, integer, make_refined_set,
     multiple_of,
 };
+use refined_sets::repetition_window_forms::repetition;
 use ruff_python_ast::{Expr, ModModule, Number, Stmt, StmtImport, StmtImportFrom, UnaryOp};
 
 /// Field kwargs that state nothing about the value set — safe to skip.
@@ -65,14 +68,28 @@ pub fn compile_aliases(module: &ModModule) -> HashMap<String, RefinedSet> {
     out
 }
 
-/// `Annotated[int|float, Field(…), …]` → the stated set, resolved
+/// `Annotated[int|float|str, Field(…), …]` → the stated set, resolved
 /// against the module's import identities. The `Annotated` head name
 /// must itself resolve to an import of `typing.Annotated` (or
 /// `typing_extensions.Annotated`) — a bare `Annotated` that was never
 /// imported is not recognized. The `int` sort carries the integer form
-/// (int ≠ float is a product law); every metadata element must be a
-/// recognized `Field(…)` call (by import identity, not spelling) or
-/// the alias refuses.
+/// (int ≠ float is a product law); the `str` sort carries the string
+/// ground (`C*`, codepoint_sets::strings) so a bare `Annotated[str,
+/// Field(…)]` with no length/pattern kwarg still names a set (every
+/// string). Every metadata element must be a recognized `Field(…)`
+/// call (by import identity, not spelling) or the alias refuses.
+///
+/// `min_length`/`max_length` fold into ONE repetition window over the
+/// codepoint ground rather than stacking a form per kwarg — pydantic
+/// itself reads them as one window's two edges
+/// (`StringConstraints`/`Len`, PYREFLY-PYDANTIC-SURFACE.md §2.3), and
+/// `tighten_repetition`'s own reading of chained `.min`/`.max` folds
+/// the same way. `pattern` intersects the compiled grammar set
+/// (`format_grammar`, unanchored search semantics per
+/// AGENT-BRIEF.md's pydantic surface facts) as its own conjoined form
+/// — a length window and a pattern on the same alias both hold at
+/// once, exactly like pydantic validates both constraints on the same
+/// field.
 pub fn annotated_expression_set(value: &Expr, imports: &SurfaceImports) -> Option<RefinedSet> {
     let Expr::Subscript(subscript) = value else {
         return None;
@@ -87,11 +104,17 @@ pub fn annotated_expression_set(value: &Expr, imports: &SurfaceImports) -> Optio
         return None;
     };
     let (base, metadata) = arguments.elts.split_first()?;
+    let is_string_sort = matches!(base, Expr::Name(sort) if sort.id.as_str() == "str");
     let mut forms: Vec<Refinement> = match base {
         Expr::Name(sort) if sort.id.as_str() == "int" => vec![integer()],
         Expr::Name(sort) if sort.id.as_str() == "float" => vec![],
+        // RefinedSet carries an iterative Drop, so `.forms` cannot move
+        // out of a set — std::mem::take is the house pattern (AGENT-BRIEF)
+        Expr::Name(sort) if sort.id.as_str() == "str" => std::mem::take(&mut strings().forms),
         _ => return None,
     };
+    let mut min_length: Option<i64> = None;
+    let mut max_length: Option<i64> = None;
     for meta in metadata {
         let Expr::Call(call) = meta else {
             return None;
@@ -107,12 +130,52 @@ pub fn annotated_expression_set(value: &Expr, imports: &SurfaceImports) -> Optio
                 "le" => forms.push(at_most(literal_number(&keyword.value)?)),
                 "lt" => forms.push(below(literal_number(&keyword.value)?)),
                 "multiple_of" => forms.push(multiple_of(literal_number(&keyword.value)?)),
+                "min_length" if is_string_sort => {
+                    min_length = Some(literal_length(&keyword.value)?);
+                }
+                "max_length" if is_string_sort => {
+                    max_length = Some(literal_length(&keyword.value)?);
+                }
+                "pattern" if is_string_sort => {
+                    let pattern = literal_string(&keyword.value)?;
+                    let mut grammar = format_grammar(pattern, "");
+                    if !grammar.ok {
+                        // a pattern this table cannot compile refuses the
+                        // WHOLE alias, the same decline the table gives
+                        // any other unrecognized kwarg — never a partial
+                        // set missing the pattern conjunct.
+                        return None;
+                    }
+                    forms.extend(std::mem::take(&mut grammar.set.forms));
+                }
                 other if INERT_FIELD_KWARGS.contains(&other) => {}
                 _ => return None,
             }
         }
     }
+    if min_length.is_some() || max_length.is_some() {
+        // the window REPLACES the plain C* ground rather than joining
+        // it (a length window is strictly tighter), so the ground
+        // conjunct is dropped before the window is added — leaving
+        // exactly one repetition form when no pattern conjunct is
+        // present, and the pattern conjunct plus the window when one
+        // is (codepoint_sets::without_string_ground keeps the ground
+        // when it is the ONLY form, the opposite of what a REPLACING
+        // window needs, so this drops it unconditionally instead).
+        let mut window = repetition(strings_codepoint_ground(), min_length.unwrap_or(0), max_length);
+        let ground = strings();
+        let plain_ground = &ground.forms[0];
+        forms.retain(|f| f != plain_ground);
+        forms.extend(std::mem::take(&mut window.forms));
+    }
     Some(make_refined_set(forms))
+}
+
+/// The codepoint ground (`C`, one scalar) `min_length`/`max_length`
+/// repeat over — `repetition_window_forms::repetition` takes the
+/// ELEMENT set, not the already-starred string ground.
+fn strings_codepoint_ground() -> RefinedSet {
+    refined_sets::codepoint_sets::codepoints()
 }
 
 /// A metadata call names pydantic's `Field` when its callee is either
@@ -208,6 +271,29 @@ pub fn literal_number(expr: &Expr) -> Option<f64> {
     }
 }
 
+/// A plain (non-f-string) string literal — the readable-RHS gate for
+/// `pattern=r"…"`. None anywhere else, matching `literal_number`'s
+/// decline-don't-guess discipline.
+fn literal_string(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::StringLiteral(literal) => Some(literal.value.to_str()),
+        _ => None,
+    }
+}
+
+/// `min_length`/`max_length`'s literal int argument — pydantic's own
+/// `StringConstraints`/`Field` types these as `int`, never a float, so
+/// a fractional or non-literal value declines rather than truncating.
+fn literal_length(expr: &Expr) -> Option<i64> {
+    match expr {
+        Expr::NumberLiteral(literal) => match &literal.value {
+            Number::Int(i) => i.as_i64(),
+            Number::Float(_) | Number::Complex { .. } => None,
+        },
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,5 +382,118 @@ mod tests {
         assert!(out.contains_key("Age"));
         assert!(out.contains_key("Adult"));
         assert_eq!(out.get("Age"), out.get("Adult"));
+    }
+
+    /// An anchored `pattern=r"^[0-9a-f]+$"` compiles — the alias's set
+    /// is exactly what `format_grammar` gives the same pattern string
+    /// directly, so a matching literal ("1a2b", o-file's in-set row)
+    /// and a non-matching one ("zz", the o-file's out-of-set row) judge
+    /// against the identical compiled set the standalone grammar
+    /// reader would give either literal.
+    #[test]
+    fn anchored_pattern_compiles_to_the_grammar_reader_own_set() {
+        let module = parsed(
+            "from pydantic import Field\n\
+             from typing import Annotated\n\
+             type Hex = Annotated[str, Field(min_length=1, max_length=6, pattern=r\"^[0-9a-f]+$\")]\n",
+        );
+        let out = compile_aliases(&module);
+        let compiled = out.get("Hex").expect("Hex compiles");
+        let direct = format_grammar("^[0-9a-f]+$", "");
+        assert!(direct.ok);
+        // the pattern conjunct is present verbatim in the compiled
+        // alias's forms (matching o-file's "1a2b" is a hex string, "zz"
+        // is not — both judge against this same conjunct at check time)
+        assert!(
+            compiled.forms.iter().any(|f| direct.set.forms.contains(f)),
+            "the anchored pattern's own compiled form must appear in Hex's forms"
+        );
+    }
+
+    /// An unanchored `pattern=r"^id-"` (anchored only at the start, the
+    /// o-file's `Anchored` row) compiles to a set whose top-level shape
+    /// is the padded concatenation `format_grammar` gives that same
+    /// pattern directly (prefix, then any suffix) — not the exact
+    /// two-sided anchored shape.
+    #[test]
+    fn unanchored_pattern_pads_the_open_side() {
+        let module = parsed(
+            "from pydantic import Field\n\
+             from typing import Annotated\n\
+             type Anchored = Annotated[str, Field(min_length=3, max_length=10, pattern=r\"^id-\")]\n",
+        );
+        let out = compile_aliases(&module);
+        let compiled = out.get("Anchored").expect("Anchored compiles");
+        let direct = format_grammar("^id-", "");
+        assert!(direct.ok);
+        assert!(
+            compiled.forms.iter().any(|f| direct.set.forms.contains(f)),
+            "the unanchored pattern's own padded form must appear in Anchored's forms"
+        );
+    }
+
+    /// A pattern `format_grammar` refuses (a backreference, which does
+    /// not denote a regular language) declines the WHOLE alias — no
+    /// partial set missing just the pattern conjunct.
+    #[test]
+    fn a_pattern_the_grammar_refuses_declines_the_whole_alias() {
+        let module = parsed(
+            "from pydantic import Field\n\
+             from typing import Annotated\n\
+             type Bad = Annotated[str, Field(min_length=1, pattern=r\"(a)\\1\")]\n",
+        );
+        let out = compile_aliases(&module);
+        assert!(!out.contains_key("Bad"));
+    }
+
+    /// `min_length`/`max_length` on a `str` alias (the o-file's
+    /// `Handle` row) compile to ONE repetition window over the
+    /// codepoint ground — `as_repetition` reads the compiled set back
+    /// with the exact [lo, hi] the two kwargs stated.
+    #[test]
+    fn string_length_window_compiles_to_one_repetition_form() {
+        let module = parsed(
+            "from pydantic import Field\n\
+             from typing import Annotated\n\
+             type Handle = Annotated[str, Field(min_length=2, max_length=6)]\n",
+        );
+        let out = compile_aliases(&module);
+        let compiled = out.get("Handle").expect("Handle compiles");
+        let read_back = refined_sets::repetition_window_forms::as_repetition(compiled)
+            .expect("a length-window-only str alias reads back as one repetition");
+        assert_eq!(read_back.lo, 2);
+        assert_eq!(read_back.hi, Some(6));
+    }
+
+    /// `min_length` with no `max_length` (an open ceiling) reads back
+    /// unbounded on the high side.
+    #[test]
+    fn string_min_length_alone_is_an_open_upper_bound() {
+        let module = parsed(
+            "from pydantic import Field\n\
+             from typing import Annotated\n\
+             type AtLeastTwo = Annotated[str, Field(min_length=2)]\n",
+        );
+        let out = compile_aliases(&module);
+        let compiled = out.get("AtLeastTwo").expect("AtLeastTwo compiles");
+        let read_back = refined_sets::repetition_window_forms::as_repetition(compiled)
+            .expect("a min_length-only str alias reads back as one repetition");
+        assert_eq!(read_back.lo, 2);
+        assert_eq!(read_back.hi, None);
+    }
+
+    /// An unrecognized kwarg on a `str` alias (`json_schema_extra`,
+    /// never on the inert list and never a bound) declines the whole
+    /// alias — the same discipline as the existing int-sort test
+    /// `an_alias_the_table_cannot_lower_declines_whole` in check.rs.
+    #[test]
+    fn an_unrecognized_string_kwarg_declines_the_whole_alias() {
+        let module = parsed(
+            "from pydantic import Field\n\
+             from typing import Annotated\n\
+             type Odd = Annotated[str, Field(min_length=1, json_schema_extra={})]\n",
+        );
+        let out = compile_aliases(&module);
+        assert!(!out.contains_key("Odd"));
     }
 }

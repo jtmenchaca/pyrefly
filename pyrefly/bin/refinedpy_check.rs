@@ -17,10 +17,12 @@
 //!
 //! Exit 0 when nothing prints — every expectation held.
 
+use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use pyrefly::refinedpy::check::findings_for_module;
+use pyrefly::refinedpy::check::findings_for_module_with_resolver;
+use pyrefly::refinedpy::cross_module::disk_resolver;
 use pyrefly::refinedpy::kernel_path::resolve_kernel_dylib;
 use refined_kernel::kernel_bridge::load_kernel;
 use refined_kernel::kernel_interface::RefinedTSKernel;
@@ -88,7 +90,13 @@ fn check_file(path: &str, kernel: &Arc<RefinedTSKernel>) -> (usize, Vec<String>)
         return (1, vec![format!("{path}: the entry file did not parse")]);
     };
     let module = parsed.into_syntax();
-    let findings = findings_for_module(&module, kernel);
+    // The entry file's own parent directory is where a sibling `.py`
+    // module it imports lives (`disk_resolver`'s own contract) — a bare
+    // filename with no parent (a relative path in the current
+    // directory) resolves against `.` instead of an empty path.
+    let entry_directory = Path::new(path).parent().filter(|dir| !dir.as_os_str().is_empty());
+    let resolver = disk_resolver(entry_directory.unwrap_or_else(|| Path::new(".")).to_path_buf());
+    let findings = findings_for_module_with_resolver(&module, &resolver, kernel);
     let markers = markers_of(&source);
     let line_starts = line_starts_of(&source);
 

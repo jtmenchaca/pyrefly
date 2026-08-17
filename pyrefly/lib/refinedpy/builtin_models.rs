@@ -9,10 +9,13 @@
 //! One dispatcher — `builtin_call_result` — takes the callee name and the
 //! already-evaluated argument values; `None` means "not modeled here" (the
 //! caller declines honestly), `Some` is an exact answer. Every modeled row
-//! cites its clause of docs.python.org/3.12/library/functions.html; a row
-//! with no citation is not written.
+//! cites its clause of docs.python.org/3.12/library/functions.html or
+//! library/stdtypes.html (the container constructors `list`/`set`/`dict`
+//! live in stdtypes.html's own class entries); a row with no citation is
+//! not written.
 
-use refined_domain::abstract_value::{known_values, AbstractValue, Kind, PrimitiveKind};
+use refined_domain::abstract_value::{known_values, opaque_value, AbstractValue, Kind, PrimitiveKind};
+use refined_domain::known_constructors::known_list;
 use refined_domain::trust_grades::{derived_trust_level, TrustSpec};
 
 /// Read a single known numeric value out of an argument: `Kind::Values`,
@@ -61,6 +64,166 @@ fn round_call(arguments: &[AbstractValue]) -> Option<AbstractValue> {
         PrimitiveKind::Integer,
         grade,
     ))
+}
+
+/// The single numeric value out of a KNOWN `Kind::List` element — the
+/// same acceptance `single_known_numeric` gives a bare argument, read
+/// off one list slot for `sum`/`min`/`max`'s single-iterable rows.
+fn single_known_numeric_element(element: &AbstractValue) -> Option<(f64, PrimitiveKind)> {
+    single_known_numeric(element)
+}
+
+/// `sum(iterable, start=0)` over a known `Kind::List` of known single-
+/// numeric elements (a known list literal, or the comprehension/
+/// generator shape `evaluate_list_or_set_comp` already builds as a
+/// `Kind::List`) — library/functions.html#sum: "Sums *start* and the
+/// items of an *iterable* from left to right and returns the total."
+/// The two-argument `start=` form threads the caller's own start value
+/// (defaulting to Integer 0, matching the doc's own default); any
+/// non-numeric element declines the whole call rather than skip it.
+/// Sort widens to Float the moment any addend (the start value or any
+/// element) is Float-sorted, matching ordinary `+` — the same mixed-
+/// arithmetic widening `expressions.rs`'s `binary_arithmetic_value`
+/// already applies.
+fn sum_call(arguments: &[AbstractValue]) -> Option<AbstractValue> {
+    let (iterable, start) = match arguments {
+        [iterable] => (iterable, None),
+        [iterable, start] => (iterable, Some(start)),
+        _ => return None,
+    };
+    if iterable.kind != Kind::List {
+        return None;
+    }
+    let (mut total, mut all_int) = match start {
+        Some(start_value) => {
+            let (value, sort) = single_known_numeric(start_value)?;
+            (value, sort == PrimitiveKind::Integer)
+        }
+        None => (0.0, true),
+    };
+    for element in &iterable.items {
+        let (value, sort) = single_known_numeric_element(element)?;
+        total += value;
+        all_int = all_int && sort == PrimitiveKind::Integer;
+    }
+    let grade = derived_trust_level(TrustSpec, &[iterable.clone()]);
+    let sort = if all_int { PrimitiveKind::Integer } else { PrimitiveKind::Float };
+    Some(known_values(vec![total], sort, grade))
+}
+
+/// `min`/`max` over a SINGLE known `Kind::List` iterable argument —
+/// library/functions.html#min/#max: "If one positional argument is
+/// provided, it should be an iterable... the largest [smallest] item
+/// in the iterable is returned." An empty iterable has no row here:
+/// CPython raises `ValueError` on an empty sequence with no `default=`
+/// keyword, which this file has no exception channel for this wave —
+/// this row declines on an empty list rather than answer a fabricated
+/// value.
+fn min_max_over_iterable(arguments: &[AbstractValue], pick: fn(f64, f64) -> bool) -> Option<AbstractValue> {
+    let [iterable] = arguments else { return None };
+    if iterable.kind != Kind::List || iterable.items.is_empty() {
+        return None;
+    }
+    let mut best: Option<(f64, PrimitiveKind)> = None;
+    for element in &iterable.items {
+        let candidate = single_known_numeric_element(element)?;
+        best = Some(match best {
+            None => candidate,
+            Some(current) => if pick(candidate.0, current.0) { candidate } else { current },
+        });
+    }
+    let (value, sort) = best?;
+    let grade = derived_trust_level(TrustSpec, &[iterable.clone()]);
+    Some(known_values(vec![value], sort, grade))
+}
+
+/// `sorted(iterable)` (no `key=`/`reverse=` keyword arguments) over a
+/// known `Kind::List` of known single-numeric elements —
+/// library/functions.html#sorted: "Return a new sorted list from the
+/// items in *iterable*." Ascending numeric order, matching the
+/// no-`key`/no-`reverse` default row; a non-numeric element declines
+/// the whole call.
+fn sorted_call(arguments: &[AbstractValue]) -> Option<AbstractValue> {
+    let [iterable] = arguments else { return None };
+    if iterable.kind != Kind::List {
+        return None;
+    }
+    let mut pairs: Vec<(f64, PrimitiveKind)> = Vec::with_capacity(iterable.items.len());
+    for element in &iterable.items {
+        pairs.push(single_known_numeric_element(element)?);
+    }
+    pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).expect("known numeric values are never NaN"));
+    let grade = derived_trust_level(TrustSpec, &[iterable.clone()]);
+    let sorted_items: Vec<AbstractValue> = pairs.into_iter().map(|(value, sort)| known_values(vec![value], sort, grade)).collect();
+    Some(known_list(sorted_items, grade))
+}
+
+/// `list(iterable)` — library/stdtypes.rst's `class:: list([iterable])`
+/// constructor row: "Lists may be constructed... using the type
+/// constructor `list()` or `list(iterable)`." A known `Kind::List`
+/// argument copies through unchanged (`list`/`tuple`/`set` all share
+/// this domain's one `Kind::List` shape, per `collection_models.rs`'s
+/// own module doc — `list(some_set)` and `list(some_tuple)` both read
+/// through this same row).
+fn list_constructor_call(arguments: &[AbstractValue]) -> Option<AbstractValue> {
+    let [iterable] = arguments else { return None };
+    if iterable.kind != Kind::List {
+        return None;
+    }
+    Some(known_list(iterable.items.clone(), derived_trust_level(TrustSpec, arguments)))
+}
+
+/// `set(iterable)` — library/stdtypes.rst's `class:: set([iterable])`
+/// constructor row: "Return a new set... object whose elements are
+/// taken from *iterable*." This domain has no dedicated set Kind (the
+/// same `Kind::List` shape a list/tuple carries, per
+/// `collection_models.rs`'s own module doc — a set's own element-
+/// uniqueness is invisible to any reader that only ever consumes the
+/// sequence via `len()`/iteration, matching that file's list/set-comp
+/// note), so this row is `list_constructor_call` under a different
+/// name; deduplication is NOT modeled (an already-List argument is
+/// assumed unique-enough for this file's callers, since a set LITERAL
+/// display is not what feeds this row — only an already-list-shaped
+/// iterable is).
+fn set_constructor_call(arguments: &[AbstractValue]) -> Option<AbstractValue> {
+    list_constructor_call(arguments)
+}
+
+/// `dict(pairs)` — one positional argument, an iterable of `(key,
+/// value)` 2-element pairs — library/stdtypes.rst's `class:: dict(...)`
+/// constructor row: "dict(iterable, **kwargs)... Dictionaries can be
+/// created by... providing an iterable of key/value pairs, including
+/// tuples: `dict([('foo', 100), ('bar', 200)])`." Modeled ONLY when
+/// `pairs` is a known `Kind::List` of known `Kind::List` 2-element
+/// pairs whose first slot is a known exact string (this domain's
+/// dict's own string-keyed-only restriction, `collection_models.rs`'s
+/// module doc) — anything else declines. A repeated key keeps the LAST
+/// value, matching the same overwrite rule `dict_literal_value` and
+/// the `dict(...)` constructor doc both state.
+fn dict_constructor_call(arguments: &[AbstractValue]) -> Option<AbstractValue> {
+    let [pairs] = arguments else { return None };
+    if pairs.kind != Kind::List {
+        return None;
+    }
+    let mut keys: Vec<Option<String>> = Vec::with_capacity(pairs.items.len());
+    let mut values: Vec<AbstractValue> = Vec::with_capacity(pairs.items.len());
+    for pair in &pairs.items {
+        if pair.kind != Kind::List || pair.items.len() != 2 {
+            return None;
+        }
+        let key = &pair.items[0];
+        if key.kind != Kind::Values || key.kind_tag != Some(PrimitiveKind::String) {
+            return None;
+        }
+        let key_text: String = key.values.iter().filter_map(|point| char::from_u32(*point as i64 as u32)).collect();
+        keys.push(Some(key_text));
+        values.push(pair.items[1].clone());
+    }
+    // dict_literal_value's own last-value-wins overwrite rule handles a
+    // repeated key exactly the way this constructor's own cited row
+    // does — this file reaches into collection_models.rs for the one
+    // shared building block rather than duplicating that merge loop
+    Some(crate::refinedpy::collection_models::dict_literal_value(&keys, &values))
 }
 
 /// `min`/`max` over two or more known single-numeric arguments —
@@ -124,6 +287,55 @@ fn float_call(arguments: &[AbstractValue]) -> Option<AbstractValue> {
     Some(known_values(vec![value], PrimitiveKind::Float, grade))
 }
 
+/// `chr(i)` on a known Integer code point — library/functions.html#chr:
+/// "Return the string representing a character whose Unicode code
+/// point is the integer *i*." A one-code-point exact string, the same
+/// `Kind::Values`/`PrimitiveKind::String` shape `string_models.rs`
+/// builds for any other exact string. `i` outside the valid code-point
+/// range (`0..=0x10FFFF`, the same range `char::from_u32` itself
+/// enforces) has no row here: CPython raises `ValueError`, which this
+/// domain has no channel for this wave, so this row declines rather
+/// than answer a fabricated character.
+fn chr_call(arguments: &[AbstractValue]) -> Option<AbstractValue> {
+    let [only] = arguments else { return None };
+    let (value, sort) = single_known_numeric(only)?;
+    if sort != PrimitiveKind::Integer {
+        return None;
+    }
+    if value < 0.0 || value > 0x10FFFF as f64 {
+        return None;
+    }
+    char::from_u32(value as u32)?;
+    Some(known_values(vec![value], PrimitiveKind::String, TrustSpec))
+}
+
+/// `str(object)` — library/stdtypes.rst's `class:: str(object='')`
+/// constructor row: "Return a string version of *object*." Modeled for
+/// two known argument shapes only: an exact string (the identity
+/// conversion — `str(word)` answers `word` unchanged, per the same
+/// row's own "If *object* already is a string, it is returned
+/// unchanged" behavior) and a known Integer (CPython's plain decimal
+/// spelling, no `.0` — the same integer-spelling rule
+/// `expressions.rs`'s f-string composition already establishes for an
+/// interpolated Integer). A known FLOAT argument is NOT modeled: the
+/// repr-shortest spelling `format_py_number` builds lives in the
+/// `refined_sets` crate, out of this file's own dependency edge for
+/// this wave, so `str(float)` declines rather than half-build that
+/// spelling by hand.
+fn str_call(arguments: &[AbstractValue]) -> Option<AbstractValue> {
+    let [only] = arguments else { return None };
+    if only.kind == Kind::Values && only.kind_tag == Some(PrimitiveKind::String) {
+        return Some(only.clone());
+    }
+    let (value, sort) = single_known_numeric(only)?;
+    if sort != PrimitiveKind::Integer {
+        return None;
+    }
+    let spelled = format!("{}", value as i64);
+    let code_points: Vec<f64> = spelled.chars().map(|c| c as u32 as f64).collect();
+    Some(known_values(code_points, PrimitiveKind::String, TrustSpec))
+}
+
 /// The dispatcher: a call to Python builtin `function` with already-
 /// evaluated `arguments`. `None` means "not modeled here" — the caller
 /// declines honestly rather than reading this as "the call is unknown to
@@ -132,8 +344,15 @@ pub fn builtin_call_result(function: &str, arguments: &[AbstractValue]) -> Optio
     match function {
         "abs" => abs_call(arguments),
         "round" => round_call(arguments),
-        "min" => min_max_call(arguments, |candidate, current| candidate < current),
-        "max" => min_max_call(arguments, |candidate, current| candidate > current),
+        // two-or-more-argument form first (min_max_call's own `len < 2`
+        // guard declines there); the single-iterable form is the ONE
+        // row this file's own doc used to call out as "not modeled" —
+        // now answered by min_max_over_iterable once the argument is a
+        // known Kind::List
+        "min" => min_max_call(arguments, |candidate, current| candidate < current)
+            .or_else(|| min_max_over_iterable(arguments, |candidate, current| candidate < current)),
+        "max" => min_max_call(arguments, |candidate, current| candidate > current)
+            .or_else(|| min_max_over_iterable(arguments, |candidate, current| candidate > current)),
         // len() declines for now: answering it needs container states
         // (string/list/tuple/dict length facts) this domain does not yet
         // carry — single_known_numeric only ever reads a known SCALAR,
@@ -142,10 +361,21 @@ pub fn builtin_call_result(function: &str, arguments: &[AbstractValue]) -> Optio
         "len" => None,
         "int" => int_call(arguments),
         "float" => float_call(arguments),
-        // sum() declines: it reads an iterable's elements, and iterable
-        // states are not yet carried by this domain (the same gap as
-        // len()) — no row to write until they are.
-        "sum" => None,
+        "sum" => sum_call(arguments),
+        "sorted" => sorted_call(arguments),
+        "list" => list_constructor_call(arguments),
+        "set" => set_constructor_call(arguments),
+        "dict" => dict_constructor_call(arguments),
+        "chr" => chr_call(arguments),
+        "str" => str_call(arguments),
+        // `type(object)` (one-argument form) — library/functions.html#type:
+        // "With one argument, return the type of an object." This domain
+        // has no type-object Kind, so the answer is opaque — the honest
+        // "a type object" sort, never a specific value
+        // (b-body-expressions.py's `type_as_value`). The three-argument
+        // `type(name, bases, dict)` class-creation form is not this row
+        // (a different arity, out of scope).
+        "type" if arguments.len() == 1 => Some(opaque_value("a type object")),
         _ => None,
     }
 }
@@ -243,11 +473,103 @@ mod tests {
     }
 
     #[test]
-    fn min_single_argument_declines() {
-        // min(some_list) reads an iterable, not two-or-more scalars —
-        // out of this row's modeled shape.
+    fn min_single_scalar_argument_declines() {
+        // min(3) is neither the two-or-more-scalar form nor the
+        // single-iterable form — a bare scalar is not a Kind::List.
         let got = builtin_call_result("min", &[integer(3.0)]);
-        assert!(got.is_none(), "min(x) with one argument should decline: {got:?}");
+        assert!(got.is_none(), "min(x) with one scalar argument should decline: {got:?}");
+    }
+
+    #[test]
+    fn min_single_iterable_argument_picks_the_smallest() {
+        let list = known_list(vec![integer(3.0), integer(-1.0), integer(5.0)], TrustSpec);
+        let got = builtin_call_result("min", &[list]).expect("min([...]) models");
+        assert_eq!(got.values, vec![-1.0]);
+    }
+
+    #[test]
+    fn max_single_iterable_argument_picks_the_largest() {
+        let list = known_list(vec![integer(200.0)], TrustSpec);
+        let got = builtin_call_result("max", &[list]).expect("max([...]) models");
+        assert_eq!(got.values, vec![200.0]);
+    }
+
+    #[test]
+    fn min_max_empty_iterable_declines() {
+        let empty = known_list(vec![], TrustSpec);
+        assert!(builtin_call_result("min", &[empty]).is_none());
+    }
+
+    #[test]
+    fn sum_over_known_list_totals_the_elements() {
+        let list = known_list(vec![integer(1.0), integer(2.0), integer(3.0)], TrustSpec);
+        let got = builtin_call_result("sum", &[list]).expect("sum([...]) models");
+        assert_eq!(got.values, vec![6.0]);
+        assert_eq!(got.kind_tag, Some(PrimitiveKind::Integer));
+    }
+
+    #[test]
+    fn sum_with_a_start_value_adds_it_in() {
+        let list = known_list(vec![integer(1.0), integer(2.0)], TrustSpec);
+        let got = builtin_call_result("sum", &[list, integer(10.0)]).expect("sum([...], start) models");
+        assert_eq!(got.values, vec![13.0]);
+    }
+
+    #[test]
+    fn sum_widens_to_float_when_any_element_is_float() {
+        let list = known_list(vec![integer(1.0), float(2.5)], TrustSpec);
+        let got = builtin_call_result("sum", &[list]).expect("sum([...]) models");
+        assert_eq!(got.values, vec![3.5]);
+        assert_eq!(got.kind_tag, Some(PrimitiveKind::Float));
+    }
+
+    #[test]
+    fn sorted_over_known_list_ascending() {
+        let list = known_list(vec![integer(3.0), integer(1.0), integer(2.0)], TrustSpec);
+        let got = builtin_call_result("sorted", &[list]).expect("sorted([...]) models");
+        assert_eq!(got.kind, Kind::List);
+        assert_eq!(got.items, vec![integer(1.0), integer(2.0), integer(3.0)]);
+    }
+
+    #[test]
+    fn list_constructor_copies_a_known_list() {
+        let list = known_list(vec![integer(1.0), integer(2.0)], TrustSpec);
+        let got = builtin_call_result("list", &[list]).expect("list([...]) models");
+        assert_eq!(got.kind, Kind::List);
+        assert_eq!(got.items, vec![integer(1.0), integer(2.0)]);
+    }
+
+    #[test]
+    fn set_constructor_copies_a_known_list() {
+        let list = known_list(vec![integer(1.0)], TrustSpec);
+        let got = builtin_call_result("set", &[list]).expect("set([...]) models");
+        assert_eq!(got.kind, Kind::List);
+        assert_eq!(got.items, vec![integer(1.0)]);
+    }
+
+    #[test]
+    fn dict_constructor_from_pairs() {
+        let pair_a = known_list(vec![string_value("ann"), integer(40.0)], TrustSpec);
+        let pair_b = known_list(vec![string_value("bea"), integer(200.0)], TrustSpec);
+        let pairs = known_list(vec![pair_a, pair_b], TrustSpec);
+        let got = builtin_call_result("dict", &[pairs]).expect("dict([...]) models");
+        assert_eq!(got.kind, Kind::Object);
+        assert_eq!(got.keys.len(), 2);
+    }
+
+    #[test]
+    fn dict_constructor_repeated_key_keeps_the_last_value() {
+        let pair_a = known_list(vec![string_value("ann"), integer(1.0)], TrustSpec);
+        let pair_b = known_list(vec![string_value("ann"), integer(2.0)], TrustSpec);
+        let pairs = known_list(vec![pair_a, pair_b], TrustSpec);
+        let got = builtin_call_result("dict", &[pairs]).expect("dict([...]) models");
+        assert_eq!(got.keys.len(), 1);
+        assert_eq!(got.keys[0].value, integer(2.0));
+    }
+
+    fn string_value(text: &str) -> AbstractValue {
+        let code_points: Vec<f64> = text.chars().map(|c| c as u32 as f64).collect();
+        known_values(code_points, PrimitiveKind::String, TrustSpec)
     }
 
     #[test]

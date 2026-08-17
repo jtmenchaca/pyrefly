@@ -6,18 +6,24 @@
  */
 
 //! `math.*` call transfers: the exactly-decidable slice of the `math`
-//! module (PYREFLY-NUMERIC-B3-B4.md's "do first" list — `floor`,
-//! `ceil`, `trunc`, `isqrt`, `fabs`, `copysign`), and nothing past it.
+//! module (`floor`, `ceil`, `trunc`, `isqrt`, `fabs`, `copysign`), PLUS
+//! the sort-only approximated family (`sqrt`, every trig/hyperbolic
+//! function, `cbrt`, `exp`, `expm1`, `log`, `log1p`, `hypot`), which
+//! answers `float_sorted_unknown()` — a Float-tagged all-numbers SET,
+//! never a specific value — once every argument is known, so
+//! assignability's sort-fire law can still refuse an int-sorted sink.
 //! `math` is CPython's thin libm wrapper (library/math.html,
-//! implementation detail note); PYREFLY-NUMERIC-B3-B4.md grades the
-//! general float/transcendental family B4 (engine-approximated, same
-//! honesty as RefinedTS's approximated `Math`), so those rows answer
-//! `None` here rather than an approximated value.
+//! implementation detail note: "the current implementation... will
+//! raise ValueError for invalid operations... and OverflowError for
+//! results that overflow" — an IMPLEMENTATION-graded accuracy promise,
+//! never a pinned exact bit pattern).
 
+use refined_domain::abstract_value::float_sorted_unknown;
 use refined_domain::abstract_value::known_values;
 use refined_domain::abstract_value::AbstractValue;
 use refined_domain::abstract_value::Kind;
 use refined_domain::abstract_value::PrimitiveKind;
+use refined_domain::abstract_value::SetKindTag;
 use refined_domain::trust_grades::TrustProved;
 
 /// The single numeric value and its sort (int vs float), read off a
@@ -133,19 +139,60 @@ fn copysign_call(magnitude: f64, sign_source: f64) -> Option<AbstractValue> {
     Some(float_result(magnitude.copysign(sign_source)))
 }
 
-/// `math.hypot(*coordinates)` — DEFERRED, not modeled, even for
-/// all-known arguments. library/math.html grades `hypot` as
-/// **implementation** (PYREFLY-NUMERIC-B3-B4.md's honesty table): the
-/// 3.10+ accuracy note only promises "maximum error is under 1 ulp...
-/// more typically... correctly rounded to within 1/2 ulp" — a soft
-/// accuracy claim, not the exact-value guarantee `floor`/`ceil`/
-/// `isqrt`/`fabs`/`copysign` carry. Without a clause pinning one
-/// correctly-rounded bit pattern the way IEEE `copysign` does, this
-/// file cannot compute an exact representable result and declines
-/// rather than approximate.
-#[allow(dead_code)]
-fn hypot_call() -> Option<AbstractValue> {
-    None
+/// `math.sqrt(x)` on a KNOWN NEGATIVE operand provably raises
+/// `ValueError` rather than answering a value — library/math.html's own
+/// module-introduction note: "The current implementation will raise
+/// `ValueError` for invalid operations like `sqrt(-1.0)`..." A
+/// negative operand is `provable_raise`'s own business (expressions.rs
+/// calls this row through its own dispatch), not this function's — this
+/// helper only reports WHETHER the operand is a known negative,
+/// leaving the raise message's own wording to the caller that owns
+/// `provable_raise`'s one voice.
+pub fn sqrt_argument_is_known_negative(arguments: &[AbstractValue]) -> bool {
+    let Some(first) = arguments.first() else {
+        return false;
+    };
+    match single_numeric_operand(first) {
+        Some((value, _)) => value < 0.0,
+        None => false,
+    }
+}
+
+/// The approximated float family this wave promotes from `None` (plain
+/// unknown) to `float_sorted_unknown()` (a Float-tagged, all-numbers
+/// SET) once every argument is known: `sqrt`, `sin`, `cos`, `tan`,
+/// `asin`, `acos`, `atan`, `atan2`, `sinh`, `cosh`, `tanh`, `asinh`,
+/// `acosh`, `atanh`, `cbrt`, `exp`, `expm1`, `log`, `log1p`, `hypot`.
+/// None of these carries a pinned exact-value clause (library/math.html's
+/// module intro: "the current implementation... Behavior in exceptional
+/// cases follows Annex F... will raise ValueError for invalid
+/// operations... and OverflowError for results that overflow" — an
+/// IMPLEMENTATION-graded accuracy promise, not an exact bit pattern),
+/// so this row never answers a specific VALUE; it answers only the
+/// SORT — Float, unconstrained — so `assignability`'s own sort-fire law
+/// can still refuse an int-sorted sink without this file pretending to
+/// know which float the real call would produce. Every argument must
+/// still be a known single numeric value (an unknown argument answers
+/// plain `unknown()` instead — see the dispatcher below), matching
+/// every other row in this file's "known operands only" discipline.
+fn approximated_family_result(function: &str, arguments: &[AbstractValue]) -> Option<AbstractValue> {
+    const APPROXIMATED_NAMES: &[&str] = &[
+        "sqrt", "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "sinh", "cosh", "tanh", "asinh", "acosh",
+        "atanh", "cbrt", "exp", "expm1", "log", "log1p", "hypot",
+    ];
+    if !APPROXIMATED_NAMES.contains(&function) {
+        return None;
+    }
+    // sqrt(negative) is `provable_raise`'s row, not this one's — a
+    // negative sqrt argument answers no VALUE here (the real call never
+    // returns; it raises), matching every other raising row's decline
+    if function == "sqrt" && sqrt_argument_is_known_negative(arguments) {
+        return None;
+    }
+    for argument in arguments {
+        single_numeric_operand(argument)?;
+    }
+    Some(float_sorted_unknown())
 }
 
 /// `math_call_result` is the FROZEN entry point: `function` is the
@@ -154,22 +201,26 @@ fn hypot_call() -> Option<AbstractValue> {
 /// modeled" — the caller declines, same honesty as every other B4 row
 /// in PYREFLY-NUMERIC-B3-B4.md.
 ///
-/// Modeled (each an exactly-decidable row cited above): `floor`,
-/// `ceil`, `trunc`, `isqrt`, `fabs`, `copysign`.
+/// Modeled EXACTLY (each an exactly-decidable row cited above):
+/// `floor`, `ceil`, `trunc`, `isqrt`, `fabs`, `copysign`.
 ///
-/// Deferred (PYREFLY-NUMERIC-B3-B4.md's "Defer or B4-shape" list —
-/// engine-approximated, no pinned exact result): `sqrt`, `pow`, `exp`,
-/// `log`, `log2`, `log10`, `log1p`, `expm1`, every trig/hyperbolic
-/// function (`sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`,
-/// `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh`), `cbrt`, `hypot`,
-/// `fsum`, `remainder`, `fmod`, `gcd`, `lcm`, `factorial`, `comb`,
-/// `perm`, `degrees`, `radians`, `isnan`, `isinf`, `isfinite`, `nextafter`,
-/// `ulp`, `frexp`, `ldexp`, `modf`, `dist`, `prod` — none of these
-/// carries a cited exact-value clause in this wave, so every one of
-/// them falls through the wildcard arm below to `None`. Constants
-/// (`math.pi`, `math.e`, `math.tau`, `math.inf`, `math.nan`) are
-/// attribute reads, not calls — out of scope for this function
-/// entirely.
+/// Modeled at SORT-ONLY precision (`approximated_family_result`'s own
+/// doc): `sqrt`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`,
+/// `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh`, `cbrt`, `exp`,
+/// `expm1`, `log`, `log1p`, `hypot` — every argument known answers
+/// `float_sorted_unknown()` (a Float-tagged all-numbers set), never a
+/// specific value; `math.sqrt` on a known negative argument answers
+/// `None` here because it provably RAISES instead (see
+/// `sqrt_argument_is_known_negative`, read by `provable_raise`).
+///
+/// Still declined (no cited row this wave, and not sort-only-graded
+/// either): `pow`, `log2`, `log10`, `fsum`, `remainder`, `fmod`, `gcd`,
+/// `lcm`, `factorial`, `comb`, `perm`, `degrees`, `radians`, `isnan`,
+/// `isinf`, `isfinite`, `nextafter`, `ulp`, `frexp`, `ldexp`, `modf`,
+/// `dist`, `prod` — every one of them falls through the wildcard arm
+/// below to `None`. Constants (`math.pi`, `math.e`, `math.tau`,
+/// `math.inf`, `math.nan`) are attribute reads, not calls — out of
+/// scope for this function entirely.
 pub fn math_call_result(function: &str, arguments: &[AbstractValue]) -> Option<AbstractValue> {
     match function {
         "floor" => {
@@ -197,11 +248,10 @@ pub fn math_call_result(function: &str, arguments: &[AbstractValue]) -> Option<A
             let (sign_source, _) = single_numeric_operand(arguments.get(1)?)?;
             copysign_call(magnitude, sign_source)
         }
-        // general float pow, sqrt, trig, log, exp, hypot, and every
-        // other libm-graded row: PYREFLY-NUMERIC-B3-B4.md's "Defer or
-        // B4-shape" list — engine-approximated, no pinned exact
-        // result, so this file declines rather than approximate
-        _ => None,
+        // the sort-only approximated family (sqrt, trig, log, exp,
+        // hypot): float_sorted_unknown() once every argument is known,
+        // per approximated_family_result's own doc
+        _ => approximated_family_result(function, arguments),
     }
 }
 
@@ -284,24 +334,48 @@ mod tests {
         assert_eq!(result.kind_tag, Some(PrimitiveKind::Float));
     }
 
+    /// `math.sqrt` on a known non-negative argument answers the sort-
+    /// only Float set, never a specific value — the exact perfect-
+    /// square result (`math.sqrt(4) == 2.0`) is not claimed here.
     #[test]
-    fn test_sqrt_declines() {
-        // general float sqrt is engine-approximated (B4) — never answered
-        let result = math_call_result("sqrt", &[float_operand(4.0)]);
+    fn test_sqrt_known_nonnegative_answers_float_sorted_unknown() {
+        let result = math_call_result("sqrt", &[float_operand(4.0)]).expect("sqrt should answer sort-only");
+        assert_eq!(result.kind, Kind::Set);
+        assert_eq!(result.set_kind_tag, SetKindTag::None);
+    }
+
+    /// `math.sqrt` on a KNOWN NEGATIVE argument answers no value at
+    /// all — the real call raises `ValueError`, which is
+    /// `provable_raise`'s row, not this dispatcher's.
+    #[test]
+    fn test_sqrt_known_negative_answers_none() {
+        let result = math_call_result("sqrt", &[float_operand(-2.0)]);
         assert_eq!(result, None);
     }
 
     #[test]
-    fn test_sin_declines() {
-        let result = math_call_result("sin", &[float_operand(0.0)]);
-        assert_eq!(result, None);
+    fn test_sqrt_argument_is_known_negative_reads_true_for_a_negative_operand() {
+        assert!(sqrt_argument_is_known_negative(&[float_operand(-2.0)]));
+        assert!(!sqrt_argument_is_known_negative(&[float_operand(4.0)]));
     }
 
     #[test]
-    fn test_hypot_declines_even_with_all_known_arguments() {
-        // hypot is graded implementation/B4 in PYREFLY-NUMERIC-B3-B4.md —
-        // declines even though every argument here is known exactly
-        let result = math_call_result("hypot", &[float_operand(3.0), float_operand(4.0)]);
+    fn test_sin_known_argument_answers_sort_only() {
+        let result = math_call_result("sin", &[float_operand(0.0)]).expect("sin should answer sort-only");
+        assert_eq!(result.kind, Kind::Set);
+    }
+
+    #[test]
+    fn test_hypot_known_arguments_answer_sort_only() {
+        let result =
+            math_call_result("hypot", &[float_operand(3.0), float_operand(4.0)]).expect("hypot should answer sort-only");
+        assert_eq!(result.kind, Kind::Set);
+    }
+
+    #[test]
+    fn test_sin_of_unknown_argument_declines() {
+        let unknown_argument = AbstractValue::default();
+        let result = math_call_result("sin", &[unknown_argument]);
         assert_eq!(result, None);
     }
 

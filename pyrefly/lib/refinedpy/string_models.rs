@@ -57,6 +57,21 @@
 //!   follows Unicode's full case-folding table (Unicode Standard
 //!   section 3.13), a locale-and-table-dependent mapping this file does
 //!   not carry.
+//! - `join(iterable)`: "Return a string which is the concatenation of
+//!   the strings in *iterable*... The separator between elements is
+//!   the string providing this method." Modeled for a known
+//!   `Kind::List` (this domain's shared list/generator/comprehension
+//!   shape, `collection_models.rs`'s own module doc) of known exact-
+//!   string elements only; a non-string element declines the whole
+//!   call, matching str.join's own `TypeError` on a non-string member.
+//! - `split(sep)` (one string-separator argument, no `maxsplit`):
+//!   "Return a list of the words in the string, using *sep* as the
+//!   delimiter string... consecutive delimiters are not grouped
+//!   together and are deemed to delimit empty strings." The no-argument
+//!   whitespace-splitting form (`sep=None`) is NOT modeled: that row
+//!   collapses runs of whitespace and strips leading/trailing empty
+//!   strings, a different splitting rule from the one-argument exact-
+//!   separator row this file builds.
 //!
 //! Concatenation (`+`) is not a method call in Python's grammar — it is
 //! `ast.BinOp` with `Operator::Add`, the same node `expressions.rs`
@@ -64,6 +79,7 @@
 //! beside that dispatcher, not in this method-result function.
 
 use refined_domain::abstract_value::{known_values, AbstractValue, Kind, PrimitiveKind};
+use refined_domain::known_constructors::known_list;
 use refined_domain::trust_grades::TrustProved;
 
 /// The state for a known string literal: an exact value, one f64 code
@@ -154,6 +170,39 @@ pub fn string_method_result(
         // approximating with `to_lowercase` (which does NOT casefold:
         // "ß".to_lowercase() stays "ß", not "ss").
         "casefold" => None,
+        // "Return a list of the words in the string, using *sep* as the
+        // delimiter string... consecutive delimiters are not grouped
+        // together and are deemed to delimit empty strings." (str.split,
+        // one-arg exact-separator row; str.split's own `maxsplit`
+        // argument is not modeled). An EMPTY separator raises
+        // `ValueError` in CPython ("empty separator") — this row
+        // declines rather than answer the whitespace-splitting fallback
+        // an empty `sep` never actually falls back to.
+        "split" if arguments.len() == 1 => {
+            let sep = exact_string_text(&arguments[0])?;
+            if sep.is_empty() {
+                return None;
+            }
+            let parts: Vec<AbstractValue> = receiver_text.split(&sep).map(string_literal_value).collect();
+            Some(known_list(parts, TrustProved))
+        }
+        // "Return a string which is the concatenation of the strings in
+        // *iterable*... The separator between elements is the string
+        // providing this method." (str.join, one-arg row — the
+        // receiver IS the separator; the argument is a known Kind::List
+        // of known exact-string elements, this domain's shared
+        // list/generator shape)
+        "join" if arguments.len() == 1 => {
+            let iterable = &arguments[0];
+            if iterable.kind != Kind::List {
+                return None;
+            }
+            let mut parts: Vec<String> = Vec::with_capacity(iterable.items.len());
+            for element in &iterable.items {
+                parts.push(exact_string_text(element)?);
+            }
+            Some(string_literal_value(&parts.join(&receiver_text)))
+        }
         _ => None,
     }
 }
@@ -359,5 +408,36 @@ mod tests {
         let old = string_literal_value("X");
         let new = known_values(vec![1.0], PrimitiveKind::Number, TrustProved);
         assert_eq!(string_method_result("replace", &receiver, &[old, new]), None);
+    }
+
+    #[test]
+    fn test_split_by_string_separator() {
+        let receiver = string_literal_value("ab,cd,ef");
+        let sep = string_literal_value(",");
+        let result = string_method_result("split", &receiver, &[sep]).expect("split must decide");
+        assert_eq!(result.kind, Kind::List);
+        assert_eq!(result.items.len(), 3);
+        assert_eq!(exact_string_text(&result.items[0]).as_deref(), Some("ab"));
+        assert_eq!(exact_string_text(&result.items[1]).as_deref(), Some("cd"));
+        assert_eq!(exact_string_text(&result.items[2]).as_deref(), Some("ef"));
+    }
+
+    /// consecutive delimiters delimit an empty string, matching
+    /// stdtypes.rst's own worked example ("'1,,2'.split(',')" -> ['1',
+    /// '', '2']).
+    #[test]
+    fn test_split_consecutive_delimiters_yield_an_empty_element() {
+        let receiver = string_literal_value("1,,2");
+        let sep = string_literal_value(",");
+        let result = string_method_result("split", &receiver, &[sep]).expect("split must decide");
+        assert_eq!(result.items.len(), 3);
+        assert_eq!(exact_string_text(&result.items[1]).as_deref(), Some(""));
+    }
+
+    #[test]
+    fn test_split_empty_separator_declines() {
+        let receiver = string_literal_value("ab");
+        let sep = string_literal_value("");
+        assert_eq!(string_method_result("split", &receiver, &[sep]), None);
     }
 }

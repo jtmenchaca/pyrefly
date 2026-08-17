@@ -483,15 +483,14 @@ mod tests {
         let cases = match_cases("match x:\n    case y if y == 5:\n        pass\n");
         let subject = known_values(vec![5.0], PrimitiveKind::Number, TrustProved);
         let environment = empty_environment();
-        // evaluate_expression does not model `==` this wave, so a guard
-        // built from unmodeled comparison syntax reads Undecidable —
-        // exercised instead through a guard shape evaluate_expression
-        // DOES read: a bare bound name.
+        // the capture binds y to the subject, and evaluate_expression
+        // decides `y == 5` over the known value — the guard reads true,
+        // so the arm is Taken with the capture bound.
         let outcome = arm_outcome(&cases[0].pattern, cases[0].guard.as_deref(), &subject, &environment, &kernel);
-        assert!(
-            matches!(outcome, ArmOutcome::Undecidable),
-            "a guard evaluate_expression cannot read is Undecidable, not a false verdict"
-        );
+        let ArmOutcome::Taken(arm_env) = outcome else {
+            panic!("a guard deciding true over a known capture takes the arm");
+        };
+        assert_eq!(arm_env.read("y").expect("y binds the subject").values, vec![5.0]);
     }
 
     #[test]

@@ -13,15 +13,20 @@
 
 pub mod assignability;
 pub mod builtin_models;
+pub mod bytes_models;
 pub mod check;
 pub mod collection_models;
+pub mod cross_module;
 pub mod env;
 pub mod expressions;
+pub mod function_table;
+pub mod instances;
 pub mod kernel_path;
 pub mod loops;
 pub mod match_arms;
 pub mod math_models;
 pub mod narrowing;
 pub mod string_models;
+pub mod summaries;
 pub mod surface;
 pub mod typereading;
