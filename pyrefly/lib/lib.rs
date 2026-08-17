@@ -38,6 +38,7 @@ pub mod lsp;
 pub mod module;
 pub mod playground;
 pub mod query;
+pub mod refinedpy;
 mod report;
 // Re-export the generated Cap'n Proto module at crate root, because the generated
 // code references types via `crate::pysa_report_capnp::...`.
