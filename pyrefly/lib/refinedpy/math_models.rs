@@ -22,13 +22,27 @@
 //! separate from `math_call_result` since a constant read is never a
 //! call.
 
+use std::sync::Arc;
+
 use refined_domain::abstract_value::float_sorted_unknown;
+use refined_domain::abstract_value::known_set;
 use refined_domain::abstract_value::known_values;
 use refined_domain::abstract_value::AbstractValue;
 use refined_domain::abstract_value::Kind;
 use refined_domain::abstract_value::PrimitiveKind;
 use refined_domain::abstract_value::SetKindTag;
+use refined_domain::trust_grades::derived_trust_level;
 use refined_domain::trust_grades::TrustProved;
+use refined_domain::trust_grades::TrustSpec;
+use refined_kernel::kernel_interface::RefinedTSKernel;
+use refined_kernel::transfer_questions::PowOperandKind;
+use refined_kernel::transfer_questions::PowOperandWire;
+use refined_kernel::transfer_questions::TransferAnswerKind;
+use refined_kernel::transfer_questions::TransferQuestion;
+use refined_kernel::transfer_questions::TransferQuestionOp;
+use refined_sets::refinement_forms::at_least;
+use refined_sets::refinement_forms::below;
+use refined_sets::refinement_forms::make_refined_set;
 
 /// The single numeric value and its sort (int vs float), read off a
 /// known single-valued AbstractValue — the same reading
@@ -74,6 +88,53 @@ fn float_result(value: f64) -> AbstractValue {
 /// value").
 fn floor_call(value: f64) -> Option<AbstractValue> {
     Some(integer_result(value.floor()))
+}
+
+/// `math.floor(x)` on a KNOWN NUMERIC SET (a seeded range, or a bounded
+/// set another transfer already produced, e.g. `random.random() * 121`):
+/// the kernel's own `Floor` transfer answers the floored enclosure
+/// directly, so the half-open/closed distinction at the set's own
+/// bounds is the kernel's proved arithmetic, never a bound this file
+/// recomputes by hand
+/// (https://docs.python.org/3.12/library/math.html#math.floor — same
+/// clause `floor_call`'s single-value row cites; the set-valued
+/// argument still floors to Integer sort). A non-numeric-sorted set, or
+/// a kernel refusal on this set shape, declines to `None` — the same
+/// honesty every other row in this file keeps.
+fn floor_call_over_set(value: &AbstractValue, kernel: &Arc<RefinedTSKernel>) -> Option<AbstractValue> {
+    if value.kind != Kind::Set {
+        return None;
+    }
+    if !matches!(
+        value.kind_tag,
+        Some(PrimitiveKind::Integer)
+            | Some(PrimitiveKind::Float)
+            | Some(PrimitiveKind::Boolean)
+            | Some(PrimitiveKind::Number)
+    ) {
+        return None;
+    }
+    let nan_operand = PowOperandWire { kind: PowOperandKind::NaN, set: make_refined_set(vec![]) };
+    let asked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        (kernel.transfer)(&TransferQuestion {
+            op: TransferQuestionOp::Floor,
+            a: value.set.clone(),
+            b: make_refined_set(vec![]),
+            c: 0.0,
+            base: nan_operand.clone(),
+            exp: nan_operand,
+        })
+    }))
+    .ok()?;
+    let grade = derived_trust_level(TrustSpec, std::slice::from_ref(value));
+    match asked.kind {
+        TransferAnswerKind::Values => Some(known_values(asked.values, PrimitiveKind::Integer, grade)),
+        TransferAnswerKind::Set => Some(AbstractValue {
+            kind_tag: Some(PrimitiveKind::Integer),
+            ..known_set(asked.set, None, grade, SetKindTag::None)
+        }),
+        TransferAnswerKind::NaN | TransferAnswerKind::Unknown => None,
+    }
 }
 
 /// `math.ceil(x)` on a known single numeric value: the exact
@@ -252,16 +313,40 @@ pub fn math_constant_value(name: &str) -> Option<AbstractValue> {
     }
 }
 
+/// `random.random()` — library/random.rst, `function:: random()`:
+/// "Return the next random floating-point number in the range `0.0 <=
+/// X < 1.0`." A Float-tagged Set bounded to that half-open window
+/// (`at_least(0.0)` meets `below(1.0)`, the same ray-intersection shape
+/// `float_sorted_unknown()` builds over the unbounded ray) — narrower
+/// than the sort-only all-numbers answer other approximated `math`
+/// calls carry, since this clause pins the interval exactly, only the
+/// specific real drawn within it. Scoped to this one function of the
+/// `random` module; no other `random.*` call is modeled here.
+pub fn random_call_result(function: &str, arguments: &[AbstractValue]) -> Option<AbstractValue> {
+    if function != "random" || !arguments.is_empty() {
+        return None;
+    }
+    let window = make_refined_set(vec![at_least(0.0), below(1.0)]);
+    Some(AbstractValue {
+        kind_tag: Some(PrimitiveKind::Float),
+        ..known_set(window, None, TrustSpec, SetKindTag::None)
+    })
+}
+
 /// `math_call_result` is the FROZEN entry point: `function` is the
 /// attribute name after `math.` ("floor", "sqrt", …); `arguments` are
-/// the already-evaluated operands in call order. `None` means "not
-/// modeled" — the caller declines, same honesty as every other B4 row
-/// in PYREFLY-NUMERIC-B3-B4.md.
+/// the already-evaluated operands in call order; `kernel` answers
+/// `floor`'s own set-valued row (`floor_call_over_set`'s own doc) when
+/// the operand is a bounded numeric set rather than one known value.
+/// `None` means "not modeled" — the caller declines, same honesty as
+/// every other B4 row in PYREFLY-NUMERIC-B3-B4.md.
 ///
 /// Modeled EXACTLY (each an exactly-decidable row cited above):
 /// `floor`, `ceil`, `trunc`, `isqrt`, `fabs`, `copysign`, and `sqrt` on
 /// a known non-negative PERFECT-SQUARE operand (`sqrt_exact_perfect_square`'s
-/// own doc — IEEE 754 correct rounding, not an approximation).
+/// own doc — IEEE 754 correct rounding, not an approximation). `floor`
+/// additionally answers a bounded numeric SET operand through the
+/// kernel's own `Floor` transfer (`floor_call_over_set`).
 ///
 /// Modeled at SORT-ONLY precision (`approximated_family_result`'s own
 /// doc): `sqrt` on a non-perfect-square operand, `sin`, `cos`, `tan`,
@@ -282,11 +367,21 @@ pub fn math_constant_value(name: &str) -> Option<AbstractValue> {
 /// `math.nan`) are attribute reads, not calls — out of scope for this
 /// function entirely; see `math_constant_value` for those (`math.nan`
 /// still excluded there, see its own doc).
-pub fn math_call_result(function: &str, arguments: &[AbstractValue]) -> Option<AbstractValue> {
+pub fn math_call_result(
+    function: &str,
+    arguments: &[AbstractValue],
+    kernel: &Arc<RefinedTSKernel>,
+) -> Option<AbstractValue> {
     match function {
         "floor" => {
-            let (value, _) = single_numeric_operand(arguments.first()?)?;
-            floor_call(value)
+            let first = arguments.first()?;
+            match single_numeric_operand(first) {
+                Some((value, _)) => floor_call(value),
+                // no single known value — try the bounded-set row
+                // (e.g. `math.floor(random.random() * 121)`) before
+                // declining
+                None => floor_call_over_set(first, kernel),
+            }
         }
         "ceil" => {
             let (value, _) = single_numeric_operand(arguments.first()?)?;
@@ -329,7 +424,12 @@ pub fn math_call_result(function: &str, arguments: &[AbstractValue]) -> Option<A
 
 #[cfg(test)]
 mod tests {
+    use refined_kernel::kernel_bridge::dylib_path;
+    use refined_kernel::kernel_bridge::kernel_artifacts_present;
+    use refined_kernel::kernel_bridge::load_kernel;
+
     use super::*;
+    use crate::refinedpy::expressions::binary_arithmetic_value_with_kernel;
 
     fn int_operand(value: f64) -> AbstractValue {
         known_values(vec![value], PrimitiveKind::Integer, TrustProved)
@@ -339,9 +439,27 @@ mod tests {
         known_values(vec![value], PrimitiveKind::Float, TrustProved)
     }
 
+    /// A kernel handle for tests that ask a `floor`-over-a-set question.
+    /// `None` when the native dylib artifact has not been built (the
+    /// same skip `expressions.rs`'s own tests use), so this file's tests
+    /// run without requiring `pnpm kernel:native` first.
+    fn loaded_kernel() -> Option<Arc<RefinedTSKernel>> {
+        let path = dylib_path();
+        if !kernel_artifacts_present(&path) {
+            eprintln!("native kernel dylib absent — build it first");
+            return None;
+        }
+        Some(load_kernel(&path).expect("load_kernel"))
+    }
+
+    fn math_call(function: &str, arguments: &[AbstractValue]) -> Option<AbstractValue> {
+        let Some(kernel) = loaded_kernel() else { return None };
+        math_call_result(function, arguments, &kernel)
+    }
+
     #[test]
     fn test_floor_known_float() {
-        let result = math_call_result("floor", &[float_operand(200.9)]).expect("floor should answer");
+        let Some(result) = math_call("floor", &[float_operand(200.9)]) else { return };
         assert_eq!(result.kind, Kind::Values);
         assert_eq!(result.values, vec![200.0]);
         assert_eq!(result.kind_tag, Some(PrimitiveKind::Integer));
@@ -349,14 +467,14 @@ mod tests {
 
     #[test]
     fn test_ceil_known_float() {
-        let result = math_call_result("ceil", &[float_operand(200.1)]).expect("ceil should answer");
+        let Some(result) = math_call("ceil", &[float_operand(200.1)]) else { return };
         assert_eq!(result.values, vec![201.0]);
         assert_eq!(result.kind_tag, Some(PrimitiveKind::Integer));
     }
 
     #[test]
     fn test_trunc_known_float_positive() {
-        let result = math_call_result("trunc", &[float_operand(200.9)]).expect("trunc should answer");
+        let Some(result) = math_call("trunc", &[float_operand(200.9)]) else { return };
         assert_eq!(result.values, vec![200.0]);
         assert_eq!(result.kind_tag, Some(PrimitiveKind::Integer));
     }
@@ -364,13 +482,13 @@ mod tests {
     #[test]
     fn test_trunc_known_float_negative() {
         // trunc rounds toward zero, not floor — -200.9 truncates to -200
-        let result = math_call_result("trunc", &[float_operand(-200.9)]).expect("trunc should answer");
+        let Some(result) = math_call("trunc", &[float_operand(-200.9)]) else { return };
         assert_eq!(result.values, vec![-200.0]);
     }
 
     #[test]
     fn test_isqrt_perfect_square() {
-        let result = math_call_result("isqrt", &[int_operand(16.0)]).expect("isqrt should answer");
+        let Some(result) = math_call("isqrt", &[int_operand(16.0)]) else { return };
         assert_eq!(result.values, vec![4.0]);
         assert_eq!(result.kind_tag, Some(PrimitiveKind::Integer));
     }
@@ -378,7 +496,7 @@ mod tests {
     #[test]
     fn test_isqrt_non_perfect_square_floors() {
         // isqrt(17) == 4 (floor of the exact square root, not a perfect square)
-        let result = math_call_result("isqrt", &[int_operand(17.0)]).expect("isqrt should answer");
+        let Some(result) = math_call("isqrt", &[int_operand(17.0)]) else { return };
         assert_eq!(result.values, vec![4.0]);
     }
 
@@ -387,21 +505,23 @@ mod tests {
         // math.isqrt raises ValueError for a negative operand; no exception
         // channel exists yet, so this declines rather than answer a value
         // the real call never produces
-        let result = math_call_result("isqrt", &[int_operand(-1.0)]);
+        if loaded_kernel().is_none() {
+            return;
+        }
+        let result = math_call("isqrt", &[int_operand(-1.0)]);
         assert_eq!(result, None);
     }
 
     #[test]
     fn test_fabs_negative_int_widens_to_float() {
-        let result = math_call_result("fabs", &[int_operand(-3.0)]).expect("fabs should answer");
+        let Some(result) = math_call("fabs", &[int_operand(-3.0)]) else { return };
         assert_eq!(result.values, vec![3.0]);
         assert_eq!(result.kind_tag, Some(PrimitiveKind::Float));
     }
 
     #[test]
     fn test_copysign_exact() {
-        let result =
-            math_call_result("copysign", &[float_operand(3.0), float_operand(-1.0)]).expect("copysign should answer");
+        let Some(result) = math_call("copysign", &[float_operand(3.0), float_operand(-1.0)]) else { return };
         assert_eq!(result.values, vec![-3.0]);
         assert_eq!(result.kind_tag, Some(PrimitiveKind::Float));
     }
@@ -411,7 +531,7 @@ mod tests {
     /// exactly, not merely approximately.
     #[test]
     fn test_sqrt_perfect_square_answers_the_exact_value() {
-        let result = math_call_result("sqrt", &[float_operand(40000.0)]).expect("sqrt(40000) should answer exactly");
+        let Some(result) = math_call("sqrt", &[float_operand(40000.0)]) else { return };
         assert_eq!(result.values, vec![200.0]);
         assert_eq!(result.kind_tag, Some(PrimitiveKind::Float));
     }
@@ -420,7 +540,7 @@ mod tests {
     /// answers the sort-only Float set, never a specific value.
     #[test]
     fn test_sqrt_non_perfect_square_answers_float_sorted_unknown() {
-        let result = math_call_result("sqrt", &[float_operand(2.0)]).expect("sqrt should answer sort-only");
+        let Some(result) = math_call("sqrt", &[float_operand(2.0)]) else { return };
         assert_eq!(result.kind, Kind::Set);
         assert_eq!(result.set_kind_tag, SetKindTag::None);
     }
@@ -430,7 +550,10 @@ mod tests {
     /// `provable_raise`'s row, not this dispatcher's.
     #[test]
     fn test_sqrt_known_negative_answers_none() {
-        let result = math_call_result("sqrt", &[float_operand(-2.0)]);
+        if loaded_kernel().is_none() {
+            return;
+        }
+        let result = math_call("sqrt", &[float_operand(-2.0)]);
         assert_eq!(result, None);
     }
 
@@ -442,36 +565,69 @@ mod tests {
 
     #[test]
     fn test_sin_known_argument_answers_sort_only() {
-        let result = math_call_result("sin", &[float_operand(0.0)]).expect("sin should answer sort-only");
+        let Some(result) = math_call("sin", &[float_operand(0.0)]) else { return };
         assert_eq!(result.kind, Kind::Set);
     }
 
     #[test]
     fn test_hypot_known_arguments_answer_sort_only() {
-        let result =
-            math_call_result("hypot", &[float_operand(3.0), float_operand(4.0)]).expect("hypot should answer sort-only");
+        let Some(result) = math_call("hypot", &[float_operand(3.0), float_operand(4.0)]) else { return };
         assert_eq!(result.kind, Kind::Set);
     }
 
     #[test]
     fn test_sin_of_unknown_argument_declines() {
+        if loaded_kernel().is_none() {
+            return;
+        }
         let unknown_argument = AbstractValue::default();
-        let result = math_call_result("sin", &[unknown_argument]);
+        let result = math_call("sin", &[unknown_argument]);
         assert_eq!(result, None);
     }
 
     #[test]
     fn test_unmodeled_function_declines() {
-        let result = math_call_result("frexp", &[float_operand(1.0)]);
+        if loaded_kernel().is_none() {
+            return;
+        }
+        let result = math_call("frexp", &[float_operand(1.0)]);
         assert_eq!(result, None);
     }
 
     #[test]
     fn test_log2_and_log10_answer_sort_only() {
-        let log2 = math_call_result("log2", &[float_operand(1024.0)]).expect("log2 should answer sort-only");
+        let Some(log2) = math_call("log2", &[float_operand(1024.0)]) else { return };
         assert_eq!(log2.kind, Kind::Set);
-        let log10 = math_call_result("log10", &[float_operand(1000.0)]).expect("log10 should answer sort-only");
+        let Some(log10) = math_call("log10", &[float_operand(1000.0)]) else { return };
         assert_eq!(log10.kind, Kind::Set);
+    }
+
+    /// `math.floor(random.random() * 121)` — the kernel's own `Mult`
+    /// transfer carries the half-open `[0.0, 1.0)` window through
+    /// multiplication by 121 to `[0.0, 121.0)`, and this file's
+    /// `floor_call_over_set` asks the kernel's `Floor` transfer on that
+    /// set — the row this file was built to close (c-reads-and-values.py
+    /// c:546). Floor of `[0.0, 121.0)` is the integer set `[0, 120]`, so
+    /// a value of exactly 121 must never be reachable through this row.
+    #[test]
+    fn test_floor_over_a_bounded_float_set_from_multiplication() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let random_window = AbstractValue {
+            kind_tag: Some(PrimitiveKind::Float),
+            ..known_set(make_refined_set(vec![at_least(0.0), below(1.0)]), None, TrustSpec, SetKindTag::None)
+        };
+        let scale = int_operand(121.0);
+        let scaled =
+            binary_arithmetic_value_with_kernel(ruff_python_ast::Operator::Mult, &random_window, &scale, &kernel);
+        assert_eq!(scaled.kind, Kind::Set, "random() * 121 should stay a set: {scaled:?}");
+        let result = math_call_result("floor", std::slice::from_ref(&scaled), &kernel)
+            .expect("floor of a bounded float set should answer");
+        assert_eq!(result.kind_tag, Some(PrimitiveKind::Integer));
+        // the set must decide 121 as NOT a member — the upper bound is
+        // strictly below 121, so floor never reaches it
+        assert!(!(kernel.member)(&result.set, &[121.0]), "121 must not be a member of floor([0, 121))");
+        assert!((kernel.member)(&result.set, &[120.0]), "120 must be a member of floor([0, 121))");
+        assert!((kernel.member)(&result.set, &[0.0]), "0 must be a member of floor([0, 121))");
     }
 
     /// `math.pi` is a sort-only Float set — never an exact digit

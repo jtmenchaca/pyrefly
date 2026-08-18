@@ -128,20 +128,26 @@ pub fn evaluate_expression(
         // `function_stored_as_local`).
         //
         // RETAINED CALLABLE: when `register_retained_callables` has
-        // already recorded this exact lambda's own body into
+        // already recorded a creation of this exact lambda into
         // `environment` (its statement-level caller runs that scan
         // before reaching this evaluation — `check.rs::sink_value`,
         // `summaries::interpret_body`'s `Stmt::Return` arm), the value
-        // additionally encodes the table key on `source`
+        // encodes the CURRENT retained-callable key on `source`
         // (`env::retained_callable_value`) so a later call through
         // `evaluate_call`'s retained-callable arm can interpret the
-        // body instead of declining. A lambda `register_retained_
-        // callables` never reached (a shape outside its own recursion,
-        // or an environment with no such registration step at all —
-        // every existing test environment, unaffected) still answers
-        // the plain opaque value exactly as before this table existed.
-        Expr::Lambda(lambda) => match environment.retained_callable(lambda.range().start().to_u32()) {
-            Some(_) => env::retained_callable_value(lambda.range().start().to_u32()),
+        // body instead of declining. The key is read back through
+        // `environment.lambda_key` — never the range itself as a key
+        // (`env.rs`'s own doc on why a fresh id is minted per creation,
+        // not the AST range) — so two creations of the SAME lambda
+        // text (`make_adder(1)` and `make_adder(100)`, each closing
+        // over a different `step`) never conflate. A lambda `register_
+        // retained_callables` never reached (a shape outside its own
+        // recursion, or an environment with no such registration step
+        // at all — every existing test environment, unaffected) still
+        // answers the plain opaque value exactly as before this table
+        // existed.
+        Expr::Lambda(lambda) => match environment.lambda_key(lambda.range().start().to_u32()) {
+            Some(key) => env::retained_callable_value(key),
             None => opaque_value("a function value"),
         },
         _ => unknown(),
@@ -153,15 +159,24 @@ pub fn evaluate_expression(
 /// arguments/keywords, an attribute's own receiver, a lambda's own
 /// body — the shapes this corpus's five retained-callable rows
 /// actually nest a lambda inside: a call argument, a constructor
-/// argument), and records each one into `environment` with an EMPTY
-/// closure — every lambda literal this scan reaches reads no free
-/// name outside its own parameters (`e-class-and-function.py`'s
-/// `pick(lambda s: s.age)`, `b-body-expressions.py`'s
-/// `Person(lambda: 40)`), so there is nothing to seed. A `Stmt::Return`
-/// whose value is a BARE lambda (`return lambda age: age + step`,
-/// `make_adder`'s own row) is also reached here — a bare lambda is
-/// still an `Expr`, so this scan's own top-level match arm covers it
-/// with no separate case.
+/// argument, or a bare `return <lambda>`), and records each one into
+/// `environment` with a CLOSURE snapshot of every free name its own
+/// body reads (`e-class-and-function.py`'s `make_adder`: `return
+/// lambda age: age + step` reads `step`, `make_adder`'s own
+/// parameter — a lambda is not always closure-free, so this scan
+/// always computes the snapshot rather than assuming one is never
+/// needed). Reused rather than duplicated: `RetainedCallable::
+/// from_lambda` builds the synthetic single-`Return` body first, and
+/// `summaries::free_variable_snapshot` reads that SAME body's own free
+/// names — the identical free-name reader `Stmt::FunctionDef`'s own
+/// retention (`summaries::interpret_body`) already calls for a nested
+/// def. Each registration mints a FRESH key
+/// (`Environment::next_retained_callable_key`) and publishes it as the
+/// lambda's own range's CURRENT key (`Environment::record_lambda_key`)
+/// — never keys by the range itself, so a second creation of the same
+/// lambda text with a different closure (`make_adder(1)` vs.
+/// `make_adder(100)`) never overwrites the first's still-live retained
+/// value under a shared key.
 ///
 /// Called at the few STATEMENT-level points that hold `&mut
 /// Environment` just before the expression evaluates
@@ -177,8 +192,12 @@ pub fn register_retained_callables(expr: &Expr, environment: &mut Environment) {
     match expr {
         Expr::Lambda(lambda) => {
             register_retained_callables(lambda.body.as_ref(), environment);
-            let key = lambda.range().start().to_u32();
-            environment.record_retained_callable(key, env::RetainedCallable::from_lambda(lambda, HashMap::new()));
+            let placeholder = env::RetainedCallable::from_lambda(lambda, HashMap::new());
+            let synthetic_def = placeholder.as_synthetic_def("<lambda>", lambda.range());
+            let closure = summaries::free_variable_snapshot(&synthetic_def, environment);
+            let key = environment.next_retained_callable_key();
+            environment.record_retained_callable(key, env::RetainedCallable::from_lambda(lambda, closure));
+            environment.record_lambda_key(lambda.range().start().to_u32(), key);
         }
         Expr::Call(call) => {
             register_retained_callables(call.func.as_ref(), environment);
@@ -308,32 +327,32 @@ fn evaluate_dict(dict: &ruff_python_ast::ExprDict, environment: &Environment, ke
             Some(key_expr) => {
                 // a non-string-LITERAL key: a known single Integer-sorted
                 // VALUE (an int literal, or any expression that reduces to
-                // one, e.g. `{age + 1: v}`) still has a slot — read the
-                // same way `evaluate_dict_comp`'s own key row does. A
-                // known EXACT STRING value (never a string LITERAL — that
-                // shape is the `Expr::StringLiteral` arm above) also has a
-                // slot: a COMPUTED key that happens to evaluate to a
-                // string — a bare Name bound to a string
+                // one, e.g. `{age + 1: v}`) still has a slot, a known
+                // EXACT STRING value (never a string LITERAL — that shape
+                // is the `Expr::StringLiteral` arm above) also has a slot
+                // — a COMPUTED key that happens to evaluate to a string —
+                // a bare Name bound to a string
                 // (h-object-literal-members.py's own `computed_key_other_
                 // expression`: `key = "age"`, `{key: 40}`), or any other
                 // expression this file can reduce to a known string — is
                 // the identical string-keyed dict entry a literal `{"age":
-                // 40}` would build; `collection_models::DictKey::string`
-                // takes the same plain text either way.
+                // 40}` would build. A recognized IDENTITY value (a module-
+                // level `object()` sentinel read back by name,
+                // `builtin_models::object_call`'s own `source: "object()"`
+                // tag) also has a slot, matched by provenance rather than
+                // value. `collection_models::known_dict_key` is the SAME
+                // reader `subscript_read` uses on the read side, so a
+                // dict literal's keys are recognized identically whether
+                // this is the build or the later `d[key]` lookup.
                 let key_value = evaluate_expression(key_expr, environment, kernel);
-                match single_numeric_value(&key_value) {
-                    Some((number, PrimitiveKind::Integer)) => {
-                        keys.push(Some(collection_models::DictKey::integer(number as i64)));
+                match collection_models::known_dict_key(&key_value) {
+                    Some(dict_key) => keys.push(Some(dict_key)),
+                    None => {
+                        // no slot — decline the whole literal via a
+                        // None row, matching dict_literal_value's own
+                        // all-keys-must-be-Some check
+                        keys.push(None);
                     }
-                    _ => match exact_string_values(&key_value).and_then(code_points_to_string) {
-                        Some(text) => keys.push(Some(collection_models::DictKey::string(&text))),
-                        None => {
-                            // no slot — decline the whole literal via a
-                            // None row, matching dict_literal_value's own
-                            // all-keys-must-be-Some check
-                            keys.push(None);
-                        }
-                    },
                 }
                 values.push(evaluate_expression(&item.value, environment, kernel));
             }
@@ -1594,6 +1613,78 @@ fn datetime_field(instance: &AbstractValue, name: &str) -> Option<f64> {
     Some(value)
 }
 
+/// A retained-callable call's own positional arguments, given `def`'s
+/// synthetic parameter list — tries `positional_arguments_for_def`'s
+/// existing exact mapping FIRST (the ordinary, no-splat call shape
+/// every other row uses), and only when THAT declines because the
+/// call site carries a `Starred` positional argument (`f(*args,
+/// **kwargs)`, r-ast-census.py's own `wrapper`: a ParamSpec-forwarding
+/// body handing its own received `*args`/`**kwargs` straight to the
+/// retained callable it wraps) tries splicing instead: `*args`
+/// splices through `splice_call_arguments` (a known `Kind::List`
+/// receiver only — the same honest decline on an unbounded iterable
+/// that function's own doc states), and a `**kwargs`-spread keyword
+/// argument (`keyword.arg.is_none()`) reads its own known `Kind::
+/// Object` entries, mapping each by NAME onto `def`'s own parameter
+/// list — the same by-name mapping `positional_arguments_with_kwargs_
+/// dict` gives an ordinary named keyword, extended to a spread rather
+/// than a single name. A `**kwargs` value that is not a known
+/// `Kind::Object`, or an entry naming no parameter of `def`, declines
+/// the whole call — this reader guesses at neither shape.
+fn positional_arguments_for_retained_call(
+    call: &ruff_python_ast::ExprCall,
+    def: &ruff_python_ast::StmtFunctionDef,
+    environment: &Environment,
+    kernel: &Arc<RefinedTSKernel>,
+) -> Option<Vec<AbstractValue>> {
+    if let Some(mapped) = positional_arguments_for_def(call, def, environment, kernel) {
+        return Some(mapped);
+    }
+    let has_starred_positional = call.arguments.args.iter().any(|arg| matches!(arg, Expr::Starred(_)));
+    let has_kwargs_spread = call.arguments.keywords.iter().any(|keyword| keyword.arg.is_none());
+    if !has_starred_positional && !has_kwargs_spread {
+        return None;
+    }
+    let parameter_names: Vec<&str> = def
+        .parameters
+        .posonlyargs
+        .iter()
+        .chain(def.parameters.args.iter())
+        .chain(def.parameters.kwonlyargs.iter())
+        .map(|parameter| parameter.parameter.name.id.as_str())
+        .collect();
+    let mut positional = splice_call_arguments(&call.arguments.args, environment, kernel)?;
+    for keyword in &call.arguments.keywords {
+        match keyword.arg.as_ref() {
+            Some(arg_name) => {
+                let position = parameter_names.iter().position(|name| *name == arg_name.as_str())?;
+                if position < positional.len() {
+                    positional[position] = evaluate_expression(&keyword.value, environment, kernel);
+                } else {
+                    positional.resize_with(position + 1, unknown);
+                    positional[position] = evaluate_expression(&keyword.value, environment, kernel);
+                }
+            }
+            None => {
+                let spread = evaluate_expression(&keyword.value, environment, kernel);
+                if spread.kind != Kind::Object {
+                    return None;
+                }
+                for entry in &spread.keys {
+                    let position = parameter_names.iter().position(|name| *name == entry.name.as_str())?;
+                    if position < positional.len() {
+                        positional[position] = entry.value.clone();
+                    } else {
+                        positional.resize_with(position + 1, unknown);
+                        positional[position] = entry.value.clone();
+                    }
+                }
+            }
+        }
+    }
+    Some(positional)
+}
+
 /// `callee(...)` where `callee` is a retained-callable value
 /// (`env::retained_callable_key` reads `Some`) — resolves the call
 /// through the SAME restricted interpreter an ordinary same-module
@@ -1617,9 +1708,10 @@ fn datetime_field(instance: &AbstractValue, name: &str) -> Option<f64> {
 /// names from — the same closure-reading contract that function
 /// already gives an ordinary nested `def`, reused rather than
 /// duplicated. Positional arguments read through `positional_
-/// arguments_for_def`, the same keyword-to-position mapping and arity
-/// checking an ordinary same-module call already gets — one binding
-/// law, not a second for retained callables.
+/// arguments_for_retained_call` — the ordinary same-module keyword-
+/// to-position mapping and arity checking, PLUS the one splicing
+/// fallback a ParamSpec-forwarding wrapper needs (that function's own
+/// doc).
 fn retained_callable_call_result(
     callee: &AbstractValue,
     call: &ruff_python_ast::ExprCall,
@@ -1631,25 +1723,34 @@ fn retained_callable_call_result(
         return Some(unknown());
     };
     let def = retained.as_synthetic_def("<retained>", call.range());
-    let Some(positional) = positional_arguments_for_def(call, &def, environment, kernel) else {
+    let Some(positional) = positional_arguments_for_retained_call(call, &def, environment, kernel) else {
         return Some(unknown());
     };
-    let answer = if retained.closure.is_empty() {
-        summaries::call_result_with_enclosing(&def, &positional, environment.functions(), kernel, environment.call_depth(), None)
-    } else {
-        let mut closure_environment = Environment::new(std::collections::HashSet::new());
-        for (name, value) in &retained.closure {
-            closure_environment.bind(name, value.clone());
-        }
-        summaries::call_result_with_enclosing(
-            &def,
-            &positional,
-            environment.functions(),
-            kernel,
-            environment.call_depth(),
-            Some(&closure_environment),
-        )
-    };
+    // `enclosing` is ALWAYS the call site's own environment, carried
+    // through a throwaway wrapper seeded with the retained body's own
+    // closure snapshot (empty for a lambda/def that reads no free
+    // name, the common case) — never `None` — so `call_result_with_
+    // enclosing`'s own `fresh_body_environment` call always inherits
+    // this call site's retained-callable table
+    // (`Environment::inherit_retained_callables`'s own doc): a
+    // retained value the closure carries (r-ast-census.py's `f`) still
+    // resolves through the SAME shared table when `def`'s own body
+    // calls it, and a retained value THIS call creates is still
+    // reachable from `environment` (and everywhere `environment`'s own
+    // `Arc` reaches) once this call returns.
+    let mut closure_environment = Environment::new(std::collections::HashSet::new());
+    closure_environment.inherit_retained_callables(environment);
+    for (name, value) in &retained.closure {
+        closure_environment.bind(name, value.clone());
+    }
+    let answer = summaries::call_result_with_enclosing(
+        &def,
+        &positional,
+        environment.functions(),
+        kernel,
+        environment.call_depth(),
+        Some(&closure_environment),
+    );
     Some(answer.unwrap_or_else(unknown))
 }
 
@@ -2396,10 +2497,20 @@ fn evaluate_attribute_call(
 ) -> AbstractValue {
     if let Expr::Name(module_name) = attribute.value.as_ref() {
         if module_name.id.as_str() == "math" && environment.read("math").is_none() {
-            return match math_models::math_call_result(attribute.attr.as_str(), arguments) {
+            return match math_models::math_call_result(attribute.attr.as_str(), arguments, kernel) {
                 Some(value) => value,
                 None => unknown(),
             };
+        }
+        // `random.random()` — the sound `[0.0, 1.0)` range
+        // (`math_models::random_call_result`'s own doc, citing
+        // library/random.rst). Only this one function of the module is
+        // modeled; every other `random.*` call falls through to the
+        // generic unmodeled-call path below.
+        if module_name.id.as_str() == "random" && environment.read("random").is_none() {
+            if let Some(value) = math_models::random_call_result(attribute.attr.as_str(), arguments) {
+                return value;
+            }
         }
         // `re.compile(pattern)` — library/re.html, `re.compile`: "Compile
         // a regular expression pattern... into a regular expression
@@ -2743,6 +2854,22 @@ fn evaluate_attribute_call(
         // this file already draws.
         if attribute.attr.as_str() == "sort" && arguments.is_empty() {
             return null_value();
+        }
+        // `xs.index(needle)` — stdtypes.rst's Common Sequence Operations
+        // table, `s.index(x)`: "index of the first occurrence of x in
+        // s." Modeled only on the FOUND leg (a missing needle raises
+        // ValueError at runtime instead of returning — that leg is
+        // `call_provable_raise`'s own `"index"` row, checked separately
+        // against the same `single_pair_equal` equality this row uses,
+        // so the two passes agree on exactly which needle is present).
+        // Answers the position of the first matching element as an
+        // exact Integer.
+        if attribute.attr.as_str() == "index" {
+            if let [needle] = arguments {
+                if let Some(position) = receiver.items.iter().position(|element| single_pair_equal(element, needle) == Some(true)) {
+                    return known_values(vec![position as f64], PrimitiveKind::Integer, TrustProved);
+                }
+            }
         }
     }
     unknown()
@@ -4493,6 +4620,88 @@ mod tests {
         let Some(value) = eval("lambda: 40") else { return };
         assert_eq!(value.kind, Kind::Object);
         assert_eq!(value.kind_word, Some("a function value"));
+    }
+
+    /// `register_retained_callables` scanning a bare `lambda: 40`
+    /// (the shape `summaries::interpret_body`'s `Stmt::Return` arm
+    /// hands it) makes a LATER read of that SAME `Expr::Lambda` node
+    /// answer a retained-callable value rather than the plain opaque
+    /// one — and calling that value through `evaluate_call`'s
+    /// retained-callable arm interprets the lambda's own body,
+    /// answering its exact return value.
+    #[test]
+    fn test_retained_lambda_call_answers_its_body() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let lambda_expr = parse_expression("lambda: 40").expect("test source must parse").into_expr();
+        let mut environment = empty_environment();
+        register_retained_callables(&lambda_expr, &mut environment);
+        let retained = evaluate_expression(&lambda_expr, &environment, &kernel);
+        assert_eq!(retained.kind, Kind::Object);
+        assert_eq!(retained.kind_word, Some("a function value"));
+        assert!(!retained.source.is_empty(), "a registered lambda's source carries its table key");
+
+        let call_expr = parse_expression("f()").expect("test source must parse").into_expr();
+        let Expr::Call(call) = call_expr else { panic!("expected a call expression") };
+        environment.bind("f", retained);
+        let result = evaluate_call(&call, &environment, &kernel);
+        assert_eq!(result.values, vec![40.0]);
+    }
+
+    /// A retained lambda that reads a FREE variable
+    /// (`e-class-and-function.py`'s own `make_adder` shape: `lambda
+    /// age: age + step` closes over `step`) carries that free name's
+    /// value in its own closure snapshot, taken at the moment
+    /// `register_retained_callables` runs — a later call answers using
+    /// THAT snapshot, not whatever the call site happens to bind the
+    /// free name to.
+    #[test]
+    fn test_retained_lambda_closure_reads_a_free_name_at_creation() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let lambda_expr = parse_expression("lambda age: age + step").expect("test source must parse").into_expr();
+        let mut environment = empty_environment();
+        environment.bind("step", known_values(vec![1.0], PrimitiveKind::Integer, TrustProved));
+        register_retained_callables(&lambda_expr, &mut environment);
+        let retained = evaluate_expression(&lambda_expr, &environment, &kernel);
+
+        // rebinding `step` AFTER registration must not affect the
+        // already-taken closure snapshot — Python's own closure rule
+        // pins the binding to the DEFINING scope, not the call site.
+        environment.bind("step", known_values(vec![999.0], PrimitiveKind::Integer, TrustProved));
+        environment.bind("f", retained);
+        let call_expr = parse_expression("f(40)").expect("test source must parse").into_expr();
+        let Expr::Call(call) = call_expr else { panic!("expected a call expression") };
+        let result = evaluate_call(&call, &environment, &kernel);
+        assert_eq!(result.values, vec![41.0], "must use step=1 from the closure, not step=999 from the call site");
+    }
+
+    /// Two creations of the textually SAME lambda (two calls to a
+    /// function returning `lambda x: x + step`, each closing over a
+    /// different `step`) never conflate: each registration mints its
+    /// own key, so the second's closure never overwrites the first's
+    /// still-live retained value (`conflation_probe.py`'s own row,
+    /// reproduced directly against `register_retained_callables`).
+    #[test]
+    fn test_two_creations_of_the_same_lambda_text_keep_separate_closures() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let lambda_expr = parse_expression("lambda x: x + step").expect("test source must parse").into_expr();
+        let mut environment = empty_environment();
+
+        environment.bind("step", known_values(vec![1.0], PrimitiveKind::Integer, TrustProved));
+        register_retained_callables(&lambda_expr, &mut environment);
+        let first = evaluate_expression(&lambda_expr, &environment, &kernel);
+
+        environment.bind("step", known_values(vec![100.0], PrimitiveKind::Integer, TrustProved));
+        register_retained_callables(&lambda_expr, &mut environment);
+        let second = evaluate_expression(&lambda_expr, &environment, &kernel);
+
+        environment.bind("first", first);
+        environment.bind("second", second);
+        let call_first = parse_expression("first(40)").expect("test source must parse").into_expr();
+        let Expr::Call(call_first) = call_first else { panic!("expected a call expression") };
+        let call_second = parse_expression("second(40)").expect("test source must parse").into_expr();
+        let Expr::Call(call_second) = call_second else { panic!("expected a call expression") };
+        assert_eq!(evaluate_call(&call_first, &environment, &kernel).values, vec![41.0]);
+        assert_eq!(evaluate_call(&call_second, &environment, &kernel).values, vec![140.0]);
     }
 
     /// `binary_arithmetic_value` directly, no kernel needed (pure

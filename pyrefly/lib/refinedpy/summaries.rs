@@ -165,6 +165,31 @@ pub fn call_result_with_enclosing(
     let mut environment = fresh_body_environment(def, table, depth);
     if let Some(enclosing) = enclosing {
         seed_free_variables(def, enclosing, &mut environment);
+        // RETAINED CALLABLES: this call's own environment shares the
+        // CALLER's retained-callable table (the same `Arc<Mutex<...>>>`,
+        // never a copy) rather than starting a fresh, empty one — a
+        // nested def this call's own body creates
+        // (`interpret_body`'s `Stmt::FunctionDef` arm, r-ast-census.py's
+        // `wrapper`) is returned OUT of this call and invoked later
+        // from the CALLER's own environment, which must still be able
+        // to look its table entry back up at that later call site
+        // (`env::Environment::inherit_retained_callables`'s own doc).
+        environment.inherit_retained_callables(enclosing);
+        // CLASSES: this call's own environment ALSO inherits the
+        // caller's class table when it never set one of its own — a
+        // same-module def interpreted here may itself construct a
+        // class instance (e-class-and-function.py's `pick`: `store =
+        // Store(40)`, called through `pick(lambda s: s.age)` — the
+        // retained lambda's own body reads `s.age` off that instance),
+        // and `evaluate_call`'s construction arm only ever resolves a
+        // class by reading `environment.classes()` — `None` here
+        // otherwise, since `fresh_body_environment` never populates it
+        // on its own.
+        if environment.classes().is_none() {
+            if let Some(classes) = enclosing.classes() {
+                environment.set_classes(classes.clone());
+            }
+        }
     }
     let Some(()) = bind_parameters(def, arguments, kernel, &mut environment, enclosing) else {
         return return_sort_fallback(def);
@@ -1110,7 +1135,27 @@ pub(crate) fn interpret_body(
             Stmt::AugAssign(assign) => interpret_aug_assign(assign, kernel, environment)?,
             Stmt::Pass(_) => {}
             Stmt::Expr(expr_stmt) => {
-                evaluate_expression(expr_stmt.value.as_ref(), environment, kernel);
+                // A `name.method(args)` expression-statement is tried as a
+                // MUTATION first (`write_mutating_call_expr`, the same
+                // receiver-rebinding contract `check.rs`'s own top-level
+                // walk applies) — `bucket.append(age)` must carry its
+                // written element into a LATER read in this same body
+                // (`grow_into_bucket`'s own `return bucket[0]`), not leave
+                // `bucket` bound to its stale pre-call value. Only when the
+                // expression is not this shape at all (`Err` from the
+                // `Ok`/`Err` split below — the call's func is not a
+                // Name-receiver Attribute call) does this fall back to the
+                // ordinary evaluate-and-discard `interpret_body` always
+                // used before this arm existed; a shape that IS this call
+                // form but that `mutated_receiver` does not recognize
+                // declines the whole interpretation, matching `write_
+                // subscript_target`'s identical all-or-nothing posture,
+                // rather than silently keeping a stale receiver bound.
+                if is_mutating_call_expr_shape(expr_stmt.value.as_ref()) {
+                    write_mutating_call_expr(expr_stmt.value.as_ref(), kernel, environment)?;
+                } else {
+                    evaluate_expression(expr_stmt.value.as_ref(), environment, kernel);
+                }
             }
             Stmt::If(if_stmt) => {
                 let falls_through = interpret_if(if_stmt, kernel, depth, environment, returns, super_resolver)?;
@@ -1144,20 +1189,23 @@ pub(crate) fn interpret_body(
             // A NESTED `def` INSIDE A SUMMARIZED BODY (e-class-and-
             // function.py's `make_counter`'s own `def bump(...)`,
             // r-ast-census.py's `with_paramspec_presence`'s own `def
-            // wrapper(...)`): retains the def's own body under its own
-            // range key, with a CLOSURE snapshot of every free name the
-            // def's body reads (`free_variable_snapshot`) — taken HERE,
-            // at the moment the def statement executes, never at the
-            // moment a later call reaches it (`RetainedCallable`'s own
-            // doc: Python pins a closure to its DEFINING scope). The
-            // name binds to the retained-callable value the same way an
-            // ordinary `Stmt::Assign` binds a name to whatever it
-            // evaluates to — a later `return bump`/`return wrapper`
-            // reads this binding through the ordinary `Expr::Name` arm,
-            // no special case needed there.
+            // wrapper(...)`): retains the def's own body under a FRESH
+            // counter key (`next_retained_callable_key` — never the AST
+            // range, unlike a lambda's own registration: `env.rs`'s own
+            // doc on why a def's key must be minted per call), with a
+            // CLOSURE snapshot of every free name the def's body reads
+            // (`free_variable_snapshot`) — taken HERE, at the moment the
+            // def statement executes, never at the moment a later call
+            // reaches it (`RetainedCallable`'s own doc: Python pins a
+            // closure to its DEFINING scope). The name binds to the
+            // retained-callable value the same way an ordinary
+            // `Stmt::Assign` binds a name to whatever it evaluates to —
+            // a later `return bump`/`return wrapper` reads this binding
+            // through the ordinary `Expr::Name` arm, no special case
+            // needed there.
             Stmt::FunctionDef(def) => {
                 let closure = free_variable_snapshot(def, environment);
-                let key = ruff_text_size::Ranged::range(def).start().to_u32();
+                let key = environment.next_retained_callable_key();
                 environment.record_retained_callable(key, crate::refinedpy::env::RetainedCallable::from_def(def, closure));
                 environment.bind(def.name.id.as_str(), crate::refinedpy::env::retained_callable_value(key));
             }
@@ -1297,6 +1345,17 @@ pub(crate) fn interpret_body(
             // to an enclosing name from inside the callee... is not
             // modeled" by this path.
             Stmt::Nonlocal(_) => {}
+            // `global <name>[, ...]` — the same declaration-only shape as
+            // `nonlocal`, just naming the MODULE scope instead of an
+            // enclosing function scope (simple_stmts.rst, "The `global`
+            // statement": it "causes the listed identifiers to be
+            // interpreted as globals"). This interpreter still tracks no
+            // scope chain, so the declaration itself neither reads nor
+            // writes a value — recognizing it, exactly like `Stmt::Nonlocal`,
+            // is what lets a body OPENING with `global _module_age` reach its
+            // own following statements at all, rather than declining the
+            // whole call on the declaration alone.
+            Stmt::Global(_) => {}
             _ => return None,
         }
     }
@@ -1531,6 +1590,55 @@ fn write_subscript_target(
         _ => return None,
     };
     environment.bind(name.id.as_str(), new_receiver);
+    Some(())
+}
+
+/// Whether `expr` is the `name.method(args)` shape `write_mutating_call_expr`
+/// knows how to attempt — a syntactic check only (never reads `environment`),
+/// so `interpret_body`'s `Stmt::Expr` arm can tell "not this shape, fall back
+/// to evaluate-and-discard" apart from "this shape, but the mutation itself
+/// is unresolvable, decline the whole call."
+fn is_mutating_call_expr_shape(expr: &Expr) -> bool {
+    let Expr::Call(call) = expr else {
+        return false;
+    };
+    let Expr::Attribute(attribute) = call.func.as_ref() else {
+        return false;
+    };
+    matches!(attribute.value.as_ref(), Expr::Name(_))
+}
+
+/// `name.method(args)` as its own expression-statement inside a restricted
+/// body — e-class-and-function.py's own `grow_into_bucket`:
+/// `bucket.append(age)` mutating a parameter bound from a module-level
+/// default (`bucket: list[int] = _DEFAULT_BUCKET`). `name` must already be
+/// bound to a known receiver; `collection_models::mutated_receiver` (the
+/// SAME contract `check.rs::walk_mutating_call_statement` uses for the
+/// ordinary top-level walk) replays the call and answers the updated
+/// receiver, which rebinds `name` so a LATER read in the same body (this
+/// function's own `return bucket[0]`) sees the write rather than the
+/// stale pre-call value. `None` when `name` is unbound or `mutated_receiver`
+/// does not recognize the method — this is only ever called once
+/// `is_mutating_call_expr_shape` has already confirmed the syntactic shape,
+/// so a `None` here always means "this interpreter's own contract cannot
+/// replay this specific mutation," and the whole call declines rather than
+/// silently keeping a stale receiver bound.
+fn write_mutating_call_expr(expr: &Expr, kernel: &Arc<RefinedTSKernel>, environment: &mut Environment) -> Option<()> {
+    let Expr::Call(call) = expr else {
+        return None;
+    };
+    let Expr::Attribute(attribute) = call.func.as_ref() else {
+        return None;
+    };
+    let Expr::Name(receiver_name) = attribute.value.as_ref() else {
+        return None;
+    };
+    let receiver = environment.read(receiver_name.id.as_str())?.clone();
+    let arguments: Vec<AbstractValue> =
+        call.arguments.args.iter().map(|argument| evaluate_expression(argument, environment, kernel)).collect();
+    let (new_receiver, _result) =
+        crate::refinedpy::collection_models::mutated_receiver(attribute.attr.as_str(), &receiver, &arguments)?;
+    environment.bind(receiver_name.id.as_str(), new_receiver);
     Some(())
 }
 
@@ -1837,12 +1945,60 @@ mod tests {
         assert_eq!(result.kind_tag, Some(PrimitiveKind::Integer));
     }
 
+    /// A nested `def` returned out of its own enclosing function
+    /// (e-class-and-function.py's `make_counter`, r-ast-census.py's
+    /// `with_paramspec_presence`): `interpret_body`'s `Stmt::FunctionDef`
+    /// arm retains the def's own body and binds its name to a
+    /// retained-callable value, which `return inner` then answers as an
+    /// ordinary `Expr::Name` read — no special-casing needed there.
+    #[test]
+    fn a_nested_def_returned_out_of_its_enclosing_function_is_retained() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let def = parsed_def("def make_adder(step):\n    def inner(x):\n        return x + step\n    return inner\n");
+        let result = call_result(&def, &[known_int(1.0)], None, &kernel, 0)
+            .expect("a body ending in a bare-name return of its own nested def answers");
+        assert_eq!(result.kind, Kind::Object);
+        assert_eq!(result.kind_word, Some("a function value"));
+        assert!(
+            crate::refinedpy::env::retained_callable_key(&result).is_some(),
+            "a retained callable's source must parse as its table key: {result:?}"
+        );
+        // the retained body was recorded against `call_result`'s own
+        // (disposable) interpretation environment — `call_result` itself
+        // exposes no handle to it, so this test only pins that the VALUE
+        // carries a real key; `expressions.rs`'s own retained-callable
+        // tests pin the full call-and-answer round trip through
+        // `evaluate_call`.
+    }
+
     #[test]
     fn a_trailing_default_parameter_is_evaluated_when_no_argument_covers_it() {
         let Some(kernel) = loaded_kernel() else { return };
         let def = parsed_def("def add(x, y=10):\n    return x + y\n");
         let result = call_result(&def, &[known_int(5.0)], None, &kernel, 0).expect("default parameter fills in");
         assert_eq!(result.values, vec![15.0]);
+    }
+
+    /// e-class-and-function.py's own `grow_into_bucket`: a default
+    /// parameter's value (read from `enclosing`, since the default
+    /// expression names a module-level list) is MUTATED inside the body
+    /// (`bucket.append(age)`) before a later statement reads it back
+    /// (`return bucket[0]`). Before `write_mutating_call_expr` existed,
+    /// the append call was evaluated and discarded, leaving `bucket`
+    /// bound to its stale pre-append value — the read then saw an empty
+    /// list and declined. `arguments` is empty here (`bucket` fills from
+    /// its own default), so this pins the mutation-carries-forward
+    /// behavior in isolation from the enclosing-environment default read
+    /// (that seam already has its own test above).
+    #[test]
+    fn a_mutating_call_on_a_parameter_carries_its_write_into_a_later_read() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let def = parsed_def(
+            "def grow_into_bucket(age, bucket=[40]):\n    bucket.append(age)\n    return bucket[0]\n",
+        );
+        let result = call_result(&def, &[known_int(41.0)], None, &kernel, 0)
+            .expect("the append must carry forward so bucket[0] still reads the first element, 40");
+        assert_eq!(result, known_int(40.0));
     }
 
     #[test]
@@ -2054,6 +2210,22 @@ mod tests {
         let result = call_result_with_enclosing(&def, &[], None, &kernel, 0, Some(&enclosing))
             .expect("the body's own local binding answers the read");
         assert_eq!(result, known_int(10.0), "the callee's own `age = 10` wins, never the enclosing 999");
+    }
+
+    /// a-statements.py's own `global_rebind`/`bump`: `global _module_age`
+    /// then `_module_age = 15` then `return _module_age` — the `global`
+    /// declaration must not decline the whole call the way an unrecognized
+    /// statement would. This interpreter tracks no scope chain, so the
+    /// write and the read both land in the SAME flat environment; the
+    /// declaration itself is a no-op, exactly like `Stmt::Nonlocal`.
+    #[test]
+    fn interpret_body_reaches_past_a_global_declaration() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let def = parsed_def("def bump():\n    global _module_age\n    _module_age = 15\n    return _module_age\n");
+
+        let result = call_result(&def, &[], None, &kernel, 0)
+            .expect("the `global` declaration is a no-op; the following write/read resolve normally");
+        assert_eq!(result, known_int(15.0));
     }
 
     // --- return_sort_fallback: declined-call sort fallback ---

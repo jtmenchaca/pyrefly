@@ -1490,6 +1490,33 @@ fn arm_terminates(body: &[Stmt]) -> bool {
     matches!(body.last(), Some(Stmt::Return(_)) | Some(Stmt::Raise(_)))
 }
 
+/// The same termination test as `arm_terminates`, extended with ONE more
+/// proven-terminal shape: the body's last statement is not syntactically a
+/// `return`/`raise`, but the walk's OWN provable-raise machinery already
+/// recorded an RTS7001 finding whose range falls inside that last
+/// statement's own range (e.g. `bind_known_sequence_target`'s arity-mismatch
+/// fire, anchored at the destructured value's range, inside an `Assign`
+/// statement that is itself the try body's last statement). A body ending
+/// this way also describes only unreachable code past that point — the
+/// exception is provably always raised, so a "falls through normally" path
+/// never exists. `findings_before` is `out`'s length captured immediately
+/// before this body was walked; only findings recorded DURING that walk are
+/// considered. This does not weaken the syntactic check for a body whose
+/// last statement was never proven to raise — those still route through
+/// `arm_terminates` alone.
+fn arm_terminates_or_provably_raises(body: &[Stmt], out: &[Finding], findings_before: usize) -> bool {
+    if arm_terminates(body) {
+        return true;
+    }
+    let Some(last) = body.last() else {
+        return false;
+    };
+    let last_range = last.range();
+    out[findings_before..]
+        .iter()
+        .any(|finding| finding.code == "RTS7001" && last_range.contains_range(finding.range))
+}
+
 /// `for`/`while`: `loops::loop_final_environment` concretely executes the
 /// bounded shapes it recognizes (literal list/tuple/range iterables,
 /// bounded counter `while`s), judging every declared-slot write inside
@@ -1908,6 +1935,7 @@ fn walk_try(
 
     let mut try_env = environment.fork();
     let mut try_provably_unbound: HashSet<String> = HashSet::new();
+    let try_body_findings_before = out.len();
     for stmt in &try_stmt.body {
         walk_statement(
             stmt,
@@ -1928,6 +1956,7 @@ fn walk_try(
     // taken at runtime. The combined path's survival is decided by the
     // LAST body actually executed along it: orelse's own last statement
     // when orelse is present, otherwise the try body's.
+    let orelse_findings_before = out.len();
     for stmt in &try_stmt.orelse {
         walk_statement(
             stmt,
@@ -1941,12 +1970,12 @@ fn walk_try(
             out,
         );
     }
-    let try_path_terminal_body = if try_stmt.orelse.is_empty() {
-        try_stmt.body.as_slice()
+    let (try_path_terminal_body, terminal_findings_before) = if try_stmt.orelse.is_empty() {
+        (try_stmt.body.as_slice(), try_body_findings_before)
     } else {
-        try_stmt.orelse.as_slice()
+        (try_stmt.orelse.as_slice(), orelse_findings_before)
     };
-    if !arm_terminates(try_path_terminal_body) {
+    if !arm_terminates_or_provably_raises(try_path_terminal_body, out, terminal_findings_before) {
         surviving.push(try_env);
     }
 
@@ -1971,6 +2000,7 @@ fn walk_try(
             handler_env.bind(name.id.as_str(), caught);
         }
         let mut handler_provably_unbound: HashSet<String> = HashSet::new();
+        let handler_findings_before = out.len();
         for stmt in &handler.body {
             walk_statement(
                 stmt,
@@ -1987,7 +2017,7 @@ fn walk_try(
         if let Some(name) = handler.name.as_ref() {
             handler_env.forget(name.id.as_str());
         }
-        if !arm_terminates(&handler.body) {
+        if !arm_terminates_or_provably_raises(&handler.body, out, handler_findings_before) {
             surviving.push(handler_env);
         }
     }
@@ -2726,6 +2756,7 @@ fn direct_alias_annotation(
         admits_none: false,
         element: None,
         generator: None,
+        members: None,
     })
 }
 
@@ -3657,7 +3688,16 @@ fn construction_call_verdict(
             }
         };
         if callee_open {
-            if let Some(model) = context.classes.get(callee.id.as_str()) {
+            // A class defined LOCALLY inside the walked body only lives in
+            // `environment.classes()` (`merged_classes_for_body`'s own merge
+            // over `context.classes`) — two different body-local classes
+            // sharing a bare name (e.g. two functions each declaring their
+            // own `class Person`) collide in the one shared
+            // `context.classes` map, so the per-body table must win when
+            // present, exactly as `instance_method_call_result` already
+            // reads it.
+            let classes = environment.classes().unwrap_or(&context.classes);
+            if let Some(model) = classes.get(callee.id.as_str()) {
                 let positional = evaluate_positional_arguments(&call.arguments.args, environment, context.kernel);
                 let keyword = evaluate_keyword_arguments(&call.arguments.keywords, environment, context.kernel);
                 return Some(judge_construction(model, &positional, &keyword, context.kernel));
@@ -3690,7 +3730,9 @@ fn construction_call_verdict(
         let [Expr::Name(class_name)] = adapter_call.arguments.args.as_ref() else {
             return None;
         };
-        if let Some(model) = context.classes.get(class_name.id.as_str()) {
+        // Same locality rule as the bare-Name construction arm above: a
+        // body-local class only lives in `environment.classes()`.
+        if let Some(model) = environment.classes().unwrap_or(&context.classes).get(class_name.id.as_str()) {
             let dict_argument = single_dict_argument(&call.arguments)?;
             let keyword = dict_literal_keyword_rows(dict_argument, environment, context.kernel)?;
             return Some(judge_construction(model, &[], &keyword, context.kernel));
@@ -3731,6 +3773,7 @@ fn adapter_alias_verdict(
         admits_none: false,
         element: None,
         generator: None,
+        members: None,
     };
     let range = argument_expr.range();
     let mut value = evaluate_expression(argument_expr, environment, context.kernel);
@@ -3826,14 +3869,17 @@ fn plain_digit_string_value(code_points: &[f64]) -> Option<AbstractValue> {
 }
 
 /// `<ClassName>` out of a bare-Name expression naming a class in
-/// `context.classes` — the receiver shape `<ClassName>.model_validate`
-/// reads. `None` for anything else (a non-Name receiver, or a Name that
-/// is either environment-bound to something else or simply not a known
-/// class).
+/// `environment.classes()` (falling back to `context.classes` when the
+/// environment carries none — the same locality rule
+/// `instance_method_call_result` already applies, since a class defined
+/// LOCALLY inside the walked body only lives in the per-body table) — the
+/// receiver shape `<ClassName>.model_validate` reads. `None` for anything
+/// else (a non-Name receiver, or a Name that is either environment-bound to
+/// something else or simply not a known class).
 fn class_model_of_bare_name<'a>(
     expr: &Expr,
     context: &'a WalkContext,
-    environment: &Environment,
+    environment: &'a Environment,
 ) -> Option<&'a ClassModel> {
     let Expr::Name(name) = expr else {
         return None;
@@ -3850,7 +3896,7 @@ fn class_model_of_bare_name<'a>(
             return None;
         }
     }
-    context.classes.get(name.id.as_str())
+    environment.classes().unwrap_or(&context.classes).get(name.id.as_str())
 }
 
 /// The single positional argument of a call, when it is a `Dict`
@@ -5888,6 +5934,40 @@ mod tests {
         );
     }
 
+    /// `arm_terminates_or_provably_raises` treats a body whose last
+    /// statement is NOT syntactically `return`/`raise`, but that the
+    /// walk's own provable-raise machinery already fired an RTS7001 for,
+    /// as terminating — the same as a bare `raise`. A plain `Assign` with
+    /// no recorded fire must NOT be treated as terminating; only tacking
+    /// a genuine RTS7001 finding, anchored inside that statement's own
+    /// range, onto the body flips the answer.
+    #[test]
+    fn arm_terminates_or_provably_raises_treats_a_provable_raise_as_terminal() {
+        let module = parsed(concat!(
+            "def f() -> None:\n",
+            "    a, b = (1, 2, 3)\n",
+        ));
+        let Stmt::FunctionDef(def) = &module.body[0] else { panic!("a function def") };
+        let Stmt::Assign(assign) = &def.body[0] else { panic!("an assign") };
+        let body = std::slice::from_ref(&def.body[0]);
+
+        let no_findings: Vec<Finding> = Vec::new();
+        assert!(
+            !arm_terminates_or_provably_raises(body, &no_findings, 0),
+            "a plain Assign with no recorded raise must not read as terminal"
+        );
+
+        let with_a_raise = vec![Finding {
+            range: assign.value.range(),
+            code: "RTS7001",
+            message: "this expression provably raises ValueError: too many values to unpack (expected 2)".to_owned(),
+        }];
+        assert!(
+            arm_terminates_or_provably_raises(body, &with_a_raise, 0),
+            "an RTS7001 anchored inside the last statement's own range must count as terminal"
+        );
+    }
+
     // --- HANDLER AS-NAME (law 3) ---
 
     #[test]
@@ -6980,6 +7060,49 @@ mod tests {
             fires.len(),
             1,
             "the body-local class's own out-of-set construction (200) must fire: {:?}",
+            findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+        );
+        assert!(fires[0].message.contains("'200'"), "{}", fires[0].message);
+    }
+
+    /// c-reads-and-values.py's own `read_one_field`/`read_nested_path`
+    /// collision: two DIFFERENT functions each declare their own body-local
+    /// class named `Person`, with different fields. Both classes collide
+    /// under the one shared bare name in `context.classes`
+    /// (`findings_for_module_with_resolver`'s own module-wide scan), so
+    /// `construction_call_verdict` must read `environment.classes()` (the
+    /// per-body table `merged_classes_for_body` built for THIS body) rather
+    /// than `context.classes` alone — otherwise `Person(age=40)` matches
+    /// whichever class happened to overwrite the shared entry, not the
+    /// caller's own local `Person`.
+    #[test]
+    fn a_body_local_class_construction_uses_its_own_bodys_class_not_a_same_named_sibling() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "from typing import Annotated\n",
+            "from pydantic import BaseModel, Field\n",
+            "type Age = Annotated[int, Field(ge=0, le=120)]\n",
+            "def read_one_field() -> Age:\n",
+            "    class Person(BaseModel):\n",
+            "        age: int\n",
+            "    over = Person(age=200)\n",
+            "    return over.age\n",
+            "def other_function_with_same_named_class() -> None:\n",
+            "    class Person(BaseModel):\n",
+            "        name: str\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        let blockers: Vec<&Finding> = findings.iter().filter(|f| f.code == "RTS7002").collect();
+        assert!(
+            blockers.is_empty(),
+            "the same-named sibling class must not shadow this body's own Person: {:?}",
+            findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+        );
+        let fires: Vec<&Finding> = findings.iter().filter(|f| f.code == "RTS7001").collect();
+        assert_eq!(
+            fires.len(),
+            1,
+            "read_one_field's own Person(age=200) must fire through its own body-local class: {:?}",
             findings.iter().map(|f| &f.message).collect::<Vec<_>>()
         );
         assert!(fires[0].message.contains("'200'"), "{}", fires[0].message);

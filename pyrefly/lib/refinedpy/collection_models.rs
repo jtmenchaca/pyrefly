@@ -304,8 +304,11 @@ fn identity_key_tag(value: &AbstractValue) -> Option<&str> {
 /// matching `known_integer_index`'s own scope note (no row in this
 /// file's corpus band needs `d[True]`). Any other shape (unknown, Float,
 /// String not exact, an ordinary dict/list/class-instance object)
-/// answers `None`.
-fn known_dict_key(value: &AbstractValue) -> Option<DictKey> {
+/// answers `None`. Public: `expressions.rs::evaluate_dict` reuses this
+/// same key reading on the CONSTRUCTION side, so a dict literal's
+/// identity/Integer/String keys are read the identical way whichever
+/// side (build or subscript) reads them.
+pub fn known_dict_key(value: &AbstractValue) -> Option<DictKey> {
     if let Some(text) = known_string_key(value) {
         return Some(DictKey::string(&text));
     }

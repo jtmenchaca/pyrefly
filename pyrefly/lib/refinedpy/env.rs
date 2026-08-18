@@ -13,7 +13,10 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use refined_domain::abstract_value::opaque_value;
 use refined_domain::abstract_value::AbstractValue;
@@ -38,6 +41,31 @@ use crate::refinedpy::typereading::DeclaredRefinement;
 /// `source`, which carries the retained-body table key instead of
 /// staying empty.
 pub const FUNCTION_VALUE_WORD: &str = "a function value";
+
+/// Every retained-callable table entry (a lambda's or a nested def's)
+/// is keyed by a fresh id `next_retained_callable_key` mints — NEVER
+/// by the AST's own range, for either shape. A range key would let
+/// TWO creations of the textually same lambda/def silently conflate:
+/// `make_adder(1)` and `make_adder(100)` each build `lambda age: age +
+/// step` from the SAME AST node but close over a DIFFERENT `step`, so
+/// the second call's own registration would overwrite the first's
+/// still-live retained value under a range key, corrupting whichever
+/// call's own returned callable is invoked later (`conflation_probe.py`
+/// once pinned exactly this: `add_one(40)` answered 140, the OTHER
+/// closure's arithmetic, when lambdas were range-keyed). Minting a
+/// fresh key per CREATION, the same discipline this table already
+/// gives a nested def, closes that gap for a lambda too.
+///
+/// Because the evaluation site (`expressions.rs`'s `Expr::Lambda` arm,
+/// which only reads `&Environment`) knows a lambda only by its own
+/// AST range — never by the fresh key `register_retained_callables`
+/// minted for its CURRENT creation — `Environment` also carries
+/// `lambda_keys_by_range`: a small, separately-shared index from a
+/// lambda's own range start to whichever fresh key is CURRENT for it.
+/// `register_retained_callables` mints a fresh key and updates this
+/// index every time it registers a lambda; the `Expr::Lambda` arm
+/// looks the CURRENT key up through this index rather than assuming
+/// the range IS the key.
 
 /// The bound `AbstractValue` a retained lambda/def reads as: the same
 /// `kind_word` an ordinary (non-retained) lambda value carries, plus
@@ -198,15 +226,46 @@ pub struct Environment {
     /// grown list whose length this checker cannot bound.
     variadic_parameter_names: Arc<std::collections::HashSet<String>>,
     /// Every lambda's/nested def's own retained body this walk has
-    /// recorded, keyed by the AST node's own range START offset (unique
-    /// within one module — two distinct nodes never share a start
-    /// offset). An OWNED, per-environment map — like `bindings`, never
-    /// an `Arc`-shared table like `functions`/`classes` — because a new
-    /// entry is inserted DURING the walk, the moment a lambda/def value
-    /// is created (`record_retained_callable`'s own call sites in
-    /// `check.rs`/`summaries.rs`), not built once up front. Cloned
-    /// wholesale on `fork`, same as `bindings`.
-    retained_callables: HashMap<u32, RetainedCallable>,
+    /// recorded, keyed by a fresh id `next_retained_callable_key`
+    /// mints per CREATION (never the AST's own range — see this
+    /// module's own doc on why a range key would conflate two
+    /// creations of the same lambda/def text). `Arc<Mutex<...>>`,
+    /// shared (never `Arc::make_mut`-copied) across `fork` AND across
+    /// the interpreter boundary (`summaries::fresh_body_environment`
+    /// inherits the CALLING environment's own `Arc`, rather than
+    /// starting a fresh, empty, disposable table) — the one property
+    /// `functions`/`classes`'s plain `Arc<T>` sharing does not give:
+    /// a table entry a CALLED function's own interpretation creates
+    /// (r-ast-census.py's `wrapper`, created inside `with_paramspec_
+    /// presence`'s interpreted body) must still be readable AFTER that
+    /// call returns, from the CALLER's own environment, since the
+    /// returned retained-callable value travels out of the call and is
+    /// invoked later from there (`wrapped(200)`, `param_spec_presence`'s
+    /// own row). A plain per-environment `HashMap` — sound for every
+    /// other table on this struct, all of which either never mutate
+    /// after construction or never need a write to outlive their own
+    /// call frame — cannot give a written-inside-a-call entry that
+    /// reach; this is the one field on `Environment` an ordinary
+    /// `Arc`/owned-map choice does not cover.
+    retained_callables: Arc<Mutex<HashMap<u32, RetainedCallable>>>,
+    /// The shared counter `next_retained_callable_key` draws from —
+    /// riding the SAME `Arc` reach as `retained_callables` itself
+    /// (cloned together, never separately), so every environment
+    /// reachable from one top-level walk mints keys off the one
+    /// sequence and two calls (even to unrelated functions) never
+    /// collide.
+    retained_callable_counter: Arc<AtomicU32>,
+    /// A lambda's own AST range start, mapped to whichever fresh
+    /// retained-callable key is CURRENT for it — this module's own doc
+    /// explains why this index exists: `expressions.rs`'s `Expr::
+    /// Lambda` evaluation arm only reads `&Environment` and knows a
+    /// lambda only by its own range, never by the fresh key its most
+    /// recent creation minted, so `register_retained_callables` (which
+    /// DOES hold `&mut Environment` at the moment it registers a fresh
+    /// creation) publishes the current key here for that arm to read
+    /// back. Shares the same `Arc<Mutex<...>>` reach as `retained_
+    /// callables` itself, for the identical cross-call-boundary reason.
+    lambda_keys_by_range: Arc<Mutex<HashMap<u32, u32>>>,
 }
 
 impl Environment {
@@ -222,8 +281,36 @@ impl Environment {
             callable_returns: None,
             call_depth: 0,
             variadic_parameter_names: Arc::new(HashSet::new()),
-            retained_callables: HashMap::new(),
+            retained_callables: Arc::new(Mutex::new(HashMap::new())),
+            retained_callable_counter: Arc::new(AtomicU32::new(0)),
+            lambda_keys_by_range: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Inherits `enclosing`'s own retained-callable table (the SAME
+    /// `Arc`, not a copy) — `summaries::fresh_body_environment`'s own
+    /// call site, so a def/lambda this call's own interpretation
+    /// creates (`interpret_body`'s `Stmt::FunctionDef` arm) is still
+    /// readable from `enclosing` (and everywhere `enclosing`'s own
+    /// `Arc` already reaches) once this call returns. A callee reached
+    /// with NO caller environment at all (`call_result`'s own `None`
+    /// enclosing, or a bare test environment) keeps its own fresh,
+    /// independent table instead — sound either way, just unable to
+    /// share entries with a caller that was never named.
+    pub fn inherit_retained_callables(&mut self, enclosing: &Environment) {
+        self.retained_callables = enclosing.retained_callables.clone();
+        self.retained_callable_counter = enclosing.retained_callable_counter.clone();
+        self.lambda_keys_by_range = enclosing.lambda_keys_by_range.clone();
+    }
+
+    /// Mints the next retained-callable table key, unique for as long
+    /// as this environment's own `Arc<AtomicU32>` is shared (the whole
+    /// reach of one top-level walk, `inherit_retained_callables`'s own
+    /// doc) — never reused, so two creations of the textually same
+    /// lambda/def (two calls to the same enclosing function) always
+    /// land in two distinct table slots.
+    pub fn next_retained_callable_key(&self) -> u32 {
+        self.retained_callable_counter.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Attaches the module's function table so calls evaluated against
@@ -291,25 +378,66 @@ impl Environment {
         self.variadic_parameter_names.contains(name)
     }
 
-    /// Records a lambda's/nested def's own retained body under its AST
-    /// range's start offset — the key `retained_callable_value`
-    /// encodes into the bound `AbstractValue`'s own `source` field. A
-    /// later call to `record_retained_callable` with the SAME key
-    /// overwrites the earlier entry (the same "last write wins" rule
-    /// `bindings` itself already follows) — sound because two distinct
-    /// AST nodes never share a start offset, so a repeat key means the
-    /// SAME lambda/def is being retained again (a loop iteration
-    /// re-evaluating the same `lambda` literal, for instance), with
-    /// whatever closure snapshot is current now.
+    /// Records a lambda's/nested def's own retained body under a fresh
+    /// key (`next_retained_callable_key`) — the key `retained_callable_
+    /// value` encodes into the bound `AbstractValue`'s own `source`
+    /// field. Writes through the shared `Arc<Mutex<...>>` (`fork`'s own
+    /// doc), so the entry is visible from every environment sharing
+    /// that `Arc` — including, after this call returns, the CALLER's
+    /// own environment, when this write happened inside an interpreted
+    /// call (`summaries::interpret_body`'s `Stmt::FunctionDef` arm).
     pub fn record_retained_callable(&mut self, key: u32, callable: RetainedCallable) {
-        self.retained_callables.insert(key, callable);
+        self.retained_callables
+            .lock()
+            .expect("retained-callables table poisoned by an earlier panic")
+            .insert(key, callable);
     }
 
     /// The retained body for `key`, if this walk has recorded one — a
     /// call site reads this after finding the key encoded in a bound
-    /// value's `source` field.
-    pub fn retained_callable(&self, key: u32) -> Option<&RetainedCallable> {
-        self.retained_callables.get(&key)
+    /// value's `source` field. Returns an owned clone (never a
+    /// reference into the lock) so the lock is held only for the
+    /// lookup itself.
+    pub fn retained_callable(&self, key: u32) -> Option<RetainedCallable> {
+        self.retained_callables
+            .lock()
+            .expect("retained-callables table poisoned by an earlier panic")
+            .get(&key)
+            .cloned()
+    }
+
+    /// Publishes `key` as the CURRENT retained-callable key for the
+    /// lambda whose own AST range starts at `range_start` —
+    /// `register_retained_callables`'s own call site, run every time it
+    /// registers a fresh creation of that lambda. A later creation of
+    /// the SAME lambda literal (a second call to its enclosing
+    /// function) overwrites the mapping, so the index always answers
+    /// the MOST RECENT creation's key — sound because `evaluate_
+    /// expression`'s `Expr::Lambda` arm only ever reads this index at
+    /// the moment that exact `Expr::Lambda` node is evaluated as a
+    /// value, which always happens during the SAME statement's
+    /// evaluation that `register_retained_callables` just ran ahead of
+    /// (`register_retained_callables`'s own doc: it runs immediately
+    /// before the immutable read, never long before it).
+    pub fn record_lambda_key(&mut self, range_start: u32, key: u32) {
+        self.lambda_keys_by_range
+            .lock()
+            .expect("lambda-key index poisoned by an earlier panic")
+            .insert(range_start, key);
+    }
+
+    /// The CURRENT retained-callable key for the lambda whose own AST
+    /// range starts at `range_start`, if `register_retained_callables`
+    /// has registered a creation of it. `None` when it never has (a
+    /// lambda shape `register_retained_callables`'s own recursion does
+    /// not reach, or an environment with no such registration step at
+    /// all) — the caller falls back to the plain opaque lambda value.
+    pub fn lambda_key(&self, range_start: u32) -> Option<u32> {
+        self.lambda_keys_by_range
+            .lock()
+            .expect("lambda-key index poisoned by an earlier panic")
+            .get(&range_start)
+            .copied()
     }
 
     /// Record what a name holds after a statement the walk understood.
@@ -349,24 +477,20 @@ impl Environment {
             call_depth: self.call_depth,
             variadic_parameter_names: self.variadic_parameter_names.clone(),
             retained_callables: self.retained_callables.clone(),
+            retained_callable_counter: self.retained_callable_counter.clone(),
+            lambda_keys_by_range: self.lambda_keys_by_range.clone(),
         }
     }
 
     /// Rejoin two branch arms: only names both arms still know survive,
     /// each joined through the lattice. The locally-bound set is scope
     /// structure, not flow state — it is identical in both arms. The
-    /// function, class, and callable-return tables are likewise
-    /// identical in both arms (both forked from the same body's one
-    /// environment, which carries the one module/body tables), so the
-    /// joined environment simply carries `a`'s. The retained-callable
-    /// table UNIONS both arms (rather than intersecting, the way
-    /// `bindings` does): a key is an AST node's own range start, so a
-    /// key both arms recorded always carries the SAME node's content —
-    /// there is nothing to reconcile — and a key only one arm recorded
-    /// (that arm's own branch is the only one that executed the
-    /// lambda/def) is still a true fact after the join, unlike a plain
-    /// VALUE binding, which the other arm may have rebound to something
-    /// else entirely.
+    /// function, class, callable-return, and retained-callable tables
+    /// are likewise identical in both arms (both forked from the same
+    /// body's one environment, sharing the very same `Arc`s —
+    /// `fork`'s own doc — so `a`'s and `b`'s own retained-callable
+    /// tables are not merely equal, they are the SAME underlying map),
+    /// so the joined environment simply carries `a`'s.
     pub fn join(a: Environment, b: &Environment) -> Environment {
         let mut bindings = HashMap::new();
         let locally_bound = a.locally_bound;
@@ -375,6 +499,9 @@ impl Environment {
         let callable_returns = a.callable_returns;
         let call_depth = a.call_depth;
         let variadic_parameter_names = a.variadic_parameter_names;
+        let retained_callables = a.retained_callables;
+        let retained_callable_counter = a.retained_callable_counter;
+        let lambda_keys_by_range = a.lambda_keys_by_range;
         for (name, value_a) in a.bindings {
             if let Some(value_b) = b.bindings.get(&name) {
                 bindings.insert(
@@ -382,10 +509,6 @@ impl Environment {
                     refined_domain::lattice_operations::join_known(value_a, value_b.clone()),
                 );
             }
-        }
-        let mut retained_callables = a.retained_callables;
-        for (key, callable) in &b.retained_callables {
-            retained_callables.entry(*key).or_insert_with(|| callable.clone());
         }
         Environment {
             bindings,
@@ -396,6 +519,129 @@ impl Environment {
             call_depth,
             variadic_parameter_names,
             retained_callables,
+            retained_callable_counter,
+            lambda_keys_by_range,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ruff_python_parser::parse_module;
+
+    use super::*;
+
+    /// Parses `source` as a module and returns its single top-level
+    /// `def` — the same helper `summaries.rs`'s own tests use, repeated
+    /// here since this module's tests need it too and the two files
+    /// stay independent per the mission's file-ownership convention.
+    fn parsed_def(source: &str) -> StmtFunctionDef {
+        let module = parse_module(source).expect("fixture source parses").into_syntax();
+        let stmt = module.body.into_iter().next().expect("one top-level statement");
+        stmt.function_def_stmt().expect("top-level statement is a def")
+    }
+
+    fn bare_retained_callable() -> RetainedCallable {
+        let def = parsed_def("def f(x):\n    return x\n");
+        RetainedCallable::from_def(&def, HashMap::new())
+    }
+
+    /// A key `record_retained_callable` wrote is readable back through
+    /// `retained_callable` on the SAME environment.
+    #[test]
+    fn test_record_and_read_retained_callable_round_trips() {
+        let mut environment = Environment::new(HashSet::new());
+        let key = environment.next_retained_callable_key();
+        environment.record_retained_callable(key, bare_retained_callable());
+        assert!(environment.retained_callable(key).is_some());
+        assert!(environment.retained_callable(key + 1).is_none());
+    }
+
+    /// `fork` shares the SAME underlying table (never a copy): a write
+    /// made through the forked environment is visible back through the
+    /// original — the property `summaries::fresh_body_environment`'s
+    /// own `inherit_retained_callables` call depends on to let a called
+    /// function's own retained value outlive its own call frame.
+    #[test]
+    fn test_fork_shares_the_retained_callable_table() {
+        let original = Environment::new(HashSet::new());
+        let mut forked = original.fork();
+        let key = forked.next_retained_callable_key();
+        forked.record_retained_callable(key, bare_retained_callable());
+        assert!(original.retained_callable(key).is_some());
+    }
+
+    /// `join` carries `a`'s own retained-callable table forward — since
+    /// both arms of a join were forked from the same parent (`fork`'s
+    /// own doc), a key either arm wrote is visible in the joined
+    /// environment.
+    #[test]
+    fn test_join_keeps_the_retained_callable_table() {
+        let parent = Environment::new(HashSet::new());
+        let mut arm_a = parent.fork();
+        let arm_b = parent.fork();
+        let key = arm_a.next_retained_callable_key();
+        arm_a.record_retained_callable(key, bare_retained_callable());
+        let joined = Environment::join(arm_a, &arm_b);
+        assert!(joined.retained_callable(key).is_some());
+    }
+
+    /// `inherit_retained_callables` replaces this environment's own
+    /// table with `enclosing`'s SAME `Arc` — a key this environment
+    /// later records is then visible from `enclosing` too, the exact
+    /// property a called function's own interpretation environment
+    /// needs so a def/lambda IT creates survives past its own call
+    /// frame back into the caller.
+    #[test]
+    fn test_inherit_retained_callables_shares_writes_both_ways() {
+        let enclosing = Environment::new(HashSet::new());
+        let mut callee = Environment::new(HashSet::new());
+        callee.inherit_retained_callables(&enclosing);
+        let key = callee.next_retained_callable_key();
+        callee.record_retained_callable(key, bare_retained_callable());
+        assert!(enclosing.retained_callable(key).is_some());
+    }
+
+    /// `next_retained_callable_key` never repeats within one shared
+    /// counter, even across environments that inherited it from each
+    /// other — the property that keeps two creations of the same
+    /// lambda/def text (two calls to the same enclosing function) from
+    /// landing in the same table slot.
+    #[test]
+    fn test_next_retained_callable_key_never_repeats() {
+        let environment = Environment::new(HashSet::new());
+        let first = environment.next_retained_callable_key();
+        let second = environment.next_retained_callable_key();
+        assert_ne!(first, second);
+    }
+
+    /// `record_lambda_key`/`lambda_key` round-trip, and a SECOND
+    /// registration of the same range overwrites the mapping to the
+    /// newer key — the property `expressions.rs::register_retained_
+    /// callables` depends on so a lambda re-created with a different
+    /// closure (`make_adder(1)` then `make_adder(100)`) is read back
+    /// under its OWN creation's key, never a stale earlier one.
+    #[test]
+    fn test_record_lambda_key_overwrites_on_a_later_creation() {
+        let mut environment = Environment::new(HashSet::new());
+        let range_start = 42u32;
+        let first_key = environment.next_retained_callable_key();
+        environment.record_lambda_key(range_start, first_key);
+        assert_eq!(environment.lambda_key(range_start), Some(first_key));
+        let second_key = environment.next_retained_callable_key();
+        environment.record_lambda_key(range_start, second_key);
+        assert_eq!(environment.lambda_key(range_start), Some(second_key));
+    }
+
+    /// `retained_callable_value`/`retained_callable_key` round-trip:
+    /// building a value from a key and reading the key back off it
+    /// answers the same key, and an ordinary opaque lambda value (no
+    /// retained body) reads back `None`.
+    #[test]
+    fn test_retained_callable_value_key_round_trip() {
+        let value = retained_callable_value(7);
+        assert_eq!(retained_callable_key(&value), Some(7));
+        let plain = opaque_value(FUNCTION_VALUE_WORD);
+        assert_eq!(retained_callable_key(&plain), None);
     }
 }

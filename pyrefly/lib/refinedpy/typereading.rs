@@ -59,6 +59,17 @@ pub struct DeclaredRefinement {
     /// the same "one active field" convention `element` already keeps
     /// with `set`.
     pub generator: Option<Box<GeneratorRefinement>>,
+    /// A TypedDict declaration's own member table: each declared field's
+    /// name paired with the refinement ITS OWN annotation states, in
+    /// declaration order — `PersonDict`'s `age: Age` becomes
+    /// `[("age", <Age's own DeclaredRefinement>)]`. Unlike `element`
+    /// (`dict[str, X]`'s one refinement shared by every member), a
+    /// TypedDict's members are HETEROGENEOUS by name, so this carries one
+    /// refinement per field rather than one shared refinement. `set`/
+    /// `element`/`generator` are unused (empty/None) when this is Some,
+    /// the same "one active field" convention the other container shapes
+    /// already keep.
+    pub members: Option<Vec<(String, DeclaredRefinement)>>,
 }
 
 /// The two checked positions a generator-shaped return annotation
@@ -94,6 +105,7 @@ pub fn declared_refinement(
                 admits_none: false,
                 element: None,
                 generator: None,
+                members: None,
             })
         }
         // `Optional[X]` reads X through the ordinary path and marks the
@@ -155,6 +167,7 @@ pub fn declared_refinement(
                         admits_none: false,
                         element: None,
                         generator: None,
+                        members: None,
                     });
                 }
                 if let Some(members) = string_literal_members(subscript.slice.as_ref()) {
@@ -166,6 +179,7 @@ pub fn declared_refinement(
                         admits_none: false,
                         element: None,
                         generator: None,
+                        members: None,
                     });
                 }
                 return None;
@@ -202,6 +216,7 @@ pub fn declared_refinement(
                                     admits_none: false,
                                     element: Some(Box::new(value_declared)),
                                     generator: None,
+                                    members: None,
                                 });
                             }
                         }
@@ -234,6 +249,7 @@ pub fn declared_refinement(
                         admits_none: false,
                         element: Some(Box::new(element_declared)),
                         generator: None,
+                        members: None,
                     });
                 }
                 return None;
@@ -271,6 +287,7 @@ pub fn declared_refinement(
                         admits_none: false,
                         element: None,
                         generator: Some(Box::new(generator)),
+                        members: None,
                     });
                 }
             }
@@ -282,6 +299,7 @@ pub fn declared_refinement(
                 admits_none: false,
                 element: None,
                 generator: None,
+                members: None,
             })
         }
         // `X | None` / `None | X` (exactly one side a bare `None`
@@ -420,6 +438,7 @@ pub fn base_sort_return_refinement(returns: &Expr) -> Option<DeclaredRefinement>
         admits_none: false,
         element: None,
         generator: None,
+        members: None,
     })
 }
 

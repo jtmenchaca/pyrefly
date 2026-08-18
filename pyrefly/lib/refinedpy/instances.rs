@@ -1793,6 +1793,7 @@ mod tests {
             admits_none: false,
             element: None,
             generator: None,
+            members: None,
         }
     }
 

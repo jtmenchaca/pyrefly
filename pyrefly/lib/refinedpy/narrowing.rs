@@ -86,6 +86,7 @@ use ruff_python_ast::BoolOp;
 use ruff_python_ast::CmpOp;
 use ruff_python_ast::Expr;
 use ruff_python_ast::Number;
+use ruff_python_ast::Stmt;
 use ruff_python_ast::UnaryOp;
 
 use crate::refinedpy::env::Environment;
@@ -219,10 +220,17 @@ fn narrow(condition: &Expr, environment: &mut Environment, kernel: &Arc<RefinedT
         Expr::Compare(compare) => narrow_compare(compare, environment, truth),
         Expr::Call(call) => {
             if recognizes_type_guard_call(call, environment) {
-                // a call to a `TypeGuard[X]`/`TypeIs[X]`-annotated
-                // predicate — recognized, but declined, see
-                // `recognizes_type_guard_call`'s own doc for why this
-                // function must not trust the annotation
+                if truth {
+                    narrow_type_guard_call(call, environment, kernel);
+                }
+                // The FALSE arm of a `TypeGuard`/`TypeIs` call states
+                // nothing this file reads: the predicate's own body proves
+                // a set of inputs that make it return True, and a body
+                // returning False elsewhere says nothing about which
+                // narrower set of inputs that leaves (`is_age`'s own
+                // `and`-chain has no single leaf whose negation alone
+                // characterizes every False-producing input). Declining
+                // the False arm is conservative, never wrong.
                 return;
             }
             narrow_isinstance_call(call, environment, truth);
@@ -457,25 +465,17 @@ fn narrow_is_none(left: &Expr, op: CmpOp, right: &Expr, environment: &mut Enviro
 /// annotation is `TypeGuard[X]`/`TypeIs[X]` (typing.rst's user-defined
 /// type guard: "a special form... that can be used to annotate the
 /// return type of a user-defined type guard function") — recognized
-/// SYNTACTICALLY only, never narrowed. `typing.TypeGuard`/`TypeIs`
-/// state a CLAIM the function's own signature makes; PROVING the claim
-/// needs "for which inputs does this body's own control flow return
-/// True" — a predicate-precondition question `summaries::interpret_body`
-/// answers nothing like (that machinery interprets a body given
-/// CONCRETE argument values and reads back the value it returns, never
-/// the inverse: which inputs make a KNOWN return value true). Narrowing
-/// on the annotation alone would be UNSOUND — f-type-nodes.py's own
-/// `dishonest_predicate` row is exactly this: `claims_age`'s signature
-/// states `TypeGuard[Age]`, but its body only proves `isinstance(v,
-/// int)`, strictly weaker than `Age`; trusting the claim would wrongly
-/// narrow `value` all the way to `Age` and read the row SILENT, when
-/// the row expects a fire. This function's ONLY job is to recognize the
-/// shape so the `Expr::Call` dispatch can decline explicitly (a
-/// documented boundary) rather than silently falling through as an
-/// unrecognized call — recognizing changes no narrowing outcome by
-/// itself; a future TRUSTED narrowing needs the body's own proven
-/// return-set, which is a genuinely new capability, not an extension of
-/// this function.
+/// SYNTACTICALLY only. `typing.TypeGuard`/`TypeIs` state a CLAIM the
+/// function's own signature makes; this recognizer's caller
+/// (`narrow_type_guard_call`) never trusts that claim on its own —
+/// f-type-nodes.py's own `dishonest_predicate` row is exactly why:
+/// `claims_age`'s signature states `TypeGuard[Age]`, but its body only
+/// proves `isinstance(v, int)`, strictly weaker than `Age`; trusting the
+/// claim would wrongly narrow `value` all the way to `Age` and read the
+/// row SILENT, when the row expects a fire. This function's ONLY job is
+/// to recognize the shape so the `Expr::Call` dispatch knows to ATTEMPT
+/// body-proof narrowing at all — the claimed `X` itself is never read
+/// anywhere in this recognizer or its caller.
 fn recognizes_type_guard_call(call: &ruff_python_ast::ExprCall, environment: &Environment) -> bool {
     let Expr::Name(callee) = call.func.as_ref() else {
         return false;
@@ -493,6 +493,77 @@ fn recognizes_type_guard_call(call: &ruff_python_ast::ExprCall, environment: &En
         return false;
     };
     matches!(head.id.as_str(), "TypeGuard" | "TypeIs")
+}
+
+/// Narrows `call`'s own first argument by what a `TypeGuard[X]`/`TypeIs[X]`-
+/// annotated predicate's OWN BODY proves, never by the annotation's claimed
+/// `X` — `recognizes_type_guard_call`'s own doc names why trusting the
+/// claim alone is unsound. The proof: when the predicate's body is exactly
+/// one statement, `return <condition>` (`is_age`/`claims_age`'s own shape —
+/// a boolean expression naming the predicate's own first parameter), that
+/// `<condition>` is handed to THIS SAME `assume` function, in a fresh
+/// sandbox environment where the predicate's own parameter name starts
+/// UNBOUND (mirroring a real call, where `check.rs::seed_parameters` states
+/// nothing for `object`-typed parameters), asked under `truth = true` (the
+/// question this narrowing site itself is asking: "given the call proved
+/// True, what does that say"). Whatever the predicate's own parameter name
+/// ends up bound to in that sandbox IS the proven set — read back and
+/// copied onto the CALL's own first argument name in the real environment.
+/// `is_age`'s `isinstance(v, int) and not isinstance(v, bool) and 0 <= v <=
+/// 120` proves `v` down to exactly `Age`'s own set through this same
+/// mechanism the ordinary top-level walk already uses for a seeded
+/// parameter; `claims_age`'s bare `isinstance(v, int)` proves only the
+/// unbounded `int` sort, which is NOT a subset of `Age` — so `return value`
+/// against `-> Age` still fires, exactly as the row expects. A predicate
+/// whose body is not this single-`return`-of-a-condition shape, or whose
+/// own parameter never ends up bound in the sandbox (the condition proved
+/// nothing this file's narrowing channels read), leaves the call's argument
+/// untouched — the same "narrows nothing" default as any other declined
+/// leaf.
+fn narrow_type_guard_call(call: &ruff_python_ast::ExprCall, environment: &mut Environment, kernel: &Arc<RefinedTSKernel>) {
+    let Expr::Name(callee) = call.func.as_ref() else {
+        return;
+    };
+    let Some(argument) = call.arguments.args.first() else {
+        return;
+    };
+    let Some(argument_name) = name_of(argument) else {
+        return;
+    };
+    if environment.read(argument_name).is_some() {
+        return;
+    }
+    let Some(def) = environment.functions().and_then(|table| table.def(callee.id.as_str())) else {
+        return;
+    };
+    // Skip every leading docstring (`is_age`'s own `"""honest TypeGuard...
+    // """`) before requiring the SOLE remaining statement be a bare
+    // `return` — the same docstring-shaped skip
+    // `summaries::first_non_docstring_statement` applies to a callee body
+    // elsewhere, inlined here since that function answers only the FIRST
+    // such statement, not the remaining slice this needs.
+    let non_docstring_body: Vec<&Stmt> = def
+        .body
+        .iter()
+        .skip_while(|stmt| matches!(stmt, Stmt::Expr(expr_stmt) if matches!(expr_stmt.value.as_ref(), Expr::StringLiteral(_))))
+        .collect();
+    let [Stmt::Return(ret)] = non_docstring_body.as_slice() else {
+        return;
+    };
+    let Some(condition) = ret.value.as_deref() else {
+        return;
+    };
+    let Some(parameter) = def.parameters.posonlyargs.iter().chain(def.parameters.args.iter()).next() else {
+        return;
+    };
+    let parameter_name = parameter.parameter.name.id.as_str();
+
+    let sandbox = Environment::new(std::collections::HashSet::new());
+    let sandbox = assume(condition, sandbox, kernel, true);
+    let Some(proven) = sandbox.read(parameter_name) else {
+        return;
+    };
+    environment.bind(argument_name, proven.clone());
 }
 
 /// `isinstance(name, int | float | bool)` (mission point 6): filters a
@@ -1077,13 +1148,15 @@ mod tests {
         environment
     }
 
-    /// A call to a `TypeGuard[X]`-annotated same-module predicate must
-    /// leave an unbound name untouched — the annotation alone proves
-    /// nothing this file trusts (`recognizes_type_guard_call`'s own
-    /// doc): narrowing on the claim, unverified, would read
-    /// `dishonest_predicate` silent when the row expects a fire.
+    /// A call to a `TypeGuard[X]`-annotated same-module predicate narrows
+    /// an unbound name to what the predicate's OWN BODY proves, never to
+    /// the annotation's claimed `X` (`recognizes_type_guard_call`'s own
+    /// doc: trusting the claim unverified would read `dishonest_predicate`
+    /// silent when the row expects a fire). This predicate's body only
+    /// proves `isinstance(v, int)` — a weaker claim than `Age` — so
+    /// `value` narrows to the unbounded `int` sort, not `Age`.
     #[test]
-    fn test_type_guard_call_does_not_narrow_an_unbound_name() {
+    fn test_type_guard_call_narrows_an_unbound_name_to_its_bodys_own_proof() {
         let environment = environment_with_function_table(concat!(
             "def is_age(v: object) -> TypeGuard[Age]:\n",
             "    return isinstance(v, int)\n",
@@ -1091,13 +1164,16 @@ mod tests {
         let Some(narrowed) = assumed("is_age(value)", environment, true) else {
             return;
         };
-        assert!(narrowed.read("value").is_none(), "an unproved claim must not seed a binding");
+        let value = narrowed.read("value").expect("the body's own proof seeds a binding");
+        assert_eq!(value.kind, Kind::Set, "the proof is a sort, not an exact value");
+        assert_eq!(value.kind_tag, Some(PrimitiveKind::Integer));
     }
 
     /// The same recognition for `TypeIs[X]` (typing.rst's narrower
-    /// sibling of `TypeGuard`) — the same syntactic shape, same decline.
+    /// sibling of `TypeGuard`) — the same syntactic shape, same
+    /// proof-not-claim narrowing.
     #[test]
-    fn test_type_is_call_does_not_narrow_an_unbound_name() {
+    fn test_type_is_call_narrows_an_unbound_name_to_its_bodys_own_proof() {
         let environment = environment_with_function_table(concat!(
             "def is_age(v: object) -> TypeIs[Age]:\n",
             "    return isinstance(v, int)\n",
@@ -1105,7 +1181,9 @@ mod tests {
         let Some(narrowed) = assumed("is_age(value)", environment, true) else {
             return;
         };
-        assert!(narrowed.read("value").is_none());
+        let value = narrowed.read("value").expect("the body's own proof seeds a binding");
+        assert_eq!(value.kind, Kind::Set);
+        assert_eq!(value.kind_tag, Some(PrimitiveKind::Integer));
     }
 
     /// A call to a function with NO `TypeGuard`/`TypeIs` return
@@ -1140,6 +1218,27 @@ mod tests {
         };
         let value = narrowed.read("value").expect("value stays bound");
         assert_eq!(value.values, vec![200.0], "the pre-existing binding survives unchanged");
+    }
+
+    /// f-type-nodes.py's own honest/dishonest contrast, run end to end
+    /// through `assume`: `is_age`'s body chains `isinstance(v, int) and
+    /// not isinstance(v, bool) and 0 <= v <= 120` — the SAME shape the
+    /// module doc names as the SET channel's own canonical example — so
+    /// the proof narrows `value` all the way down to a bounded `[0, 120]`
+    /// integer window, a strict subset of the unbounded `int` sort.
+    /// Needs a live kernel: the bound comparison narrows through the SET
+    /// channel's own kernel question, not the VALUES channel alone.
+    #[test]
+    fn test_an_honest_type_guard_narrows_to_a_bounded_window() {
+        let environment = environment_with_function_table(concat!(
+            "def is_age(v: object) -> TypeGuard[Age]:\n",
+            "    return isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= 120\n",
+        ));
+        let Some(narrowed) = assumed("is_age(value)", environment, true) else {
+            return;
+        };
+        let value = narrowed.read("value").expect("the bounded proof seeds a binding");
+        assert_eq!(value.kind, Kind::Set, "a bounded window is still a Set-kind proof, not an exact value");
     }
 
     // ── the SET channel ──────────────────────────────────────────────
