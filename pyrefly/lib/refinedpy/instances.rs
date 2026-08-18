@@ -31,25 +31,52 @@ use refined_domain::abstract_value::{
     known_set, unknown, AbstractValue, Kind, ObjectKey, SetKindTag,
 };
 use refined_domain::known_constructors::known_object;
+use refined_domain::lattice_operations::truthiness;
 use refined_domain::trust_grades::TrustSpec;
 use refined_kernel::kernel_interface::RefinedTSKernel;
 use refined_sets::refinement_forms::RefinedSet;
-use ruff_python_ast::{Expr, ModModule, Stmt, StmtClassDef, StmtFunctionDef};
+use ruff_python_ast::{Expr, ExprCall, ModModule, Number, Stmt, StmtClassDef, StmtFunctionDef, UnaryOp};
 use ruff_text_size::TextRange;
 
 use crate::refinedpy::assignability::{judge, Verdict};
 use crate::refinedpy::env::Environment;
 use crate::refinedpy::expressions::evaluate_expression;
+use crate::refinedpy::function_table::FunctionTable;
 use crate::refinedpy::surface::SurfaceImports;
 use crate::refinedpy::typereading::{declared_refinement, DeclaredRefinement};
 
 /// One class's declared shape: its name, its fields (in construction
-/// order), and its property accessors (read/write aliases that are
-/// never stored fields of their own — see `PropertyModel`).
+/// order), its property accessors (read/write aliases that are never
+/// stored fields of their own — see `PropertyModel`), its EFFECTIVE
+/// method set (`methods`: every def in the class body, own defs
+/// overriding an inherited def of the same name), and its PARENT's own
+/// methods unaffected by any child override (`parent_methods`, the
+/// `super().<method>(...)` resolution target). `Clone` so a class's
+/// own model can be copied wholesale — a re-exported class
+/// (`cross_module.rs::pull_member`) and a body-local class table merge
+/// (`check.rs::merged_classes_for_body`) both need an owned copy
+/// without disturbing the table they read it from.
+#[derive(Clone)]
 pub struct ClassModel {
     pub name: String,
     pub fields: Vec<ClassField>,
     pub properties: HashMap<String, PropertyModel>,
+    pub methods: HashMap<String, StmtFunctionDef>,
+    pub parent_methods: HashMap<String, StmtFunctionDef>,
+    /// Every class-body top-level PLAIN (unannotated) `name = <literal>`
+    /// row — e-class-and-function.py's `Counted`/`Limits`: `total = 0`,
+    /// `ceiling = 40`. A class attribute lives on the CLASS OBJECT
+    /// ITSELF, never on any one instance (datamodel.rst, "Classes" —
+    /// class attributes are looked up on the class, distinct from the
+    /// per-instance `__dict__` an `AnnAssign`/`__init__` field populates),
+    /// so this table is read into a SEPARATE class-object value
+    /// (`check.rs`'s own class-object seeding at `Stmt::ClassDef`), never
+    /// folded into `fields`/instance construction. An `AnnAssign` row
+    /// (`age: int = 40`, a declared INSTANCE field) is never read here —
+    /// the two tables are disjoint by construction (`AnnAssign` only,
+    /// `Assign` only), matching the language's own distinction between a
+    /// class-level attribute and a declared instance field.
+    pub class_attributes: Vec<ClassField>,
 }
 
 /// A `@property` getter/setter pair recognized on the class body:
@@ -61,6 +88,7 @@ pub struct ClassModel {
 /// annotation is pydantic-independent Python's own way of stating a
 /// property's accepted input, and is the more specific claim for a
 /// write through the accessor.
+#[derive(Clone)]
 pub struct PropertyModel {
     pub backing: String,
     pub declared: Option<DeclaredRefinement>,
@@ -323,11 +351,81 @@ fn class_model_of(
         }
     }
 
+    let own_methods = own_method_table(def);
+    let parent_methods = parent.map(|parent| parent.methods.clone()).unwrap_or_default();
+    // the EFFECTIVE method set: every parent method, with this class's
+    // own defs of the SAME name overriding it — `HashMap::extend`
+    // overwrites on a key collision, keeping the later (own) insertion,
+    // which is exactly "own defs override inherited ones."
+    let mut methods = parent_methods.clone();
+    methods.extend(own_methods);
+
+    let class_attributes = class_attribute_table(def, &empty_environment, kernel);
+
     ClassModel {
         name: def.name.id.as_str().to_owned(),
         fields,
         properties,
+        methods,
+        parent_methods,
+        class_attributes,
     }
+}
+
+/// Every class-body top-level PLAIN `name = <literal>` row (see
+/// `ClassModel.class_attributes`'s own doc): a bare-Name target on a
+/// SINGLE-target `Stmt::Assign` (no `AnnAssign` — that is an instance
+/// field, read separately above), whose RHS reads through
+/// `evaluate_expression` (the same reader `default_value_of` uses for an
+/// instance field's own default). An unreadable RHS (a call, a name
+/// reference, …) is skipped — `check.rs`'s class-object seeding has
+/// nothing to bind that attribute to either way, and skipping it here is
+/// the same honest omission `init_derived_fields`'s own unreadable-RHS
+/// row already takes for an instance field.
+fn class_attribute_table(def: &StmtClassDef, environment: &Environment, kernel: &Arc<RefinedTSKernel>) -> Vec<ClassField> {
+    let mut attributes = Vec::new();
+    for stmt in def.body.iter() {
+        let Stmt::Assign(assign) = stmt else {
+            continue;
+        };
+        let [target] = assign.targets.as_slice() else {
+            continue;
+        };
+        let Expr::Name(target_name) = target else {
+            continue;
+        };
+        let value = evaluate_expression(assign.value.as_ref(), environment, kernel);
+        if value.kind == Kind::Unknown {
+            continue;
+        }
+        attributes.push(ClassField {
+            name: target_name.id.as_str().to_owned(),
+            declared: None,
+            default: Some(value),
+        });
+    }
+    attributes
+}
+
+/// Every `def` directly in this class's OWN body, keyed by name —
+/// `__init__` included (a `super().<method>(...)` call can name
+/// `__init__` exactly like any other method, and a class with no
+/// override of a given name simply has no entry here, falling through
+/// to whatever `parent_methods` states in the caller's `methods` merge
+/// above). A class-body `def` is read regardless of its own decorator
+/// list (`@property`/`@x.setter` defs are ALSO ordinary callables by
+/// name — `property_table` reads the identical two defs for its own
+/// alias purpose, and the two readings do not conflict: a property
+/// getter/setter is simultaneously an entry in `methods` under its own
+/// name).
+fn own_method_table(def: &StmtClassDef) -> HashMap<String, StmtFunctionDef> {
+    def.body
+        .iter()
+        .filter_map(|stmt| match stmt {
+            Stmt::FunctionDef(function) => Some((function.name.id.as_str().to_owned(), function.clone())),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The fields an explicit `def __init__(self, ...)` derives — `None`
@@ -606,8 +704,12 @@ fn self_write_target(stmt: &Stmt) -> Option<(String, &Expr)> {
 /// corpus band this file serves; `self` is Python's own overwhelming
 /// convention, not a keyword, so a literal name match is the same
 /// honest-recognition posture `surface.rs`'s `names_field` takes for
-/// other by-spelling recognitions).
-fn self_attribute_name(target: &Expr) -> Option<String> {
+/// other by-spelling recognitions). `pub`: both `check.rs`'s
+/// `bind_or_forget_target`/`write_named_field` and `summaries.rs`'s
+/// restricted-body interpreter (its own `write_self_field`,
+/// `interpret_aug_assign`) recognize the identical `self.<name>` shape
+/// through this one function, rather than each re-deriving it.
+pub fn self_attribute_name(target: &Expr) -> Option<String> {
     let Expr::Attribute(attribute) = target else {
         return None;
     };
@@ -913,12 +1015,156 @@ pub fn judge_construction(
         };
         entries.push(ObjectKey {
             name: field.name.clone(),
+            numeric: false,
             value: field_value,
         });
     }
 
-    let instance = known_object(entries, None, true, TrustSpec, false);
+    let mut instance = known_object(entries, None, true, TrustSpec, false);
+    // source carries the constructing class's name so a later
+    // receiver.method(...) call can find the ClassModel in the
+    // environment's class table; empty on every non-instance object.
+    instance.source = model.name.clone();
+
+    // pydantic's own post-construction hook: `model_post_init(self,
+    // __context)` runs immediately after every field is set
+    // (docs/concepts/models.md's own "Post-init processing"), so a
+    // dependent check written there (m-pydantic-schema.py's `Range`:
+    // `if self.hi < self.lo: raise ValueError(...)`) is this
+    // construction's own business, not a later sink's. Anchored at the
+    // LAST mapped argument's range — a cross-field check has no single
+    // refusing argument to blame, and this is the closest token to the
+    // call's own closing paren among the ranges this function already
+    // carries.
+    if let Some(post_init) = model.methods.get("model_post_init") {
+        if let Some(anchor) = keyword.last().map(|(_, _, range)| *range).or_else(|| positional.last().map(|(_, range)| *range)) {
+            if let Some(message) = post_init_provable_raise(post_init, &instance, kernel) {
+                fires.push((anchor, message));
+            }
+        }
+    }
+
     ConstructionVerdict { fires, instance }
+}
+
+/// `model_post_init`'s own body, read ONLY in the one shape the corpus
+/// spells: a SINGLE top-level `if <condition>: raise <exc>` statement
+/// (no `elif`/`else`, no other statement before or after it) — the
+/// dependent-check shape pydantic's own docs name for this hook
+/// (docs/concepts/models.md, "Post-init processing" — the hook "will
+/// be called... to perform additional validation"). `self` binds to
+/// `instance` (already fully built — every field's own value, judged
+/// or not, is in place, matching real pydantic's own construction
+/// order: fields set, THEN `model_post_init` runs) and the condition
+/// evaluates through `evaluate_expression`'s ordinary comparison
+/// reading, restricted to `self.<field>` operands `field_read` already
+/// answers.
+///
+/// `Some(message)` only when the condition is PROVABLY true
+/// (`truthiness`'s `(true, true)` answer) — the same honest-decline
+/// discipline every other provable-raise reader in this checker takes:
+/// an undetermined or provably-false condition never fires here.
+/// `raise <exc>`'s own message reads `<exc>`'s single string-literal
+/// argument when `<exc>` is a bare `Call` (`ValueError("...")`,
+/// `raise <name>` alone, or a computed message, states nothing this
+/// reader can quote, so the message falls back to the exception
+/// callee's own bare name). Any other body shape (more than one
+/// top-level statement, an `elif`/`else` clause, a non-`Raise` `if`
+/// body, a body that is not exactly one `if`) declines — `None`, never
+/// a guessed fire.
+fn post_init_provable_raise(
+    post_init: &StmtFunctionDef,
+    instance: &AbstractValue,
+    kernel: &Arc<RefinedTSKernel>,
+) -> Option<String> {
+    let [Stmt::If(if_stmt)] = post_init.body.as_slice() else {
+        return None;
+    };
+    if !if_stmt.elif_else_clauses.is_empty() {
+        return None;
+    }
+    let [Stmt::Raise(raise_stmt)] = if_stmt.body.as_slice() else {
+        return None;
+    };
+
+    let mut environment = Environment::new(Default::default());
+    environment.bind("self", instance.clone());
+    let test_value = evaluate_expression(if_stmt.test.as_ref(), &environment, kernel);
+    let (truthy, known) = truthiness(&test_value);
+    if !known || !truthy {
+        return None;
+    }
+
+    Some(post_init_raise_message(raise_stmt))
+}
+
+/// `model_post_init`'s own construction-site fire message: "this
+/// expression provably raises `<ExcType>`: `<plain detail>`" — the
+/// same voice `expressions::provable_raise` already speaks, quoting
+/// `raise <exc>`'s own exception name and its single string-literal
+/// argument when `<exc>` is a bare `Call` (`ValueError("hi must be >=
+/// lo")` reads as `ValueError: hi must be >= lo`); any other `<exc>`
+/// shape (a bare name, a computed argument, no argument at all) still
+/// names the exception type alone.
+fn post_init_raise_message(raise_stmt: &ruff_python_ast::StmtRaise) -> String {
+    let Some(exc) = raise_stmt.exc.as_deref() else {
+        return "this construction provably raises an exception".to_owned();
+    };
+    let Expr::Call(call) = exc else {
+        return "this construction provably raises an exception".to_owned();
+    };
+    let Expr::Name(exc_name) = call.func.as_ref() else {
+        return "this construction provably raises an exception".to_owned();
+    };
+    let detail = call
+        .arguments
+        .args
+        .first()
+        .and_then(|arg| match arg {
+            Expr::StringLiteral(literal) => Some(literal.value.to_str().to_owned()),
+            _ => None,
+        });
+    match detail {
+        Some(detail) => format!("this construction provably raises {}: {}", exc_name.id.as_str(), detail),
+        None => format!("this construction provably raises {}", exc_name.id.as_str()),
+    }
+}
+
+/// The CLASS OBJECT's own initial value — e-class-and-function.py's
+/// `class_attribute_write`: `Counted.total = 40` then `Counted.total`
+/// read back, a write/read pair that never touches any INSTANCE (no
+/// `Counted(...)` construction happens on this row at all). Distinct
+/// from `judge_construction`'s instance value: this reads `model.
+/// class_attributes` alone (never `model.fields`, which are per-instance
+/// slots this class object does not carry), tagged with the SAME
+/// `source = model.name` convention `judge_construction` uses so
+/// `write_named_field`/`field_read_through_model` (which only ever check
+/// `instance.kind == Kind::Object` and a non-empty `source`) read/write
+/// through it with NO new machinery — a class object and an instance
+/// object share one representation, distinguished only by which table
+/// (`class_attributes` vs `fields`) built their starting keys.
+///
+/// `check.rs`'s own `Stmt::ClassDef` walk binds this value under the
+/// class's own bare name, in the ENCLOSING environment (the scope where
+/// the class statement itself executes) — the environment slot
+/// `Counted.total = 40`'s attribute-write law (a bare-Name receiver
+/// bound to a tagged `Kind::Object`) then finds and rebinds, exactly the
+/// same way an instance variable already does.
+pub fn class_object_value(model: &ClassModel) -> AbstractValue {
+    let entries: Vec<ObjectKey> = model
+        .class_attributes
+        .iter()
+        .filter_map(|attribute| {
+            attribute.default.clone().map(|value| ObjectKey {
+                name: attribute.name.clone(),
+                numeric: false,
+                value,
+            })
+        })
+        .collect();
+    let mut value = known_object(entries, None, true, TrustSpec, false);
+    value.source = model.name.clone();
+    value
 }
 
 /// `instance.field` — the field's value out of a known_object
@@ -941,8 +1187,37 @@ pub fn field_read(instance: &AbstractValue, field: &str) -> Option<AbstractValue
     instance
         .keys
         .iter()
-        .find(|entry| entry.name == field)
+        .find(|entry| entry.name == field && !entry.numeric)
         .map(|entry| entry.value.clone())
+}
+
+/// `self.<field> = v` — the struct-updated instance with `field` set to
+/// `value`, every other stored key AND every other `AbstractValue` field
+/// (`source` included — the constructing class's tag must survive a
+/// write, since a later `receiver.method(...)` call still needs it to
+/// find the `ClassModel`) preserved from `instance` unchanged. `None`
+/// for a non-`Kind::Object` instance — there is no field slot to write
+/// on anything else this table builds. A field name absent from
+/// `instance.keys` is APPENDED as a new entry (an ordinary Python
+/// attribute gain, `field_write_judgment`'s own doc: "an ordinary
+/// Python attribute gain is not a blocker") rather than declined.
+pub fn field_write(instance: &AbstractValue, field: &str, value: AbstractValue) -> Option<AbstractValue> {
+    if instance.kind != Kind::Object {
+        return None;
+    }
+    let mut keys = instance.keys.clone();
+    match keys.iter_mut().find(|entry| entry.name == field && !entry.numeric) {
+        Some(entry) => entry.value = value,
+        None => keys.push(ObjectKey {
+            name: field.to_owned(),
+            numeric: false,
+            value,
+        }),
+    }
+    Some(AbstractValue {
+        keys,
+        ..instance.clone()
+    })
 }
 
 /// `box.age` where `age` may be a stored field OR a `@property` read
@@ -981,6 +1256,435 @@ pub fn field_write_judgment(
     Some(judge(value, declared, kernel))
 }
 
+/// `model`'s own callable named `name` — own-overrides-inherited, since
+/// `model.methods` (built in `class_model_of`) already holds the
+/// EFFECTIVE set: a child's own def already replaced any inherited def
+/// of the same name there. `None` for a name the class declares no
+/// method under at all.
+pub fn method_def_of<'a>(model: &'a ClassModel, name: &str) -> Option<&'a StmtFunctionDef> {
+    model.methods.get(name)
+}
+
+/// `receiver.method(arguments)` — the instance AFTER the call (any
+/// `self.<field> = ...` write inside the method body survives on it)
+/// and the method's own return value, or `None` when the method's body
+/// or parameter shape is outside what `summaries`'s restricted body
+/// interpreter reads.
+///
+/// `self` binds to `instance` and the remaining parameters bind to
+/// `arguments` positionally (`summaries::bind_parameters`'s own
+/// convention: a trailing parameter with no matching argument takes its
+/// own default, evaluated fresh; too few arguments with no default, or
+/// too many, declines the whole call) — `self` is excluded from that
+/// positional binding since it is bound directly to `instance`, never
+/// to an entry of `arguments`.
+///
+/// The body interprets through `summaries::interpret_body`, the SAME
+/// restricted statement walk an ordinary same-module call uses, with
+/// one addition: a `super_resolver` that answers `super().<name>(args)`
+/// by looking `name` up in `model.parent_methods` (the parent's OWN
+/// methods, never touched by this child's overrides) and recursively
+/// calling `method_call_result` on THAT def, over the SAME working
+/// instance the resolver was handed (so a `super().__init__(...)` call
+/// early in a child method still writes fields onto the one instance
+/// this call is building), with an EMPTY `parent_methods` one level up
+/// (a grandparent's own further `super()` chain is out of the
+/// single-inheritance band this table builds — `class_table`'s own
+/// scope). The resolver reads the CALLER's `super_resolver` parameter
+/// (`environment: &Environment`) for `self`'s WORKING value at the
+/// point of the call, per `summaries::SuperResolver`'s own doc — every
+/// earlier `self.<field> = ...` statement in the SAME method body has
+/// already updated it there.
+///
+/// `self.<field>` reads/writes inside the body route through
+/// `summaries::interpret_body`'s own `self`-aware `Assign`/`AugAssign`/
+/// `Expr::Name("self")` handling (`field_read`/`field_write`, the same
+/// two functions this file exports) — this function does not re-walk
+/// the body itself, only sets up the environment and resolver
+/// `interpret_body` needs.
+///
+/// The answer is `(working instance, joined return value)`: every
+/// `return` the body's paths could reach joins into one value
+/// (`join_known`, `interpret_body`'s own fold), and a body that falls
+/// off the end without an explicit `return` contributes `null_value()`
+/// to that join — the same fall-through law `summaries::call_result`
+/// already applies to an ordinary function. Depth-capped through
+/// `summaries::CALL_DEPTH_CAP`, shared with every other same-module
+/// call chain so a recursive method (directly, or through a
+/// `super()`-chained cycle) declines rather than hangs. Any unsupported
+/// body/parameter shape (`*args`/`**kwargs`/keyword-only parameters, a
+/// statement `interpret_body` does not read, an unresolved `super()`
+/// call, an unreadable return) answers `None` — an honest decline,
+/// never a guessed instance.
+pub fn method_call_result(
+    instance: &AbstractValue,
+    model: &ClassModel,
+    method: &StmtFunctionDef,
+    arguments: &[AbstractValue],
+    table: Option<&Arc<FunctionTable>>,
+    kernel: &Arc<RefinedTSKernel>,
+    depth: u32,
+) -> Option<(AbstractValue, AbstractValue)> {
+    use crate::refinedpy::summaries::{collect_bound_names, interpret_body, CALL_DEPTH_CAP};
+
+    if depth >= CALL_DEPTH_CAP {
+        return None;
+    }
+    if method.parameters.vararg.is_some()
+        || method.parameters.kwarg.is_some()
+        || !method.parameters.kwonlyargs.is_empty()
+    {
+        return None;
+    }
+    let parameters: Vec<_> = method
+        .parameters
+        .posonlyargs
+        .iter()
+        .chain(method.parameters.args.iter())
+        .collect();
+    // the first parameter is `self` by convention (matching
+    // `init_derived_fields`'s own first-parameter reading) — a method
+    // with no parameter at all is not a bound instance method this
+    // function can seed `self` for.
+    let (_self_parameter, rest) = parameters.split_first()?;
+    if arguments.len() > rest.len() {
+        return None;
+    }
+
+    let mut locally_bound = std::collections::HashSet::new();
+    locally_bound.insert("self".to_owned());
+    for parameter in rest {
+        locally_bound.insert(parameter.parameter.name.id.as_str().to_owned());
+    }
+    collect_bound_names(&method.body, &mut locally_bound);
+    let mut environment = Environment::new(locally_bound);
+    // one call deeper than the caller — the depth cap engages across
+    // the evaluate↔interpreter boundary (see env::call_depth)
+    environment.set_call_depth(depth.saturating_add(1));
+    if let Some(table) = table {
+        environment.set_functions(table.clone());
+    }
+    environment.bind("self", instance.clone());
+
+    let default_environment = Environment::new(Default::default());
+    for (index, parameter) in rest.iter().enumerate() {
+        let value = if let Some(argument) = arguments.get(index) {
+            argument.clone()
+        } else {
+            let default_expr = parameter.default.as_deref()?;
+            evaluate_expression(default_expr, &default_environment, kernel)
+        };
+        environment.bind(parameter.parameter.name.id.as_str(), value);
+    }
+
+    let parent_methods = model.parent_methods.clone();
+    let super_resolver = move |name: &str, args: &[AbstractValue], environment: &Environment| {
+        let parent_def = parent_methods.get(name)?;
+        let working_instance = environment.read("self")?.clone();
+        let parentless = ClassModel {
+            name: model.name.clone(),
+            fields: Vec::new(),
+            properties: HashMap::new(),
+            methods: parent_methods.clone(),
+            parent_methods: HashMap::new(),
+            class_attributes: Vec::new(),
+        };
+        let (_after, result) =
+            method_call_result(&working_instance, &parentless, parent_def, args, table, kernel, depth + 1)?;
+        Some(result)
+    };
+
+    let mut returns: Vec<AbstractValue> = Vec::new();
+    let falls_through = interpret_body(&method.body, kernel, depth, &mut environment, &mut returns, Some(&super_resolver))?;
+    if falls_through {
+        returns.push(refined_domain::abstract_value::null_value());
+    }
+
+    let mut answers = returns.into_iter();
+    let first = answers.next()?;
+    let result = answers.fold(first, |acc, next| refined_domain::lattice_operations::join_known(acc, next));
+    let working_instance = environment.read("self")?.clone();
+    Some((working_instance, result))
+}
+
+/// A generator body's own yielded values, in order — `Some(Vec::new())`
+/// for a body that yields nothing on its only path, `None` when the
+/// body is outside the two shapes this function reads (a conditional
+/// yield, `yield from`, any restricted-body statement this function
+/// itself does not walk). Models ONLY the yields themselves; a
+/// `next(gen)` call's OWN read of "the first yield" is the WIRING
+/// owner's job (`expressions.rs`'s `evaluate_call`) — this function
+/// hands back the full ordered list so that caller can index position 0
+/// (or answer a join over every yielded value, for a plain `for x in
+/// gen():` walk, should that wiring choose to).
+///
+/// Two accepted top-level statement shapes, walked in source order and
+/// merged into one ordered list:
+///
+/// 1. A STRAIGHT-LINE `yield <expr>` statement (an `Expr` statement
+///    whose value is `Expr::Yield`) — the yielded value evaluates
+///    against the current environment and is appended in place. A bare
+///    `return` ends iteration without yielding (datamodel.rst's
+///    generator-function entry) — no more statements after it are read,
+///    and a straight-line body's own return-with-a-value shape
+///    (`StopIteration`'s `.value`) is outside this function's scope
+///    (never read by `next()`'s own first-value contract).
+/// 2. `for <name> in <literal iterable>: yield <expr>` — a-statements.py's
+///    `stream()` shape (`for value in (10, 20, 30): yield value`,
+///    wrapped in `async def` — this domain collapses `for`/`async for`
+///    into the identical `StmtFor` node, ruff's own generated.rs doc:
+///    "collapses the synchronous and asynchronous variants into a
+///    single type"). Modeled ONLY when the loop's own iterable reads
+///    through `literal_iterable_values` below (a literal list/tuple of
+///    number literals, or `range(...)` with int-literal args — the same
+///    two syntactic shapes `loops.rs`'s own reader accepts, reimplemented
+///    LOCALLY per this addendum's own scope rather than importing that
+///    file), the target a bare Name, the body EXACTLY one `yield <expr>`
+///    statement, and no `else` clause (a `for...else` is outside this
+///    shape). Each element binds the SAME environment in turn (the
+///    elements are already fully known, so no branch of the walk can
+///    see a stale binding) — parameters and any prior straight-line
+///    bindings stay visible to the yield expression, matching CPython's
+///    own left-to-right iteration order (compound_stmts.rst, "The `for`
+///    statement").
+///
+/// Any other statement shape (an `if`, a `while`, a nested `for` whose
+/// iterable is not one of the two literal forms, a `for` whose body is
+/// not exactly one `yield`, …) declines the WHOLE body — `None`, never a
+/// partial list.
+///
+/// `arguments`/`table`/`kernel`/`depth` mirror `summaries::call_result`
+/// exactly (parameters bind positionally, the module's function table
+/// composes a nested same-module call, the depth cap declines a runaway
+/// chain) — a generator's parameter list is bound exactly like an
+/// ordinary function's own.
+pub fn generator_yields(
+    def: &StmtFunctionDef,
+    arguments: &[AbstractValue],
+    table: Option<&Arc<FunctionTable>>,
+    kernel: &Arc<RefinedTSKernel>,
+    depth: u32,
+) -> Option<Vec<AbstractValue>> {
+    use crate::refinedpy::summaries::CALL_DEPTH_CAP;
+    if depth >= CALL_DEPTH_CAP {
+        return None;
+    }
+    if def.parameters.vararg.is_some() || def.parameters.kwarg.is_some() || !def.parameters.kwonlyargs.is_empty() {
+        return None;
+    }
+    let parameters: Vec<_> = def
+        .parameters
+        .posonlyargs
+        .iter()
+        .chain(def.parameters.args.iter())
+        .collect();
+    if arguments.len() > parameters.len() {
+        return None;
+    }
+    let mut locally_bound = std::collections::HashSet::new();
+    for parameter in &parameters {
+        locally_bound.insert(parameter.parameter.name.id.as_str().to_owned());
+    }
+    let mut environment = Environment::new(locally_bound);
+    // one call deeper than the caller — the depth cap engages across
+    // the evaluate↔interpreter boundary (see env::call_depth)
+    environment.set_call_depth(depth.saturating_add(1));
+    if let Some(table) = table {
+        environment.set_functions(table.clone());
+    }
+    let default_environment = Environment::new(Default::default());
+    for (index, parameter) in parameters.iter().enumerate() {
+        let value = if let Some(argument) = arguments.get(index) {
+            argument.clone()
+        } else {
+            let default_expr = parameter.default.as_deref()?;
+            evaluate_expression(default_expr, &default_environment, kernel)
+        };
+        environment.bind(parameter.parameter.name.id.as_str(), value);
+    }
+
+    let mut yields = Vec::new();
+    for stmt in &def.body {
+        match stmt {
+            Stmt::Expr(expr_stmt) => {
+                let Expr::Yield(yield_expr) = expr_stmt.value.as_ref() else {
+                    return None;
+                };
+                let value = match yield_expr.value.as_deref() {
+                    Some(value_expr) => evaluate_expression(value_expr, &environment, kernel),
+                    None => refined_domain::abstract_value::null_value(),
+                };
+                if value.kind == Kind::Unknown {
+                    return None;
+                }
+                yields.push(value);
+            }
+            // a bare `return` inside a generator ends iteration without
+            // yielding (datamodel.rst's generator-function entry) — no
+            // more values after it, and a straight-line body's own
+            // return-with-a-value shape (StopIteration's `.value`) is
+            // outside this function's scope (never read by `next()`'s
+            // own first-value contract).
+            Stmt::Return(_) => break,
+            // `for <name> in <literal iterable>: yield <expr>` — see
+            // this function's own doc, shape 2.
+            Stmt::For(for_stmt) => {
+                if !for_stmt.orelse.is_empty() {
+                    return None;
+                }
+                let Expr::Name(target_name) = for_stmt.target.as_ref() else {
+                    return None;
+                };
+                let [Stmt::Expr(body_expr_stmt)] = for_stmt.body.as_slice() else {
+                    return None;
+                };
+                let Expr::Yield(yield_expr) = body_expr_stmt.value.as_ref() else {
+                    return None;
+                };
+                let Some(value_expr) = yield_expr.value.as_deref() else {
+                    return None;
+                };
+                let elements = literal_iterable_values(for_stmt.iter.as_ref())?;
+                for element in elements {
+                    environment.bind(target_name.id.as_str(), element);
+                    let value = evaluate_expression(value_expr, &environment, kernel);
+                    if value.kind == Kind::Unknown {
+                        return None;
+                    }
+                    yields.push(value);
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(yields)
+}
+
+/// The elements a generator's own `for <target> in <iterable>: yield
+/// <expr>` shape iterates over, restricted to the two syntactic forms
+/// this addendum reads: a `List`/`Tuple` DISPLAY of bare number literals
+/// (`(10, 20, 30)`, `literal_number_elements`'s own literal-only
+/// reading — an element that is not a bare number literal declines the
+/// WHOLE iterable rather than falling back to a wider evaluated read,
+/// since this reader is deliberately the SMALL syntactic subset the
+/// addendum scopes it to), or `range(...)` with 1-3 INT-literal
+/// arguments (`range` rejects a float argument at call time — the same
+/// restriction `loops.rs`'s own `int_literal_value` states). Every
+/// produced value is Integer- or Float-sorted per its own literal syntax
+/// (never a joined `PrimitiveKind::Number`). `None` for any other
+/// iterable shape — a name, a call to anything but `range`, a
+/// non-literal element — this reader declines rather than guess.
+fn literal_iterable_values(iterable: &Expr) -> Option<Vec<AbstractValue>> {
+    match iterable {
+        Expr::List(list) => literal_number_elements(&list.elts),
+        Expr::Tuple(tuple) => literal_number_elements(&tuple.elts),
+        Expr::Call(call) => literal_range_values(call),
+        _ => None,
+    }
+}
+
+/// Every element of a `List`/`Tuple` display read as a bare (optionally
+/// unary +/- wrapped) number literal — `None` the moment one element is
+/// not that exact shape.
+fn literal_number_elements(elements: &[Expr]) -> Option<Vec<AbstractValue>> {
+    let mut values = Vec::with_capacity(elements.len());
+    for element in elements {
+        values.push(literal_number_value(element)?);
+    }
+    Some(values)
+}
+
+/// A bare (possibly unary +/- wrapped) `NumberLiteral`'s exact value,
+/// tagged with its own CPython sort — the same reading `loops.rs`'s own
+/// `sorted_number_literal_value` gives, reimplemented locally per this
+/// function's own module (the addendum's own "do NOT import loops.rs").
+fn literal_number_value(expression: &Expr) -> Option<AbstractValue> {
+    use refined_domain::abstract_value::{known_values, PrimitiveKind};
+    use refined_domain::trust_grades::TrustProved;
+    match expression {
+        Expr::NumberLiteral(literal) => match &literal.value {
+            Number::Int(int) => int.as_i64().map(|value| known_values(vec![value as f64], PrimitiveKind::Integer, TrustProved)),
+            Number::Float(value) => Some(known_values(vec![*value], PrimitiveKind::Float, TrustProved)),
+            Number::Complex { .. } => None,
+        },
+        Expr::UnaryOp(unary) if matches!(unary.op, UnaryOp::USub | UnaryOp::UAdd) => {
+            let operand = literal_number_value(unary.operand.as_ref())?;
+            let sort = operand.kind_tag?;
+            let value = operand.values.first().copied()?;
+            let signed = if unary.op == UnaryOp::USub { -value } else { value };
+            Some(known_values(vec![signed], sort, TrustProved))
+        }
+        _ => None,
+    }
+}
+
+/// A `range(...)` call's produced Integer-sorted values, `None` when the
+/// callee is not the bare name `range`, an argument is not an INT
+/// literal, the argument count is not 1/2/3, or the step is 0 — the same
+/// reading `loops.rs`'s own `range_call_values` gives, reimplemented
+/// locally (this function's own module owns no dependency on `loops.rs`
+/// per the addendum's scope).
+fn literal_range_values(call: &ExprCall) -> Option<Vec<AbstractValue>> {
+    use refined_domain::abstract_value::{known_values, PrimitiveKind};
+    use refined_domain::trust_grades::TrustProved;
+    let Expr::Name(callee) = call.func.as_ref() else {
+        return None;
+    };
+    if callee.id.as_str() != "range" {
+        return None;
+    }
+    if !call.arguments.keywords.is_empty() {
+        return None;
+    }
+    let args = &call.arguments.args;
+    let (start, stop, step) = match args.len() {
+        1 => (0.0, literal_int_value(&args[0])?, 1.0),
+        2 => (literal_int_value(&args[0])?, literal_int_value(&args[1])?, 1.0),
+        3 => (
+            literal_int_value(&args[0])?,
+            literal_int_value(&args[1])?,
+            literal_int_value(&args[2])?,
+        ),
+        _ => return None,
+    };
+    if step == 0.0 {
+        return None;
+    }
+    let mut values = Vec::new();
+    let mut current = start;
+    // r[i] = start + step*i, while r[i] < stop (step > 0) or r[i] > stop
+    // (step < 0) — library/stdtypes.rst's own range formula
+    if step > 0.0 {
+        while current < stop {
+            values.push(known_values(vec![current], PrimitiveKind::Integer, TrustProved));
+            current += step;
+        }
+    } else {
+        while current > stop {
+            values.push(known_values(vec![current], PrimitiveKind::Integer, TrustProved));
+            current += step;
+        }
+    }
+    Some(values)
+}
+
+/// A `range()` argument's value, restricted to an INT literal — `range`
+/// rejects a float argument at call time, so this reader stays honest
+/// about that CPython restriction rather than silently truncating.
+fn literal_int_value(expression: &Expr) -> Option<f64> {
+    match expression {
+        Expr::NumberLiteral(literal) => match &literal.value {
+            Number::Int(int) => int.as_i64().map(|value| value as f64),
+            _ => None,
+        },
+        Expr::UnaryOp(unary) if matches!(unary.op, UnaryOp::USub | UnaryOp::UAdd) => {
+            let operand = literal_int_value(unary.operand.as_ref())?;
+            Some(if unary.op == UnaryOp::USub { -operand } else { operand })
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1007,6 +1711,7 @@ mod tests {
             set: make_refined_set(vec![integer(), at_least(0.0), at_most(120.0)]),
             spelling: "Age".to_owned(),
             admits_none: false,
+            element: None,
         }
     }
 
@@ -1014,12 +1719,19 @@ mod tests {
         known_values(vec![v], PrimitiveKind::Integer, TrustProved)
     }
 
-    /// A hand-built `ClassModel` with no properties — every direct
-    /// `judge_construction`/`field_write_judgment` test builds a model
-    /// this way rather than parsing source, since those functions take
-    /// the model, not the class definition.
+    /// A hand-built `ClassModel` with no properties and no methods —
+    /// every direct `judge_construction`/`field_write_judgment` test
+    /// builds a model this way rather than parsing source, since those
+    /// functions take the model, not the class definition.
     fn bare_model(name: &str, fields: Vec<ClassField>) -> ClassModel {
-        ClassModel { name: name.to_owned(), fields, properties: HashMap::new() }
+        ClassModel {
+            name: name.to_owned(),
+            fields,
+            properties: HashMap::new(),
+            methods: HashMap::new(),
+            parent_methods: HashMap::new(),
+            class_attributes: Vec::new(),
+        }
     }
 
     fn range_of(source: &str) -> TextRange {
@@ -1151,6 +1863,86 @@ mod tests {
         assert!(verdict.fires.is_empty());
         let field = field_read(&verdict.instance, "age").expect("age field present");
         assert_eq!(field.kind, Kind::Set);
+    }
+
+    // --- model_post_init: the dependent-check hook ---
+
+    /// m-pydantic-schema.py's own `Range` shape: `model_post_init(self,
+    /// __context): if self.hi < self.lo: raise ValueError(...)`. A
+    /// construction whose fields provably satisfy `hi >= lo` never
+    /// fires here — the post-init condition reads False.
+    #[test]
+    fn model_post_init_is_silent_when_the_dependent_check_passes() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "class Range:\n",
+            "    lo: int\n",
+            "    hi: int\n",
+            "    def model_post_init(self, __context) -> None:\n",
+            "        if self.hi < self.lo:\n",
+            "            raise ValueError(\"hi must be >= lo\")\n",
+        ));
+        let aliases = HashMap::new();
+        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let table = class_table(&module, &aliases, &imports, &kernel);
+        let range_model = table.get("Range").expect("Range class recorded");
+        let keyword = vec![
+            ("lo".to_owned(), integer_value(10.0), range_of("10")),
+            ("hi".to_owned(), integer_value(20.0), range_of("20")),
+        ];
+        let verdict = judge_construction(range_model, &[], &keyword, &kernel);
+        assert!(verdict.fires.is_empty(), "hi (20) >= lo (10): the dependent check never raises");
+    }
+
+    /// The refused pair: `hi` (5) below `lo` (10) — the post-init
+    /// condition provably reads True, so construction fires with the
+    /// `ValueError`'s own message.
+    #[test]
+    fn model_post_init_fires_when_the_dependent_check_provably_raises() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "class Range:\n",
+            "    lo: int\n",
+            "    hi: int\n",
+            "    def model_post_init(self, __context) -> None:\n",
+            "        if self.hi < self.lo:\n",
+            "            raise ValueError(\"hi must be >= lo\")\n",
+        ));
+        let aliases = HashMap::new();
+        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let table = class_table(&module, &aliases, &imports, &kernel);
+        let range_model = table.get("Range").expect("Range class recorded");
+        let keyword = vec![
+            ("lo".to_owned(), integer_value(10.0), range_of("10")),
+            ("hi".to_owned(), integer_value(5.0), range_of("5")),
+        ];
+        let verdict = judge_construction(range_model, &[], &keyword, &kernel);
+        assert_eq!(verdict.fires.len(), 1, "hi (5) < lo (10): the dependent check provably raises");
+        assert!(verdict.fires[0].1.contains("ValueError"), "{}", verdict.fires[0].1);
+        assert!(verdict.fires[0].1.contains("hi must be >= lo"), "{}", verdict.fires[0].1);
+    }
+
+    /// An undetermined field (no keyword argument at all, so `hi`/`lo`
+    /// both hold the declared int base sort, not a concrete value)
+    /// never fires — `truthiness` cannot decide the condition, and this
+    /// reader's own honest-decline discipline never guesses.
+    #[test]
+    fn model_post_init_never_fires_on_an_undetermined_condition() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "class Range:\n",
+            "    lo: int\n",
+            "    hi: int\n",
+            "    def model_post_init(self, __context) -> None:\n",
+            "        if self.hi < self.lo:\n",
+            "            raise ValueError(\"hi must be >= lo\")\n",
+        ));
+        let aliases = HashMap::new();
+        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let table = class_table(&module, &aliases, &imports, &kernel);
+        let range_model = table.get("Range").expect("Range class recorded");
+        let verdict = judge_construction(range_model, &[], &[], &kernel);
+        assert!(verdict.fires.is_empty(), "an undetermined comparison never guesses a fire");
     }
 
     // --- field_read ---
@@ -1477,5 +2269,229 @@ mod tests {
 
         let verdict = field_write_judgment(aged, "age", &integer_value(200.0), &kernel);
         assert!(matches!(verdict, Some(Verdict::Fire(_))), "200 fires against the setter's own Age set");
+    }
+
+    // --- ClassModel is Clone ---
+
+    #[test]
+    fn class_model_clones_its_fields_properties_and_methods() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "class Aged:\n",
+            "    def __init__(self, age: int) -> None:\n",
+            "        self.age = age\n",
+            "    def next_year(self) -> int:\n",
+            "        return self.age + 1\n",
+        ));
+        let aliases = HashMap::new();
+        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let table = class_table(&module, &aliases, &imports, &kernel);
+        let aged = table.get("Aged").expect("Aged class recorded");
+        let cloned = aged.clone();
+        assert_eq!(cloned.name, aged.name);
+        assert_eq!(cloned.fields.len(), aged.fields.len());
+        assert!(cloned.methods.contains_key("next_year"), "the clone keeps the method table");
+    }
+
+    // --- method_def_of: own-overrides-inherited ---
+
+    #[test]
+    fn method_def_of_reads_a_class_own_method() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "class Aged:\n",
+            "    def __init__(self, age: int) -> None:\n",
+            "        self.age = age\n",
+            "    def next_year(self) -> int:\n",
+            "        return self.age + 1\n",
+        ));
+        let aliases = HashMap::new();
+        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let table = class_table(&module, &aliases, &imports, &kernel);
+        let aged = table.get("Aged").expect("Aged class recorded");
+        let method = method_def_of(aged, "next_year").expect("next_year is a declared method");
+        assert_eq!(method.name.id.as_str(), "next_year");
+        assert!(method_def_of(aged, "missing").is_none());
+    }
+
+    /// A child overriding a parent's method: `method_def_of` on the
+    /// child answers the CHILD's own def (its body differs from the
+    /// parent's — `label` returns 2, not the parent's 1), while
+    /// `parent_methods` still carries the parent's original — the
+    /// `super()` resolution target, proven by running both defs through
+    /// `method_call_result` and comparing their answers.
+    #[test]
+    fn method_def_of_prefers_the_childs_own_override_over_the_inherited_def() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "class BaseYears:\n",
+            "    def __init__(self, age: int) -> None:\n",
+            "        self.age = age\n",
+            "    def label(self) -> int:\n",
+            "        return 1\n",
+            "class KidYears(BaseYears):\n",
+            "    def __init__(self, age: int) -> None:\n",
+            "        super().__init__(age)\n",
+            "    def label(self) -> int:\n",
+            "        return 2\n",
+        ));
+        let aliases = HashMap::new();
+        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let table = class_table(&module, &aliases, &imports, &kernel);
+        let kid = table.get("KidYears").expect("KidYears class recorded");
+        let instance = judge_construction(kid, &[(integer_value(40.0), range_of("40"))], &[], &kernel).instance;
+
+        let effective = method_def_of(kid, "label").expect("label is declared");
+        let (_after, effective_result) = method_call_result(&instance, kid, effective, &[], None, &kernel, 0)
+            .expect("the child's own label() must interpret");
+        assert_eq!(effective_result, integer_value(2.0), "method_def_of answers the CHILD's own override");
+
+        let inherited = kid.parent_methods.get("label").expect("parent_methods keeps the parent's own def");
+        let (_after, inherited_result) = method_call_result(&instance, kid, inherited, &[], None, &kernel, 0)
+            .expect("the parent's own label() must interpret");
+        assert_eq!(inherited_result, integer_value(1.0), "parent_methods is unaffected by the child's override");
+    }
+
+    // --- method_call_result: write-then-read, and the super() chain ---
+
+    /// `outlaw.spoil()` where `spoil` writes `self.age = 200` and reads
+    /// nothing back itself — the RETURNED instance must carry the
+    /// write, matching b-body-expressions.py's own
+    /// `literal_writing_method` shape (ORIENTATION.md's own citation for
+    /// `method_call_result`).
+    #[test]
+    fn method_call_result_write_then_read_survives_on_the_returned_instance() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "class Outlaw:\n",
+            "    def __init__(self, age: int) -> None:\n",
+            "        self.age = age\n",
+            "    def spoil(self) -> None:\n",
+            "        self.age = 200\n",
+        ));
+        let aliases = HashMap::new();
+        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let table = class_table(&module, &aliases, &imports, &kernel);
+        let outlaw = table.get("Outlaw").expect("Outlaw class recorded");
+        let instance = judge_construction(outlaw, &[(integer_value(40.0), range_of("40"))], &[], &kernel).instance;
+        let method = method_def_of(outlaw, "spoil").expect("spoil is declared");
+        let (after, _result) = method_call_result(&instance, outlaw, method, &[], None, &kernel, 0)
+            .expect("spoil's straight-line self-write must interpret");
+        assert_eq!(field_read(&after, "age"), Some(integer_value(200.0)), "the write survives on the returned instance");
+    }
+
+    /// `KidYears(age=200).years()` where `years` calls
+    /// `super().years() + 1` — the parent's OWN `years` (never the
+    /// child's, since `KidYears` declares no override of that name)
+    /// answers through `parent_methods`, and the child's own method adds
+    /// 1 to it.
+    #[test]
+    fn method_call_result_resolves_a_super_call_through_parent_methods() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "class BaseYears:\n",
+            "    def __init__(self, age: int) -> None:\n",
+            "        self.age = age\n",
+            "    def years(self) -> int:\n",
+            "        return self.age\n",
+            "class KidYears(BaseYears):\n",
+            "    def __init__(self, age: int) -> None:\n",
+            "        super().__init__(age)\n",
+            "    def call_super_method(self) -> int:\n",
+            "        return super().years() + 1\n",
+        ));
+        let aliases = HashMap::new();
+        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let table = class_table(&module, &aliases, &imports, &kernel);
+        let kid = table.get("KidYears").expect("KidYears class recorded");
+        let instance = judge_construction(kid, &[(integer_value(40.0), range_of("40"))], &[], &kernel).instance;
+        let method = method_def_of(kid, "call_super_method").expect("call_super_method is declared");
+        let (_after, result) = method_call_result(&instance, kid, method, &[], None, &kernel, 0)
+            .expect("the super().years() call must resolve through parent_methods");
+        assert_eq!(result, integer_value(41.0), "super().years() answers 40, plus 1");
+    }
+
+    // --- field_write: the source tag survives ---
+
+    #[test]
+    fn field_write_preserves_the_instances_source_tag() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let model = bare_model(
+            "Aged",
+            vec![ClassField { name: "age".to_owned(), declared: None, default: None }],
+        );
+        let verdict = judge_construction(&model, &[(integer_value(40.0), range_of("40"))], &[], &kernel);
+        assert_eq!(verdict.instance.source, "Aged", "judge_construction tags the instance with the class name");
+        let written = field_write(&verdict.instance, "age", integer_value(41.0)).expect("write must decide");
+        assert_eq!(written.source, "Aged", "the source tag survives a field write");
+        assert_eq!(field_read(&written, "age"), Some(integer_value(41.0)));
+    }
+
+    // --- generator_yields: the stream() for-loop shape ---
+
+    /// `async def stream(): for value in (10, 20, 30): yield value` —
+    /// a-statements.py:547-549's own shape: a generator whose only
+    /// statement is a `for` loop over a literal tuple, yielding the
+    /// loop target unmodified. `generator_yields` must answer all three
+    /// yields, in order.
+    #[test]
+    fn generator_yields_reads_the_stream_for_loop_shape_in_order() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "async def stream():\n",
+            "    for value in (10, 20, 30):\n",
+            "        yield value\n",
+        ));
+        let def = module.body.into_iter().next().expect("one top-level def").function_def_stmt().expect("is a def");
+        let yields = generator_yields(&def, &[], None, &kernel, 0).expect("the stream() for-loop shape must decide");
+        assert_eq!(yields, vec![integer_value(10.0), integer_value(20.0), integer_value(30.0)]);
+    }
+
+    /// The same shape, but the yield expression TRANSFORMS the target
+    /// (`yield value + 100`) — the per-iterate binding must be visible
+    /// to the yield expression, not just a bare pass-through.
+    #[test]
+    fn generator_yields_evaluates_the_yield_expression_per_iterate() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "def stream():\n",
+            "    for value in [10, 20]:\n",
+            "        yield value + 100\n",
+        ));
+        let def = module.body.into_iter().next().expect("one top-level def").function_def_stmt().expect("is a def");
+        let yields = generator_yields(&def, &[], None, &kernel, 0).expect("the transformed-yield shape must decide");
+        assert_eq!(yields, vec![integer_value(110.0), integer_value(120.0)]);
+    }
+
+    /// Straight-line top-level yields merge with the for-loop's own
+    /// yields, in source order — the addendum's own "merged with any
+    /// top-level yields in source order."
+    #[test]
+    fn generator_yields_merges_straight_line_and_for_loop_yields_in_source_order() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "def mixed():\n",
+            "    yield 1\n",
+            "    for value in (2, 3):\n",
+            "        yield value\n",
+        ));
+        let def = module.body.into_iter().next().expect("one top-level def").function_def_stmt().expect("is a def");
+        let yields = generator_yields(&def, &[], None, &kernel, 0).expect("the mixed shape must decide");
+        assert_eq!(yields, vec![integer_value(1.0), integer_value(2.0), integer_value(3.0)]);
+    }
+
+    /// A `for` loop whose iterable is NOT one of the two literal shapes
+    /// (a bare name, here) declines the whole body — never a partial
+    /// list.
+    #[test]
+    fn generator_yields_declines_a_for_loop_over_a_non_literal_iterable() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "def stream(values):\n",
+            "    for value in values:\n",
+            "        yield value\n",
+        ));
+        let def = module.body.into_iter().next().expect("one top-level def").function_def_stmt().expect("is a def");
+        assert!(generator_yields(&def, &[unknown()], None, &kernel, 0).is_none());
     }
 }

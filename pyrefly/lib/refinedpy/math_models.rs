@@ -6,17 +6,21 @@
  */
 
 //! `math.*` call transfers: the exactly-decidable slice of the `math`
-//! module (`floor`, `ceil`, `trunc`, `isqrt`, `fabs`, `copysign`), PLUS
-//! the sort-only approximated family (`sqrt`, every trig/hyperbolic
-//! function, `cbrt`, `exp`, `expm1`, `log`, `log1p`, `hypot`), which
-//! answers `float_sorted_unknown()` — a Float-tagged all-numbers SET,
-//! never a specific value — once every argument is known, so
+//! module (`floor`, `ceil`, `trunc`, `isqrt`, `fabs`, `copysign`, and
+//! `sqrt` on a known perfect square), PLUS the sort-only approximated
+//! family (`sqrt` on any other operand, every trig/hyperbolic function,
+//! `cbrt`, `exp`, `expm1`, `log`, `log1p`, `log2`, `log10`, `hypot`),
+//! which answers `float_sorted_unknown()` — a Float-tagged all-numbers
+//! SET, never a specific value — once every argument is known, so
 //! assignability's sort-fire law can still refuse an int-sorted sink.
 //! `math` is CPython's thin libm wrapper (library/math.html,
 //! implementation detail note: "the current implementation... will
 //! raise ValueError for invalid operations... and OverflowError for
 //! results that overflow" — an IMPLEMENTATION-graded accuracy promise,
-//! never a pinned exact bit pattern).
+//! never a pinned exact bit pattern). `math_constant_value` answers the
+//! module's own ATTRIBUTE constants (`pi`, `e`, `tau`, `inf`) —
+//! separate from `math_call_result` since a constant read is never a
+//! call.
 
 use refined_domain::abstract_value::float_sorted_unknown;
 use refined_domain::abstract_value::known_values;
@@ -131,8 +135,8 @@ fn fabs_call(value: f64) -> Option<AbstractValue> {
 /// sign of y. On platforms that support signed zeros, copysign(1.0,
 /// -0.0) returns -1.0"). Exact per IEEE 754's copysign operation: no
 /// rounding or approximation is involved, only a magnitude/sign
-/// recombination, so this is answered unconditionally rather than
-/// gated behind an IEEE dial the way general float arithmetic is.
+/// recombination, so this is answered from the `math.copysign` clause
+/// (`tmp/cpython/Doc/library/math.rst`), not from Lean `TransferOpAdd`.
 /// `f64::copysign` is exactly this operation, including the signed-zero
 /// case the doc calls out by name.
 fn copysign_call(magnitude: f64, sign_source: f64) -> Option<AbstractValue> {
@@ -158,11 +162,44 @@ pub fn sqrt_argument_is_known_negative(arguments: &[AbstractValue]) -> bool {
     }
 }
 
+/// `math.sqrt(x)` on a KNOWN NON-NEGATIVE operand that is an EXACT
+/// PERFECT SQUARE: the exact Float result, not sort-only. IEEE 754
+/// (the standard C99's `sqrt` — and therefore CPython's libm wrapper —
+/// implements, library/math.html's own module intro: "This module
+/// provides access to the mathematical functions defined by the C
+/// standard") requires `sqrt` to be CORRECTLY ROUNDED: the returned
+/// double is the closest representable value to the true mathematical
+/// square root. When the true square root is itself an integer that
+/// fits exactly in an f64 (`arithmetic_result`'s own 2^53 exactness
+/// bound, `expressions.rs`), "closest representable value" IS that
+/// exact integer — there is no rounding error to introduce, so
+/// `math.sqrt(40000) == 200.0` is a provable fact of the standard, not
+/// an approximation this file merely observes. A non-perfect-square
+/// operand (whose true root is irrational or non-terminating in
+/// binary) has no such exactness guarantee and falls through to the
+/// sort-only row below.
+fn sqrt_exact_perfect_square(value: f64) -> Option<AbstractValue> {
+    if value < 0.0 || value.fract() != 0.0 {
+        return None;
+    }
+    let root = value.sqrt();
+    if root.fract() != 0.0 {
+        return None;
+    }
+    if root * root != value {
+        return None;
+    }
+    Some(float_result(root))
+}
+
 /// The approximated float family this wave promotes from `None` (plain
 /// unknown) to `float_sorted_unknown()` (a Float-tagged, all-numbers
 /// SET) once every argument is known: `sqrt`, `sin`, `cos`, `tan`,
 /// `asin`, `acos`, `atan`, `atan2`, `sinh`, `cosh`, `tanh`, `asinh`,
-/// `acosh`, `atanh`, `cbrt`, `exp`, `expm1`, `log`, `log1p`, `hypot`.
+/// `acosh`, `atanh`, `cbrt`, `exp`, `expm1`, `log`, `log1p`, `log2`,
+/// `log10`, `hypot` — `log2(x)`/`log10(x)` ("Return the base-2/base-10
+/// logarithm of x," library/math.rst) are the same float-returning,
+/// no-pinned-exact-value shape `log`/`log1p` already carry.
 /// None of these carries a pinned exact-value clause (library/math.html's
 /// module intro: "the current implementation... Behavior in exceptional
 /// cases follows Annex F... will raise ValueError for invalid
@@ -178,7 +215,7 @@ pub fn sqrt_argument_is_known_negative(arguments: &[AbstractValue]) -> bool {
 fn approximated_family_result(function: &str, arguments: &[AbstractValue]) -> Option<AbstractValue> {
     const APPROXIMATED_NAMES: &[&str] = &[
         "sqrt", "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "sinh", "cosh", "tanh", "asinh", "acosh",
-        "atanh", "cbrt", "exp", "expm1", "log", "log1p", "hypot",
+        "atanh", "cbrt", "exp", "expm1", "log", "log1p", "log2", "log10", "hypot",
     ];
     if !APPROXIMATED_NAMES.contains(&function) {
         return None;
@@ -195,6 +232,26 @@ fn approximated_family_result(function: &str, arguments: &[AbstractValue]) -> Op
     Some(float_sorted_unknown())
 }
 
+/// `math.pi` / `math.e` / `math.tau` / `math.inf` — ATTRIBUTE READS, not
+/// calls (library/math.rst, "Constants" section: `data:: pi`/`data:: e`/
+/// `data:: tau`/`data:: inf`, each "to available precision" or, for
+/// `inf`, "Equivalent to the output of `float('inf')`"). None of the
+/// four is a whole number, so a Float-sorted sort-only answer
+/// (`float_sorted_unknown()`) is enough for `assignability`'s int-sort
+/// fire law to refuse an int-sorted sink — the exact digit sequence is
+/// never claimed. `math.nan` is deliberately excluded: NaN fails every
+/// ordering comparison, which would make the sort-only Float set answer
+/// UNSOUND for a sink that compares by value (a NaN is never `<=` any
+/// bound), so this row stays undecided rather than answer a set that
+/// does not actually contain the value. `None` for any other attribute
+/// name.
+pub fn math_constant_value(name: &str) -> Option<AbstractValue> {
+    match name {
+        "pi" | "e" | "tau" | "inf" => Some(float_sorted_unknown()),
+        _ => None,
+    }
+}
+
 /// `math_call_result` is the FROZEN entry point: `function` is the
 /// attribute name after `math.` ("floor", "sqrt", …); `arguments` are
 /// the already-evaluated operands in call order. `None` means "not
@@ -202,25 +259,29 @@ fn approximated_family_result(function: &str, arguments: &[AbstractValue]) -> Op
 /// in PYREFLY-NUMERIC-B3-B4.md.
 ///
 /// Modeled EXACTLY (each an exactly-decidable row cited above):
-/// `floor`, `ceil`, `trunc`, `isqrt`, `fabs`, `copysign`.
+/// `floor`, `ceil`, `trunc`, `isqrt`, `fabs`, `copysign`, and `sqrt` on
+/// a known non-negative PERFECT-SQUARE operand (`sqrt_exact_perfect_square`'s
+/// own doc — IEEE 754 correct rounding, not an approximation).
 ///
 /// Modeled at SORT-ONLY precision (`approximated_family_result`'s own
-/// doc): `sqrt`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`,
-/// `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh`, `cbrt`, `exp`,
-/// `expm1`, `log`, `log1p`, `hypot` — every argument known answers
+/// doc): `sqrt` on a non-perfect-square operand, `sin`, `cos`, `tan`,
+/// `asin`, `acos`, `atan`, `atan2`, `sinh`, `cosh`, `tanh`, `asinh`,
+/// `acosh`, `atanh`, `cbrt`, `exp`, `expm1`, `log`, `log1p`, `log2`,
+/// `log10`, `hypot` — every argument known answers
 /// `float_sorted_unknown()` (a Float-tagged all-numbers set), never a
 /// specific value; `math.sqrt` on a known negative argument answers
 /// `None` here because it provably RAISES instead (see
 /// `sqrt_argument_is_known_negative`, read by `provable_raise`).
 ///
 /// Still declined (no cited row this wave, and not sort-only-graded
-/// either): `pow`, `log2`, `log10`, `fsum`, `remainder`, `fmod`, `gcd`,
-/// `lcm`, `factorial`, `comb`, `perm`, `degrees`, `radians`, `isnan`,
-/// `isinf`, `isfinite`, `nextafter`, `ulp`, `frexp`, `ldexp`, `modf`,
-/// `dist`, `prod` — every one of them falls through the wildcard arm
-/// below to `None`. Constants (`math.pi`, `math.e`, `math.tau`,
-/// `math.inf`, `math.nan`) are attribute reads, not calls — out of
-/// scope for this function entirely.
+/// either): `pow`, `fsum`, `remainder`, `fmod`, `gcd`, `lcm`,
+/// `factorial`, `comb`, `perm`, `degrees`, `radians`, `isnan`, `isinf`,
+/// `isfinite`, `nextafter`, `ulp`, `frexp`, `ldexp`, `modf`, `dist`,
+/// `prod` — every one of them falls through the wildcard arm below to
+/// `None`. Constants (`math.pi`, `math.e`, `math.tau`, `math.inf`,
+/// `math.nan`) are attribute reads, not calls — out of scope for this
+/// function entirely; see `math_constant_value` for those (`math.nan`
+/// still excluded there, see its own doc).
 pub fn math_call_result(function: &str, arguments: &[AbstractValue]) -> Option<AbstractValue> {
     match function {
         "floor" => {
@@ -248,9 +309,20 @@ pub fn math_call_result(function: &str, arguments: &[AbstractValue]) -> Option<A
             let (sign_source, _) = single_numeric_operand(arguments.get(1)?)?;
             copysign_call(magnitude, sign_source)
         }
-        // the sort-only approximated family (sqrt, trig, log, exp,
-        // hypot): float_sorted_unknown() once every argument is known,
-        // per approximated_family_result's own doc
+        // `sqrt` on an exact perfect square answers the exact Float
+        // result (IEEE 754 correct rounding — see
+        // sqrt_exact_perfect_square's own doc); any other sqrt argument,
+        // and every other approximated-family function, falls through
+        // to the sort-only row below
+        "sqrt" => {
+            let [only] = arguments else { return None };
+            let (value, _) = single_numeric_operand(only)?;
+            sqrt_exact_perfect_square(value).or_else(|| approximated_family_result(function, arguments))
+        }
+        // the sort-only approximated family (trig, log, exp, hypot,
+        // and sqrt on a non-perfect-square): float_sorted_unknown()
+        // once every argument is known, per
+        // approximated_family_result's own doc
         _ => approximated_family_result(function, arguments),
     }
 }
@@ -334,12 +406,21 @@ mod tests {
         assert_eq!(result.kind_tag, Some(PrimitiveKind::Float));
     }
 
-    /// `math.sqrt` on a known non-negative argument answers the sort-
-    /// only Float set, never a specific value — the exact perfect-
-    /// square result (`math.sqrt(4) == 2.0`) is not claimed here.
+    /// `math.sqrt` on a KNOWN PERFECT SQUARE answers the exact Float
+    /// value — IEEE 754 correct rounding pins `sqrt(40000.0) == 200.0`
+    /// exactly, not merely approximately.
     #[test]
-    fn test_sqrt_known_nonnegative_answers_float_sorted_unknown() {
-        let result = math_call_result("sqrt", &[float_operand(4.0)]).expect("sqrt should answer sort-only");
+    fn test_sqrt_perfect_square_answers_the_exact_value() {
+        let result = math_call_result("sqrt", &[float_operand(40000.0)]).expect("sqrt(40000) should answer exactly");
+        assert_eq!(result.values, vec![200.0]);
+        assert_eq!(result.kind_tag, Some(PrimitiveKind::Float));
+    }
+
+    /// `math.sqrt` on a NON-perfect-square known non-negative argument
+    /// answers the sort-only Float set, never a specific value.
+    #[test]
+    fn test_sqrt_non_perfect_square_answers_float_sorted_unknown() {
+        let result = math_call_result("sqrt", &[float_operand(2.0)]).expect("sqrt should answer sort-only");
         assert_eq!(result.kind, Kind::Set);
         assert_eq!(result.set_kind_tag, SetKindTag::None);
     }
@@ -383,5 +464,43 @@ mod tests {
     fn test_unmodeled_function_declines() {
         let result = math_call_result("frexp", &[float_operand(1.0)]);
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_log2_and_log10_answer_sort_only() {
+        let log2 = math_call_result("log2", &[float_operand(1024.0)]).expect("log2 should answer sort-only");
+        assert_eq!(log2.kind, Kind::Set);
+        let log10 = math_call_result("log10", &[float_operand(1000.0)]).expect("log10 should answer sort-only");
+        assert_eq!(log10.kind, Kind::Set);
+    }
+
+    /// `math.pi` is a sort-only Float set — never an exact digit
+    /// sequence, and never a whole number (so an int-sorted sink still
+    /// fires against it).
+    #[test]
+    fn test_math_pi_is_sort_only_float() {
+        let result = math_constant_value("pi").expect("math.pi should answer sort-only");
+        assert_eq!(result.kind, Kind::Set);
+        assert_eq!(result.kind_tag, Some(PrimitiveKind::Float));
+    }
+
+    #[test]
+    fn test_math_e_tau_inf_are_sort_only_float() {
+        for name in ["e", "tau", "inf"] {
+            let result = math_constant_value(name).unwrap_or_else(|| panic!("math.{name} should answer sort-only"));
+            assert_eq!(result.kind, Kind::Set);
+        }
+    }
+
+    /// `math.nan` is excluded: a NaN value would make the sort-only
+    /// Float set claim unsound for a value-comparing sink.
+    #[test]
+    fn test_math_nan_declines() {
+        assert_eq!(math_constant_value("nan"), None);
+    }
+
+    #[test]
+    fn test_math_unmodeled_attribute_declines() {
+        assert_eq!(math_constant_value("floor"), None);
     }
 }

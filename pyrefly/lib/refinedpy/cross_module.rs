@@ -335,6 +335,9 @@ fn pull_member(
                         )
                     })
                     .collect(),
+                methods: class_model.methods.clone(),
+                parent_methods: class_model.parent_methods.clone(),
+                class_attributes: class_model.class_attributes.clone(),
             },
         );
     }
@@ -445,6 +448,7 @@ fn fold_import(
             .iter()
             .map(|(name, value)| ObjectKey {
                 name: name.clone(),
+                numeric: false,
                 value: value.clone(),
             })
             .collect();

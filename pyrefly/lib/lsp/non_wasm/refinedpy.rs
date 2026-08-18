@@ -28,6 +28,8 @@ use refined_kernel::kernel_bridge::load_kernel;
 use refined_kernel::kernel_interface::RefinedTSKernel;
 
 use crate::refinedpy::check::findings_for_module;
+use crate::refinedpy::check::findings_for_module_with_resolver;
+use crate::refinedpy::cross_module::disk_resolver;
 use crate::state::state::Transaction;
 
 /// Resolved once before the LSP loop serves requests; `None` when no
@@ -83,7 +85,17 @@ pub fn append_refinedpy_diagnostics(
     let Some(module_info) = transaction.get_module_info(handle) else {
         return;
     };
-    for finding in findings_for_module(&ast, &kernel) {
+    // Imports resolve from the open file's own directory, the same way
+    // the check CLI resolves them — sibling files are read from disk,
+    // so an unsaved sibling buffer contributes its on-disk contents.
+    let findings = match handle.path().as_path().parent() {
+        Some(directory) => {
+            let resolver = disk_resolver(directory.to_path_buf());
+            findings_for_module_with_resolver(&ast, &resolver, &kernel)
+        }
+        None => findings_for_module(&ast, &kernel),
+    };
+    for finding in findings {
         items.push(Diagnostic {
             range: module_info.to_lsp_range(finding.range),
             severity: Some(DiagnosticSeverity::ERROR),

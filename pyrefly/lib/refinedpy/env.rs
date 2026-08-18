@@ -19,6 +19,7 @@ use refined_domain::abstract_value::AbstractValue;
 
 use crate::refinedpy::function_table::FunctionTable;
 use crate::refinedpy::instances::ClassModel;
+use crate::refinedpy::typereading::DeclaredRefinement;
 
 pub struct Environment {
     bindings: HashMap<String, AbstractValue>,
@@ -40,6 +41,18 @@ pub struct Environment {
     /// anywhere along the call chain. `None` for a walk that never set
     /// one.
     classes: Option<Arc<HashMap<String, ClassModel>>>,
+    /// Every CALLABLE-VARIABLE name this walk has recorded a return
+    /// refinement for — `x: Callable[[...], R] = ...`'s own `R`, keyed
+    /// on `x`. Rides the environment for the same reason
+    /// `functions`/`classes` do: a call-site sink
+    /// (`check.rs::sink_value`) can answer `name(...)` on a bare Name
+    /// found here by reading `environment.callable_returns()`, with no
+    /// signature change anywhere along the call chain. `None` for a
+    /// walk that never set one.
+    callable_returns: Option<Arc<HashMap<String, DeclaredRefinement>>>,
+    /// How many interpreted CALLS deep this environment sits — 0 for a
+    /// walked body, parent + 1 inside each interpreter child body.
+    call_depth: u32,
 }
 
 impl Environment {
@@ -52,6 +65,8 @@ impl Environment {
             locally_bound,
             functions: None,
             classes: None,
+            callable_returns: None,
+            call_depth: 0,
         }
     }
 
@@ -79,6 +94,33 @@ impl Environment {
         self.classes.as_ref()
     }
 
+    /// Attaches this body's callable-return table so a call site
+    /// evaluated against this environment (and any environment forked
+    /// from it) can look up a bare-Name callable's return refinement.
+    pub fn set_callable_returns(&mut self, callable_returns: Arc<HashMap<String, DeclaredRefinement>>) {
+        self.callable_returns = Some(callable_returns);
+    }
+
+    /// This body's callable-return table, if it carries one.
+    pub fn callable_returns(&self) -> Option<&Arc<HashMap<String, DeclaredRefinement>>> {
+        self.callable_returns.as_ref()
+    }
+
+    /// How many interpreted CALLS deep this environment sits — 0 for a
+    /// walked body, parent + 1 inside each summaries/instances body
+    /// interpretation. Dispatch sites pass this into the interpreters
+    /// so the CALL_DEPTH_CAP engages across the evaluate↔summaries
+    /// boundary; without it a self-recursive def (`countdown` calling
+    /// itself through the function table) re-entered at depth 0 forever
+    /// and overflowed the stack.
+    pub fn call_depth(&self) -> u32 {
+        self.call_depth
+    }
+
+    pub fn set_call_depth(&mut self, depth: u32) {
+        self.call_depth = depth;
+    }
+
     /// Record what a name holds after a statement the walk understood.
     pub fn bind(&mut self, name: &str, value: AbstractValue) {
         self.bindings.insert(name.to_owned(), value);
@@ -102,31 +144,35 @@ impl Environment {
     }
 
     /// A copy of this environment for walking one branch arm — same
-    /// locally-bound set, same current bindings, same function and
-    /// class tables (`Arc` clones, cheap: both arms of one body's fork
-    /// always share the one module tables, never a copy of their
-    /// contents).
+    /// locally-bound set, same current bindings, same function, class,
+    /// and callable-return tables (`Arc` clones, cheap: both arms of
+    /// one body's fork always share the one module/body tables, never
+    /// a copy of their contents).
     pub fn fork(&self) -> Environment {
         Environment {
             bindings: self.bindings.clone(),
             locally_bound: self.locally_bound.clone(),
             functions: self.functions.clone(),
             classes: self.classes.clone(),
+            callable_returns: self.callable_returns.clone(),
+            call_depth: self.call_depth,
         }
     }
 
     /// Rejoin two branch arms: only names both arms still know survive,
     /// each joined through the lattice. The locally-bound set is scope
     /// structure, not flow state — it is identical in both arms. The
-    /// function and class tables are likewise identical in both arms
-    /// (both forked from the same body's one environment, which
-    /// carries the one module tables), so the joined environment
-    /// simply carries `a`'s.
+    /// function, class, and callable-return tables are likewise
+    /// identical in both arms (both forked from the same body's one
+    /// environment, which carries the one module/body tables), so the
+    /// joined environment simply carries `a`'s.
     pub fn join(a: Environment, b: &Environment) -> Environment {
         let mut bindings = HashMap::new();
         let locally_bound = a.locally_bound;
         let functions = a.functions;
         let classes = a.classes;
+        let callable_returns = a.callable_returns;
+        let call_depth = a.call_depth;
         for (name, value_a) in a.bindings {
             if let Some(value_b) = b.bindings.get(&name) {
                 bindings.insert(
@@ -140,6 +186,8 @@ impl Environment {
             locally_bound,
             functions,
             classes,
+            callable_returns,
+            call_depth,
         }
     }
 }

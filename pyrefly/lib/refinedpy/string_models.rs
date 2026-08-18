@@ -52,11 +52,12 @@
 //!   otherwise return False."
 //! - `find`: "Return the lowest index in the string where substring sub
 //!   is found... Return -1 if sub is not found."
-//! - `casefold`: declines (see `string_method_result`'s own doc) —
-//!   "Casefolding is similar to lowercasing but more aggressive" and
-//!   follows Unicode's full case-folding table (Unicode Standard
-//!   section 3.13), a locale-and-table-dependent mapping this file does
-//!   not carry.
+//! - `casefold`: "Casefolding is similar to lowercasing but more
+//!   aggressive" and follows Unicode's full case-folding table (Unicode
+//!   Standard section 3.13) — that table diverges from plain
+//!   lowercasing only OUTSIDE ASCII, so an ASCII-only receiver answers
+//!   `to_lowercase()` exactly (see `string_method_result`'s own doc); a
+//!   non-ASCII receiver declines.
 //! - `join(iterable)`: "Return a string which is the concatenation of
 //!   the strings in *iterable*... The separator between elements is
 //!   the string providing this method." Modeled for a known
@@ -153,23 +154,39 @@ pub fn string_method_result(
         // found... Return -1 if sub is not found." (str.find, one-arg
         // row). The index is a CODE-POINT index (chars().position),
         // matching len()'s own code-point count — never a byte offset.
+        // Integer sort, not bare Number: `str.find` always returns a
+        // Python `int` (the found index, or the literal `-1`), never a
+        // float — so its result feeds a slice bound
+        // (`expressions.rs`'s `slice_bound_index`, which accepts only
+        // Integer-sorted bounds) the same way an ordinary `int` literal
+        // index does.
         "find" if arguments.len() == 1 => {
             let needle = exact_string_text(&arguments[0])?;
             Some(known_values(
                 vec![find_code_point_index(&receiver_text, &needle)],
-                PrimitiveKind::Number,
+                PrimitiveKind::Integer,
                 TrustProved,
             ))
         }
-        // Casefolding follows the Unicode Standard's full case-folding
-        // table (section 3.13, cited by str.casefold's own docs) rather
-        // than a per-character mapping this file can compute exactly —
-        // "strasse" for German "straße" is a length-changing,
-        // locale-independent-but-table-driven transform Rust's std
-        // library has no built-in equivalent for. Declining rather than
-        // approximating with `to_lowercase` (which does NOT casefold:
-        // "ß".to_lowercase() stays "ß", not "ss").
-        "casefold" => None,
+        // "Return a casefolded copy of the string... Casefolding is
+        // similar to lowercasing but more aggressive because it is
+        // intended to remove all case distinctions in a string"
+        // (library/stdtypes.rst, str.casefold). The full Unicode
+        // case-folding table (Unicode Standard section 3.13, cited by
+        // the same doc) diverges from plain lowercasing only OUTSIDE
+        // ASCII (its own worked example: German "ß" casefolds to "ss",
+        // which "lower" leaves unchanged) — inside the ASCII range,
+        // casefolding and lowercasing coincide exactly (ASCII has no
+        // multi-character or non-1:1 case mapping at all), so an
+        // ASCII-only receiver answers `to_lowercase()` exactly. A
+        // receiver carrying any non-ASCII code point declines rather
+        // than approximate with a mapping that is not exact there.
+        "casefold" if arguments.is_empty() => {
+            if !receiver_text.is_ascii() {
+                return None;
+            }
+            Some(string_literal_value(&receiver_text.to_lowercase()))
+        }
         // "Return a list of the words in the string, using *sep* as the
         // delimiter string... consecutive delimiters are not grouped
         // together and are deemed to delimit empty strings." (str.split,
@@ -361,7 +378,10 @@ mod tests {
         let needle = string_literal_value("a");
         let result = string_method_result("find", &receiver, &[needle]).expect("find must decide");
         assert_eq!(result.values, vec![1.0]);
-        assert_eq!(result.kind_tag, Some(PrimitiveKind::Number));
+        // Integer, not bare Number: str.find always returns a Python int
+        // (the found index or -1), so its result can feed a slice bound
+        // (expressions.rs's slice_bound_index requires Integer sort).
+        assert_eq!(result.kind_tag, Some(PrimitiveKind::Integer));
     }
 
     /// str.find answers -1 on a missing needle — the twin of JS
@@ -385,11 +405,22 @@ mod tests {
         assert_eq!(result.values, vec![2.0]);
     }
 
-    /// casefold declines: no built-in Rust equivalent of Unicode's full
-    /// case-folding table exists to model it exactly.
+    /// casefold on an ASCII-only receiver matches plain lowercasing
+    /// exactly — ASCII has no case mapping the two diverge on.
     #[test]
-    fn test_casefold_declines() {
-        let receiver = string_literal_value("ab");
+    fn test_casefold_ascii_matches_lowercase() {
+        let receiver = string_literal_value("AbC");
+        let result = string_method_result("casefold", &receiver, &[]).expect("casefold(ascii) must decide");
+        assert_eq!(exact_string_text(&result).as_deref(), Some("abc"));
+    }
+
+    /// casefold declines outside ASCII: German "ß" casefolds to "ss"
+    /// (length-changing), which plain `to_lowercase` does not produce —
+    /// stdtypes.rst's own worked example for why casefold and lower
+    /// diverge.
+    #[test]
+    fn test_casefold_non_ascii_declines() {
+        let receiver = string_literal_value("stra\u{df}e");
         assert_eq!(string_method_result("casefold", &receiver, &[]), None);
     }
 

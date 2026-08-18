@@ -7,7 +7,10 @@
 
 //! Kernel artifact resolution, shared by the LSP seam and the check
 //! CLI: `REFINEDPY_KERNEL_DYLIB` wins; otherwise the current
-//! directory's ancestors are searched for the in-repo artifact.
+//! directory's ancestors are searched for the in-repo artifact, then
+//! the executable's own ancestors — an editor spawns the server with
+//! the workspace as its working directory, and the binary itself
+//! lives inside the repository.
 
 use std::path::Path;
 use std::path::PathBuf;
@@ -23,8 +26,16 @@ pub fn resolve_kernel_dylib() -> Option<PathBuf> {
         let path = PathBuf::from(env_path);
         return path.exists().then_some(path);
     }
-    let start = std::env::current_dir().ok()?;
-    find_in_ancestors(&start, Path::new(KERNEL_DYLIB_RELATIVE))
+    let relative = Path::new(KERNEL_DYLIB_RELATIVE);
+    if let Some(found) = std::env::current_dir()
+        .ok()
+        .and_then(|start| find_in_ancestors(&start, relative))
+    {
+        return Some(found);
+    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| find_in_ancestors(&exe, relative))
 }
 
 fn find_in_ancestors(start: &Path, relative: &Path) -> Option<PathBuf> {

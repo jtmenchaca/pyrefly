@@ -33,21 +33,37 @@
 //! non-literal iterable's declared element set, a multi-name step) is
 //! still this module's `None`.
 //!
-//! ## Why a body write can still leave the walk's blocker standing
+//! ## Judging a body's declared-slot writes
 //!
-//! `check.rs`'s `walk_loop` swaps in this module's `Some(environment)`
-//! outright — nothing re-judges a body's writes against a declared
-//! refinement afterward (`check.rs`, `walk_loop`'s own doc: "`Some(env)`
-//! replaces the environment outright and the statement is consumed with
-//! no blocker"). Every currently-passing loop row relies on this in the
-//! SOUND direction: the loop only ever produces a plain value, and a
-//! POST-loop declared read (`done: Age = total`) is what actually
-//! judges it. A row whose marker sits INSIDE the body (no post-loop
-//! declared read exists to catch it) is different: this module has no
-//! declared-refinement table to judge against, so it cannot be the one
-//! to fire. `bind_checked` declines the whole loop rather than silently
-//! dropping such a write on the floor: see its own doc below.
+//! `check.rs`'s `walk_loop` swaps in this module's post-iteration
+//! environment outright, so a body write that is never re-read at a
+//! declared sink after the loop needs to be judged HERE, during
+//! execution, or not at all. `loop_final_environment` takes the body's
+//! own `declared` table (`check.rs`'s `aug_assign_refinements` — every
+//! name a preceding `x: Age = …` recorded in this same body) and an
+//! `out` sink for judged fires: every bare-name `Assign`/`AugAssign`
+//! write inside the body is judged against `declared` through
+//! `assignability::judge`, exactly as `check.rs`'s own `judge_and_bind`
+//! judges a straight-line write. A `Fire` is pushed to `out` ONCE PER
+//! SYNTACTIC ROW (deduped by the statement's own `TextRange` — a loop
+//! that iterates many times must not repeat the same fire once per
+//! iteration) and the write BINDS the declared set afterward (the same
+//! refused-write law `judge_and_bind` uses — the slot keeps its
+//! DECLARED set, so a later read in a further iteration or after the
+//! loop is silent against it rather than firing again). A name with no
+//! recorded declaration in `declared` binds its evaluated value
+//! directly, unjudged, matching every other plain local this module
+//! already tracks. An `Undetermined` verdict declines the WHOLE loop —
+//! this module cannot itself record a body's own blocker in the middle
+//! of a run it does not complete, and check.rs's outer blocker for the
+//! whole loop statement is the honest stand-in.
+//!
+//! `Finding` (check.rs's own struct) is not imported here to avoid a
+//! cycle (check.rs already imports this module) — judged fires are
+//! handed back as plain `(TextRange, String)` rows in `out`, and
+//! `check.rs` wraps each into its own `Finding` at the call site.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use refined_domain::abstract_value::known_set;
@@ -62,6 +78,7 @@ use refined_domain::lattice_operations::set_of_known;
 use refined_domain::lattice_operations::truthiness;
 use refined_domain::trust_grades::trust_level_of;
 use refined_domain::trust_grades::TrustProved;
+use refined_domain::trust_grades::TrustSpec;
 use refined_kernel::kernel_interface::RefinedTSKernel;
 use refined_kernel::loop_questions::InvariantPremise;
 use refined_kernel::loop_questions::InvariantPremiseKind;
@@ -76,6 +93,7 @@ use refined_sets::refinement_forms::make_refined_set;
 use refined_sets::refinement_forms::one_of;
 use ruff_python_ast::CmpOp;
 use ruff_python_ast::Expr;
+use ruff_python_ast::ExprAttribute;
 use ruff_python_ast::ExprCall;
 use ruff_python_ast::ExprSubscript;
 use ruff_python_ast::Number;
@@ -85,11 +103,18 @@ use ruff_python_ast::StmtFor;
 use ruff_python_ast::StmtIf;
 use ruff_python_ast::StmtWhile;
 use ruff_python_ast::UnaryOp;
+use ruff_text_size::Ranged;
+use ruff_text_size::TextRange;
 
+use crate::refinedpy::assignability::judge;
+use crate::refinedpy::assignability::Verdict;
 use crate::refinedpy::collection_models;
 use crate::refinedpy::env::Environment;
 use crate::refinedpy::expressions::binary_arithmetic_value;
 use crate::refinedpy::expressions::evaluate_expression;
+use crate::refinedpy::instances;
+use crate::refinedpy::summaries::iterable_element_sort;
+use crate::refinedpy::typereading::DeclaredRefinement;
 
 /// A `while` loop is only concretely executed up to this many
 /// iterations. Reaching the cap with the condition still true means
@@ -97,37 +122,120 @@ use crate::refinedpy::expressions::evaluate_expression;
 /// function declines rather than guessing where it converges.
 const WHILE_ITERATION_CAP: u32 = 1000;
 
-/// The post-loop environment for a `for`/`while` statement matching
-/// one of this module's concretely-executable shapes; `None` for
-/// anything else (any other statement kind, an unrecognized iterable,
-/// a body outside the recognized forms, or a `while` that does not
-/// resolve within the iteration cap). The walk keeps its own blocker
-/// on `None`.
+/// The judging context threaded through every body-execution helper:
+/// the body's own declared-refinement table (bare name → its recorded
+/// `x: Age = …` annotation, `check.rs`'s own PRE-LOOP snapshot) to judge
+/// a write against, `newly_declared` — the SAME shape table for a name
+/// this loop's OWN body declares for the first time INSIDE the body
+/// (`Stmt::AnnAssign`'s own alias-spelling reuse, see its doc) — checked
+/// second so a body-local declaration never shadows the enclosing body's
+/// own snapshot, the dedupe set of statement ranges already fired on
+/// this run (one fire per SYNTACTIC row, however many iterations
+/// actually execute it), and the fires collected so far — moved out into
+/// the caller's `out` parameter once the whole run completes.
+struct JudgeContext<'a> {
+    declared: &'a HashMap<String, DeclaredRefinement>,
+    newly_declared: HashMap<String, DeclaredRefinement>,
+    already_fired: std::collections::HashSet<TextRange>,
+    fires: Vec<(TextRange, String)>,
+}
+
+/// A `for`/`while` statement's own answer: the post-loop environment
+/// (whatever the concrete run left, matching `else_runs`'s own
+/// documented shape below regardless of `returned`), whether the
+/// loop's `else` clause RUNS, and `returned` — `Some((value, range))`
+/// when SOME concrete iteration hit a `Stmt::Return` and the loop ended
+/// right there (CPython's own semantics: a `return` inside a loop body
+/// exits the function, so no further iteration ever runs — RETURN-
+/// THROUGH-LOOP CHANNEL, serving c-reads-and-values.py:927/928's own
+/// `for age in overs.values(): return age` shape). The inner
+/// `value: Option<AbstractValue>` is `None` for a BARE `return` (no
+/// expression) — matching `check.rs`'s own `walk_return` convention
+/// that a bare return "carries no value expression and judges nothing
+/// either"; `Some(value)` for `return <expr>`. `check.rs`'s `walk_loop`
+/// judges a `Some` value against the enclosing function's own
+/// `-> Annotation` at the carried range, exactly as `walk_return` would
+/// for a straight-line return, and ALSO keeps walking the rest of the
+/// body with `environment`/`else_runs` — this module never tries to
+/// prove the statements after the loop are unreachable (a return that
+/// fires on one concrete run states nothing about every OTHER call
+/// site's own arguments), so `returned` is purely ADDITIVE information
+/// layered on top of the ordinary environment/else_runs answer, never a
+/// replacement for it. A return that never fires across every
+/// concretely-run iteration reports `returned: None`, unchanged from
+/// before this law.
+pub struct LoopAnswer {
+    pub environment: Environment,
+    pub else_runs: bool,
+    pub returned: Option<(Option<AbstractValue>, TextRange)>,
+}
+
+/// The post-loop answer for a `for`/`while` statement matching one of
+/// this module's concretely-executable shapes (see `LoopAnswer`'s own
+/// doc for the full contract). `None` for anything else (any other
+/// statement kind, an unrecognized iterable, a body outside the
+/// recognized forms, a `while` that does not resolve within the
+/// iteration cap, or a body write judged `Undetermined` against
+/// `declared`). The walk keeps its own blocker on `None`; this module
+/// never runs the `orelse` body itself — `check.rs` walks it (fully
+/// judged) when `else_runs`, or fires the dead-else law when not.
 pub fn loop_final_environment(
     stmt: &Stmt,
     environment: &Environment,
     kernel: &Arc<RefinedTSKernel>,
-) -> Option<Environment> {
-    match stmt {
-        Stmt::For(for_stmt) => for_loop_final_environment(for_stmt, environment, kernel),
-        Stmt::While(while_stmt) => while_loop_final_environment(while_stmt, environment, kernel),
+    declared: &HashMap<String, DeclaredRefinement>,
+    out: &mut Vec<(TextRange, String)>,
+) -> Option<LoopAnswer> {
+    let mut judge_context = JudgeContext {
+        declared,
+        newly_declared: HashMap::new(),
+        already_fired: std::collections::HashSet::new(),
+        fires: Vec::new(),
+    };
+    let result = match stmt {
+        Stmt::For(for_stmt) => for_loop_final_environment(for_stmt, environment, kernel, &mut judge_context),
+        Stmt::While(while_stmt) => while_loop_final_environment(while_stmt, environment, kernel, &mut judge_context),
         _ => None,
-    }
+    };
+    // A fire recorded during a run that LATER declines (e.g. iteration 1
+    // provably refuses a write, and a later iteration's condition then
+    // reads unknown because that same write also widened the counter to
+    // a Kind::Set) is still a genuine, already-proven fact: CPython
+    // really did execute that statement with that value at least once.
+    // Surfacing it — even though the loop as a whole is this module's
+    // blocker — is strictly more determined than dropping it silently,
+    // so fires propagate unconditionally, before the `?` on the run's
+    // own success.
+    out.append(&mut judge_context.fires);
+    result
 }
 
-/// Whether a `break` fired during one run of a loop body — the signal
+/// What running one loop body ONCE (top level or nested inside an `if`
+/// arm) says about the rest of the CURRENT iteration: `Fell` — ran every
+/// statement, keep going; `Broke` — a `break` fired, the signal
 /// `for_loop_final_environment`/`while_loop_final_environment` use to
 /// skip the `else` clause and, for `for`, stop advancing the target
 /// past the element the `break` fired on (compound_stmts.rst, "the
 /// `for` statement"/"the `while` statement": "the `else` clause...
 /// executes when the loop terminates through exhaustion... rather than
-/// by `break`"). `Continue` is folded away inside `run_body_once`
-/// itself — it never needs to propagate past the statement loop that
-/// runs one iteration's statements in order, since "skip the rest of
-/// this iteration" is exactly what returning early from that loop does.
+/// by `break`"); `Continued` — a `continue` fired, which must skip every
+/// statement still left in EVERY enclosing body for this iteration (not
+/// just the innermost `if` arm's own body) and land back at the
+/// iteration boundary. `Continued` is a DISTINCT case from `Fell`
+/// precisely so a `continue` inside a nested `if` arm does not get
+/// mistaken, once folded back into the enclosing body's own outcome,
+/// for an ordinary fall-through that should let the enclosing body's
+/// LATER statements still run. `Returned(value, range)` — a
+/// `Stmt::Return` fired (RETURN-THROUGH-LOOP CHANNEL): propagates
+/// straight out through every enclosing body/if-arm/loop the same way
+/// `Broke` does, ending the WHOLE loop (real CPython: a `return` exits
+/// the function outright, so no later statement in this body, this
+/// iteration, or any further iteration ever runs).
 enum BodyOutcome {
     Fell,
     Broke,
+    Continued,
+    Returned(Option<AbstractValue>, TextRange),
 }
 
 /// `for target in <iterable>: <body> [else: <body>]` — every element
@@ -138,45 +246,143 @@ enum BodyOutcome {
 /// iterable runs the body zero times, so the target keeps whatever the
 /// pre-loop environment already held for that name. A `break` on any
 /// iteration stops the loop AT that element (the target stays bound to
-/// the element the `break` fired on) and skips `else`; otherwise `else`
-/// runs once the iterable is exhausted.
+/// the element the `break` fired on) and reports `else_runs: false`;
+/// otherwise (the iterable is exhausted with no `break`) `else_runs:
+/// true` — this function never runs `for_stmt.orelse` itself
+/// (`check.rs` walks it, fully judged, when `else_runs`). A `return`
+/// stops the loop immediately (no further elements bind, no `else`
+/// clause runs — `else_runs: false`, matching `break`'s own posture,
+/// though `check.rs` never reads `else_runs` once `returned` is `Some`)
+/// and reports `returned: Some((value, range))`.
+///
+/// `for_stmt.is_async` (an `async for`) runs through the SAME
+/// `iterable_values` path as a plain `for` — compound_stmts.rst, "The
+/// `async for` statement": an `async for` desugars to a `while` binding
+/// `TARGET = await type(iter).__anext__(iter)` each pass, and `await`
+/// only ever suspends/resumes scheduling around whatever value the
+/// awaited call eventually produces; it never changes WHICH elements
+/// come out of a receiver whose element sequence this module already
+/// reads concretely (a literal tuple/list, `range(...)`, a dict view —
+/// `iterable_values`'s own recognized shapes). There is no such literal/
+/// range/dict-view shape that is also asynchronous in the corpus or in
+/// CPython at all (those builtins have no `__aiter__`), so this arm is
+/// reachable only in principle; the honest boundary is that `is_async`
+/// itself is NEVER the reason to decline — an unrecognized receiver
+/// (an async generator call, a custom `__aiter__`/`__anext__` class
+/// instance — a-statements.py:555's `stream()`, b-body-expressions.py:
+/// 877's `Stream()`) still declines through `iterable_values`'s own
+/// `None`, exactly as an equivalent unmodeled SYNC receiver would.
+/// Concretely stepping a genuine async source is out of this function's
+/// scope regardless of `is_async`: an async iterator's `__anext__` is
+/// arbitrary code this module never executes, sync or async.
 fn for_loop_final_environment(
     for_stmt: &StmtFor,
     environment: &Environment,
     kernel: &Arc<RefinedTSKernel>,
-) -> Option<Environment> {
-    if for_stmt.is_async {
-        return None;
-    }
-    let elements = iterable_values(for_stmt.iter.as_ref(), environment, kernel)?;
-    let mut current = environment.fork();
-    let mut broke = false;
-    for element in elements {
-        if !bind_for_target(for_stmt.target.as_ref(), &element, &mut current) {
-            return None;
-        }
-        match run_body_once(&for_stmt.body, &mut current, kernel)? {
-            BodyOutcome::Fell => {}
-            BodyOutcome::Broke => {
-                broke = true;
-                break;
+    judge_context: &mut JudgeContext,
+) -> Option<LoopAnswer> {
+    if let Some(elements) = iterable_values(for_stmt.iter.as_ref(), environment, kernel) {
+        let mut current = environment.fork();
+        let mut broke = false;
+        for element in elements {
+            if !bind_for_target(for_stmt.target.as_ref(), &element, &mut current) {
+                return None;
+            }
+            match run_body_once(&for_stmt.body, &mut current, kernel, judge_context)? {
+                BodyOutcome::Fell | BodyOutcome::Continued => {}
+                BodyOutcome::Broke => {
+                    broke = true;
+                    break;
+                }
+                BodyOutcome::Returned(value, range) => {
+                    return Some(LoopAnswer { environment: current, else_runs: false, returned: Some((value, range)) });
+                }
             }
         }
+        return Some(LoopAnswer { environment: current, else_runs: !broke, returned: None });
     }
-    if broke {
-        return Some(current);
-    }
-    match run_body_once(&for_stmt.orelse, &mut current, kernel)? {
-        BodyOutcome::Fell | BodyOutcome::Broke => Some(current),
-    }
+    abstract_element_sort_pass(for_stmt, environment, kernel, judge_context)
 }
+
+/// ABSTRACT SORT-ELEMENT PASS: `for`/`async for` over a same-module
+/// generator/stream `def` whose OWN element sort is readable
+/// (`summaries::iterable_element_sort`) but whose concrete elements are
+/// not (`iterable_values` already declined — a-statements.py's own
+/// `async_for_over_stream`: `stream() -> AsyncIterator[int]` declines
+/// the body-level `raise` this checker never executes concretely, so
+/// there is no LIST of known iterates to walk one at a time the way
+/// `for_loop_final_environment`'s own concrete path does). Mirrors
+/// refined-ts-go's own abstract loop walk (one JUDGED pass standing in
+/// for the whole unknown-length run, `tmp/cpython/Doc/reference/
+/// compound_stmts.rst`'s `for` statement: the body may run zero or more
+/// times over an iterable whose LENGTH this checker cannot observe, so
+/// no CONCRETE per-element walk is honest here — a single pass over the
+/// CLAIMED element sort is the coarser, sound stand-in): the target
+/// binds to the element sort-set (never one concrete value — every
+/// element the real stream could produce is somewhere in that set), the
+/// body runs ONCE through the same judged executor (`run_body_once`) a
+/// concrete pass already uses, so a declared-slot write inside the body
+/// (`age = chunk` under `age: Age`) reaches `bind_checked`'s own
+/// `assignability::judge` CONTAINMENT law and fires exactly as it would
+/// on a concrete iterate — the row's own fire. The answer JOINS the
+/// PRE-LOOP environment (the zero-iterations possibility — an empty
+/// stream runs the body not at all) with the ONE-PASS environment (the
+/// at-least-one-iteration possibility) through `Environment::join`,
+/// stating the loop's own zero-or-more semantics honestly rather than
+/// assuming the body ran. `else_runs: true` (the `for`/`else` clause
+/// runs whenever no `break` stops the loop — an abstract pass never
+/// observes a `break`, so `else_runs` cannot be proven false here; a
+/// `break`/`continue`/`return` inside the one abstract pass still
+/// propagates through `outcome_of_body`, and a `Returned` outcome still
+/// reports `returned: Some(...)`, the same RETURN-THROUGH-LOOP CHANNEL
+/// every concrete pass uses).
+///
+/// `None` when the iterable is not a bare-Name call to a SAME-MODULE def
+/// (any keyword/starred argument declines, matching `generator_call_
+/// values`'s own no-keyword-guessing posture), the def's element sort is
+/// itself unreadable, or the one abstract pass hits a statement shape
+/// `run_body_once` does not recognize — the ordinary "this shape is not
+/// this module's business" decline, same honesty as every other row.
+fn abstract_element_sort_pass(
+    for_stmt: &StmtFor,
+    environment: &Environment,
+    kernel: &Arc<RefinedTSKernel>,
+    judge_context: &mut JudgeContext,
+) -> Option<LoopAnswer> {
+    let Expr::Call(call) = for_stmt.iter.as_ref() else {
+        return None;
+    };
+    let Expr::Name(callee) = call.func.as_ref() else {
+        return None;
+    };
+    if !call.arguments.keywords.is_empty() || !call.arguments.args.is_empty() {
+        return None;
+    }
+    let table = environment.functions()?;
+    let def = table.def(callee.id.as_str())?;
+    let element_sort = iterable_element_sort(def)?;
+
+    let mut one_pass = environment.fork();
+    if !bind_for_target(for_stmt.target.as_ref(), &element_sort, &mut one_pass) {
+        return None;
+    }
+    match run_body_once(&for_stmt.body, &mut one_pass, kernel, judge_context)? {
+        BodyOutcome::Fell | BodyOutcome::Continued | BodyOutcome::Broke => {}
+        BodyOutcome::Returned(value, range) => {
+            return Some(LoopAnswer { environment: one_pass, else_runs: false, returned: Some((value, range)) });
+        }
+    }
+    let joined = Environment::join(environment.fork(), &one_pass);
+    Some(LoopAnswer { environment: joined, else_runs: true, returned: None })
+}
+
 
 /// `while <name> <op> <literal>: <body> [else: <body>]`, where `<op>`
 /// is `<` or `<=` and the loop is a plain counter this function can run
 /// out to its own halt. Each iteration re-evaluates the condition
 /// against the CURRENT environment (a real interpretation step, not a
-/// one-shot bound check) and stops the moment the condition reads false
-/// or unknown. Reaching `WHILE_ITERATION_CAP` with the condition still
+/// one-shot bound check) and stops the moment the condition reads
+/// false. Reaching `WHILE_ITERATION_CAP` with the condition still
 /// provably true is an unproved bound — declines. A counter whose
 /// CURRENT value is a known SET rather than one known number
 /// (`Kind::Set` — a seeded parameter's declared range) can never
@@ -184,33 +390,80 @@ fn for_loop_final_environment(
 /// reads `None` on the very first check, so this function tries
 /// `kernel_bounded_counter_environment` FIRST for exactly that shape,
 /// before the concrete stepping loop ever runs. A `break` stops the
-/// loop immediately and skips `else`; otherwise `else` runs once the
-/// condition reads false (compound_stmts.html "the while statement").
+/// loop immediately and reports `else_runs: false`; otherwise
+/// (`else_runs: true`) once the condition reads false — this function
+/// never runs `while_stmt.orelse` itself (`check.rs` walks it, fully
+/// judged, when `else_runs`; `kernel_bounded_counter_environment`'s own
+/// shape requires an empty `else`, so it always reports `else_runs:
+/// true` trivially, and never runs a body that could return either). A
+/// `return` stops the loop immediately, same as `break`, and reports
+/// `returned: Some((value, range))`.
+///
+/// A condition that reads UNKNOWN after at least one iteration ran (the
+/// counter's own `Kind::Values` widened to `Kind::Set` — the refused-
+/// write law's own rebind, `bind_checked`'s doc: a body write judged
+/// `Fire` against the counter's `declared` entry keeps the DECLARED set
+/// afterward) is a genuinely reached, honest terminal state, not an
+/// unrecognized shape: every statement up to and including the one that
+/// widened the counter is a real, already-judged fact (`loop_body_over_
+/// ceiling`, a-statements.py:494 — the single-statement body's own `age
+/// = age + 121` fires against `Age`'s ceiling on iteration 1, and the
+/// refused-write rebind then makes the counter's OWN condition test
+/// unreadable on iteration 2's check). Reporting `Some` here (rather
+/// than `None`) is what lets `check.rs`'s `walk_loop` adopt the judged
+/// environment and stop recording its OWN "a while statement is not yet
+/// walked" blocker on TOP of the fire this module already proved —
+/// `check.rs`'s RTS7002 channel is for a shape this module never even
+/// started running, not for a run that reached a real, judged stopping
+/// point. `else_runs: false` here (never proven to reach exhaustion, so
+/// the safe answer matches `break`'s own posture) — this is distinct
+/// from the CAP case below, which never ran any further body statement
+/// past the point the bound stopped being provable and stays `None`:
+/// a full iteration-budget's worth of `Some(true)` reads is the
+/// unbounded-loop shape this module must keep refusing to guess at.
 fn while_loop_final_environment(
     while_stmt: &StmtWhile,
     environment: &Environment,
     kernel: &Arc<RefinedTSKernel>,
-) -> Option<Environment> {
+    judge_context: &mut JudgeContext,
+) -> Option<LoopAnswer> {
     if let Some(kernel_result) = kernel_bounded_counter_environment(while_stmt, environment, kernel) {
-        return Some(kernel_result);
+        return Some(LoopAnswer { environment: kernel_result, else_runs: true, returned: None });
     }
     let mut current = environment.fork();
+    let mut ran_an_iteration = false;
     for _ in 0..WHILE_ITERATION_CAP {
         match counter_condition_value(while_stmt.test.as_ref(), &current, kernel) {
-            Some(true) => match run_body_once(&while_stmt.body, &mut current, kernel)? {
-                BodyOutcome::Fell => {}
-                BodyOutcome::Broke => return Some(current),
-            },
-            Some(false) => {
-                return match run_body_once(&while_stmt.orelse, &mut current, kernel)? {
-                    BodyOutcome::Fell | BodyOutcome::Broke => Some(current),
-                };
+            Some(true) => {
+                match run_body_once(&while_stmt.body, &mut current, kernel, judge_context)? {
+                    BodyOutcome::Fell | BodyOutcome::Continued => {}
+                    BodyOutcome::Broke => {
+                        return Some(LoopAnswer { environment: current, else_runs: false, returned: None });
+                    }
+                    BodyOutcome::Returned(value, range) => {
+                        return Some(LoopAnswer {
+                            environment: current,
+                            else_runs: false,
+                            returned: Some((value, range)),
+                        });
+                    }
+                }
+                ran_an_iteration = true;
+            }
+            Some(false) => return Some(LoopAnswer { environment: current, else_runs: true, returned: None }),
+            // an UNREADABLE condition after at least one judged iteration
+            // is the counter's own honest widening (see this function's
+            // doc); an unreadable condition on the very FIRST check is a
+            // shape this module never recognized at all and must decline,
+            // same as before.
+            None if ran_an_iteration => {
+                return Some(LoopAnswer { environment: current, else_runs: false, returned: None });
             }
             None => return None,
         }
     }
-    // the cap was reached with the condition still true (or unreadable
-    // on the final check) — the bound was never proved
+    // the cap was reached with the condition still true — the bound was
+    // never proved
     None
 }
 
@@ -471,34 +724,92 @@ fn known_string(text: &str) -> AbstractValue {
 ///   (`Kind::List` of `[key, value]`) per entry — CPython's own view
 ///   order, library/stdtypes.rst dict views, "Keys views are set-like...
 ///   Dictionary views... iterate over `... items in insertion order`".
+/// - a same-module (sync or async) generator `def`'s own call
+///   (`generator_call_values`, `instances::generator_yields`) — a
+///   bare-Name call whose def's body is straight-line `yield`
+///   statements; each yielded value becomes one iterate, in yield
+///   order.
 ///
 /// Anything else (a name that is not a known dict, a call other than
-/// `range`/`.values`/`.items`/`.keys`, a non-literal element) is
+/// `range`/`.values`/`.items`/`.keys`/a readable same-module generator,
+/// a non-literal element whose EVALUATED value is not itself known) is
 /// `None`: this function only answers when every iterate is known
 /// without running any unmodeled code.
+///
+/// EVALUATED ELEMENTS: a `List`/`Tuple` display's own elements are read
+/// SYNTACTICALLY first (`sorted_number_literal_value` — the exact
+/// literal-number path, which also carries the element's true Integer/
+/// Float sort); an element that is not a bare number literal falls back
+/// to `evaluate_expression`. a-statements.py's `for_over_unread_iterable`:
+/// `(unread_number(),)`'s single element is a CALL, and `unread_number`'s
+/// own body (`raise NotImplementedError`) is a genuine decline in
+/// `summaries::interpret_body` (no `Stmt::Raise` row there) — its call
+/// answers `return_sort_fallback`'s `-> int` claim instead, the
+/// whole-number SET (`Kind::Set`, Integer-tagged), never `Kind::Null`.
+/// Accepted evaluated shapes: ANY known AbstractValue whose `kind` is not
+/// `Kind::Unknown` — a known single scalar, `Kind::Null`, or a known SET
+/// (Integer/Float/String-sorted, `Kind::Set`) all accepted alike, because
+/// the DISPLAY's own element COUNT is syntactic (this is a fixed-arity
+/// tuple/list literal, not an iterable whose length depends on a value),
+/// so binding the `for` target to each element's own value — whatever
+/// shape that value is — and running the body once per element is sound
+/// regardless of what sort of value that element turns out to be. Only a
+/// truly UNKNOWN element (`Kind::Unknown` — nothing at all is known about
+/// it) declines the WHOLE display, same as every other honest refusal in
+/// this file. This acceptance is scoped to a DISPLAY's own elements only:
+/// a non-display iterable (a bare Name bound to a set-VALUED expression,
+/// for instance) has no syntactic element count to fall back on and is
+/// not read through this function at all.
 fn iterable_values(
     iterable: &Expr,
     environment: &Environment,
     kernel: &Arc<RefinedTSKernel>,
 ) -> Option<Vec<AbstractValue>> {
     match iterable {
-        Expr::List(list) => elements_as_sorted_numbers(&list.elts),
-        Expr::Tuple(tuple) => elements_as_sorted_numbers(&tuple.elts),
-        Expr::Call(call) => {
-            range_call_values(call).or_else(|| dict_view_call_values(call, environment, kernel))
-        }
+        Expr::List(list) => elements_as_values(&list.elts, environment, kernel),
+        Expr::Tuple(tuple) => elements_as_values(&tuple.elts, environment, kernel),
+        Expr::Call(call) => range_call_values(call)
+            .or_else(|| dict_view_call_values(call, environment, kernel))
+            .or_else(|| generator_call_values(call, environment, kernel)),
         Expr::Dict(_) => {
             let receiver = evaluate_expression(iterable, environment, kernel);
             dict_keys_as_strings(&receiver)
         }
-        _ => None,
+        // Any other iterable expression (a bare Name most commonly)
+        // whose EVALUATED value is a known List of fully-known items:
+        // the element count is carried by the value itself, so
+        // iterating its items is exactly as sound as a display's — the
+        // same acceptance rule elements_as_values applies per element.
+        // A known dict value iterates its keys, the same reading the
+        // Dict-display arm gives. Anything else stays None.
+        other => {
+            let receiver = evaluate_expression(other, environment, kernel);
+            if receiver.kind == Kind::List
+                && receiver.items.iter().all(|item| item.kind != Kind::Unknown)
+            {
+                return Some(receiver.items.clone());
+            }
+            dict_keys_as_strings(&receiver)
+        }
     }
 }
 
-fn elements_as_sorted_numbers(elements: &[Expr]) -> Option<Vec<AbstractValue>> {
+fn elements_as_values(
+    elements: &[Expr],
+    environment: &Environment,
+    kernel: &Arc<RefinedTSKernel>,
+) -> Option<Vec<AbstractValue>> {
     let mut values = Vec::with_capacity(elements.len());
     for element in elements {
-        values.push(sorted_number_literal_value(element)?);
+        if let Some(literal) = sorted_number_literal_value(element) {
+            values.push(literal);
+            continue;
+        }
+        let evaluated = evaluate_expression(element, environment, kernel);
+        if evaluated.kind == Kind::Unknown {
+            return None;
+        }
+        values.push(evaluated);
     }
     Some(values)
 }
@@ -550,6 +861,69 @@ fn dict_view_call_values(
         ),
         _ => None,
     }
+}
+
+/// `some_generator(args...)` — a bare-Name call to a SAME-MODULE `def`
+/// (sync or async: `async def stream(): ...` still parses as
+/// `StmtFunctionDef`, ruff carries `is_async` as a flag on the def, not
+/// a distinct node type) whose body `instances::generator_yields` can
+/// read straight-line — `for value in gen(): ...`/`async for value in
+/// gen(): ...` both iterate the SAME element sequence a plain call's
+/// yields name: compound_stmts.rst, "The `async for` statement" desugars
+/// to `TARGET = await type(iter).__anext__(iter)` each pass, and
+/// `await` only ever suspends/resumes scheduling — it does not change
+/// which values `__anext__` (itself backed by the same generator body's
+/// `yield` statements, datamodel.rst's generator-iterator protocol)
+/// hands back. `is_async` on `def` is therefore not read here at all:
+/// an async generator's yielded elements are the same values a sync
+/// generator's would be, only reached through a different awaited
+/// protocol. `None` for a non-Name callee, a name with no same-module
+/// `def`, any keyword/starred argument (this file does not guess
+/// keyword-to-position mapping the way `expressions.rs`'s own
+/// `positional_arguments_for_def` does — that helper is private to its
+/// module), or a def `generator_yields` itself declines (no top-level
+/// `yield`, a conditional yield, a `yield` reached only through a loop
+/// or other nested control flow, `yield from` — see that function's own
+/// doc for its exact straight-line-body contract).
+fn generator_call_values(
+    call: &ExprCall,
+    environment: &Environment,
+    kernel: &Arc<RefinedTSKernel>,
+) -> Option<Vec<AbstractValue>> {
+    let Expr::Name(callee) = call.func.as_ref() else {
+        return None;
+    };
+    if !call.arguments.keywords.is_empty() {
+        return None;
+    }
+    if call.arguments.args.iter().any(|argument| matches!(argument, Expr::Starred(_))) {
+        return None;
+    }
+    let table = environment.functions()?;
+    let def = table.def(callee.id.as_str())?;
+    let mut arguments = Vec::with_capacity(call.arguments.args.len());
+    for argument in &call.arguments.args {
+        arguments.push(evaluate_expression(argument, environment, kernel));
+    }
+    let yields = instances::generator_yields(def, &arguments, Some(table), kernel, environment.call_depth())?;
+    let mut values = Vec::with_capacity(yields.len());
+    for yielded in yields {
+        // NOT the same widened acceptance `elements_as_values` now takes
+        // for a DISPLAY's own elements: a generator's own yield COUNT is
+        // not syntactic the way a tuple/list literal's element count is
+        // (`generator_yields` itself already declines any body shape
+        // wider than its own two recognized forms before this point is
+        // ever reached), so this guard stays at the narrower "a known
+        // single scalar or Kind::Null" acceptance — anything wider
+        // declines the WHOLE generator's contribution rather than
+        // silently narrow it.
+        if yielded.kind == Kind::Null || (yielded.kind == Kind::Values && yielded.values.len() == 1) {
+            values.push(yielded);
+            continue;
+        }
+        return None;
+    }
+    Some(values)
 }
 
 /// A `range(...)` call's produced values, or `None` when the callee
@@ -698,24 +1072,32 @@ fn bind_for_target(target: &Expr, element: &AbstractValue, environment: &mut Env
 /// Runs one loop body's statements against `environment` IN PLACE, in
 /// order, honoring real control flow: `break` stops immediately
 /// (`BodyOutcome::Broke`, propagated straight out — CPython never runs
-/// statements after a `break` in the same body), `continue` stops this
-/// ITERATION's statement loop early but is not itself an outcome (the
-/// caller's own per-element loop simply moves to the next iterate,
-/// which running out of statements to execute already achieves). `None`
-/// is the same "this loop is not this module's shape" honesty every
-/// other decline here uses — no statement here EVER writes a value that
-/// might be wrong; an unrecognized shape declines the WHOLE loop rather
-/// than skip or approximate.
+/// statements after a `break` in the same body); `continue` stops THIS
+/// body's statement loop early and reports `BodyOutcome::Continued` — a
+/// distinct outcome from `Fell` precisely because this same function
+/// also runs a NESTED `if`-arm's body (via `run_if_once`/
+/// `outcome_of_body`): when the `continue` fired inside an if-arm, the
+/// enclosing body still has statements left after the `if`, and those
+/// must NOT run. Reporting `Continued` up through
+/// `StatementOutcome::Continue` (see `outcome_of_body`) lets the
+/// enclosing body's own statement loop, right here, also stop early
+/// rather than mistake the if-statement's `Next` for an ordinary
+/// fall-through. `None` is the same "this loop is not this module's
+/// shape" honesty every other decline here uses — no statement here
+/// EVER writes a value that might be wrong; an unrecognized shape
+/// declines the WHOLE loop rather than skip or approximate.
 fn run_body_once(
     body: &[Stmt],
     environment: &mut Environment,
     kernel: &Arc<RefinedTSKernel>,
+    judge_context: &mut JudgeContext,
 ) -> Option<BodyOutcome> {
     for stmt in body {
-        match run_statement_once(stmt, environment, kernel)? {
+        match run_statement_once(stmt, environment, kernel, judge_context)? {
             StatementOutcome::Next => {}
-            StatementOutcome::Continue => return Some(BodyOutcome::Fell),
+            StatementOutcome::Continue => return Some(BodyOutcome::Continued),
             StatementOutcome::Break => return Some(BodyOutcome::Broke),
+            StatementOutcome::Returned(value, range) => return Some(BodyOutcome::Returned(value, range)),
         }
     }
     Some(BodyOutcome::Fell)
@@ -723,11 +1105,14 @@ fn run_body_once(
 
 /// What one statement, run once against the current environment, says
 /// about the rest of THIS iteration: keep going (`Next`), stop this
-/// iteration early (`Continue`), or stop the whole loop (`Break`).
+/// iteration early (`Continue`), stop the whole loop (`Break`), or stop
+/// the whole loop AND carry a returned value out
+/// (`Returned(value, range)` — RETURN-THROUGH-LOOP CHANNEL).
 enum StatementOutcome {
     Next,
     Continue,
     Break,
+    Returned(Option<AbstractValue>, TextRange),
 }
 
 /// Runs exactly one loop-body statement, dispatched by syntactic form.
@@ -738,6 +1123,7 @@ fn run_statement_once(
     stmt: &Stmt,
     environment: &mut Environment,
     kernel: &Arc<RefinedTSKernel>,
+    judge_context: &mut JudgeContext,
 ) -> Option<StatementOutcome> {
     match stmt {
         Stmt::Pass(_) => Some(StatementOutcome::Next),
@@ -751,17 +1137,49 @@ fn run_statement_once(
                 run_subscript_assign_once(subscript, assign.value.as_ref(), environment, kernel)?;
                 return Some(StatementOutcome::Next);
             }
-            run_assign_once(target, assign.value.as_ref(), environment, kernel)?;
+            run_assign_once(target, assign.value.as_ref(), stmt.range(), environment, kernel, judge_context)?;
             Some(StatementOutcome::Next)
         }
         Stmt::AnnAssign(assign) => {
+            // A declared-slot target INSIDE the loop body (`bad: Age =
+            // over_value` where `bad` is never bound before this
+            // statement) carries no entry in `judge_context.declared` —
+            // that table is `check.rs`'s own `aug_assign_refinements`
+            // snapshot from BEFORE this loop started (`loop_final_
+            // environment`'s own doc), and this module has no access to
+            // `WalkContext`'s alias table to read a fresh annotation the
+            // way `check.rs`'s own `walk_ann_assign` does. Reusing an
+            // ALREADY-RECORDED entry's own `DeclaredRefinement` by ALIAS
+            // SPELLING (rather than re-reading the annotation) is sound
+            // without that table: a module-level type alias (`type Age =
+            // …`) names exactly one set, so any two `declared` entries
+            // that read the same bare-Name annotation carry an identical
+            // `set`/`admits_none` — matching `declared`'s own existing
+            // entry for a DIFFERENT name is the same fact, not a guess.
+            // Scoped to a bare `Expr::Name` annotation only (never a
+            // subscript/union/string form this module cannot parse
+            // without the alias table); `None` from this lookup leaves
+            // the target OUTSIDE `declared`, unjudged, same as before.
+            if let Expr::Name(target_name) = assign.target.as_ref()
+                && let Expr::Name(annotation_name) = assign.annotation.as_ref()
+                && !judge_context.declared.contains_key(target_name.id.as_str())
+            {
+                let matched: Option<DeclaredRefinement> = judge_context
+                    .declared
+                    .values()
+                    .find(|declared| declared.spelling == annotation_name.id.as_str())
+                    .cloned();
+                if let Some(matched) = matched {
+                    judge_context.newly_declared.insert(target_name.id.as_str().to_owned(), matched);
+                }
+            }
             let Some(value_expr) = assign.value.as_deref() else {
                 // `x: T` alone declares no value — nothing to bind or
                 // judge, matching simple_stmts.rst's "the `=` clause is
                 // optional" reading check.rs's own walk_ann_assign uses.
                 return Some(StatementOutcome::Next);
             };
-            run_assign_once(assign.target.as_ref(), value_expr, environment, kernel)?;
+            run_assign_once(assign.target.as_ref(), value_expr, stmt.range(), environment, kernel, judge_context)?;
             Some(StatementOutcome::Next)
         }
         Stmt::AugAssign(assign) => {
@@ -777,11 +1195,31 @@ fn run_statement_once(
             if updated.kind != Kind::Values {
                 return None;
             }
-            bind_checked(name.id.as_str(), updated, environment)?;
+            bind_checked(name.id.as_str(), updated, stmt.range(), environment, kernel, judge_context)?;
             Some(StatementOutcome::Next)
         }
-        Stmt::If(if_stmt) => run_if_once(if_stmt, environment, kernel),
+        Stmt::If(if_stmt) => run_if_once(if_stmt, environment, kernel, judge_context),
         Stmt::Expr(expr_stmt) => run_expr_statement_once(expr_stmt.value.as_ref(), environment, kernel),
+        // RETURN-THROUGH-LOOP CHANNEL: `return [expr]` inside a loop body
+        // ends the whole loop right here (real CPython — a return exits
+        // the function, so no later statement in this iteration or any
+        // further iteration ever runs). A BARE `return` (no expression)
+        // carries `None` — matching `check.rs`'s own `walk_return`
+        // convention that a bare return "carries no value expression and
+        // judges nothing either," so this channel must not invent a
+        // Null value for check.rs to judge where the straight-line walk
+        // never would; `return <expr>` evaluates the expression against
+        // the CURRENT environment (the same plain read `check.rs`'s own
+        // `sink_value` falls back to) and carries `Some(value)`. The
+        // carried `TextRange` is the value expression's own range when
+        // one exists, else the whole `return` statement's own range.
+        Stmt::Return(ret) => {
+            let (value, range) = match ret.value.as_deref() {
+                Some(value_expr) => (Some(evaluate_expression(value_expr, environment, kernel)), value_expr.range()),
+                None => (None, stmt.range()),
+            };
+            Some(StatementOutcome::Returned(value, range))
+        }
         // `del a, b, ...` (simple_stmts.rst, "The `del` statement":
         // "Deletion of a target list recursively deletes each target,
         // from left to right") — every named target simply forgets
@@ -818,35 +1256,61 @@ fn forget_bare_name_target(target: &Expr, environment: &mut Environment) -> bool
 }
 
 /// `name = value` / `name: T = value` on a plain-name target: evaluates
-/// the RHS and binds it, `None` unless the value comes back fully known
-/// (`Kind::Values`, `Kind::List`, or `Kind::Object` — an unreadable
-/// right side, a call, or an unbound name fails the whole loop rather
-/// than silently binding unknown). A non-name target (attribute,
-/// subscript-outside-the-mutation-contract) is `None`: this function
-/// only ever writes a name it can name.
+/// the RHS and binds it (through `bind_checked`'s own judging), `None`
+/// unless the value comes back fully known (`Kind::Values`, `Kind::List`,
+/// `Kind::Object`, `Kind::Null`, or `Kind::Set` — an unreadable right
+/// side, a call, or an unbound name fails the whole loop rather than
+/// silently binding unknown, and so does a write `bind_checked` judges
+/// `Undetermined`). A non-name
+/// target (attribute, subscript-outside-the-mutation-contract) is
+/// `None`: this function only ever writes a name it can name.
+/// `stmt_range` is the ENCLOSING statement's own range — the dedupe key
+/// and fire anchor `bind_checked` uses, so `x = y` and `x: Age = y` both
+/// fire (if they fire) at their own statement, never at a sub-expression.
 fn run_assign_once(
     target: &Expr,
     value_expr: &Expr,
+    stmt_range: TextRange,
     environment: &mut Environment,
     kernel: &Arc<RefinedTSKernel>,
+    judge_context: &mut JudgeContext,
 ) -> Option<()> {
     let Expr::Name(name) = target else {
         return None;
     };
     let value = evaluate_expression(value_expr, environment, kernel);
-    if !matches!(value.kind, Kind::Values | Kind::List | Kind::Object) {
+    // Kind::Null (Python's None) is a fully-known value — accepted
+    // alongside Values/List/Object so a declared-slot write of None
+    // (a-statements.py:541's own row: an iterate that evaluates to
+    // None) reaches bind_checked's own judging rather than declining
+    // the whole loop for a kind this guard used to treat as unknown.
+    // Kind::Set is likewise a fully-known value — a for-loop iterate
+    // bound off a display's own tuple/list element (elements_as_values'
+    // own widened acceptance) can be a whole-number/whole-string SET
+    // rather than one scalar (`for item in (unread_number(),):` — the
+    // element is `-> int`'s own claimed whole-number set, not a single
+    // value); `age = item` inside the loop body re-reads that same Set
+    // value and must reach `bind_checked`'s own `assignability::judge`
+    // CONTAINMENT law rather than decline the whole loop for a kind this
+    // guard used to treat as unknown.
+    if !matches!(value.kind, Kind::Values | Kind::List | Kind::Object | Kind::Null | Kind::Set) {
         return None;
     }
-    bind_checked(name.id.as_str(), value, environment)
+    bind_checked(name.id.as_str(), value, stmt_range, environment, kernel, judge_context)
 }
 
 /// `name[k] = v` — the MUTATION CONTRACT's subscript-target shape.
 /// `name` must be a bare name already bound to a known receiver;
 /// `collection_models::dict_with_item`/`list_with_item` (dispatched by
 /// the receiver's own `Kind`) answer the new receiver value, which
-/// rebinds `name` through the same cross-sort check every other write
-/// in this file goes through. `None` for anything the contract does
-/// not resolve (an unknown receiver, a key/value shape the contract
+/// rebinds `name` directly — a subscript-store receiver is a
+/// container (dict/list), never itself a scalar declared slot, so this
+/// write is not a `declared`-table judging candidate the way a bare-name
+/// Assign/AugAssign is; `bind_checked` is not called here; sound because
+/// a container name reaching a scalar declared sink is caught at the
+/// READ side (a later `x[i]` flowing into a declared sink), same as the
+/// ordinary (non-loop) walk. `None` for anything the contract does not
+/// resolve (an unknown receiver, a key/value shape the contract
 /// declines, a receiver `Kind` neither function owns).
 fn run_subscript_assign_once(
     subscript: &ExprSubscript,
@@ -865,54 +1329,65 @@ fn run_subscript_assign_once(
         Kind::List => collection_models::list_with_item(&receiver, &key, &value)?,
         _ => return None,
     };
-    bind_checked(name.id.as_str(), new_receiver, environment)
-}
-
-/// Binds `name` to `value`, UNLESS `name` already carried a known value
-/// in the environment (bound before this statement ran, whether from
-/// before the loop started or from an earlier iteration/statement)
-/// whose HOST-TYPE FAMILY disagrees with `value`'s. A cross-family
-/// overwrite of a name that was already known is exactly the shape a
-/// declared-slot fire (`age: Age = 0` followed by a body write `age =
-/// key` binding a STRING into that Integer-sorted slot) needs to catch
-/// — and this module has no declared-refinement table to judge that
-/// fire itself (`check.rs`'s `walk_loop` swaps in this module's whole
-/// environment with no post-hoc judging, see the module doc). Declining
-/// the loop keeps the walk's OWN blocker standing rather than silently
-/// letting the write through unjudged.
-///
-/// Scoped to FAMILY (numeric vs `String` vs `Boolean`), not to the
-/// numeric sort's own Integer/Float/Number precision split: a numeric
-/// accumulator legitimately narrows from the sort-erased `Number` tag
-/// (a test's hand-built pre-loop binding, or any value this domain has
-/// not yet sort-tagged) to `Integer`/`Float` as arithmetic runs — that
-/// is exactly how every currently-passing accumulation row works (`total
-/// = total + age`, the POST-loop declared read still judges the
-/// result), and is not the cross-sort fire this function exists to
-/// catch.
-fn family_of(sort: PrimitiveKind) -> u8 {
-    match sort {
-        PrimitiveKind::String => 0,
-        PrimitiveKind::Boolean => 1,
-        PrimitiveKind::Number | PrimitiveKind::Integer | PrimitiveKind::Float => 2,
-        // never produced by this domain's Kind::Values path (RefinedPy
-        // has no JS-array-shaped scalar reading) — its own family so a
-        // future producer cannot silently fold into the numeric check
-        PrimitiveKind::Array => 3,
-    }
-}
-
-fn bind_checked(name: &str, value: AbstractValue, environment: &mut Environment) -> Option<()> {
-    if let Some(existing) = environment.read(name)
-        && let (Some(existing_sort), Kind::Values) = (existing.kind_tag, existing.kind)
-        && value.kind == Kind::Values
-        && let Some(new_sort) = value.kind_tag
-        && family_of(new_sort) != family_of(existing_sort)
-    {
-        return None;
-    }
-    environment.bind(name, value);
+    environment.bind(name.id.as_str(), new_receiver);
     Some(())
+}
+
+/// Binds `name` to `value`, judging first when `name` carries a
+/// recorded declaration in `judge_context.declared` (this body's own
+/// `x: Age = …` table, threaded in from `check.rs`'s
+/// `aug_assign_refinements`) — the REPLACEMENT for the old cross-family
+/// decline guard: rather than declining the whole loop the moment a
+/// write's sort family disagrees with the slot's prior value, this
+/// function now judges the write through `assignability::judge` exactly
+/// as `check.rs`'s own `judge_and_bind` does for a straight-line write.
+///
+/// `Verdict::Fire`: pushed to `judge_context.fires` ONCE PER SYNTACTIC
+/// `stmt_range` (`judge_context.already_fired`'s dedupe — a loop that
+/// iterates the same statement many times must not repeat the same
+/// fire once per iteration), and the slot binds the DECLARED set
+/// afterward (the refused-write law: the write is refused, so the slot
+/// keeps its declaration, matching `judge_and_bind`'s own convention —
+/// a later read in a further iteration or after the loop is silent
+/// against the declaration, not a second fire for the same refusal).
+/// `Verdict::Silent`: binds the evaluated value, unchanged from before.
+/// `Verdict::Undetermined`: declines the WHOLE loop (`None`) — this
+/// module cannot record a body-local blocker mid-run; `check.rs`'s own
+/// outer blocker for the whole loop statement is the honest stand-in.
+///
+/// A name with NO recorded declaration (in EITHER `declared`, the
+/// pre-loop snapshot, or `newly_declared`, this loop's own body-local
+/// alias-reuse table — see `Stmt::AnnAssign`'s own doc) binds directly,
+/// unjudged — every plain (undeclared) local this module already
+/// tracked, unchanged.
+fn bind_checked(
+    name: &str,
+    value: AbstractValue,
+    stmt_range: TextRange,
+    environment: &mut Environment,
+    kernel: &Arc<RefinedTSKernel>,
+    judge_context: &mut JudgeContext,
+) -> Option<()> {
+    let Some(declared) = judge_context.declared.get(name).or_else(|| judge_context.newly_declared.get(name)) else {
+        environment.bind(name, value);
+        return Some(());
+    };
+    let declared = declared.clone();
+    match judge(&value, &declared, kernel) {
+        Verdict::Fire(message) => {
+            if judge_context.already_fired.insert(stmt_range) {
+                judge_context.fires.push((stmt_range, message));
+            }
+            let refused_slot = known_set(declared.set.clone(), None, TrustSpec, SetKindTag::None);
+            environment.bind(name, refused_slot);
+            Some(())
+        }
+        Verdict::Silent => {
+            environment.bind(name, value);
+            Some(())
+        }
+        Verdict::Undetermined(_) => None,
+    }
 }
 
 /// `if test: body [elif test: body ...] [else: body]` inside a loop —
@@ -929,6 +1404,7 @@ fn run_if_once(
     if_stmt: &StmtIf,
     environment: &mut Environment,
     kernel: &Arc<RefinedTSKernel>,
+    judge_context: &mut JudgeContext,
 ) -> Option<StatementOutcome> {
     let condition = evaluate_expression(if_stmt.test.as_ref(), environment, kernel);
     let (taken, known) = truthiness(&condition);
@@ -936,14 +1412,14 @@ fn run_if_once(
         return None;
     }
     if taken {
-        return run_body_once(&if_stmt.body, environment, kernel).map(outcome_of_body);
+        return run_body_once(&if_stmt.body, environment, kernel, judge_context).map(outcome_of_body);
     }
     for clause in &if_stmt.elif_else_clauses {
         match clause.test.as_ref() {
             None => {
                 // a bare `else:` — always taken once every prior
                 // `elif`/`if` test read false
-                return run_body_once(&clause.body, environment, kernel).map(outcome_of_body);
+                return run_body_once(&clause.body, environment, kernel, judge_context).map(outcome_of_body);
             }
             Some(test) => {
                 let clause_condition = evaluate_expression(test, environment, kernel);
@@ -952,7 +1428,7 @@ fn run_if_once(
                     return None;
                 }
                 if clause_taken {
-                    return run_body_once(&clause.body, environment, kernel).map(outcome_of_body);
+                    return run_body_once(&clause.body, environment, kernel, judge_context).map(outcome_of_body);
                 }
             }
         }
@@ -963,14 +1439,22 @@ fn run_if_once(
 }
 
 /// Folds a nested `run_body_once` result (an `if` arm's own body, which
-/// may itself `break`/`continue`) into this statement's own outcome —
-/// `break`/`continue` inside an `if` arm propagates exactly as if it
-/// had appeared directly in the enclosing loop body (compound_stmts.rst
-/// places no restriction on `break`/`continue` nesting inside `if`).
+/// may itself `break`/`continue`/`return`) into this statement's own
+/// outcome — `break`/`continue`/`return` inside an `if` arm propagates
+/// exactly as if it had appeared directly in the enclosing loop body
+/// (compound_stmts.rst places no restriction on `break`/`continue`
+/// nesting inside `if`, and a `return` statement is legal anywhere a
+/// function body reaches). `Continued` maps to `StatementOutcome::Continue`
+/// (not `Next`) so the ENCLOSING body's own `run_body_once` statement
+/// loop also stops at the `if` statement rather than running whatever
+/// comes after it this iteration; `Returned` maps straight through the
+/// same way.
 fn outcome_of_body(outcome: BodyOutcome) -> StatementOutcome {
     match outcome {
         BodyOutcome::Fell => StatementOutcome::Next,
         BodyOutcome::Broke => StatementOutcome::Break,
+        BodyOutcome::Continued => StatementOutcome::Continue,
+        BodyOutcome::Returned(value, range) => StatementOutcome::Returned(value, range),
     }
 }
 
@@ -981,8 +1465,12 @@ fn outcome_of_body(outcome: BodyOutcome) -> StatementOutcome {
 /// _call_result))` rebinds `name` to the new receiver (the call
 /// result itself is discarded, same as every other statement-position
 /// sink in this file: a loop body never reads a bare expression
-/// statement's own value back). Any other expression statement (a
-/// read with no effect, a call this module cannot resolve) is `None`.
+/// statement's own value back) — OR the one chained shape
+/// `run_setdefault_append_once` recognizes
+/// (`name.setdefault(key, default).append(value)`, dict_groupby's own
+/// group-by idiom, c-reads-and-values.py:1007). Any other expression
+/// statement (a read with no effect, a call this module cannot
+/// resolve) is `None`.
 fn run_expr_statement_once(
     expr: &Expr,
     environment: &mut Environment,
@@ -994,6 +1482,9 @@ fn run_expr_statement_once(
     let Expr::Attribute(attribute) = call.func.as_ref() else {
         return None;
     };
+    if let Some(outcome) = run_setdefault_append_once(call, attribute, environment, kernel) {
+        return Some(outcome);
+    }
     let Expr::Name(receiver_name) = attribute.value.as_ref() else {
         return None;
     };
@@ -1007,7 +1498,96 @@ fn run_expr_statement_once(
     }
     let (new_receiver, _call_result) =
         collection_models::mutated_receiver(attribute.attr.as_str(), &receiver, &arguments)?;
-    bind_checked(receiver_name.id.as_str(), new_receiver, environment)?;
+    // a mutating-call receiver is a container (list/dict/set), never
+    // itself a scalar declared slot — matches run_subscript_assign_once's
+    // own reasoning: this rebind is not a `declared`-table judging
+    // candidate, so it binds directly rather than through bind_checked.
+    environment.bind(receiver_name.id.as_str(), new_receiver);
+    Some(StatementOutcome::Next)
+}
+
+/// `name.setdefault(<key>, <default>).append(<value>)` — the manual
+/// group-by idiom (`dict_groupby`, c-reads-and-values.py:1007's own
+/// shape: `grouped.setdefault("old" if age > 100 else "young",
+/// []).append(age)`): `name` must be a bare-name receiver already bound
+/// to a known `Kind::Object`, and the outer call's OWN attribute must
+/// be `append` with exactly one positional argument (`value`) and no
+/// keywords. The chain's inner call — `attribute.value`, the `append`
+/// receiver — must itself be exactly `name.setdefault(key[, default])`
+/// (stdtypes.rst's own dict `setdefault(key, default=None)` row: "If
+/// *key* is in the dictionary, return its value. If not, insert *key*
+/// with a value of *default* and return *default*"), so its own answer
+/// composes the two contracts already proved elsewhere in this crate
+/// rather than re-deriving either: `collection_models::mutated_receiver`
+/// answers `(dict-after-setdefault, entry-value)` for the inner call
+/// exactly as `run_expr_statement_once`'s own bare-mutating-call arm
+/// would if `setdefault` sat alone in statement position, and the entry
+/// value it answers must itself be a `Kind::List` — `.append`'s own
+/// receiver contract (`list.append`, stdtypes.rst) — for `append`'s own
+/// row of `mutated_receiver` to answer the appended list. The final
+/// write is `dict_with_item(dict-after-setdefault, key, appended-list)`
+/// (`collection_models::dict_with_item`'s own `d[key] = value` contract)
+/// rather than a second walk of `setdefault`'s own key-presence branch —
+/// `setdefault`'s dict-after-answer already carries the right entry
+/// whether the key was present (unchanged) or absent (freshly inserted
+/// with the default), so overwriting that SAME key with the appended
+/// list is correct either way. `key` is evaluated ONCE against the
+/// current environment (matching CPython's own single left-to-right
+/// evaluation of a chained call's every sub-expression) and reused for
+/// both the `setdefault` receiver-answer and the final rebind — this
+/// function never re-evaluates it. `None` for anything off this exact
+/// shape (a non-Name inner receiver, a wrong argument count/keyword on
+/// either call, a non-Object/non-List intermediate value, an
+/// unresolved `setdefault`/`append` row) — the caller's own bare-call
+/// arm, or an outer decline, is the fallback.
+fn run_setdefault_append_once(
+    outer_call: &ExprCall,
+    outer_attribute: &ExprAttribute,
+    environment: &mut Environment,
+    kernel: &Arc<RefinedTSKernel>,
+) -> Option<StatementOutcome> {
+    if outer_attribute.attr.as_str() != "append" {
+        return None;
+    }
+    if !outer_call.arguments.keywords.is_empty() {
+        return None;
+    }
+    let [value_expr] = &*outer_call.arguments.args else {
+        return None;
+    };
+    let Expr::Call(inner_call) = outer_attribute.value.as_ref() else {
+        return None;
+    };
+    let Expr::Attribute(inner_attribute) = inner_call.func.as_ref() else {
+        return None;
+    };
+    if inner_attribute.attr.as_str() != "setdefault" {
+        return None;
+    }
+    let Expr::Name(receiver_name) = inner_attribute.value.as_ref() else {
+        return None;
+    };
+    if !inner_call.arguments.keywords.is_empty() {
+        return None;
+    }
+    let (key_expr, default_expr) = match &*inner_call.arguments.args {
+        [key] => (key, None),
+        [key, default] => (key, Some(default)),
+        _ => return None,
+    };
+    let receiver = environment.read(receiver_name.id.as_str())?.clone();
+    let key = evaluate_expression(key_expr, environment, kernel);
+    let mut setdefault_arguments = Vec::with_capacity(2);
+    setdefault_arguments.push(key.clone());
+    if let Some(default_expr) = default_expr {
+        setdefault_arguments.push(evaluate_expression(default_expr, environment, kernel));
+    }
+    let (dict_after_setdefault, entry_value) =
+        collection_models::mutated_receiver("setdefault", &receiver, &setdefault_arguments)?;
+    let value = evaluate_expression(value_expr, environment, kernel);
+    let (appended_list, _null_result) = collection_models::mutated_receiver("append", &entry_value, &[value])?;
+    let written_receiver = collection_models::dict_with_item(&dict_after_setdefault, &key, &appended_list)?;
+    environment.bind(receiver_name.id.as_str(), written_receiver);
     Some(StatementOutcome::Next)
 }
 
@@ -1018,6 +1598,11 @@ mod tests {
     use refined_kernel::kernel_bridge::dylib_path;
     use refined_kernel::kernel_bridge::kernel_artifacts_present;
     use refined_kernel::kernel_bridge::load_kernel;
+    use refined_sets::refinement_forms::at_least;
+    use refined_sets::refinement_forms::at_most;
+    use refined_sets::refinement_forms::integer as integer_form;
+    use refined_sets::refinement_forms::make_refined_set;
+    use ruff_python_ast::StmtFunctionDef;
     use ruff_python_parser::parse_module;
 
     use super::*;
@@ -1038,6 +1623,15 @@ mod tests {
         module.body.into_iter().next().expect("one top-level statement")
     }
 
+    /// Parses `source` as a module body and returns its single top-level
+    /// `def` — `iterable_element_sort`'s own test fixture shape, which
+    /// needs a `&StmtFunctionDef` directly rather than a loop statement.
+    fn parsed_def(source: &str) -> StmtFunctionDef {
+        let module = parse_module(source).expect("fixture source parses").into_syntax();
+        let stmt = module.body.into_iter().next().expect("one top-level statement");
+        stmt.function_def_stmt().expect("top-level statement is a def")
+    }
+
     fn environment_with(bindings: &[(&str, f64)]) -> Environment {
         let locally_bound: HashSet<String> = bindings.iter().map(|(name, _)| name.to_string()).collect();
         let mut environment = Environment::new(locally_bound);
@@ -1051,12 +1645,59 @@ mod tests {
         known_values(vec![value], PrimitiveKind::Integer, TrustProved)
     }
 
+    fn no_declared() -> HashMap<String, DeclaredRefinement> {
+        HashMap::new()
+    }
+
+    /// `type Age = Annotated[int, Field(ge=0, le=120)]` — the one
+    /// declared refinement this module's judged-write tests need,
+    /// built directly (this module's tests construct environments and
+    /// declared tables by hand rather than walking a function
+    /// signature — matching `check.rs`'s own `age_refinement` test
+    /// fixture in spirit).
+    fn age_refinement() -> DeclaredRefinement {
+        DeclaredRefinement {
+            set: make_refined_set(vec![integer_form(), at_least(0.0), at_most(120.0)]),
+            spelling: "Age".to_owned(),
+            admits_none: false,
+            element: None,
+        }
+    }
+
+    fn declared_age(name: &str) -> HashMap<String, DeclaredRefinement> {
+        let mut declared = HashMap::new();
+        declared.insert(name.to_owned(), age_refinement());
+        declared
+    }
+
+    /// Runs `loop_final_environment` with no declared table and
+    /// discards its judged-fires/else_runs/returned — the shape every
+    /// UNIT 1/2 test above cares about is just the post-loop environment.
+    fn run(stmt: &Stmt, environment: &Environment, kernel: &Arc<RefinedTSKernel>) -> Option<Environment> {
+        let declared = no_declared();
+        let mut out = Vec::new();
+        loop_final_environment(stmt, environment, kernel, &declared, &mut out).map(|answer| answer.environment)
+    }
+
+    /// Parses `source` as a module with MULTIPLE top-level statements
+    /// (a generator `def` plus the loop under test) and returns the
+    /// LAST statement (the loop) alongside the module's own function
+    /// table — the generator-call tests need `environment.functions()`
+    /// to resolve the callee, which `parsed_loop`'s single-statement
+    /// module cannot carry.
+    fn parsed_loop_with_functions(source: &str) -> (Stmt, Arc<crate::refinedpy::function_table::FunctionTable>) {
+        let module = parse_module(source).expect("fixture source parses").into_syntax();
+        let table = Arc::new(crate::refinedpy::function_table::function_table(&module));
+        let loop_stmt = module.body.into_iter().last().expect("at least one top-level statement");
+        (loop_stmt, table)
+    }
+
     #[test]
     fn for_over_literal_list_sums_and_keeps_last_target_value() {
         let Some(kernel) = loaded_kernel() else { return };
         let stmt = parsed_loop("for age in [60, 61]:\n    total += age\n");
         let environment = environment_with(&[("total", 0.0), ("age", 0.0)]);
-        let result = loop_final_environment(&stmt, &environment, &kernel).expect("shape is concrete");
+        let result = run(&stmt, &environment, &kernel).expect("shape is concrete");
         assert_eq!(result.read("total").unwrap().values, vec![121.0]);
         // the target stays bound to the LAST element after the loop —
         // never reset or deleted (compound_stmts.html "the for statement")
@@ -1068,7 +1709,7 @@ mod tests {
         let Some(kernel) = loaded_kernel() else { return };
         let stmt = parsed_loop("for i in range(3):\n    total += i\n");
         let environment = environment_with(&[("total", 0.0)]);
-        let result = loop_final_environment(&stmt, &environment, &kernel).expect("range(3) is concrete");
+        let result = run(&stmt, &environment, &kernel).expect("range(3) is concrete");
         assert_eq!(result.read("total").unwrap().values, vec![3.0]);
         assert_eq!(result.read("i").unwrap().values, vec![2.0]);
     }
@@ -1078,7 +1719,7 @@ mod tests {
         let Some(kernel) = loaded_kernel() else { return };
         let stmt = parsed_loop("while n < 5:\n    n += 1\n    total += n\n");
         let environment = environment_with(&[("n", 0.0), ("total", 0.0)]);
-        let result = loop_final_environment(&stmt, &environment, &kernel).expect("bounded counter");
+        let result = run(&stmt, &environment, &kernel).expect("bounded counter");
         // n: 0->1->2->3->4->5, loop stops once n == 5; total sums 1+2+3+4+5
         assert_eq!(result.read("n").unwrap().values, vec![5.0]);
         assert_eq!(result.read("total").unwrap().values, vec![15.0]);
@@ -1089,17 +1730,29 @@ mod tests {
         let Some(kernel) = loaded_kernel() else { return };
         let stmt = parsed_loop("for x in [1, 2]:\n    total = f(x)\n");
         let environment = environment_with(&[("total", 0.0)]);
-        assert!(loop_final_environment(&stmt, &environment, &kernel).is_none());
+        assert!(run(&stmt, &environment, &kernel).is_none());
     }
 
     #[test]
-    fn for_else_applies_its_body_after_exhaustion() {
+    fn for_else_reports_else_runs_true_after_exhaustion() {
         let Some(kernel) = loaded_kernel() else { return };
+        // this module no longer runs the else body itself (check.rs
+        // owns that, fully judged) — it only reports else_runs: true,
+        // since the loop is exhausted with no break.
         let stmt = parsed_loop("for x in [1, 2]:\n    total += x\nelse:\n    done = 1\n");
         let environment = environment_with(&[("total", 0.0), ("done", 0.0)]);
-        let result = loop_final_environment(&stmt, &environment, &kernel).expect("body runs, else runs");
-        assert_eq!(result.read("total").unwrap().values, vec![3.0]);
-        assert_eq!(result.read("done").unwrap().values, vec![1.0]);
+        let declared = no_declared();
+        let mut out = Vec::new();
+        let answer = loop_final_environment(&stmt, &environment, &kernel, &declared, &mut out)
+            .expect("body runs, else_runs reported");
+        assert_eq!(answer.environment.read("total").unwrap().values, vec![3.0]);
+        assert!(answer.else_runs, "the loop exhausts with no break — the else clause runs");
+        assert!(answer.returned.is_none(), "no return fires in this row");
+        // the orelse body (`done = 1`) never runs HERE — this module
+        // only reports else_runs; check.rs walks the orelse. `done`
+        // therefore still carries its PRE-loop binding (0.0), proving
+        // the executor did not run the else itself.
+        assert_eq!(answer.environment.read("done").unwrap().values, vec![0.0]);
     }
 
     #[test]
@@ -1109,7 +1762,7 @@ mod tests {
         // guess convergence; must decline once the cap is hit
         let stmt = parsed_loop("while n < 5:\n    total += 1\n");
         let environment = environment_with(&[("n", 0.0), ("total", 0.0)]);
-        assert!(loop_final_environment(&stmt, &environment, &kernel).is_none());
+        assert!(run(&stmt, &environment, &kernel).is_none());
     }
 
     #[test]
@@ -1117,7 +1770,7 @@ mod tests {
         let Some(kernel) = loaded_kernel() else { return };
         let stmt = parsed_loop("for x in []:\n    total += x\n");
         let environment = environment_with(&[("total", 0.0)]);
-        let result = loop_final_environment(&stmt, &environment, &kernel).expect("empty literal list is concrete");
+        let result = run(&stmt, &environment, &kernel).expect("empty literal list is concrete");
         // x was never assigned by the loop (compound_stmts.html): it
         // carries forward whatever the pre-loop environment held, which
         // here is nothing
@@ -1130,7 +1783,7 @@ mod tests {
         let Some(kernel) = loaded_kernel() else { return };
         let stmt = parsed_loop("total = 1\n");
         let environment = environment_with(&[("total", 0.0)]);
-        assert!(loop_final_environment(&stmt, &environment, &kernel).is_none());
+        assert!(run(&stmt, &environment, &kernel).is_none());
     }
 
     #[test]
@@ -1150,7 +1803,7 @@ mod tests {
         let stmt = parsed_loop("for age in [10, 20, 30]:\n    total = total + age\n");
         let mut environment = Environment::new(HashSet::from(["total".to_owned(), "age".to_owned()]));
         environment.bind("total", integer(0.0));
-        let result = loop_final_environment(&stmt, &environment, &kernel).expect("int list is concrete");
+        let result = run(&stmt, &environment, &kernel).expect("int list is concrete");
         let total = result.read("total").expect("total stays bound");
         assert_eq!(total.values, vec![60.0]);
         // the fix under test: an all-int accumulation answers an
@@ -1166,7 +1819,7 @@ mod tests {
         let stmt = parsed_loop("for i in range(3):\n    total = total + i\n");
         let mut environment = Environment::new(HashSet::from(["total".to_owned(), "i".to_owned()]));
         environment.bind("total", integer(0.0));
-        let result = loop_final_environment(&stmt, &environment, &kernel).expect("range is concrete");
+        let result = run(&stmt, &environment, &kernel).expect("range is concrete");
         assert_eq!(result.read("total").unwrap().kind_tag, Some(PrimitiveKind::Integer));
     }
 
@@ -1176,7 +1829,7 @@ mod tests {
         let stmt = parsed_loop("for x in [1.5, 2.5]:\n    total = total + x\n");
         let mut environment = Environment::new(HashSet::from(["total".to_owned(), "x".to_owned()]));
         environment.bind("total", known_values(vec![0.0], PrimitiveKind::Float, TrustProved));
-        let result = loop_final_environment(&stmt, &environment, &kernel).expect("float list is concrete");
+        let result = run(&stmt, &environment, &kernel).expect("float list is concrete");
         let total = result.read("total").expect("total stays bound");
         assert_eq!(total.values, vec![4.0]);
         assert_eq!(total.kind_tag, Some(PrimitiveKind::Float));
@@ -1190,7 +1843,7 @@ mod tests {
         let stmt = parsed_loop("for x in [1, 2, 3]:\n    if x > 1:\n        total = total + x\n");
         let mut environment = Environment::new(HashSet::from(["total".to_owned(), "x".to_owned()]));
         environment.bind("total", integer(0.0));
-        let result = loop_final_environment(&stmt, &environment, &kernel).expect("if inside body is concrete");
+        let result = run(&stmt, &environment, &kernel).expect("if inside body is concrete");
         // x=1: test false, no-op; x=2: total=2; x=3: total=5
         assert_eq!(result.read("total").unwrap().values, vec![5.0]);
     }
@@ -1203,7 +1856,7 @@ mod tests {
         );
         let mut environment = Environment::new(HashSet::from(["total".to_owned(), "x".to_owned()]));
         environment.bind("total", integer(0.0));
-        let result = loop_final_environment(&stmt, &environment, &kernel).expect("if/else inside body is concrete");
+        let result = run(&stmt, &environment, &kernel).expect("if/else inside body is concrete");
         assert_eq!(result.read("total").unwrap().values, vec![3.0]);
     }
 
@@ -1213,23 +1866,28 @@ mod tests {
         let stmt = parsed_loop("for x in [1, 2]:\n    if f():\n        total = total + x\n");
         let mut environment = Environment::new(HashSet::from(["total".to_owned(), "x".to_owned()]));
         environment.bind("total", integer(0.0));
-        assert!(loop_final_environment(&stmt, &environment, &kernel).is_none());
+        assert!(run(&stmt, &environment, &kernel).is_none());
     }
 
-    // --- break / continue (UNIT 2) ---
+    // --- break / continue / else_runs (UNIT 2, extended for the LOOP
+    // ELSE + DEAD-ELSE LAW) ---
 
     #[test]
-    fn break_stops_the_loop_and_skips_else() {
+    fn break_stops_the_loop_and_reports_else_runs_false() {
         let Some(kernel) = loaded_kernel() else { return };
         let stmt = parsed_loop(
             "for i in range(3):\n    if i == 1:\n        break\n    total = total + 1\nelse:\n    total = 200\n",
         );
         let mut environment = Environment::new(HashSet::from(["total".to_owned(), "i".to_owned()]));
         environment.bind("total", integer(0.0));
-        let result = loop_final_environment(&stmt, &environment, &kernel).expect("break inside body is concrete");
-        // i=0: total=1; i=1: breaks before total += 1 runs, else never runs
-        assert_eq!(result.read("total").unwrap().values, vec![1.0]);
-        assert_eq!(result.read("i").unwrap().values, vec![1.0]);
+        let declared = no_declared();
+        let mut out = Vec::new();
+        let answer = loop_final_environment(&stmt, &environment, &kernel, &declared, &mut out)
+            .expect("break inside body is concrete");
+        // i=0: total=1; i=1: breaks before total += 1 runs
+        assert_eq!(answer.environment.read("total").unwrap().values, vec![1.0]);
+        assert_eq!(answer.environment.read("i").unwrap().values, vec![1.0]);
+        assert!(!answer.else_runs, "a break must report else_runs: false");
     }
 
     #[test]
@@ -1240,18 +1898,34 @@ mod tests {
         );
         let mut environment = Environment::new(HashSet::from(["total".to_owned(), "i".to_owned()]));
         environment.bind("total", integer(0.0));
-        let result = loop_final_environment(&stmt, &environment, &kernel).expect("continue inside body is concrete");
+        let result = run(&stmt, &environment, &kernel).expect("continue inside body is concrete");
         // 0 + 1 + (skip 2) + 3 = 4
         assert_eq!(result.read("total").unwrap().values, vec![4.0]);
     }
 
     #[test]
-    fn while_break_stops_immediately_and_skips_else() {
+    fn while_break_stops_immediately_and_reports_else_runs_false() {
         let Some(kernel) = loaded_kernel() else { return };
         let stmt = parsed_loop("while n < 5:\n    if n == 2:\n        break\n    n += 1\nelse:\n    n = 200\n");
         let environment = environment_with(&[("n", 0.0)]);
-        let result = loop_final_environment(&stmt, &environment, &kernel).expect("while break is concrete");
-        assert_eq!(result.read("n").unwrap().values, vec![2.0]);
+        let declared = no_declared();
+        let mut out = Vec::new();
+        let answer = loop_final_environment(&stmt, &environment, &kernel, &declared, &mut out)
+            .expect("while break is concrete");
+        assert_eq!(answer.environment.read("n").unwrap().values, vec![2.0]);
+        assert!(!answer.else_runs, "a break must report else_runs: false");
+    }
+
+    #[test]
+    fn a_while_with_no_break_reports_else_runs_true() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let stmt = parsed_loop("while n < 3:\n    n += 1\nelse:\n    done = 1\n");
+        let environment = environment_with(&[("n", 0.0)]);
+        let declared = no_declared();
+        let mut out = Vec::new();
+        let answer = loop_final_environment(&stmt, &environment, &kernel, &declared, &mut out)
+            .expect("while with no break is concrete");
+        assert!(answer.else_runs, "no break ever fires — the else clause runs");
     }
 
     // --- dict-shaped iteration (UNIT 2) ---
@@ -1261,52 +1935,149 @@ mod tests {
         let Some(kernel) = loaded_kernel() else { return };
         let stmt = parsed_loop("for key in {\"a\": 1, \"b\": 2}:\n    last = key\n");
         let environment = Environment::new(HashSet::from(["last".to_owned(), "key".to_owned()]));
-        let result = loop_final_environment(&stmt, &environment, &kernel).expect("dict-literal key iteration");
+        let result = run(&stmt, &environment, &kernel).expect("dict-literal key iteration");
         let last = result.read("last").expect("last stays bound");
         assert_eq!(last.kind_tag, Some(PrimitiveKind::String));
     }
 
     #[test]
-    fn dict_literal_iteration_into_a_pre_bound_int_slot_declines() {
+    fn dict_literal_iteration_into_a_declared_int_slot_fires_through_judge() {
         let Some(kernel) = loaded_kernel() else { return };
-        // `age: Age = 0` pre-binds age as an Integer; writing a dict
-        // key (a String) into it is a declared-slot fire this module
-        // cannot judge itself — must decline, not silently overwrite.
+        // `age: Age = 0` pre-binds age as an Integer; writing a dict key
+        // (a String) into it is now JUDGED through assignability::judge
+        // — a-statements.py:508's own row — rather than declining the
+        // whole loop the way the old cross-family guard did.
         let stmt = parsed_loop("for key in {\"a\": 1, \"b\": 2}:\n    age = key\n");
         let mut environment = Environment::new(HashSet::from(["age".to_owned(), "key".to_owned()]));
         environment.bind("age", integer(0.0));
-        assert!(loop_final_environment(&stmt, &environment, &kernel).is_none());
+        let declared = declared_age("age");
+        let mut out = Vec::new();
+        let answer = loop_final_environment(&stmt, &environment, &kernel, &declared, &mut out)
+            .expect("the loop still runs concretely — the write fires, it does not decline");
+        assert!(!out.is_empty(), "a String into a declared int-sorted Age slot must fire");
+        // the refused write keeps the declared set afterward (refused-
+        // write law) — a later read of `age` is silent against Age
+        let age = answer.environment.read("age").expect("age stays bound to the declared set");
+        assert_eq!(age.kind, Kind::Set);
     }
 
     #[test]
-    fn for_over_dict_values_call_binds_the_stored_values() {
+    fn dedupe_by_range_fires_once_per_syntactic_row_across_many_iterations() {
         let Some(kernel) = loaded_kernel() else { return };
-        let stmt = parsed_loop("for age in ages.values():\n    last = age\n");
-        let mut environment = Environment::new(HashSet::from(["ages".to_owned(), "last".to_owned(), "age".to_owned()]));
-        let dict = collection_models::dict_literal_value(&[Some("ann".to_owned())], &[integer(40.0)]);
-        environment.bind("ages", dict);
-        let result = loop_final_environment(&stmt, &environment, &kernel).expect(".values() iteration");
-        assert_eq!(result.read("last").unwrap().values, vec![40.0]);
+        // the loop iterates twice; both keys are strings, so the SAME
+        // syntactic write (`age = key`) would fire twice without the
+        // dedupe-by-range rule. Only ONE fire must land.
+        let stmt = parsed_loop("for key in {\"a\": 1, \"b\": 2}:\n    age = key\n");
+        let mut environment = Environment::new(HashSet::from(["age".to_owned(), "key".to_owned()]));
+        environment.bind("age", integer(0.0));
+        let declared = declared_age("age");
+        let mut out = Vec::new();
+        loop_final_environment(&stmt, &environment, &kernel, &declared, &mut out)
+            .expect("the loop runs concretely");
+        assert_eq!(out.len(), 1, "one syntactic row fires once, however many iterations run: {out:?}");
     }
 
     #[test]
-    fn for_over_dict_items_call_unpacks_key_and_value() {
+    fn a_declared_slot_write_that_stays_in_set_is_silent() {
         let Some(kernel) = loaded_kernel() else { return };
-        let stmt = parsed_loop("for _, age in ages.items():\n    total = total + age\n");
-        let mut environment = Environment::new(HashSet::from([
-            "ages".to_owned(),
-            "total".to_owned(),
-            "_".to_owned(),
-            "age".to_owned(),
-        ]));
-        environment.bind("total", integer(0.0));
-        let dict = collection_models::dict_literal_value(
-            &[Some("ann".to_owned()), Some("bea".to_owned())],
-            &[integer(40.0), integer(41.0)],
+        let stmt = parsed_loop("for x in [10, 20]:\n    age = x\n");
+        let mut environment = Environment::new(HashSet::from(["age".to_owned(), "x".to_owned()]));
+        environment.bind("age", integer(0.0));
+        let declared = declared_age("age");
+        let mut out = Vec::new();
+        let answer = loop_final_environment(&stmt, &environment, &kernel, &declared, &mut out)
+            .expect("the loop runs concretely");
+        assert!(out.is_empty(), "every in-set write must stay silent: {out:?}");
+        assert_eq!(answer.environment.read("age").unwrap().values, vec![20.0]);
+    }
+
+    #[test]
+    fn a_declared_slot_write_of_none_fires_rather_than_declining_the_loop() {
+        let Some(kernel) = loaded_kernel() else { return };
+        // a-statements.py:541's own shape: an evaluated (non-literal)
+        // iterate that is Kind::Null must still reach bind_checked's own
+        // judging — run_assign_once's kind guard used to reject
+        // Kind::Null outright (only Values/List/Object were accepted),
+        // which declined the WHOLE loop before any judging ever ran.
+        let stmt = parsed_loop("for item in [x]:\n    age = item\n");
+        let mut environment = Environment::new(HashSet::from(["age".to_owned(), "item".to_owned(), "x".to_owned()]));
+        environment.bind("age", integer(0.0));
+        environment.bind("x", refined_domain::abstract_value::null_value());
+        let declared = declared_age("age");
+        let mut out = Vec::new();
+        let answer = loop_final_environment(&stmt, &environment, &kernel, &declared, &mut out)
+            .expect("a Kind::Null iterate must still run the loop concretely, not decline it");
+        assert_eq!(out.len(), 1, "None into a non-Optional declared Age slot must fire: {out:?}");
+        let age = answer.environment.read("age").expect("age stays bound to the declared set after the refused write");
+        assert_eq!(age.kind, Kind::Set);
+    }
+
+    // --- RETURN-THROUGH-LOOP CHANNEL ---
+
+    #[test]
+    fn a_return_on_the_first_iteration_ends_the_loop_and_carries_the_value_out() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let stmt = parsed_loop("for age in [40, 200]:\n    return age\n");
+        let environment = Environment::new(HashSet::from(["age".to_owned()]));
+        let declared = no_declared();
+        let mut out = Vec::new();
+        let answer = loop_final_environment(&stmt, &environment, &kernel, &declared, &mut out)
+            .expect("a return inside the body is still a concretely-executable shape");
+        let (value, _range) = answer.returned.expect("the first iteration's return must be carried out");
+        assert_eq!(
+            value.expect("return age carries a value, not a bare return").values,
+            vec![40.0],
+            "only the FIRST iterate's return fires — the loop ends right there"
         );
-        environment.bind("ages", dict);
-        let result = loop_final_environment(&stmt, &environment, &kernel).expect(".items() iteration");
-        assert_eq!(result.read("total").unwrap().values, vec![81.0]);
+        assert!(!answer.else_runs, "a return, like a break, never lets the else clause run");
+    }
+
+    #[test]
+    fn a_return_under_an_if_that_never_triggers_reports_no_return() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let stmt = parsed_loop("for age in [10, 20]:\n    if age == 999:\n        return age\n    total = total + age\n");
+        let mut environment = Environment::new(HashSet::from(["age".to_owned(), "total".to_owned()]));
+        environment.bind("total", integer(0.0));
+        let declared = no_declared();
+        let mut out = Vec::new();
+        let answer = loop_final_environment(&stmt, &environment, &kernel, &declared, &mut out)
+            .expect("the loop runs concretely — the guarded return never fires");
+        assert!(answer.returned.is_none(), "the guard is false on every concrete iterate, so no return fires");
+        assert_eq!(answer.environment.read("total").unwrap().values, vec![30.0]);
+    }
+
+    #[test]
+    fn a_return_under_an_if_that_triggers_on_a_later_iterate_ends_the_loop_there() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let stmt = parsed_loop("for age in [10, 200]:\n    if age > 100:\n        return age\n    total = total + age\n");
+        let mut environment = Environment::new(HashSet::from(["age".to_owned(), "total".to_owned()]));
+        environment.bind("total", integer(0.0));
+        let declared = no_declared();
+        let mut out = Vec::new();
+        let answer = loop_final_environment(&stmt, &environment, &kernel, &declared, &mut out)
+            .expect("the loop runs concretely up to the returning iterate");
+        let (value, _range) = answer.returned.expect("age=200 triggers the guard and returns");
+        assert_eq!(value.expect("return age carries a value").values, vec![200.0]);
+        // the first iterate (age=10) ran total = total + age BEFORE the
+        // second iterate's return fired — the environment still reflects
+        // that, even though the returned value is what check.rs judges
+        assert_eq!(answer.environment.read("total").unwrap().values, vec![10.0]);
+    }
+
+    #[test]
+    fn a_bare_return_inside_a_loop_carries_no_value_to_judge() {
+        let Some(kernel) = loaded_kernel() else { return };
+        // matches check.rs's own walk_return convention: a bare `return`
+        // (no expression) judges nothing — this channel must not invent
+        // a Null value the way a straight-line bare return never would.
+        let stmt = parsed_loop("for age in [40]:\n    return\n");
+        let environment = Environment::new(HashSet::from(["age".to_owned()]));
+        let declared = no_declared();
+        let mut out = Vec::new();
+        let answer = loop_final_environment(&stmt, &environment, &kernel, &declared, &mut out)
+            .expect("a bare return inside the body is still concretely executable");
+        let (value, _range) = answer.returned.expect("the bare return must still end the loop and be carried out");
+        assert!(value.is_none(), "a bare `return` carries no value to judge, matching walk_return's own convention");
     }
 
     // --- statement-level mutation contract (UNIT 2) ---
@@ -1322,7 +2093,7 @@ mod tests {
         // this loop must adopt (Some rebinds, None declines) — this
         // test only pins that the call reaches the contract and does
         // not crash, not a specific collection_models.rs answer shape.
-        let _ = loop_final_environment(&stmt, &environment, &kernel);
+        let _ = run(&stmt, &environment, &kernel);
     }
 
     #[test]
@@ -1335,7 +2106,7 @@ mod tests {
         // own contract; this test pins that a subscript-target write
         // reaches it (Some rebinds, None declines), not a specific
         // answer shape.
-        let _ = loop_final_environment(&stmt, &environment, &kernel);
+        let _ = run(&stmt, &environment, &kernel);
     }
 
     #[test]
@@ -1343,7 +2114,7 @@ mod tests {
         let Some(kernel) = loaded_kernel() else { return };
         let stmt = parsed_loop("for x in [1, 2]:\n    for y in [1]:\n        total = total + y\n");
         let environment = environment_with(&[("total", 0.0)]);
-        assert!(loop_final_environment(&stmt, &environment, &kernel).is_none());
+        assert!(run(&stmt, &environment, &kernel).is_none());
     }
 
     /// An `Age`-shaped declared set (`[0, 120]`, integers) — the same
@@ -1369,7 +2140,7 @@ mod tests {
         let stmt = parsed_loop("while n < 121:\n    n += 1\n");
         let mut environment = Environment::new(HashSet::from(["n".to_owned()]));
         environment.bind("n", known_set(age_set(), None, TrustProved, SetKindTag::None));
-        let result = loop_final_environment(&stmt, &environment, &kernel).expect("kernel bounds the counter");
+        let result = run(&stmt, &environment, &kernel).expect("kernel bounds the counter");
         let bound = result.read("n").expect("n stays bound");
         assert_eq!(bound.kind, Kind::Set);
     }
@@ -1383,7 +2154,7 @@ mod tests {
         let stmt = parsed_loop("while n < 121:\n    n *= 2\n");
         let mut environment = Environment::new(HashSet::from(["n".to_owned()]));
         environment.bind("n", known_set(age_set(), None, TrustProved, SetKindTag::None));
-        assert!(loop_final_environment(&stmt, &environment, &kernel).is_none());
+        assert!(run(&stmt, &environment, &kernel).is_none());
     }
 
     #[test]
@@ -1395,6 +2166,330 @@ mod tests {
         let stmt = parsed_loop("while n < 121:\n    n += 1\nelse:\n    done = 1\n");
         let mut environment = Environment::new(HashSet::from(["n".to_owned(), "done".to_owned()]));
         environment.bind("n", known_set(age_set(), None, TrustProved, SetKindTag::None));
-        assert!(loop_final_environment(&stmt, &environment, &kernel).is_none());
+        assert!(run(&stmt, &environment, &kernel).is_none());
+    }
+
+    // --- while body write widens the counter past Kind::Values (UNIT 3) ---
+
+    #[test]
+    fn a_refused_write_that_widens_the_counter_fires_and_still_answers_some() {
+        let Some(kernel) = loaded_kernel() else { return };
+        // a-statements.py:494's own shape (loop_body_over_ceiling): the
+        // single-statement body's own `age = age + 121` fires on
+        // iteration 1 against Age's [0, 120] ceiling, and the
+        // refused-write law rebinds `age` to the DECLARED set
+        // (Kind::Set) — the next condition check (`age < 3`) can no
+        // longer read a single known number, so this run must stop
+        // WITHOUT declining the whole loop: the fire already proved is
+        // a real fact, and check.rs must not ALSO record its own "while
+        // statement is not yet walked" blocker on top of it.
+        let stmt = parsed_loop("while age < 3:\n    age = age + 121\n");
+        let mut environment = Environment::new(HashSet::from(["age".to_owned()]));
+        environment.bind("age", integer(0.0));
+        let declared = declared_age("age");
+        let mut out = Vec::new();
+        let answer = loop_final_environment(&stmt, &environment, &kernel, &declared, &mut out)
+            .expect("a widened counter after a judged fire is an honest stop, not a decline");
+        assert_eq!(out.len(), 1, "the +121 step must fire exactly once: {out:?}");
+        let age = answer.environment.read("age").expect("age stays bound to the declared set");
+        assert_eq!(age.kind, Kind::Set);
+    }
+
+    #[test]
+    fn an_unreadable_condition_on_the_first_check_still_declines() {
+        let Some(kernel) = loaded_kernel() else { return };
+        // `age` starts already unbound (not a single known number, and
+        // not a Kind::Set the kernel path could pick up either) — the
+        // FIRST condition check itself is unreadable, so this is a
+        // shape this module never recognized at all, not a widened
+        // counter after a judged run. Must still decline.
+        let stmt = parsed_loop("while age < 3:\n    age = age + 1\n");
+        let environment = Environment::new(HashSet::from(["age".to_owned()]));
+        assert!(run(&stmt, &environment, &kernel).is_none());
+    }
+
+    // --- async for (UNIT 3) ---
+
+    #[test]
+    fn async_for_over_a_known_literal_tuple_runs_concretely() {
+        let Some(kernel) = loaded_kernel() else { return };
+        // `is_async` alone must never decline — the same literal-tuple
+        // shape a plain `for` already runs concretely.
+        let stmt = parsed_loop("async for x in (10, 20, 30):\n    total = total + x\n");
+        let mut environment = Environment::new(HashSet::from(["total".to_owned(), "x".to_owned()]));
+        environment.bind("total", integer(0.0));
+        let result = run(&stmt, &environment, &kernel).expect("a known literal tuple runs under async for too");
+        assert_eq!(result.read("total").unwrap().values, vec![60.0]);
+    }
+
+    #[test]
+    fn async_for_over_an_unmodeled_call_receiver_still_declines() {
+        let Some(kernel) = loaded_kernel() else { return };
+        // a-statements.py:555's own shape: `stream()` is neither `range`
+        // nor a `.values()`/`.items()`/`.keys()` dict-view call —
+        // iterable_values cannot read it regardless of is_async, so this
+        // must still decline, exactly as an equivalent sync receiver
+        // would (body_with_a_call_declines, above).
+        let stmt = parsed_loop("async for chunk in stream():\n    age = chunk\n");
+        let environment = Environment::new(HashSet::from(["age".to_owned(), "chunk".to_owned()]));
+        assert!(run(&stmt, &environment, &kernel).is_none());
+    }
+
+    #[test]
+    fn for_over_a_same_module_generator_call_iterates_its_straight_line_yields() {
+        let Some(kernel) = loaded_kernel() else { return };
+        // a same-module `def` whose body is straight-line `yield`
+        // statements (no loop, no conditional — the shape
+        // `instances::generator_yields` itself reads) is a recognized
+        // `for` iterable through `generator_call_values`.
+        let (stmt, table) = parsed_loop_with_functions(concat!(
+            "def gen():\n",
+            "    yield 10\n",
+            "    yield 20\n",
+            "    yield 30\n",
+            "for x in gen():\n",
+            "    total = total + x\n",
+        ));
+        let mut environment = Environment::new(HashSet::from(["total".to_owned(), "x".to_owned()]));
+        environment.set_functions(table);
+        environment.bind("total", integer(0.0));
+        let result = run(&stmt, &environment, &kernel).expect("a straight-line generator's yields are known iterates");
+        assert_eq!(result.read("total").unwrap().values, vec![60.0]);
+        assert_eq!(result.read("x").unwrap().values, vec![30.0], "the target stays bound to the last yield");
+    }
+
+    #[test]
+    fn for_over_a_loop_bodied_generator_iterates_its_yields() {
+        let Some(kernel) = loaded_kernel() else { return };
+        // a-statements.py:547's own `stream` shape: the `yield` is
+        // nested inside a single `for` loop over a literal iterable —
+        // `generator_yields` reads exactly this shape, so the consuming
+        // loop iterates the yields concretely.
+        let (stmt, table) = parsed_loop_with_functions(concat!(
+            "def stream():\n",
+            "    for value in (10, 20, 30):\n",
+            "        yield value\n",
+            "for chunk in stream():\n",
+            "    age = chunk\n",
+        ));
+        let mut environment = Environment::new(HashSet::from(["age".to_owned(), "chunk".to_owned()]));
+        environment.set_functions(table);
+        let answer = run(&stmt, &environment, &kernel).expect("the yields iterate concretely");
+        assert_eq!(answer.read("age").unwrap().values, vec![30.0]);
+    }
+
+    // --- setdefault(...).append(...) composition (UNIT 3) ---
+
+    #[test]
+    fn setdefault_append_extends_an_absent_key_with_the_default_and_the_value() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let stmt = parsed_loop("for age in [40]:\n    grouped.setdefault(\"young\", []).append(age)\n");
+        let mut environment = Environment::new(HashSet::from(["grouped".to_owned(), "age".to_owned()]));
+        environment.bind("grouped", collection_models::dict_literal_value(&[], &[]));
+        let result = run(&stmt, &environment, &kernel).expect("the chained mutation is a recognized statement shape");
+        let grouped = result.read("grouped").expect("grouped stays bound");
+        assert_eq!(grouped.kind, Kind::Object);
+        assert_eq!(grouped.keys.len(), 1);
+        assert_eq!(grouped.keys[0].name, "young");
+        assert_eq!(grouped.keys[0].value.items.len(), 1);
+        assert_eq!(grouped.keys[0].value.items[0].values, vec![40.0]);
+    }
+
+    #[test]
+    fn setdefault_append_appends_to_a_present_key_without_losing_earlier_entries() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let stmt = parsed_loop("for age in [40, 200]:\n    grouped.setdefault(\"young\", []).append(age)\n");
+        let mut environment = Environment::new(HashSet::from(["grouped".to_owned(), "age".to_owned()]));
+        environment.bind("grouped", collection_models::dict_literal_value(&[], &[]));
+        let result = run(&stmt, &environment, &kernel).expect("two iterates over the same key both compose");
+        let grouped = result.read("grouped").expect("grouped stays bound");
+        assert_eq!(grouped.keys.len(), 1, "one key, both appends land on it");
+        assert_eq!(
+            grouped.keys[0].value.items.iter().map(|v| v.values[0]).collect::<Vec<_>>(),
+            vec![40.0, 200.0]
+        );
+    }
+
+    #[test]
+    fn setdefault_append_over_a_ternary_key_groups_by_the_per_iterate_branch() {
+        let Some(kernel) = loaded_kernel() else { return };
+        // c-reads-and-values.py:1007's own dict_groupby shape: the key
+        // expression is a ternary that reads differently PER ITERATE.
+        let stmt = parsed_loop(
+            "for age in [40, 200]:\n    grouped.setdefault(\"old\" if age > 100 else \"young\", []).append(age)\n",
+        );
+        let mut environment = Environment::new(HashSet::from(["grouped".to_owned(), "age".to_owned()]));
+        environment.bind("grouped", collection_models::dict_literal_value(&[], &[]));
+        let result = run(&stmt, &environment, &kernel).expect("the ternary key resolves per iterate");
+        let grouped = result.read("grouped").expect("grouped stays bound");
+        assert_eq!(grouped.keys.len(), 2, "40 groups under young, 200 groups under old");
+        let young = grouped.keys.iter().find(|k| k.name == "young").expect("young key exists");
+        assert_eq!(young.value.items[0].values, vec![40.0]);
+        let old = grouped.keys.iter().find(|k| k.name == "old").expect("old key exists");
+        assert_eq!(old.value.items[0].values, vec![200.0]);
+    }
+
+    // --- abstract_element_sort_pass: ABSTRACT SORT-ELEMENT LOOP PASS ---
+
+    /// a-statements.py's own `async_for_over_stream`/`stream` shape:
+    /// `stream() -> AsyncIterator[int]` is opaque (`raise
+    /// NotImplementedError` — `iterable_values` cannot read any concrete
+    /// element), but the return annotation still states the element's own
+    /// sort. `age = chunk` under a DECLARED `age: Age` slot must fire —
+    /// the one-pass judged write, proof the abstract pass runs the body
+    /// through the same `bind_checked`/`assignability::judge` seam a
+    /// concrete pass uses, not merely binding the target and stopping.
+    #[test]
+    fn abstract_element_sort_pass_fires_a_judged_write_inside_the_one_pass_body() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let (stmt, table) = parsed_loop_with_functions(concat!(
+            "async def stream() -> AsyncIterator[int]:\n",
+            "    raise NotImplementedError\n",
+            "    yield 0\n",
+            "async for chunk in stream():\n",
+            "    age = chunk\n",
+        ));
+        let mut environment = Environment::new(HashSet::from(["age".to_owned(), "chunk".to_owned()]));
+        environment.set_functions(table);
+        environment.bind("age", integer(0.0));
+        let declared = declared_age("age");
+        let mut out = Vec::new();
+        let answer = loop_final_environment(&stmt, &environment, &kernel, &declared, &mut out)
+            .expect("the AsyncIterator[int] annotation carries an abstract element sort even though the body declines concretely");
+        assert_eq!(out.len(), 1, "{:?}", out.iter().map(|(_, message)| message).collect::<Vec<_>>());
+        assert!(out[0].1.contains("Age"), "{}", out[0].1);
+        // the refused write keeps the DECLARED set afterward (the same
+        // refused-write law every other judged sink uses) — never the
+        // whole-number element sort itself.
+        assert_eq!(answer.environment.read("age").unwrap().kind, Kind::Set);
+    }
+
+    /// The abstract pass's own JOIN semantics: the answer is
+    /// `join(pre-loop environment, one-pass environment)`, stating the
+    /// loop's real zero-or-more possibility rather than assuming the body
+    /// definitely ran — a name the body does NOT touch (`untouched`)
+    /// still reads its PRE-LOOP value afterward, since both sides of the
+    /// join agree on it.
+    #[test]
+    fn abstract_element_sort_pass_joins_the_pre_loop_and_one_pass_environments() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let (stmt, table) = parsed_loop_with_functions(concat!(
+            "async def stream() -> AsyncIterator[int]:\n",
+            "    raise NotImplementedError\n",
+            "    yield 0\n",
+            "async for chunk in stream():\n",
+            "    age = chunk\n",
+        ));
+        let mut environment = Environment::new(HashSet::from(["age".to_owned(), "chunk".to_owned(), "untouched".to_owned()]));
+        environment.set_functions(table);
+        environment.bind("age", integer(0.0));
+        environment.bind("untouched", integer(7.0));
+        let result = run(&stmt, &environment, &kernel).expect("the abstract pass answers instead of declining");
+        assert_eq!(result.read("untouched").unwrap().values, vec![7.0], "a name neither side's own pass touches survives the join unchanged");
+    }
+
+    /// `iterable_element_sort` itself: `AsyncIterator[int]` reads as the
+    /// Integer-tagged whole-number set — the same `whole_integers()` shape
+    /// `return_sort_fallback` builds for a bare `-> int`, one subscript
+    /// level up.
+    #[test]
+    fn iterable_element_sort_reads_asynciterator_int_as_the_whole_number_set() {
+        let def = parsed_def("async def stream() -> AsyncIterator[int]:\n    raise NotImplementedError\n    yield 0\n");
+        let element_sort = iterable_element_sort(&def).expect("AsyncIterator[int] states an element sort");
+        assert_eq!(element_sort.kind, Kind::Set);
+        assert_eq!(element_sort.kind_tag, Some(PrimitiveKind::Integer));
+    }
+
+    /// A return annotation that is not one of `AsyncIterator`/`Iterator`/
+    /// `Iterable` (a bare `-> int`, the RETURN value's own sort, never an
+    /// element sort) reads as `None` — this fallback never confuses the
+    /// two claims.
+    #[test]
+    fn iterable_element_sort_declines_a_bare_return_annotation() {
+        let def = parsed_def("def counted() -> int:\n    return 3\n");
+        assert!(iterable_element_sort(&def).is_none());
+    }
+
+    // --- body-local AnnAssign reuses an already-declared alias's own
+    // DeclaredRefinement by SPELLING (UNIT 4) ---
+
+    /// g-binding-destructuring.py:191-193's own shape: the for-target is
+    /// a TUPLE UNPACK (`for _, over_value in over_items:`), and the
+    /// body's first statement is an `AnnAssign` (`bad: Age = over_value`)
+    /// whose target was never bound before this loop — `declared` (the
+    /// pre-loop snapshot) has no entry for `bad`, only for `total` (an
+    /// EARLIER `total: Age = 0` in the same enclosing function). The
+    /// alias-spelling reuse must still fire the out-of-range write.
+    #[test]
+    fn body_local_ann_assign_reuses_an_alias_already_declared_under_a_different_name() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let stmt = parsed_loop(concat!(
+            "for _, over_value in over_items:\n",
+            "    bad: Age = over_value\n",
+        ));
+        let mut environment = Environment::new(HashSet::from([
+            "over_items".to_owned(),
+            "_".to_owned(),
+            "over_value".to_owned(),
+            "bad".to_owned(),
+        ]));
+        let pairs = known_list(
+            vec![
+                known_list(vec![known_string("a"), integer(200.0)], TrustProved),
+                known_list(vec![known_string("b"), integer(201.0)], TrustProved),
+            ],
+            TrustProved,
+        );
+        environment.bind("over_items", pairs);
+        // `declared` carries Age only under "total" — "bad" is not a key
+        // here at all, matching the pre-loop snapshot's real shape.
+        let declared = declared_age("total");
+        let mut out = Vec::new();
+        let answer = loop_final_environment(&stmt, &environment, &kernel, &declared, &mut out)
+            .expect("the tuple-unpack target binds and the loop runs concretely");
+        assert_eq!(out.len(), 1, "the 200/201 writes into Age must fire, deduped to one syntactic row: {out:?}");
+        assert!(out[0].1.contains("Age"), "{}", out[0].1);
+        let bad = answer.environment.read("bad").expect("bad stays bound to the declared set after the refused write");
+        assert_eq!(bad.kind, Kind::Set);
+    }
+
+    /// The reuse is scoped to a MATCHING alias spelling only: a
+    /// body-local AnnAssign under an annotation that names NO alias
+    /// already present in `declared` stays unjudged, exactly as before —
+    /// this is not a general "annotation reading" fallback.
+    #[test]
+    fn body_local_ann_assign_under_an_unmatched_alias_stays_unjudged() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let stmt = parsed_loop(concat!(
+            "for x in [200]:\n",
+            "    bad: Unrelated = x\n",
+        ));
+        let mut environment = Environment::new(HashSet::from(["x".to_owned(), "bad".to_owned()]));
+        let declared = declared_age("total");
+        let mut out = Vec::new();
+        let answer = loop_final_environment(&stmt, &environment, &kernel, &declared, &mut out)
+            .expect("the loop still runs concretely — an unmatched annotation never declines it");
+        assert!(out.is_empty(), "no declared entry matches 'Unrelated' by spelling, so nothing fires: {out:?}");
+        assert_eq!(answer.environment.read("bad").unwrap().values, vec![200.0], "bad binds unjudged, unchanged from before this fix");
+    }
+
+    /// A body-local AnnAssign target that IS already a key in `declared`
+    /// (a name the pre-loop snapshot already recorded, then rewritten
+    /// with a fresh `x: Age = …` inside the SAME loop body) keeps reading
+    /// `declared`'s own entry — `newly_declared` never shadows it, since
+    /// `bind_checked` tries `declared` first.
+    #[test]
+    fn a_redeclared_name_already_in_declared_is_not_overridden_by_the_reuse_table() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let stmt = parsed_loop(concat!("for x in [200]:\n", "    total: Age = x\n",));
+        let mut environment = Environment::new(HashSet::from(["x".to_owned(), "total".to_owned()]));
+        environment.bind("total", integer(0.0));
+        let declared = declared_age("total");
+        let mut out = Vec::new();
+        let answer = loop_final_environment(&stmt, &environment, &kernel, &declared, &mut out)
+            .expect("the loop runs concretely");
+        assert_eq!(out.len(), 1, "the redeclared write still fires against Age's own declared entry: {out:?}");
+        let total = answer.environment.read("total").expect("total stays bound to the declared set");
+        assert_eq!(total.kind, Kind::Set);
     }
 }

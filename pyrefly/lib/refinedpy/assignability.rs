@@ -64,12 +64,31 @@ pub enum Verdict {
 ///   word, `codepoint_sets`'s "a string value IS its codepoint tuple")
 ///   against a declared set that is NUMERIC-ground
 ///   (`on_one_tuple_layer`, the scalar ray/point forms) fires, and the
-///   mirror — a numeric value against a declared set that is
-///   STRING-ground (`is_string_ground`, the codepoint-alphabet star)
-///   fires too. A tuple of code points and a tuple of numbers share the
-///   same wire shape; only the two sides' own sort tags can tell a
-///   string from a number, so this is judged the same way as the
-///   int-sort law rather than asked of the kernel.
+///   mirror — a numeric value against a declared set that DEMONSTRABLY
+///   STATES A SEQUENCE (`states_sequence` — a Star/Concatenation/
+///   Repeat/RepeatWord/EmptyTuple form present) fires too. A tuple of
+///   code points and a tuple of numbers share the same wire shape; only
+///   the two sides' own sort tags can tell a string from a number, so
+///   this is judged the same way as the int-sort law rather than asked
+///   of the kernel. THE TUPLE PUN: a 1-character string's own tuple
+///   (`codepoint_sets::string_tuple`'s length-1 encoding is a bare
+///   `OneOf`, never wrapped in `Concatenation`) sits on the one-tuple
+///   layer exactly like a numeric point does, so `Literal["A", "B",
+///   "C"]` (a `Union` of single-codepoint `OneOf`s, `surface.rs`'s
+///   `string_literal_set`) reads as numeric-ground under
+///   `on_one_tuple_layer` alone with no way to tell it from a bare
+///   numeric `one_of([65, 66, 67])`. The string-into-numeric-ground
+///   direction is therefore gated on `states_sequence(declared.set) ||
+///   !within_codepoint_door(declared.set, false)` (ported from
+///   refined-ts-go's `checkExactValues`/`StatesSequence`/
+///   `WithinCodepointDoor`, walk/set_membership.go +
+///   walk/sequence_measures.go): a target that does not demonstrably
+///   state a sequence AND sits wholly inside the codepoint alphabet
+///   (every admitted value is a valid single codepoint — `Grade`'s own
+///   shape) is indistinguishable from a union of one-character strings,
+///   so a String-tagged value may legitimately be one of its members
+///   and the law declines, falling through to the ordinary whole-word
+///   kernel membership ask below.
 /// - The BOOLEAN PRODUCT LAW: a Boolean-tagged value against a declared
 ///   set that requires the `int` form fires — `True`/`False` are `bool`,
 ///   and bool is excluded from the int sort by product law
@@ -93,7 +112,41 @@ pub enum Verdict {
 /// way via `format_py_number`.
 ///
 /// `Kind::Set` (a refined set of possible values, not one exact word)
-/// carries its own FLOAT-SORT law first: a Float-sorted Set (`kind_tag:
+/// carries its own SORT laws first, mirroring the Values-side
+/// string/numeric ground law and judged the same way — before any
+/// kernel ask, because the sort is a fact only the checker's own tags
+/// (or, for an untagged Set, the SET'S OWN SHAPE) state, never something
+/// `scalar_subset`/`scalar_disjoint` can see:
+///
+/// - A STRING-sorted Set (`kind_tag: Some(PrimitiveKind::String)`, or an
+///   UNTAGGED Set — `kind_tag: None` — whose own set is SEQUENCE-shaped,
+///   `sequence_shaped` below, the untagged-Set-reads-as-string-sorted
+///   convention `AGENT-BRIEF.md`/`ORIENTATION.md` both pin) against a
+///   declared set that is NUMERIC-ground (`on_one_tuple_layer`) AND
+///   (per the same tuple-pun gate the Values-side law above takes)
+///   either demonstrably states a sequence or sits outside the
+///   codepoint door fires: a string-sorted value is never a member of
+///   an int-sorted set, regardless of which characters either side
+///   admits. The `__name__` read (`expressions.rs`, `known_set(strings(),
+///   None, TrustSpec, SetKindTag::None)` — untagged, the full string
+///   ground) flowing into an `Age`-shaped return is exactly this shape.
+/// - The mirror: a NUMERIC-sorted Set (`kind_tag: Some(Integer/Float/
+///   Number)`, or an untagged Set whose own set sits `on_one_tuple_layer`
+///   — the shape a bare `integer()`/range Set carries with no producer
+///   ever tagging it) against a declared set that DEMONSTRABLY STATES A
+///   SEQUENCE (`states_sequence`) fires the same way.
+///
+/// Only when both sides share a sort (both string-shaped, or both
+/// numeric-shaped, or the value's shape is neither recognized law's
+/// antecedent) does judgment fall through past these two laws to the
+/// FLOAT-SORT law and then the containment ask below — so a same-sort
+/// pair the kernel cannot yet decide (e.g. the full string ground
+/// against a bounded length window) still reaches the CONTAINMENT
+/// REFUSAL catch rather than being wrongly waved through or wrongly
+/// fired by a sort law that does not apply to it.
+///
+/// After the two sort-shape laws, a Set carries its own FLOAT-SORT law:
+/// a Float-sorted Set (`kind_tag:
 /// Some(PrimitiveKind::Float)` — `abstract_value::float_sorted_unknown`,
 /// the shape `math.sqrt`'s value-unknown result carries) against a
 /// declared set that requires the `int` form fires outright, the same
@@ -101,12 +154,38 @@ pub enum Verdict {
 /// never a member of an int-sorted set, regardless of which real
 /// numbers either side admits. A Float-sorted Set against a
 /// NON-integer-sorted declared set declines this law and falls through
-/// to the kernel's own set-relationship questions: `scalar_subset`
-/// proves the whole flowing set lands inside the declared set (silent),
-/// `scalar_disjoint` proves no member of the flowing set can ever land
-/// inside it (fire), and neither proof going through is an honest
-/// overlap the walk cannot resolve further — undetermined, naming what
-/// blocked in the sentence the mission specifies verbatim.
+/// to the CONTAINMENT-REFUTATION law (adopted from
+/// refined-ts-go/internal/refinedts/walk/check_assignability.go's own
+/// three-outcome vocabulary: "proved says nothing, a refutation reports
+/// 7001 with the counterexample spelled, and an undetermined verdict
+/// reports 7002"): a checked position IS the claim `flowing ⊆ declared`,
+/// so `scalar_subset` proving it holds is silent, and ANY proof that it
+/// does NOT hold — subset false, whether the two sets are disjoint or
+/// merely overlapping — is a refutation and fires. The two-ask form
+/// below (`scalar_subset` then `scalar_disjoint`) is not a second
+/// three-way split; it exists only because the disjoint case gets its
+/// own message emphasis (no member of either set lines up with the
+/// other), while the overlap case's fire message spells both sets and
+/// lets the reader see the escaping region. Both closures are total
+/// over the scalar (1-tuple) shape `Kind::Set` carries here: the Lean
+/// kernel's `kernelScalarSubset`/`kernelScalarDisjoint`
+/// (refined-ts-lean/boundary/exports.lean) are proved theorems "in both
+/// directions" over scalar-shaped sets and only `fail` (a Lean-level
+/// refusal) on a non-scalar shape; the Rust closures
+/// (`refined_kernel::kernel_asks`) turn any such refusal into a `panic!`
+/// rather than a `false` — so a `false` this file ever observes from
+/// `scalar_subset` or `scalar_disjoint` is always a DECIDED refutation,
+/// never a refusal in disguise (matching Go's own
+/// `containedInAsked`/`scalarSubsetAsked`, which documents "the scalar
+/// decider is a theorem in both directions, so its false is a verdict,
+/// not a refusal" — refused kernel asks there are a `recover()`d panic,
+/// exactly the same shape as this crate's `.unwrap_or_else(|err| panic!
+/// ...)`). No search loop names a counterexample element; the fire
+/// message spells both sets via `format_for_diagnostics` and leaves
+/// finding a witness to the reader — the only existing helper that
+/// could name one, `refinement_forms::word_of`, reads a SINGLETON
+/// shape's own tuple and has no bearing on naming a member of the
+/// flowing set that escapes the declared set.
 ///
 /// `Kind::Object` / `Kind::List` (a dict, or a list/tuple) can never be
 /// a member of a SCALAR declared set (numeric-ground or string-ground)
@@ -130,8 +209,91 @@ pub fn judge(
     declared: &DeclaredRefinement,
     kernel: &Arc<RefinedTSKernel>,
 ) -> Verdict {
+    // The ELEMENT LAW: a container declaration (`dict[str, X]`,
+    // `declared.element` Some, `declared.set` unused/empty) judges
+    // every MEMBER VALUE against its element refinement rather than
+    // judging the container itself against a scalar/sequence set —
+    // `declared.set` carries nothing a dict could ever be a member of.
+    // A known Object (a dict literal, `Kind::Object` with no
+    // `kind_word` — the opaque-object law above already owns the
+    // kind_word case) walks every key in order and asks THIS SAME
+    // `judge` of each member's value; the first Fire is the verdict,
+    // its message naming the offending key so the reader sees which
+    // member escaped. All-Silent members is Silent. Any Undetermined
+    // member makes the whole judgment Undetermined, carrying that
+    // member's own sentence (the walk cannot claim more than its
+    // least-determined member knows). `None`/a list against an
+    // element-carrying declaration are their own explicit arms below —
+    // a dict declaration is not scalar-shaped, so the ordinary
+    // structural law (further down, gated on `scalar_or_string_shaped`)
+    // must never see them: `declared.set` is empty, which
+    // `scalar_or_string_shaped` reads as "not scalar-ground" and would
+    // leave None/a list Undetermined instead of firing the honest
+    // structural mismatch. `None`'s `admits_none` check comes first — a
+    // `dict[str, X] | None` declaration is still element-carrying (the
+    // `| None` wrapper only sets `admits_none`, never clears `element`,
+    // per typereading.rs's union-arm recursion), and `admits_none` wins
+    // the same way it does for every other declaration shape.
+    if let Some(element) = &declared.element {
+        if value.kind == Kind::Null {
+            if declared.admits_none {
+                return Verdict::Silent;
+            }
+            return Verdict::Fire(format!(
+                "a value of type 'None' is not assignable to type '{}'",
+                declared.spelling,
+            ));
+        }
+        // WHICH container the declaration names is read off its own
+        // spelling (both element-carrying constructors build it —
+        // "dict[str, X]" vs "list[X]"/"set[X]"): a dict declaration
+        // judges an Object's MEMBER VALUES, a list/set declaration
+        // judges a List's ITEMS, and the mismatched container kind
+        // fires the structural mismatch. Spelling-based dispatch is a
+        // stopgap the doc comment owns honestly — a container tag on
+        // DeclaredRefinement is the clean form once a third container
+        // arrives.
+        let declares_sequence =
+            declared.spelling.starts_with("list[") || declared.spelling.starts_with("set[");
+        if value.kind == Kind::Object && value.kind_word.is_none() {
+            if declares_sequence {
+                return Verdict::Fire(format!(
+                    "a value of type 'a dict' is not assignable to type '{}'",
+                    declared.spelling,
+                ));
+            }
+            for key in &value.keys {
+                match judge(&key.value, element, kernel) {
+                    Verdict::Fire(message) => {
+                        return Verdict::Fire(format!("{message} (at key '{}')", key.name));
+                    }
+                    Verdict::Undetermined(sentence) => return Verdict::Undetermined(sentence),
+                    Verdict::Silent => {}
+                }
+            }
+            return Verdict::Silent;
+        }
+        if value.kind == Kind::List {
+            if !declares_sequence {
+                return Verdict::Fire(format!(
+                    "a value of type 'a list' is not assignable to type '{}'",
+                    declared.spelling,
+                ));
+            }
+            for (index, item) in value.items.iter().enumerate() {
+                match judge(item, element, kernel) {
+                    Verdict::Fire(message) => {
+                        return Verdict::Fire(format!("{message} (at index {index})"));
+                    }
+                    Verdict::Undetermined(sentence) => return Verdict::Undetermined(sentence),
+                    Verdict::Silent => {}
+                }
+            }
+            return Verdict::Silent;
+        }
+    }
     if value.kind == Kind::Object && value.kind_word.is_some() {
-        let scalar_ground = on_one_tuple_layer(&declared.set) || is_string_ground(&declared.set);
+        let scalar_ground = scalar_or_string_shaped(&declared.set);
         if scalar_ground {
             let word = value.kind_word.expect("checked Some above");
             return Verdict::Fire(format!(
@@ -144,14 +306,46 @@ pub fn judge(
         let is_string = value.kind_tag == Some(PrimitiveKind::String);
         let is_float_sorted = value.kind_tag == Some(PrimitiveKind::Float);
         let is_boolean = value.kind_tag == Some(PrimitiveKind::Boolean);
-        if is_string && on_one_tuple_layer(&declared.set) {
+        // The TUPLE PUN: a 1-character string's own tuple (`string_tuple`'s
+        // `OneOf([codepoint])`, no `Concatenation` wrapper for a
+        // length-1 word) sits ON THE ONE-TUPLE LAYER exactly like a bare
+        // numeric point does — `Literal["A", "B", "C"]` compiles through
+        // nothing but `OneOf`/`Union` (surface.rs's `string_literal_set`,
+        // typereading.rs's own twin), so `on_one_tuple_layer` alone
+        // cannot tell "B"'s target set from a numeric one-of. Ported
+        // from refined-ts-go's own two-part gate
+        // (walk/set_membership.go's `checkExactValues`,
+        // walk/sequence_measures.go's `StatesSequence`/
+        // `WithinCodepointDoor`): the string-into-numeric-ground fire
+        // requires the target to DEMONSTRABLY state a sequence shape
+        // (`states_sequence` — a Star/Concatenation/Repeat/RepeatWord/
+        // EmptyTuple form present, never inferred from the layer alone)
+        // OR sit outside the codepoint door (`within_codepoint_door` —
+        // every value the target admits is a valid single codepoint, so
+        // the set is indistinguishable from a union of one-character
+        // strings and a string value may legitimately be one of its
+        // members).
+        // An explicit `Integer` form is numeric INTENT by construction —
+        // no string set ever carries it (`string_tuple`/`string_literal_set`
+        // build OneOf/Concatenation/Union only), so `requires_integer`
+        // opens the sort law even INSIDE the codepoint door: `Age`'s
+        // `[0,120] ∧ integer` refuses every String-tagged value outright
+        // (the corpus's "a string key is not in the set"), while `Grade`'s
+        // integer-less union of one-codepoint OneOfs still declines to the
+        // membership ask below.
+        if is_string
+            && on_one_tuple_layer(&declared.set)
+            && (requires_integer(&declared.set)
+                || states_sequence(&declared.set)
+                || !within_codepoint_door(&declared.set, false))
+        {
             return Verdict::Fire(format!(
                 "a value of type '{}' is not assignable to type '{}'",
                 spelled_string_word(&value.values),
                 declared.spelling,
             ));
         }
-        if !is_string && is_string_ground(&declared.set) {
+        if !is_string && states_sequence(&declared.set) {
             for v in &value.values {
                 return Verdict::Fire(format!(
                     "a value of type '{}' is not assignable to type '{}'",
@@ -178,28 +372,83 @@ pub fn judge(
                 declared.spelling,
             ));
         }
+        // Every member ask is wrapped like the containment ask below: a
+        // kernel REFUSAL (a set shape the member decider does not
+        // decide) panics inside the closure; caught here it answers
+        // Undetermined naming the refusal — never a crash that silences
+        // the rest of the file's judging, and never misread as a
+        // verdict.
         if is_string {
-            if !(kernel.member)(&declared.set, &value.values) {
-                return Verdict::Fire(format!(
+            let asked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                (kernel.member)(&declared.set, &value.values)
+            }));
+            return match asked {
+                Ok(true) => Verdict::Silent,
+                Ok(false) => Verdict::Fire(format!(
                     "a value of type '{}' is not assignable to type '{}'",
                     spelled_string_word(&value.values),
                     declared.spelling,
-                ));
-            }
-            return Verdict::Silent;
+                )),
+                Err(_) => Verdict::Undetermined(
+                    "the kernel does not yet decide membership for this set shape".to_owned(),
+                ),
+            };
         }
         for v in &value.values {
-            if !(kernel.member)(&declared.set, &[*v]) {
-                return Verdict::Fire(format!(
-                    "a value of type '{}' is not assignable to type '{}'",
-                    format_py_number(*v, false),
-                    declared.spelling,
-                ));
+            let asked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                (kernel.member)(&declared.set, &[*v])
+            }));
+            match asked {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Verdict::Fire(format!(
+                        "a value of type '{}' is not assignable to type '{}'",
+                        format_py_number(*v, false),
+                        declared.spelling,
+                    ));
+                }
+                Err(_) => {
+                    return Verdict::Undetermined(
+                        "the kernel does not yet decide membership for this set shape".to_owned(),
+                    );
+                }
             }
         }
         return Verdict::Silent;
     }
     if value.kind == Kind::Set {
+        let is_string_sorted_set = value.kind_tag == Some(PrimitiveKind::String)
+            || (value.kind_tag.is_none() && sequence_shaped(&value.set));
+        let is_numeric_sorted_set = matches!(
+            value.kind_tag,
+            Some(PrimitiveKind::Integer) | Some(PrimitiveKind::Float) | Some(PrimitiveKind::Number)
+        ) || (value.kind_tag.is_none() && on_one_tuple_layer(&value.set));
+        // The same TUPLE PUN as the Values-side law above applies to a
+        // Set-kind value's own sort tag: gated on `states_sequence`/
+        // `within_codepoint_door`, never `on_one_tuple_layer` alone —
+        // see that law's doc comment for the ported refined-ts-go
+        // source.
+        // the same `requires_integer` opening as the Values-side law —
+        // an explicit Integer form is numeric intent no string set carries
+        if is_string_sorted_set
+            && on_one_tuple_layer(&declared.set)
+            && (requires_integer(&declared.set)
+                || states_sequence(&declared.set)
+                || !within_codepoint_door(&declared.set, false))
+        {
+            return Verdict::Fire(format!(
+                "a value of type '{}' is not assignable to type '{}' — a string-sorted value is never in an int-sorted set",
+                refined_sets::format_for_diagnostics::format_for_diagnostics(&value.set),
+                declared.spelling,
+            ));
+        }
+        if is_numeric_sorted_set && states_sequence(&declared.set) {
+            return Verdict::Fire(format!(
+                "a value of type '{}' is not assignable to type '{}' — a numeric-sorted value is never in a string-sorted set",
+                refined_sets::format_for_diagnostics::format_for_diagnostics(&value.set),
+                declared.spelling,
+            ));
+        }
         let is_float_sorted = value.kind_tag == Some(PrimitiveKind::Float);
         if is_float_sorted && requires_integer(&declared.set) {
             return Verdict::Fire(format!(
@@ -208,25 +457,37 @@ pub fn judge(
                 declared.spelling,
             ));
         }
-        if (kernel.scalar_subset)(&value.set, &declared.set) {
-            return Verdict::Silent;
-        }
-        if (kernel.scalar_disjoint)(&value.set, &declared.set) {
-            return Verdict::Fire(format!(
-                "a value of type '{}' is not assignable to type '{}'",
+        // CONTAINMENT-REFUTATION LAW: the checked position IS the claim
+        // `flowing ⊆ declared`. `scalar_subset` proves it (silent);
+        // a decided `false` refutes it — whether by a proved disjoint or
+        // a proved overlap, both fire. A REFUSAL (a set shape the
+        // kernel's subset decider does not decide — e.g. a concatenation
+        // pattern against a length window today) PANICS inside the
+        // kernel closure rather than returning a boolean; that panic is
+        // caught here and answered as Undetermined naming the refusal —
+        // never read as a refutation (refined-ts-go's containedInAsked
+        // recover()s the same way).
+        let asked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            (kernel.scalar_subset)(&value.set, &declared.set)
+        }));
+        return match asked {
+            Ok(true) => Verdict::Silent,
+            Ok(false) => Verdict::Fire(format!(
+                "a value of type '{}' is not assignable to type '{}' ({}) — the flowing set admits values outside the declared set",
                 refined_sets::format_for_diagnostics::format_for_diagnostics(&value.set),
                 declared.spelling,
-            ));
-        }
-        return Verdict::Undetermined(
-            "the flowing value's set is not contained in the declared set".to_owned(),
-        );
+                refined_sets::format_for_diagnostics::format_for_diagnostics(&declared.set),
+            )),
+            Err(_) => Verdict::Undetermined(
+                "the kernel does not yet decide containment for this set shape".to_owned(),
+            ),
+        };
     }
     if value.kind == Kind::Null && declared.admits_none {
         return Verdict::Silent;
     }
     if matches!(value.kind, Kind::Object | Kind::List | Kind::Null)
-        && (on_one_tuple_layer(&declared.set) || is_string_ground(&declared.set))
+        && scalar_or_string_shaped(&declared.set)
     {
         let value_word = match value.kind {
             Kind::Object => value.kind_word.unwrap_or("a dict"),
@@ -240,6 +501,139 @@ pub fn judge(
         ));
     }
     Verdict::Undetermined("the flowing value is not yet readable".to_owned())
+}
+
+/// Whether the declared set names scalars or strings — the shapes a
+/// dict/list/None/opaque value can NEVER inhabit. Three recognizers:
+/// numeric 1-tuple forms (`on_one_tuple_layer`), the full string ground
+/// (`is_string_ground`), and SEQUENCE-SHAPED sets (every top-level form
+/// is a string/sequence form — EmptyTuple/Concatenation/Star/Repeat/
+/// RepeatWord — or a Union/Difference of sequence-shaped operands),
+/// which is what a `Literal["a", "b"]` union of string tuples compiles
+/// to. A set none of the three recognize declines the structural laws
+/// and falls through to the general undetermined answer.
+fn scalar_or_string_shaped(set: &refined_sets::refinement_forms::RefinedSet) -> bool {
+    on_one_tuple_layer(set) || is_string_ground(set) || sequence_shaped(set)
+}
+
+fn sequence_shaped(set: &refined_sets::refinement_forms::RefinedSet) -> bool {
+    use refined_sets::refinement_forms::Form;
+    !set.forms.is_empty()
+        && set.forms.iter().all(|form| match form.form {
+            Form::EmptyTuple | Form::Concatenation | Form::Star | Form::Repeat | Form::RepeatWord => true,
+            Form::Union | Form::Difference => {
+                form.a_.as_deref().map(sequence_shaped).unwrap_or(false)
+                    && form.b.as_deref().map(sequence_shaped).unwrap_or(false)
+            }
+            Form::AtLeast
+            | Form::Above
+            | Form::AtMost
+            | Form::Below
+            | Form::Integer
+            | Form::MultipleOf
+            | Form::OneOf => false,
+        })
+}
+
+/// Whether a set's OWN top-level forms DEMONSTRABLY state a sequence —
+/// a `Star`/`Concatenation`/`Repeat`/`RepeatWord`/`EmptyTuple` form
+/// sits among them. Ported from refined-ts-go's `StatesSequence`
+/// (walk/sequence_measures.go): a POSITIVE, non-recursive test — unlike
+/// `sequence_shaped` above (which requires EVERY form, recursing
+/// through Union/Difference, and serves the Object/List/Null
+/// structural-mismatch law), `states_sequence` only asks whether the
+/// set's own top layer carries a sequence form at all, and is what
+/// gates the string-vs-numeric-ground SORT laws below: `on_one_tuple_
+/// layer` alone cannot tell a numeric one-of from a union of
+/// single-character string tuples (the tuple pun — `string_tuple`'s
+/// length-1 encoding is bare `OneOf`, no `Concatenation` wrapper), so
+/// the sort law must see an actual sequence form before it may read
+/// "on the one-tuple layer" as "numeric."
+fn states_sequence(set: &refined_sets::refinement_forms::RefinedSet) -> bool {
+    use refined_sets::refinement_forms::Form;
+    set.forms.iter().any(|form| {
+        matches!(
+            form.form,
+            Form::Star | Form::Concatenation | Form::Repeat | Form::RepeatWord | Form::EmptyTuple
+        )
+    })
+}
+
+/// One admitted scalar that could be a one-character string's own
+/// codepoint — ported from refined-ts-go's `CodepointScalar`
+/// (walk/sequence_measures.go): a natural number inside the codepoint
+/// alphabet (`codepoint_sets::codepoints`'s own surrogate-gap-excluding
+/// range), never a negative, fractional, or out-of-range value.
+fn codepoint_scalar(v: f64) -> bool {
+    v == v.trunc() && v >= 0.0 && (v <= 0xD7FF as f64 || (v >= 0xE000 as f64 && v <= 0x10FFFF as f64))
+}
+
+/// Whether EVERY value a scalar set admits sits inside the codepoint
+/// alphabet — ported from refined-ts-go's `WithinCodepointDoor`
+/// (walk/sequence_measures.go): such a set is indistinguishable from a
+/// union of one-character strings, so the string-vs-numeric sort laws
+/// must not refute a string value against it on shape alone. Two
+/// spellings pass: enumerated codepoints (`OneOf`), and
+/// INTEGER-constrained windows wholly inside one side of the surrogate
+/// gap (`Field(pattern=r"^[\x00-\x7f]$")`'s own shape). Windows without
+/// the `Integer` form answer false (they admit non-codepoint reals),
+/// and the window test is conservative (`Above`/`Below` widen to their
+/// closed bounds) so the door never opens wrongly. `integer_inherited`
+/// carries the ancestor's own `Integer` form down through a `Union`
+/// (the same recursion refined-ts-go's Go source takes), since a bound
+/// form nested under a `Union` reads its sort from the branch that
+/// states it, not from its own immediate siblings.
+fn within_codepoint_door(
+    set: &refined_sets::refinement_forms::RefinedSet,
+    integer_inherited: bool,
+) -> bool {
+    use refined_sets::refinement_forms::Form;
+    if set.forms.is_empty() {
+        return false;
+    }
+    let mut integer = integer_inherited;
+    if !integer {
+        integer = set.forms.iter().any(|form| form.form == Form::Integer);
+    }
+    let mut lo = f64::NEG_INFINITY;
+    let mut hi = f64::INFINITY;
+    let mut content = false;
+    for form in &set.forms {
+        match form.form {
+            Form::Integer => {}
+            Form::OneOf => {
+                if !form.w.iter().all(|&w| codepoint_scalar(w)) {
+                    return false;
+                }
+                content = true;
+            }
+            Form::AtLeast | Form::Above => lo = lo.max(form.a),
+            Form::AtMost | Form::Below => hi = hi.min(form.a),
+            Form::Union => {
+                let a = form.a_.as_deref();
+                let b = form.b.as_deref();
+                let a_ok = a.map(|s| within_codepoint_door(s, integer)).unwrap_or(false);
+                let b_ok = b.map(|s| within_codepoint_door(s, integer)).unwrap_or(false);
+                if !a_ok || !b_ok {
+                    return false;
+                }
+                content = true;
+            }
+            _ => return false,
+        }
+    }
+    if lo != f64::NEG_INFINITY || hi != f64::INFINITY {
+        if !integer || lo > hi {
+            return false;
+        }
+        let in_low = lo >= 0.0 && hi <= 0xD7FF as f64;
+        let in_high = lo >= 0xE000 as f64 && hi <= 0x10FFFF as f64;
+        if !in_low && !in_high {
+            return false;
+        }
+        content = true;
+    }
+    content
 }
 
 /// The readable spelling of a string word for a fire message: the code
@@ -274,6 +668,8 @@ fn spelled_boolean_word(values: &[f64]) -> String {
 mod tests {
     use std::sync::Arc;
 
+    use refined_domain::abstract_value::SetKindTag;
+    use refined_domain::abstract_value::known_set;
     use refined_domain::abstract_value::known_values;
     use refined_domain::trust_grades::TrustProved;
     use refined_kernel::kernel_bridge::dylib_path;
@@ -281,6 +677,7 @@ mod tests {
     use refined_kernel::kernel_bridge::load_kernel;
     use refined_sets::refinement_forms::at_least;
     use refined_sets::refinement_forms::at_most;
+    use refined_sets::refinement_forms::below;
     use refined_sets::refinement_forms::integer;
     use refined_sets::refinement_forms::make_refined_set;
 
@@ -305,6 +702,7 @@ mod tests {
             set: make_refined_set(vec![integer(), at_least(0.0), at_most(120.0)]),
             spelling: "Age".to_owned(),
             admits_none: false,
+            element: None,
         }
     }
 
@@ -315,6 +713,7 @@ mod tests {
             set: make_refined_set(vec![integer(), at_least(0.0), at_most(120.0)]),
             spelling: "Age | None".to_owned(),
             admits_none: true,
+            element: None,
         }
     }
 
@@ -378,6 +777,7 @@ mod tests {
             set: make_refined_set(vec![at_least(0.0)]),
             spelling: "Weight".to_owned(),
             admits_none: false,
+            element: None,
         };
         let thirty_float = known_values(vec![30.0], PrimitiveKind::Float, TrustProved);
         assert!(matches!(judge(&thirty_float, &declared, &kernel), Verdict::Silent));
@@ -395,6 +795,7 @@ mod tests {
             set: make_refined_set(vec![repeat_of(codepoints(), 0, Some(8))]),
             spelling: "Label".to_owned(),
             admits_none: false,
+            element: None,
         }
     }
 
@@ -408,6 +809,7 @@ mod tests {
             set: strings(),
             spelling: "AnyString".to_owned(),
             admits_none: false,
+            element: None,
         }
     }
 
@@ -440,20 +842,155 @@ mod tests {
         assert!(message.contains("'Label'"), "{message}");
     }
 
-    /// A String-tagged value against a NUMERIC-ground alias (Age, an
-    /// int-sorted ray) fires the sort law before any kernel question —
-    /// a string is never a member of an int-sorted set, regardless of
-    /// what the code points spell. No kernel ask is needed to decide
-    /// this, so the message is asserted without requiring the kernel be
-    /// built (the sort law short-circuits before `(kernel.member)` is
-    /// ever called).
+    /// `type ChartLayout = Literal["horizontal", "vertical", "centric",
+    /// "radial"]` — c-reads-and-values.py:1182's own alias, the UNION of
+    /// four singleton string tuples `typereading::string_literal_set`
+    /// builds. Untagged `Kind::Set` (`set_kind_tag: SetKindTag::None`)
+    /// reads as string-sorted by convention (ORIENTATION.md's own
+    /// recognition-slice fact) — no kind_tag field on a `RefinedSet`.
+    fn chart_layout_refinement() -> DeclaredRefinement {
+        use refined_sets::codepoint_sets::string_tuple;
+        use refined_sets::refinement_forms::union;
+        let set = make_refined_set(vec![union(
+            make_refined_set(vec![union(
+                make_refined_set(vec![union(string_tuple("horizontal"), string_tuple("vertical"))]),
+                string_tuple("centric"),
+            )]),
+            string_tuple("radial"),
+        )]);
+        DeclaredRefinement {
+            set,
+            spelling: "ChartLayout".to_owned(),
+            admits_none: false,
+            element: None,
+        }
+    }
+
+    /// `c-reads-and-values.py:1197`'s HELD arm — `layout` narrowed to
+    /// `"horizontal"` (a String-tagged whole word) against
+    /// `Literal["horizontal", "vertical", "centric", "radial"]`: ONE
+    /// membership ask over the whole word (line 208's `is_string` arm),
+    /// silent because "horizontal" is one of the four tuples the union
+    /// spells.
     #[test]
-    fn a_string_value_into_a_numeric_ground_alias_fires_the_sort_law_before_any_kernel_ask() {
+    fn a_literal_union_member_string_value_is_silent_via_whole_word_membership() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let declared = chart_layout_refinement();
+        let value = known_values(hi_points("horizontal"), PrimitiveKind::String, TrustProved);
+        assert!(matches!(judge(&value, &declared, &kernel), Verdict::Silent));
+    }
+
+    /// The mirror: a String-tagged whole word NOT among the union's four
+    /// tuples fires the ordinary kernel membership ask, quoting the
+    /// string readably.
+    #[test]
+    fn a_literal_union_non_member_string_value_fires_quoting_the_string() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let declared = chart_layout_refinement();
+        let value = known_values(hi_points("diagonal"), PrimitiveKind::String, TrustProved);
+        let message = fire_message(judge(&value, &declared, &kernel));
+        assert!(message.contains("\"diagonal\""), "{message}");
+        assert!(message.contains("'ChartLayout'"), "{message}");
+    }
+
+    /// c-reads-and-values.py:1199's own shape: `return None` under a
+    /// declared `Literal["horizontal", "vertical"]` — NOT `| None`
+    /// wrapped, so `declared.admits_none` is false. `Kind::Null` reaches
+    /// A Literal union of specific string tuples is SEQUENCE-SHAPED
+    /// (`sequence_shaped`: a Union of Concatenation forms), so the
+    /// structural-mismatch law recognizes it and `None` against a
+    /// non-admitting Literal union FIRES — None is provably not a
+    /// string of any spelling (c-reads-and-values.py's fall-through-
+    /// to-None row).
+    #[test]
+    fn none_against_a_literal_union_that_does_not_admit_none_fires() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let two_member_declared = DeclaredRefinement {
+            set: make_refined_set(vec![refined_sets::refinement_forms::union(
+                refined_sets::codepoint_sets::string_tuple("horizontal"),
+                refined_sets::codepoint_sets::string_tuple("vertical"),
+            )]),
+            spelling: "Literal['horizontal', 'vertical']".to_owned(),
+            admits_none: false,
+            element: None,
+        };
+        let value = refined_domain::abstract_value::null_value();
+        let Verdict::Fire(message) = judge(&value, &two_member_declared, &kernel) else {
+            panic!("None against a non-admitting string-Literal union fires the structural law");
+        };
+        assert!(message.contains("None"), "{message}");
+    }
+
+    /// A String-tagged value against a NUMERIC-ground alias (Age, an
+    /// int-sorted ray) still fires — but via the ORDINARY whole-word
+    /// kernel membership ask, not the sort law: `Age`'s own range
+    /// `[0, 120]` sits WITHIN the codepoint door (every value it admits
+    /// is a valid single codepoint), so the sort law declines per the
+    /// tuple-pun gate (`within_codepoint_door`) and falls through.
+    /// `"30"` is a 2-CODEPOINT tuple, never a member of `Age`'s
+    /// 1-tuple-shaped set regardless, so the kernel's own derivative
+    /// walk refutes it — the fire message is identical either way, this
+    /// test only pins that the value is still refused.
+    #[test]
+    fn a_string_value_into_a_numeric_ground_alias_still_fires_via_the_kernel_ask() {
         let Some(kernel) = loaded_kernel() else { return };
         let declared = age_refinement();
         let value = known_values(hi_points("30"), PrimitiveKind::String, TrustProved);
         let message = fire_message(judge(&value, &declared, &kernel));
         assert!(message.contains("'Age'"), "{message}");
+    }
+
+    /// The TUPLE-PUN fix's own pin: `"B"` (a String-tagged whole word)
+    /// into `Grade = Literal["A", "B", "C"]` — a `Union` of
+    /// single-codepoint `OneOf`s (`surface.rs`'s `string_literal_set`
+    /// over 1-character members) — is SILENT. Before the fix, the
+    /// string-vs-numeric-ground sort law read `Grade`'s shape as
+    /// numeric-ground (`on_one_tuple_layer` alone, blind to the
+    /// single-character tuple pun) and fired outright on every real
+    /// member; `Grade`'s own range sits wholly inside the codepoint
+    /// door (every member is a valid codepoint) with no sequence form
+    /// present, so the law now declines and the ordinary whole-word
+    /// kernel membership ask decides it correctly.
+    #[test]
+    fn a_single_character_literal_union_member_is_silent_not_the_numeric_ground_sort_law() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let declared = grade_refinement();
+        let value = known_values(hi_points("B"), PrimitiveKind::String, TrustProved);
+        assert!(matches!(judge(&value, &declared, &kernel), Verdict::Silent));
+    }
+
+    /// The mirror: `"F"` (outside `Grade`'s three members) fires via the
+    /// ordinary whole-word kernel ask, quoting the string readably —
+    /// never the numeric-ground sort law's own wording.
+    #[test]
+    fn a_single_character_literal_union_non_member_fires_quoting_the_string() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let declared = grade_refinement();
+        let value = known_values(hi_points("F"), PrimitiveKind::String, TrustProved);
+        let message = fire_message(judge(&value, &declared, &kernel));
+        assert!(message.contains("\"F\""), "{message}");
+        assert!(message.contains("'Grade'"), "{message}");
+    }
+
+    /// `type Grade = Literal["A", "B", "C"]` — o-grammar-refinements.py's
+    /// own alias, `surface.rs`'s `literal_alias_set`/
+    /// `string_literal_set`'s exact fold: `union(union(string_tuple("A"),
+    /// string_tuple("B")), string_tuple("C"))`, every member a single
+    /// character so every `string_tuple` call is a bare `OneOf` (no
+    /// `Concatenation` wrapper for a length-1 word).
+    fn grade_refinement() -> DeclaredRefinement {
+        use refined_sets::codepoint_sets::string_tuple;
+        use refined_sets::refinement_forms::union;
+        let set = make_refined_set(vec![union(
+            make_refined_set(vec![union(string_tuple("A"), string_tuple("B"))]),
+            string_tuple("C"),
+        )]);
+        DeclaredRefinement {
+            set,
+            spelling: "Grade".to_owned(),
+            admits_none: false,
+            element: None,
+        }
     }
 
     /// The mirror: an Integer-tagged value against the STRING-ground
@@ -570,8 +1107,104 @@ mod tests {
             set: make_refined_set(Vec::new()),
             spelling: "Anything".to_owned(),
             admits_none: false,
+            element: None,
         };
         let value = refined_domain::abstract_value::opaque_value("a function value");
+        assert!(matches!(judge(&value, &declared, &kernel), Verdict::Undetermined(_)));
+    }
+
+    /// The STRING-SORTED-SET law declines for a target whose own range
+    /// sits WITHIN THE CODEPOINT DOOR: an UNTAGGED Set holding the full
+    /// string ground (`kind_tag: None`, the exact shape `expressions.rs`'s
+    /// `__name__` read carries — `known_set(strings(), None, TrustSpec,
+    /// SetKindTag::None)`) against Age FIRES via the sort law: `Age`
+    /// carries the explicit `Integer` form, which is numeric INTENT by
+    /// construction (no string set ever builds one), so the
+    /// `requires_integer` opening decides the sort mismatch even though
+    /// Age's `[0, 120]` range sits inside the codepoint door — the
+    /// d-module-surface row's own expectation ("a host-defined string is
+    /// not in an int-sorted set").
+    #[test]
+    fn an_untagged_string_shaped_set_into_an_integer_formed_alias_fires() {
+        let Some(kernel) = loaded_kernel() else { return };
+        use refined_sets::codepoint_sets::strings;
+        let declared = age_refinement();
+        let value = known_set(strings(), None, TrustProved, SetKindTag::None);
+        let message = fire_message(judge(&value, &declared, &kernel));
+        assert!(message.contains("'Age'"), "{message}");
+    }
+
+    /// The same law, explicitly String-tagged: a Set carrying `kind_tag:
+    /// Some(PrimitiveKind::String)` against Age fires identically — the
+    /// law reads either the explicit tag or the untagged-Set convention,
+    /// and Age's explicit `Integer` form opens the sort law for both.
+    #[test]
+    fn a_string_tagged_set_into_an_integer_formed_alias_fires() {
+        let Some(kernel) = loaded_kernel() else { return };
+        use refined_sets::codepoint_sets::strings;
+        let declared = age_refinement();
+        let value = AbstractValue {
+            kind_tag: Some(PrimitiveKind::String),
+            ..known_set(strings(), None, TrustProved, SetKindTag::None)
+        };
+        let message = fire_message(judge(&value, &declared, &kernel));
+        assert!(message.contains("'Age'"), "{message}");
+    }
+
+    /// The tuple-pun gate's own Set-kind pin: an EXPLICITLY String-tagged
+    /// Set built from a single-codepoint `OneOf` (`{66}`, "B") against
+    /// `Grade` (single-codepoint `OneOf`/`Union` forms only,
+    /// `on_one_tuple_layer` true, no demonstrable sequence form) reaches
+    /// the CONTAINMENT ask rather than the sort law, because `Grade`
+    /// sits wholly inside the codepoint door — `{66}` IS `scalar_subset`
+    /// of `Grade`'s set (both are scalar/1-tuple shaped here), so this
+    /// is Silent, not a sort-law Fire. (An UNTAGGED bare `OneOf` Set
+    /// reads as NUMERIC-sorted by the codebase's own convention — this
+    /// test tags String explicitly so it exercises the string-sorted
+    /// branch, mirroring `a_string_tagged_set_into_a_codepoint_door_
+    /// alias_is_undetermined` above but with a value that IS
+    /// scalar-shaped, so the containment ask decides rather than
+    /// refuses.)
+    #[test]
+    fn a_single_codepoint_string_tagged_set_wholly_inside_a_single_character_literal_union_is_silent() {
+        let Some(kernel) = loaded_kernel() else { return };
+        use refined_sets::refinement_forms::one_of;
+        let declared = grade_refinement();
+        let value = AbstractValue {
+            kind_tag: Some(PrimitiveKind::String),
+            ..known_set(make_refined_set(vec![one_of(&[66.0])]), None, TrustProved, SetKindTag::None)
+        };
+        assert!(matches!(judge(&value, &declared, &kernel), Verdict::Silent));
+    }
+
+    /// The mirror: a NUMERIC-sorted Set (an untagged Set whose own set is
+    /// `on_one_tuple_layer`, e.g. the bare `integer()` line) against the
+    /// STRING-ground alias fires the sort law before any kernel ask — a
+    /// number is never a member of a string-ground set, regardless of
+    /// which real numbers the set admits.
+    #[test]
+    fn a_numeric_shaped_set_into_a_string_ground_alias_fires_the_sort_law() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let declared = any_string_refinement();
+        let value = known_set(make_refined_set(vec![integer()]), None, TrustProved, SetKindTag::None);
+        let message = fire_message(judge(&value, &declared, &kernel));
+        assert!(message.contains("'AnyString'"), "{message}");
+    }
+
+    /// The non-firing neighbor: a STRING-sorted Set against a declared
+    /// set that is string-shaped but NOT the full ground (`Label`'s
+    /// bounded `max_length=8` window) declines both new sort laws —
+    /// both sides share the string sort — and falls through to the
+    /// CONTAINMENT REFUSAL catch this file already tests
+    /// (`an_unbounded_string_set_against_a_max_length_window_is_a_caught_refusal`),
+    /// never a false Fire from a law that does not apply to a same-sort
+    /// pair.
+    #[test]
+    fn a_string_sorted_set_against_a_bounded_string_window_still_reaches_the_containment_ask() {
+        let Some(kernel) = loaded_kernel() else { return };
+        use refined_sets::codepoint_sets::strings;
+        let declared = label_refinement();
+        let value = known_set(strings(), None, TrustProved, SetKindTag::None);
         assert!(matches!(judge(&value, &declared, &kernel), Verdict::Undetermined(_)));
     }
 
@@ -589,24 +1222,110 @@ mod tests {
         assert!(message.to_lowercase().contains("float"), "{message}");
     }
 
-    /// The non-firing neighbor: a Float-sorted Set against a
-    /// float-TOLERANT (non-integer-sorted) declared set stays on today's
-    /// ordinary Set path — undetermined here (R-bar is not a subset of,
-    /// nor disjoint from, `Weight`'s `[0, ∞)` ray), never fired by the
-    /// sort law, which is specific to `requires_integer`.
+    /// CONTAINMENT-REFUTATION LAW, the overlap case: a Float-sorted Set
+    /// against a float-TOLERANT (non-integer-sorted) declared set skips
+    /// the sort law (specific to `requires_integer`) and falls to the
+    /// ordinary Set path — R-bar (`float_sorted_unknown`'s set, the
+    /// whole real line) is NOT a subset of `Weight`'s `[0, ∞)` ray (it
+    /// admits negatives the declared set excludes) and is NOT disjoint
+    /// from it either (they overlap on `[0, ∞)`). Before this law, that
+    /// overlap sat Undetermined; the law now fires it, because
+    /// `scalar_subset` proving false over decided scalar forms IS a
+    /// refutation of the checked position's containment claim, whether
+    /// the two sets are disjoint or merely overlapping.
     #[test]
-    fn a_float_sorted_set_into_a_non_integer_sorted_alias_stays_on_the_set_path() {
+    fn a_float_sorted_set_overlapping_a_non_integer_sorted_alias_fires() {
         let Some(kernel) = loaded_kernel() else { return };
         let declared = DeclaredRefinement {
             set: make_refined_set(vec![at_least(0.0)]),
             spelling: "Weight".to_owned(),
             admits_none: false,
+            element: None,
         };
         let value = refined_domain::abstract_value::float_sorted_unknown();
-        assert!(matches!(
-            judge(&value, &declared, &kernel),
-            Verdict::Undetermined(_)
-        ));
+        let message = fire_message(judge(&value, &declared, &kernel));
+        assert!(message.contains("'Weight'"), "{message}");
+        assert!(message.contains("admits values outside"), "{message}");
+    }
+
+    /// CONTAINMENT-REFUTATION LAW, the subset case: an int-sorted Set
+    /// `[10, 20]` (wholly inside Age's `[0, 120]` window) is still
+    /// Silent — `scalar_subset` proves the containment claim outright,
+    /// unchanged by this law.
+    #[test]
+    fn an_int_sorted_set_wholly_inside_the_declared_window_is_silent() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let declared = age_refinement();
+        let value = known_set(
+            make_refined_set(vec![integer(), at_least(10.0), at_most(20.0)]),
+            None,
+            TrustProved,
+            SetKindTag::None,
+        );
+        assert!(matches!(judge(&value, &declared, &kernel), Verdict::Silent));
+    }
+
+    /// CONTAINMENT-REFUTATION LAW, the decided-disjoint case: an
+    /// int-sorted Set entirely below Age's floor (`< 0`) still fires —
+    /// `scalar_disjoint` proves no member of either set can ever be the
+    /// other's, the sharpest form of refutation the law covers.
+    #[test]
+    fn an_int_sorted_set_disjoint_from_the_declared_window_fires() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let declared = age_refinement();
+        let value = known_set(
+            make_refined_set(vec![integer(), below(0.0)]),
+            None,
+            TrustProved,
+            SetKindTag::None,
+        );
+        let message = fire_message(judge(&value, &declared, &kernel));
+        assert!(message.contains("'Age'"), "{message}");
+        assert!(message.contains("admits values outside"), "{message}");
+    }
+
+    /// CONTAINMENT-REFUTATION LAW, the overlap case (int-sort whole set
+    /// vs Age window): the unrestricted integer line is NOT a subset of
+    /// Age's `[0, 120]` window (it admits negatives and values above
+    /// 120) and NOT disjoint from it either (10 is a member of both).
+    /// Before this law, that overlap sat Undetermined; the law now fires
+    /// it — `scalar_subset` proving false over decided scalar forms is a
+    /// refutation of the checked position's containment claim regardless
+    /// of whether the two sets are disjoint or merely overlapping.
+    #[test]
+    fn an_int_sort_whole_set_overlapping_the_age_window_fires() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let declared = age_refinement();
+        let value = known_set(
+            make_refined_set(vec![integer()]),
+            None,
+            TrustProved,
+            SetKindTag::None,
+        );
+        let message = fire_message(judge(&value, &declared, &kernel));
+        assert!(message.contains("'Age'"), "{message}");
+        assert!(message.contains("admits values outside"), "{message}");
+    }
+
+    /// CONTAINMENT REFUSAL, the sequence case: the kernel's subset
+    /// decider REFUSES the `strings()`-vs-length-window pair today (its
+    /// panic message: "subset is decided for scalar and sequence shapes
+    /// today" — this pair's shape is outside the decided fragment). The
+    /// refusal is CAUGHT and answered as Undetermined naming the shape,
+    /// never read as a refutation — a false fire here would be unsound.
+    /// When the kernel's sequence-containment fragment grows to decide
+    /// this pair, this test flips to the Fire the overlap semantics
+    /// warrant ("admits strings over 8 characters").
+    #[test]
+    fn an_unbounded_string_set_against_a_max_length_window_is_a_caught_refusal() {
+        let Some(kernel) = loaded_kernel() else { return };
+        use refined_sets::codepoint_sets::strings;
+        let declared = label_refinement();
+        let value = known_set(strings(), None, TrustProved, SetKindTag::None);
+        let Verdict::Undetermined(sentence) = judge(&value, &declared, &kernel) else {
+            panic!("a kernel refusal must answer Undetermined, never a fire or silence");
+        };
+        assert!(sentence.contains("containment"), "{sentence}");
     }
 
     /// The BOOLEAN PRODUCT LAW: `True` (Boolean-tagged) against Age
@@ -638,8 +1357,169 @@ mod tests {
             set: make_refined_set(vec![at_least(0.0)]),
             spelling: "Weight".to_owned(),
             admits_none: false,
+            element: None,
         };
         let value = known_values(vec![1.0], PrimitiveKind::Boolean, TrustProved);
         assert!(matches!(judge(&value, &declared, &kernel), Verdict::Silent));
+    }
+
+    // --- m-pydantic-schema.py's Digits: pattern-and-window intersection ---
+
+    /// `type Digits = Annotated[str, Field(min_length=1, max_length=4,
+    /// pattern=r"^[0-9]+$")]` — `surface.rs`'s `annotated_expression_set`
+    /// own fold: the compiled `[0-9]+` grammar's `Repeat` form (the
+    /// digit range, unbounded repetition) INTERSECTED with the
+    /// `min_length`/`max_length` window's own `Repeat` form (the full
+    /// codepoint ground, length `[1, 4]`) — two `Repeat` forms over
+    /// DIFFERENT element sets, never `on_one_tuple_layer` (each is a
+    /// `Form::Repeat`, not a scalar form), so this alias never reaches
+    /// the tuple-pun sort law this file's other Digits/Grade tests pin;
+    /// it flows straight to the ordinary whole-word kernel membership
+    /// ask.
+    fn digits_refinement() -> DeclaredRefinement {
+        use refined_sets::codepoint_sets::codepoints;
+        use refined_sets::refinement_forms::repeat_of;
+        let digit_range = make_refined_set(vec![integer(), at_least(0x30 as f64), at_most(0x39 as f64)]);
+        DeclaredRefinement {
+            set: make_refined_set(vec![
+                repeat_of(digit_range, 1, None),
+                repeat_of(codepoints(), 1, Some(4)),
+            ]),
+            spelling: "Digits".to_owned(),
+            admits_none: false,
+            element: None,
+        }
+    }
+
+    /// `TypeAdapter(Digits).validate_python("42")` — m-pydantic-schema.py:65's
+    /// own row. `"42"` (a String-tagged whole word, 2 code points, both
+    /// ASCII digits) is a genuine member of `Digits`'s pattern-and-window
+    /// set: `judge()` proves this Silent via the ordinary whole-word
+    /// kernel membership ask, root-causing this row's OWN reported false
+    /// Fire to `check.rs`'s adapter-alias route (`adapter_alias_verdict`'s
+    /// LAX INT COERCION), not to this file — that coercion is gated only
+    /// on the value being a digit string and the alias not being a
+    /// `StrictInt` name, with no check that the alias's declared set is
+    /// even NUMERIC-sorted, so `"42"` is silently rewritten to the
+    /// Integer value `42` before `judge()` ever sees it, and `42`
+    /// (correctly) fails membership in a codepoint-tuple-shaped set. This
+    /// test pins that `judge()` itself, given the UN-coerced String
+    /// value, decides the row correctly.
+    #[test]
+    fn a_string_value_member_of_the_digits_pattern_and_window_set_is_silent() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let declared = digits_refinement();
+        let value = known_values(hi_points("42"), PrimitiveKind::String, TrustProved);
+        assert!(matches!(judge(&value, &declared, &kernel), Verdict::Silent));
+    }
+
+    /// The mirror: `"ab"` (letters, outside the digit pattern) fires via
+    /// the ordinary whole-word kernel ask, quoting the string readably —
+    /// m-pydantic-schema.py:71's own row.
+    #[test]
+    fn a_string_value_outside_the_digits_pattern_fires_quoting_the_string() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let declared = digits_refinement();
+        let value = known_values(hi_points("ab"), PrimitiveKind::String, TrustProved);
+        let message = fire_message(judge(&value, &declared, &kernel));
+        assert!(message.contains("\"ab\""), "{message}");
+        assert!(message.contains("'Digits'"), "{message}");
+    }
+
+    // --- the ELEMENT LAW: dict[str, X]'s value-slot judgment ---
+
+    /// `dict[str, Age]` — the `element`-carrying declaration
+    /// `a-statements.py`'s `return_dict_members` needs, `element` set to
+    /// the same `age_refinement` every other test in this file shares.
+    fn dict_of_age_refinement() -> DeclaredRefinement {
+        DeclaredRefinement {
+            set: make_refined_set(Vec::new()),
+            spelling: "dict[str, Age]".to_owned(),
+            admits_none: false,
+            element: Some(Box::new(age_refinement())),
+        }
+    }
+
+    /// `return {"age": 200}` under `-> dict[str, Age]` — an Object with
+    /// one out-of-set member fires, naming the key so the reader sees
+    /// which member escaped ("(at key 'age')").
+    #[test]
+    fn a_dict_with_an_out_of_set_member_fires_naming_the_key() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let declared = dict_of_age_refinement();
+        let value = refined_domain::known_constructors::known_object(
+            vec![refined_domain::abstract_value::ObjectKey {
+                name: "age".to_owned(),
+                numeric: false,
+                value: known_values(vec![200.0], PrimitiveKind::Integer, TrustProved),
+            }],
+            None,
+            true,
+            TrustProved,
+            false,
+        );
+        let message = fire_message(judge(&value, &declared, &kernel));
+        assert!(message.contains("'Age'"), "{message}");
+        assert!(message.contains("(at key 'age')"), "{message}");
+    }
+
+    /// `return {"age": 40}` under `-> dict[str, Age]` — every member sits
+    /// inside the element refinement, so the whole dict is Silent.
+    #[test]
+    fn a_dict_with_every_member_in_set_is_silent() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let declared = dict_of_age_refinement();
+        let value = refined_domain::known_constructors::known_object(
+            vec![refined_domain::abstract_value::ObjectKey {
+                name: "age".to_owned(),
+                numeric: false,
+                value: known_values(vec![40.0], PrimitiveKind::Integer, TrustProved),
+            }],
+            None,
+            true,
+            TrustProved,
+            false,
+        );
+        assert!(matches!(judge(&value, &declared, &kernel), Verdict::Silent));
+    }
+
+    /// `None` against a plain (non-`Optional`) `dict[str, Age]` fires —
+    /// a dict declaration is not scalar-shaped, so this exercises the
+    /// element law's own explicit Null arm rather than the ordinary
+    /// structural law (which would decline: `declared.set` is empty for
+    /// an element-carrying declaration).
+    #[test]
+    fn none_against_a_plain_dict_declaration_fires() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let declared = dict_of_age_refinement();
+        assert!(!declared.admits_none);
+        let value = refined_domain::abstract_value::null_value();
+        let message = fire_message(judge(&value, &declared, &kernel));
+        assert!(message.contains("'dict[str, Age]'"), "{message}");
+        assert!(message.to_lowercase().contains("none"), "{message}");
+    }
+
+    /// `None` against `dict[str, Age] | None` (`admits_none` true, still
+    /// element-carrying) is Silent — the admits_none check wins before
+    /// the element law's Null arm would otherwise fire.
+    #[test]
+    fn none_against_an_admits_none_dict_declaration_is_silent() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let mut declared = dict_of_age_refinement();
+        declared.admits_none = true;
+        let value = refined_domain::abstract_value::null_value();
+        assert!(matches!(judge(&value, &declared, &kernel), Verdict::Silent));
+    }
+
+    /// A list against `dict[str, Age]` fires — the element law's own
+    /// explicit List arm, kind-worded.
+    #[test]
+    fn a_list_against_a_dict_declaration_fires() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let declared = dict_of_age_refinement();
+        let value = refined_domain::known_constructors::known_list(Vec::new(), TrustProved);
+        let message = fire_message(judge(&value, &declared, &kernel));
+        assert!(message.contains("'dict[str, Age]'"), "{message}");
+        assert!(message.to_lowercase().contains("list"), "{message}");
     }
 }

@@ -173,19 +173,25 @@ fn list_constructor_call(arguments: &[AbstractValue]) -> Option<AbstractValue> {
     Some(known_list(iterable.items.clone(), derived_trust_level(TrustSpec, arguments)))
 }
 
-/// `set(iterable)` — library/stdtypes.rst's `class:: set([iterable])`
+/// `set([iterable])` — library/stdtypes.rst's `class:: set([iterable])`
 /// constructor row: "Return a new set... object whose elements are
 /// taken from *iterable*." This domain has no dedicated set Kind (the
 /// same `Kind::List` shape a list/tuple carries, per
 /// `collection_models.rs`'s own module doc — a set's own element-
 /// uniqueness is invisible to any reader that only ever consumes the
 /// sequence via `len()`/iteration, matching that file's list/set-comp
-/// note), so this row is `list_constructor_call` under a different
-/// name; deduplication is NOT modeled (an already-List argument is
-/// assumed unique-enough for this file's callers, since a set LITERAL
-/// display is not what feeds this row — only an already-list-shaped
-/// iterable is).
+/// note). The BARE zero-argument form `set()` — the brackets in the
+/// doc's own signature mark the argument optional — answers the empty
+/// list directly (an empty set has no elements to dedupe); the
+/// one-argument form is `list_constructor_call` under a different name;
+/// deduplication is NOT modeled for the one-argument form (an already-
+/// List argument is assumed unique-enough for this file's callers,
+/// since a set LITERAL display is not what feeds this row — only an
+/// already-list-shaped iterable is).
 fn set_constructor_call(arguments: &[AbstractValue]) -> Option<AbstractValue> {
+    if arguments.is_empty() {
+        return Some(known_list(Vec::new(), TrustSpec));
+    }
     list_constructor_call(arguments)
 }
 
@@ -202,10 +208,16 @@ fn set_constructor_call(arguments: &[AbstractValue]) -> Option<AbstractValue> {
 /// the `dict(...)` constructor doc both state.
 fn dict_constructor_call(arguments: &[AbstractValue]) -> Option<AbstractValue> {
     let [pairs] = arguments else { return None };
+    // `dict(<existing dict>)` — the copy-constructor form ("providing
+    // ... another dictionary", the same class:: dict(...) row): a known
+    // Kind::Object argument answers a fresh dict with the same entries.
+    if pairs.kind == Kind::Object && pairs.kind_word.is_none() {
+        return Some(pairs.clone());
+    }
     if pairs.kind != Kind::List {
         return None;
     }
-    let mut keys: Vec<Option<String>> = Vec::with_capacity(pairs.items.len());
+    let mut keys: Vec<Option<crate::refinedpy::collection_models::DictKey>> = Vec::with_capacity(pairs.items.len());
     let mut values: Vec<AbstractValue> = Vec::with_capacity(pairs.items.len());
     for pair in &pairs.items {
         if pair.kind != Kind::List || pair.items.len() != 2 {
@@ -216,7 +228,7 @@ fn dict_constructor_call(arguments: &[AbstractValue]) -> Option<AbstractValue> {
             return None;
         }
         let key_text: String = key.values.iter().filter_map(|point| char::from_u32(*point as i64 as u32)).collect();
-        keys.push(Some(key_text));
+        keys.push(Some(crate::refinedpy::collection_models::DictKey::string(&key_text)));
         values.push(pair.items[1].clone());
     }
     // dict_literal_value's own last-value-wins overwrite rule handles a
@@ -224,6 +236,88 @@ fn dict_constructor_call(arguments: &[AbstractValue]) -> Option<AbstractValue> {
     // does — this file reaches into collection_models.rs for the one
     // shared building block rather than duplicating that merge loop
     Some(crate::refinedpy::collection_models::dict_literal_value(&keys, &values))
+}
+
+/// `iter(object)` (one-argument form, no `sentinel`) — library/functions.html#iter:
+/// "Return an iterator object... *object* must be a collection object
+/// which supports the iterable protocol." This domain has no separate
+/// iterator Kind: an iterator over a known `Kind::List` reads through
+/// as the SAME list value (the one shape a caller ever inspects it
+/// through — `next_call`'s own row below), matching the module's
+/// shared list/set/generator representation
+/// (`collection_models.rs`'s own module doc). Any other receiver
+/// shape declines.
+fn iter_call(arguments: &[AbstractValue]) -> Option<AbstractValue> {
+    let [only] = arguments else { return None };
+    if only.kind != Kind::List {
+        return None;
+    }
+    Some(only.clone())
+}
+
+/// `next(iterator)` (one-argument form, no `default`) — library/functions.html#next:
+/// "Retrieve the next item from the iterator by calling its
+/// `__next__` method." Modeled ONLY for the `iter_call`-shaped receiver
+/// (a known `Kind::List` standing in for its own iterator, per that
+/// function's own doc) AND a generator call's own answer
+/// (`Kind::List` tagged `source == "generator"`,
+/// `instances::generator_yields`'s own doc — a same-module generator
+/// `def`'s call answers the ordered List of every yielded value): the
+/// FIRST element is the first item `__next__` would ever produce off a
+/// freshly-built iterator or a freshly-called generator. An EMPTY list
+/// provably raises `StopIteration` ("If *default* is given, it is
+/// returned if the iterator is exhausted, otherwise `StopIteration` is
+/// raised") — this row declines on an empty receiver rather than answer
+/// a fabricated element; the raise itself is `provable_raise`'s own
+/// business, not this dispatcher's.
+///
+/// SCOPE: this domain carries no per-call exhaustion/position state — a
+/// generator-tagged List is a fixed VALUE (the full yield sequence),
+/// not a stateful cursor, so `next_call` cannot tell "the first read of
+/// this generator" apart from "a second read of the SAME already-
+/// advanced generator." Every corpus row this file serves calls `next`
+/// exactly once per freshly-constructed generator/iterator value
+/// (`next(some_gen())`, never `next(g); next(g)` on one bound name), so
+/// this row is honest for that shape; a second `next()` against the
+/// SAME generator value would answer element 0 again rather than
+/// element 1, which is a known gap this file does not claim to close.
+fn next_call(arguments: &[AbstractValue]) -> Option<AbstractValue> {
+    let [only] = arguments else { return None };
+    if only.kind != Kind::List {
+        return None;
+    }
+    only.items.first().cloned()
+}
+
+/// `anext(async_iterator)` (one-argument form, no `default`) — the
+/// `async`-generator twin of `next(iterator)`: library/functions.html
+/// documents `anext` as `next`'s async counterpart. `await anext(gen)`
+/// evaluates through `evaluate_expression`'s own `Expr::Await` arm
+/// (transparent unwrap — `async`/`await` carry no gate of their own,
+/// matching this file's asyncio.gather doc's identical note), so the
+/// `anext(...)` call itself lands in this dispatcher exactly like a
+/// plain `next(...)` call would. An async generator's yielded elements
+/// are the SAME `Kind::List` (tagged `source == "generator"`,
+/// `instances::generator_yields`'s own doc) a sync generator's call
+/// answers — `datamodel.rst`'s generator-iterator protocol makes no
+/// distinction between a sync and an async generator's own yielded
+/// VALUES, only in how the caller RECEIVES them (`__anext__` returns
+/// an awaitable rather than the value directly) — so this row is
+/// `next_call` under a different name, not a separate reading.
+fn anext_call(arguments: &[AbstractValue]) -> Option<AbstractValue> {
+    next_call(arguments)
+}
+
+/// `typing.cast(typ, val)` — `Lib/typing.py`'s own `cast` docstring:
+/// "This returns the value unchanged. To the type checker this signals
+/// that the return value has the designated type, but at runtime we
+/// intentionally don't check anything." `typ` is never read (a type
+/// expression, not a value this file evaluates); `val` passes through
+/// exactly, whatever shape it is — the identity function over its
+/// second argument.
+fn cast_call(arguments: &[AbstractValue]) -> Option<AbstractValue> {
+    let [_typ, val] = arguments else { return None };
+    Some(val.clone())
 }
 
 /// `min`/`max` over two or more known single-numeric arguments —
@@ -261,18 +355,77 @@ fn min_max_call(
     Some(known_values(vec![value], sort, grade))
 }
 
-/// `int(x)` on a single known numeric — library/functions.html#int:
-/// "For floating-point numbers, this truncates towards zero." An
-/// already-Integer argument is the identity read under this row (the
-/// same trunc-toward-zero rule with no fractional part to discard).
-/// `int(str)` is not modeled: a string argument is never a
-/// `single_known_numeric`, so the call declines, matching the row's
-/// own scope (numeric argument only).
+/// `int(x)` — library/functions.html#int: "For floating-point numbers,
+/// this truncates towards zero." An already-Integer argument is the
+/// identity read under this row (the same trunc-toward-zero rule with
+/// no fractional part to discard). A known EXACT STRING parses through
+/// `parse_base_ten_int_string` — the base-10 `int(string, base=10)`
+/// row (functions.rst): j-stdlib-surfaces.py's own `int_parse`,
+/// `int("40")`/`int("200")`, both exact parses this row now answers
+/// precisely rather than declining. A string that does not parse as a
+/// base-10 integer (`int("abc")`) still declines HERE — CPython raises
+/// `ValueError` for it, which `expressions.rs`'s own `call_provable_
+/// raise` speaks through the raise channel (its own `is_valid_base_
+/// ten_int_string` gate, a parallel/duplicate validity check to this
+/// row's own `parse_base_ten_int_string` — the two files stay
+/// independent per the mission's own file-ownership split, so the
+/// validity rule is written twice rather than shared across the
+/// boundary).
 fn int_call(arguments: &[AbstractValue]) -> Option<AbstractValue> {
     let [only] = arguments else { return None };
+    if only.kind == Kind::Values && only.kind_tag == Some(PrimitiveKind::String) {
+        let text: String = only.values.iter().filter_map(|point| char::from_u32(*point as i64 as u32)).collect();
+        let parsed = parse_base_ten_int_string(&text)?;
+        let grade = derived_trust_level(TrustSpec, arguments);
+        return Some(known_values(vec![parsed], PrimitiveKind::Integer, grade));
+    }
     let (value, _sort) = single_known_numeric(only)?;
     let grade = derived_trust_level(TrustSpec, arguments);
     Some(known_values(vec![value.trunc()], PrimitiveKind::Integer, grade))
+}
+
+/// `int(string, base=10)`'s exact parsed value, for the base-10
+/// default form ONLY (`int_call`'s own scope — a `base=` keyword
+/// changes the digit alphabet entirely and is not read by this row's
+/// caller, which never passes one through). functions.rst's own
+/// grammar: "the string can be preceded by + or - (with no space in
+/// between), have leading zeros, be surrounded by whitespace, and have
+/// single underscores interspersed between digits." Returns `None`
+/// (never a fabricated value) the moment the text does not parse —
+/// `call_provable_raise`'s own `is_valid_base_ten_int_string` is the
+/// row that speaks the ValueError this shape raises at runtime.
+fn parse_base_ten_int_string(text: &str) -> Option<f64> {
+    let trimmed = text.trim();
+    let negative = trimmed.starts_with('-');
+    let digits_and_underscores = trimmed.strip_prefix(['+', '-']).unwrap_or(trimmed);
+    if digits_and_underscores.is_empty() {
+        return None;
+    }
+    let chars: Vec<char> = digits_and_underscores.chars().collect();
+    if chars.first() == Some(&'_') || chars.last() == Some(&'_') {
+        return None;
+    }
+    let mut digits = String::new();
+    let mut previous_was_underscore = false;
+    for &c in &chars {
+        if c == '_' {
+            if previous_was_underscore {
+                return None;
+            }
+            previous_was_underscore = true;
+            continue;
+        }
+        if !c.is_ascii_digit() {
+            return None;
+        }
+        digits.push(c);
+        previous_was_underscore = false;
+    }
+    if digits.is_empty() {
+        return None;
+    }
+    let magnitude: f64 = digits.parse().ok()?;
+    Some(if negative { -magnitude } else { magnitude })
 }
 
 /// `float(x)` on a single known numeric — library/functions.html#float:
@@ -311,13 +464,25 @@ fn chr_call(arguments: &[AbstractValue]) -> Option<AbstractValue> {
 
 /// `str(object)` — library/stdtypes.rst's `class:: str(object='')`
 /// constructor row: "Return a string version of *object*." Modeled for
-/// two known argument shapes only: an exact string (the identity
+/// three known argument shapes: an exact string (the identity
 /// conversion — `str(word)` answers `word` unchanged, per the same
 /// row's own "If *object* already is a string, it is returned
-/// unchanged" behavior) and a known Integer (CPython's plain decimal
+/// unchanged" behavior), a known Integer (CPython's plain decimal
 /// spelling, no `.0` — the same integer-spelling rule
 /// `expressions.rs`'s f-string composition already establishes for an
-/// interpolated Integer). A known FLOAT argument is NOT modeled: the
+/// interpolated Integer), and a known EXCEPTION instance
+/// (`expressions.rs`'s `exception_construction_value`, tagged
+/// `source == "exception"`, one `args` field holding the constructor's
+/// own positional arguments as a `Kind::List`) whose FIRST argument is
+/// a known exact string — `str(Exception(message))` answers `message`
+/// unchanged: `Doc/tutorial/errors.rst`, "Errors and Exceptions" §8.3,
+/// "the exception instance... typically has an `args` attribute...
+/// builtin exception types define `__str__` to print all the
+/// arguments." A single-string-argument exception's `__str__` is
+/// exactly that one string (CPython's own `BaseException.__str__`:
+/// zero args -> `''`, one arg -> `str(args[0])`, 2+ args -> the
+/// `repr()` of the whole tuple — only the one-string-argument row is
+/// modeled here). A known FLOAT argument is NOT modeled: the
 /// repr-shortest spelling `format_py_number` builds lives in the
 /// `refined_sets` crate, out of this file's own dependency edge for
 /// this wave, so `str(float)` declines rather than half-build that
@@ -327,6 +492,9 @@ fn str_call(arguments: &[AbstractValue]) -> Option<AbstractValue> {
     if only.kind == Kind::Values && only.kind_tag == Some(PrimitiveKind::String) {
         return Some(only.clone());
     }
+    if only.kind == Kind::Object && only.source == "exception" {
+        return exception_single_string_message(only);
+    }
     let (value, sort) = single_known_numeric(only)?;
     if sort != PrimitiveKind::Integer {
         return None;
@@ -334,6 +502,26 @@ fn str_call(arguments: &[AbstractValue]) -> Option<AbstractValue> {
     let spelled = format!("{}", value as i64);
     let code_points: Vec<f64> = spelled.chars().map(|c| c as u32 as f64).collect();
     Some(known_values(code_points, PrimitiveKind::String, TrustSpec))
+}
+
+/// The exact message `str()` of a known exception instance answers, for
+/// the ONE constructor-argument shape this file models: an `args`
+/// field (`expressions.rs`'s own exception-construction tag) holding a
+/// `Kind::List` of exactly one known exact-string element —
+/// `BaseException.__str__`'s one-argument row (this function's own
+/// caller doc). Any other `args` shape (zero elements, 2+ elements, a
+/// non-string element) declines — this file does not build the `repr()`
+/// spelling a multi-argument `__str__` would need.
+fn exception_single_string_message(instance: &AbstractValue) -> Option<AbstractValue> {
+    let args = &instance.keys.iter().find(|key| key.name == "args")?.value;
+    if args.kind != Kind::List {
+        return None;
+    }
+    let [only] = args.items.as_slice() else { return None };
+    if only.kind == Kind::Values && only.kind_tag == Some(PrimitiveKind::String) {
+        return Some(only.clone());
+    }
+    None
 }
 
 /// The dispatcher: a call to Python builtin `function` with already-
@@ -368,6 +556,10 @@ pub fn builtin_call_result(function: &str, arguments: &[AbstractValue]) -> Optio
         "dict" => dict_constructor_call(arguments),
         "chr" => chr_call(arguments),
         "str" => str_call(arguments),
+        "iter" => iter_call(arguments),
+        "next" => next_call(arguments),
+        "anext" => anext_call(arguments),
+        "cast" => cast_call(arguments),
         // `type(object)` (one-argument form) — library/functions.html#type:
         // "With one argument, return the type of an object." This domain
         // has no type-object Kind, so the answer is opaque — the honest
@@ -438,14 +630,29 @@ mod tests {
     }
 
     #[test]
-    fn int_of_string_declines() {
-        let string_argument = known_values(
-            vec![55.0, 53.0],
-            PrimitiveKind::String,
-            TrustSpec,
-        );
+    fn int_of_a_base_ten_digit_string_parses_the_exact_value() {
+        // int("75") == 75 — j-stdlib-surfaces.py's own int_parse row
+        let string_argument = known_values(vec![55.0, 53.0], PrimitiveKind::String, TrustSpec);
+        let got = builtin_call_result("int", &[string_argument]).expect("int(\"75\") models");
+        assert_eq!(got.values, vec![75.0]);
+        assert_eq!(got.kind_tag, Some(PrimitiveKind::Integer));
+    }
+
+    #[test]
+    fn int_of_a_non_numeric_string_declines() {
+        // int("abc") raises ValueError at runtime — this row never
+        // fabricates a value for it; the raise itself is
+        // expressions.rs's call_provable_raise's own business
+        let string_argument = string_value("abc");
         let got = builtin_call_result("int", &[string_argument]);
-        assert!(got.is_none(), "int(str) should decline: {got:?}");
+        assert!(got.is_none(), "int(\"abc\") should decline: {got:?}");
+    }
+
+    #[test]
+    fn int_of_a_negative_digit_string_parses_the_exact_negative_value() {
+        let string_argument = string_value("-7");
+        let got = builtin_call_result("int", &[string_argument]).expect("int(\"-7\") models");
+        assert_eq!(got.values, vec![-7.0]);
     }
 
     #[test]
@@ -548,6 +755,13 @@ mod tests {
     }
 
     #[test]
+    fn set_bare_constructor_answers_the_empty_list() {
+        let got = builtin_call_result("set", &[]).expect("set() models");
+        assert_eq!(got.kind, Kind::List);
+        assert_eq!(got.items.len(), 0);
+    }
+
+    #[test]
     fn dict_constructor_from_pairs() {
         let pair_a = known_list(vec![string_value("ann"), integer(40.0)], TrustSpec);
         let pair_b = known_list(vec![string_value("bea"), integer(200.0)], TrustSpec);
@@ -588,5 +802,103 @@ mod tests {
     fn unmodeled_name_declines() {
         let got = builtin_call_result("print", &[integer(3.0)]);
         assert!(got.is_none(), "an unmodeled builtin name should decline: {got:?}");
+    }
+
+    #[test]
+    fn iter_of_a_known_list_reads_as_the_same_list() {
+        let list = known_list(vec![integer(1.0), integer(2.0)], TrustSpec);
+        let got = builtin_call_result("iter", &[list.clone()]).expect("iter([...]) models");
+        assert_eq!(got, list);
+    }
+
+    #[test]
+    fn iter_of_a_non_list_declines() {
+        let got = builtin_call_result("iter", &[integer(1.0)]);
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn next_of_iter_of_a_known_list_answers_the_first_element() {
+        let list = known_list(vec![integer(1.0), integer(2.0)], TrustSpec);
+        let iterator = builtin_call_result("iter", &[list]).expect("iter([...]) models");
+        let got = builtin_call_result("next", &[iterator]).expect("next(iter([...])) models");
+        assert_eq!(got, integer(1.0));
+    }
+
+    #[test]
+    fn next_of_an_empty_list_declines() {
+        let empty = known_list(vec![], TrustSpec);
+        let got = builtin_call_result("next", &[empty]);
+        assert!(got.is_none(), "next() over an empty iterator should decline: {got:?}");
+    }
+
+    /// `anext` — the async twin of `next`, e-class-and-function.py's own
+    /// `async_generator_first_value`/`generator_first_value` pair: a
+    /// generator-tagged List (or a plain iterator List) answers its
+    /// first element identically whether read through `next` or `anext`.
+    #[test]
+    fn anext_of_a_generator_tagged_list_answers_the_first_yielded_value() {
+        let mut generator = known_list(vec![integer(40.0), integer(41.0)], TrustSpec);
+        generator.source = "generator".to_owned();
+        let got = builtin_call_result("anext", &[generator]).expect("anext(generator) models");
+        assert_eq!(got, integer(40.0));
+    }
+
+    #[test]
+    fn anext_of_an_empty_list_declines() {
+        let empty = known_list(vec![], TrustSpec);
+        let got = builtin_call_result("anext", &[empty]);
+        assert!(got.is_none(), "anext() over an empty generator should decline: {got:?}");
+    }
+
+    #[test]
+    fn cast_returns_the_value_argument_unchanged() {
+        // the `typ` argument is never read by `cast` — an unknown value
+        // there does not block the answer
+        let unread_type_argument = AbstractValue::default();
+        let got = builtin_call_result("cast", &[unread_type_argument, integer(200.0)]).expect("cast(...) models");
+        assert_eq!(got, integer(200.0));
+    }
+
+    #[test]
+    fn cast_wrong_arity_declines() {
+        let got = builtin_call_result("cast", &[integer(200.0)]);
+        assert!(got.is_none());
+    }
+
+    fn exception_instance(message: &str) -> AbstractValue {
+        let args = known_list(vec![string_value(message)], TrustSpec);
+        let mut instance = known_object_helper(vec![("args", args)]);
+        instance.source = "exception".to_owned();
+        instance
+    }
+
+    fn known_object_helper(entries: Vec<(&str, AbstractValue)>) -> AbstractValue {
+        use refined_domain::abstract_value::ObjectKey;
+        use refined_domain::known_constructors::known_object;
+        let keys = entries
+            .into_iter()
+            .map(|(name, value)| ObjectKey { name: name.to_owned(), numeric: false, value })
+            .collect();
+        known_object(keys, None, true, TrustSpec, false)
+    }
+
+    #[test]
+    fn str_of_a_single_string_argument_exception_answers_the_message() {
+        let instance = exception_instance("failure");
+        let got = builtin_call_result("str", &[instance]).expect("str(Exception(...)) models");
+        assert_eq!(exact_text(&got), "failure");
+    }
+
+    fn exact_text(value: &AbstractValue) -> String {
+        value.values.iter().filter_map(|point| char::from_u32(*point as i64 as u32)).collect()
+    }
+
+    #[test]
+    fn str_of_an_exception_with_no_args_declines() {
+        let mut instance = known_object_helper(vec![("args", known_list(vec![], TrustSpec))]);
+        instance.source = "exception".to_owned();
+        let got = builtin_call_result("str", &[instance]);
+        assert!(got.is_none(), "a zero-argument exception's __str__ (empty string) is not modeled: {got:?}");
     }
 }

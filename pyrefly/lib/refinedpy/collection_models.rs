@@ -26,8 +26,8 @@
 //!
 //! `dict` maps to `Kind::Object` (`known_constructors::known_object`,
 //! "rooted-keys record") — an ordered `Vec<ObjectKey>` of
-//! `{name: String, value: AbstractValue}` pairs, never a JS-style
-//! prototype-bearing map. This is a deliberate choice over
+//! `{name: String, numeric: bool, value: AbstractValue}` pairs, never
+//! a JS-style prototype-bearing map. This is a deliberate choice over
 //! `Kind::Collection`/`Flavor::Map` (`abstract_value.rs`): the
 //! `Collection`/`Flavor` pair is the TS twin's carry-over for a JS
 //! `Map`/`Set` INSTANCE built via `new Map()` — the AGENT-BRIEF's
@@ -40,13 +40,23 @@
 //! (`dict(...)`, a comprehension) is out of this file's scope — only
 //! `dict_literal_value` (a literal `{...}` display) is modeled.
 //!
-//! String-keyed entries only: a Python dict key that is not a string
-//! literal (an int key, a computed key, a tuple key) has no slot in
-//! `ObjectKey.name: String` to occupy. `dict_literal_value` takes
-//! `keys: &[Option<String>]` — `None` at a position means "this key
-//! is not a string literal" — and that entire literal answers
-//! `unknown()` rather than silently dropping the non-string entry
-//! (dropping would misreport the dict's key set to every later read).
+//! String- and int-keyed entries: a Python dict key that is a string
+//! literal OR a single known `Integer`-sorted value has a slot in
+//! `ObjectKey` — `ObjectKey.name` carries the key's spelling (a
+//! string's own text, or an int key's plain decimal digits) and
+//! `ObjectKey.numeric` tells the two apart (`abstract_value.rs`'s own
+//! `ObjectKey` doc: an int key and a string key of the same spelling
+//! are DIFFERENT Python dict keys — `1 == "1"` is `False`). Any other
+//! key shape (a computed key this file cannot reduce to one of those
+//! two sorts, a tuple key, a float/bool key — this domain does not
+//! yet fold `1.0`/`True` into the same slot `1` occupies, per
+//! stdtypes.rst's "values that compare equal... can be used
+//! interchangeably") has no slot to occupy: `dict_literal_value` takes
+//! `keys: &[Option<DictKey>]` — `None` at a position means "this key
+//! expression is not a supported literal" — and that entire literal
+//! answers `unknown()` rather than silently dropping the unsupported
+//! entry (dropping would misreport the dict's key set to every later
+//! read).
 //!
 //! `len()` is modeled for known lists/tuples/dicts (their slot/key
 //! count) and exact strings (`values.len()`, one code point per
@@ -107,26 +117,67 @@ pub fn tuple_literal_value(elements: &[AbstractValue]) -> AbstractValue {
     known_list(elements.to_vec(), TrustProved)
 }
 
-/// A Python `dict` display (`{k: v, ...}`) with STRING-LITERAL keys
-/// only. `keys[i]` is the string a key expression displayed as a
-/// literal; `None` at a position means that key expression was not a
-/// string literal (an int key, a computed key, an f-string key, a
-/// `**spread` entry) — this domain's `ObjectKey.name` has no slot for
-/// a non-string key, so the presence of even one `None` makes the
-/// WHOLE literal `unknown()` rather than silently omitting that one
-/// entry (an omission would misreport the dict's key set to every
-/// later `subscript_read`/`dict_get_result`/`len_result` call, which
-/// is worse than declining outright).
+/// One dict-display key's spelling and sort: a plain string key
+/// (`numeric: false`, `name` is the string's own text) or an int key
+/// (`numeric: true`, `name` is the key's plain decimal spelling, e.g.
+/// `"15"` for the key `15`) — the same (name, numeric) identity pair
+/// `ObjectKey` carries (`abstract_value.rs`'s own doc), read here
+/// before the value side of a dict-display/comprehension row is known.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DictKey {
+    pub name: String,
+    pub numeric: bool,
+}
+
+impl DictKey {
+    /// A plain string key, `numeric: false` — the ordinary case every
+    /// existing string-literal-keyed dict display/constructor call
+    /// builds.
+    pub fn string(text: &str) -> DictKey {
+        DictKey {
+            name: text.to_owned(),
+            numeric: false,
+        }
+    }
+
+    /// An int key's plain decimal spelling, `numeric: true` — built
+    /// from the key expression's own known Integer value
+    /// (`format!("{}", value as i64)`, the same bare-integer spelling
+    /// `expressions.rs`'s own `format_integer_spelling` builds for an
+    /// f-string interpolation: Python's `str()` of an int has no
+    /// decimal point).
+    pub fn integer(value: i64) -> DictKey {
+        DictKey {
+            name: format!("{value}"),
+            numeric: true,
+        }
+    }
+}
+
+/// A Python `dict` display (`{k: v, ...}`) with STRING-LITERAL or known
+/// single-Integer keys. `keys[i]` is the key expression's own
+/// `DictKey` spelling; `None` at a position means that key expression
+/// was not one of the two supported shapes (a computed key, an
+/// f-string key, a float/bool/tuple key, a `**spread` entry) — this
+/// domain's `ObjectKey.name`/`numeric` pair has no slot for any other
+/// key shape, so the presence of even one `None` makes the WHOLE
+/// literal `unknown()` rather than silently omitting that one entry
+/// (an omission would misreport the dict's key set to every later
+/// `subscript_read`/`dict_get_result`/`len_result` call, which is
+/// worse than declining outright).
 ///
 /// `keys` and `values` are the same length, one key AbstractValue per
 /// value at the same index — the caller's own walk of the dict
-/// display's key/value expression pairs. A duplicate string key
-/// follows CPython's own "if a key occurs more than once, the last
-/// value... becomes the corresponding value" rule
+/// display's key/value expression pairs. A duplicate key (same name
+/// AND same numeric-ness) follows CPython's own "if a key occurs more
+/// than once, the last value... becomes the corresponding value" rule
 /// (library/stdtypes.rst, `dict(...)` constructor doc, the same rule
 /// a literal display honors): this function keeps the LAST ObjectKey
-/// entry for a repeated name, matching that overwrite.
-pub fn dict_literal_value(keys: &[Option<String>], values: &[AbstractValue]) -> AbstractValue {
+/// entry for a repeated key. A string key and an int key of the same
+/// spelling (`"15"` and `15`) are NOT a repeat — they hold two
+/// separate entries, matching CPython's own `1 == "1"` being `False`
+/// (`abstract_value.rs`'s own `ObjectKey` doc).
+pub fn dict_literal_value(keys: &[Option<DictKey>], values: &[AbstractValue]) -> AbstractValue {
     if keys.len() != values.len() {
         return unknown();
     }
@@ -135,14 +186,17 @@ pub fn dict_literal_value(keys: &[Option<String>], values: &[AbstractValue]) -> 
     }
     let mut entries: Vec<ObjectKey> = Vec::new();
     for (key, value) in keys.iter().zip(values.iter()) {
-        let name = key.clone().expect("checked above: no None key remains");
+        let key = key.clone().expect("checked above: no None key remains");
         // last-value-wins on a repeated key, matching CPython's own
-        // dict-display overwrite rule
-        if let Some(existing) = entries.iter_mut().find(|entry| entry.name == name) {
+        // dict-display overwrite rule — a string key and a numeric key
+        // of the same spelling are DIFFERENT keys, so both `name` AND
+        // `numeric` must match for this to be a repeat
+        if let Some(existing) = entries.iter_mut().find(|entry| entry.name == key.name && entry.numeric == key.numeric) {
             existing.value = value.clone();
         } else {
             entries.push(ObjectKey {
-                name,
+                name: key.name,
+                numeric: key.numeric,
                 value: value.clone(),
             });
         }
@@ -186,6 +240,26 @@ fn known_string_key(value: &AbstractValue) -> Option<String> {
     )
 }
 
+/// An already-evaluated subscript/read index, read as a dict key: a
+/// known exact String reads as an ordinary string key (`numeric:
+/// false`), a known single Integer-sorted value reads as an int key
+/// (`numeric: true`, `DictKey::integer`'s own plain-decimal spelling)
+/// — the same two key sorts `dict_literal_value` accepts, so a
+/// `d[15]` subscript read matches the exact entry `{15: ...}` built.
+/// Boolean-sorted values are NOT accepted here, matching
+/// `known_integer_index`'s own scope note (no row in this file's
+/// corpus band needs `d[True]`). Any other shape (unknown, Float,
+/// String not exact) answers `None`.
+fn known_dict_key(value: &AbstractValue) -> Option<DictKey> {
+    if let Some(text) = known_string_key(value) {
+        return Some(DictKey::string(&text));
+    }
+    if value.kind == Kind::Values && value.values.len() == 1 && value.kind_tag == Some(PrimitiveKind::Integer) {
+        return Some(DictKey::integer(value.values[0] as i64));
+    }
+    None
+}
+
 /// `container[index]` on a known LIST/TUPLE receiver (`Kind::List`)
 /// with a known Integer index: negative indexing adjusts by the
 /// list's own length first (expressions.rst, "Subscriptions" —
@@ -206,25 +280,30 @@ fn list_index_read(items: &[AbstractValue], index: i64) -> Option<AbstractValue>
 }
 
 /// `container[key]` on a known DICT receiver (`Kind::Object`) with a
-/// known string key: the value at that key's `ObjectKey` entry, or
-/// `None` if no entry carries that name — `d[key]` raises `KeyError`
-/// on a miss (library/stdtypes.rst, dict's `d[key]` row), which this
-/// domain has no channel for this wave, matching the list/tuple
-/// out-of-range row's same honesty.
-fn dict_key_read(keys: &[ObjectKey], key: &str) -> Option<AbstractValue> {
+/// known string OR int key: the value at that key's `ObjectKey` entry
+/// — matched by BOTH `name` and `numeric` (a string key and an int key
+/// of the same spelling are different entries, `ObjectKey`'s own doc)
+/// — or `None` if no entry carries that identity. `d[key]` raises
+/// `KeyError` on a miss (library/stdtypes.rst, dict's `d[key]` row),
+/// which this domain has no channel for this wave, matching the
+/// list/tuple out-of-range row's same honesty.
+fn dict_key_read(keys: &[ObjectKey], key: &DictKey) -> Option<AbstractValue> {
     keys.iter()
-        .find(|entry| entry.name == key)
+        .find(|entry| entry.name == key.name && entry.numeric == key.numeric)
         .map(|entry| entry.value.clone())
 }
 
 /// `container[index]` — the subscription read (expressions.rst,
 /// "Subscriptions"): a known list/tuple (`Kind::List`) with a known
 /// Integer index, or a known dict (`Kind::Object`) with a known
-/// String-sorted key. Every other receiver shape or index/key shape
-/// answers `None` — an unknown receiver, a non-Integer index into a
-/// list, a non-String key into a dict, or a slice — none of those are
-/// modeled here and this function declines honestly rather than
-/// guessing.
+/// String- or Integer-sorted key (`known_dict_key`'s own doc — an
+/// Object receiver keyed numerically is still a DICT read, never the
+/// list/tuple positional-index path above: the two receiver kinds
+/// never share one dispatch arm). Every other receiver shape or
+/// index/key shape answers `None` — an unknown receiver, a non-Integer
+/// index into a list, an unsupported key sort into a dict, or a slice
+/// — none of those are modeled here and this function declines
+/// honestly rather than guessing.
 pub fn subscript_read(container: &AbstractValue, index: &AbstractValue) -> Option<AbstractValue> {
     match container.kind {
         Kind::List => {
@@ -232,7 +311,7 @@ pub fn subscript_read(container: &AbstractValue, index: &AbstractValue) -> Optio
             list_index_read(&container.items, position)
         }
         Kind::Object => {
-            let key = known_string_key(index)?;
+            let key = known_dict_key(index)?;
             dict_key_read(&container.keys, &key)
         }
         _ => None,
@@ -273,8 +352,8 @@ pub fn len_result(container: &AbstractValue) -> Option<AbstractValue> {
 /// `abstract_value.rs`) standing in for Python's `None` — the same
 /// exactly-null admission the Lean kernel's AbsentMark split carries
 /// (`null_value`'s own doc). Only a known-`Kind::Object` receiver
-/// with a known-String key is modeled; every other shape answers
-/// `None`.
+/// with a known String- or Integer-sorted key (`known_dict_key`'s own
+/// doc) is modeled; every other shape answers `None`.
 pub fn dict_get_result(
     container: &AbstractValue,
     key: &AbstractValue,
@@ -283,8 +362,8 @@ pub fn dict_get_result(
     if container.kind != Kind::Object {
         return None;
     }
-    let key_text = known_string_key(key)?;
-    if let Some(found) = dict_key_read(&container.keys, &key_text) {
+    let key = known_dict_key(key)?;
+    if let Some(found) = dict_key_read(&container.keys, &key) {
         return Some(found);
     }
     Some(match default {
@@ -294,29 +373,64 @@ pub fn dict_get_result(
 }
 
 /// `dict[key] = value` — the written-through dict, known shapes only:
-/// a known `Kind::Object` receiver and a known String-sorted key. The
-/// new entry overwrites a same-named existing entry (an ordinary
-/// assignment, not the dict-DISPLAY's own duplicate-literal-key rule,
-/// but the same last-value-wins effect); an absent key appends a new
-/// entry in insertion order, matching `dict.__setitem__`'s own
-/// behavior (library/stdtypes.rst, "Mapping Types — dict": "`d[key] =
-/// value` — Set `d[key]` to *value*"). `None` for any other receiver
-/// or a non-String key — the write is not modeled, so the caller must
-/// not assume the container is unchanged.
+/// a known `Kind::Object` receiver and a known String- or
+/// Integer-sorted key (`known_dict_key`'s own doc). The new entry
+/// overwrites a same-IDENTITY existing entry (matched by BOTH `name`
+/// and `numeric`, an ordinary assignment, not the dict-DISPLAY's own
+/// duplicate-literal-key rule, but the same last-value-wins effect);
+/// an absent key appends a new entry in insertion order, matching
+/// `dict.__setitem__`'s own behavior (library/stdtypes.rst, "Mapping
+/// Types — dict": "`d[key] = value` — Set `d[key]` to *value*"). `None`
+/// for any other receiver or an unsupported key sort — the write is
+/// not modeled, so the caller must not assume the container is
+/// unchanged.
 pub fn dict_with_item(receiver: &AbstractValue, key: &AbstractValue, value: &AbstractValue) -> Option<AbstractValue> {
     if receiver.kind != Kind::Object {
         return None;
     }
-    let key_text = known_string_key(key)?;
+    let key = known_dict_key(key)?;
     let mut entries = receiver.keys.clone();
-    if let Some(existing) = entries.iter_mut().find(|entry| entry.name == key_text) {
+    if let Some(existing) = entries.iter_mut().find(|entry| entry.name == key.name && entry.numeric == key.numeric) {
         existing.value = value.clone();
     } else {
         entries.push(ObjectKey {
-            name: key_text,
+            name: key.name,
+            numeric: key.numeric,
             value: value.clone(),
         });
     }
+    Some(known_object(entries, None, true, TrustProved, false))
+}
+
+/// `del d[key]` — the written-through dict with `key`'s own entry
+/// removed: a known `Kind::Object` receiver and a known String-sorted
+/// key that IS present (library/simple_stmts.rst's own `del` entry:
+/// "Deletion of a name removes the binding of that name... Deletion of
+/// items... follows the semantics defined for `object.__delitem__()`" —
+/// dict's `__delitem__` in turn is `d[key]`'s own removal counterpart,
+/// stdtypes.rst's Mapping Types table). `None` for any other receiver
+/// or a non-String key (the write is not modeled), AND for a key that
+/// is ABSENT — CPython raises `KeyError` on `del` of a missing key
+/// (the same raise `d[key]` itself raises, stdtypes.rst's `d[key]`
+/// row), so an absent-key `del` is `provable_raise`'s own row to speak
+/// (its existing `known_container_index_absent` check already reads
+/// this exact container/key pair for the ordinary subscript-read raise)
+/// rather than this function inventing a second decline message for
+/// the identical fact.
+pub fn dict_without_item(receiver: &AbstractValue, key: &AbstractValue) -> Option<AbstractValue> {
+    if receiver.kind != Kind::Object {
+        return None;
+    }
+    let key = known_dict_key(key)?;
+    if !receiver.keys.iter().any(|entry| entry.name == key.name && entry.numeric == key.numeric) {
+        return None;
+    }
+    let entries: Vec<ObjectKey> = receiver
+        .keys
+        .iter()
+        .filter(|entry| !(entry.name == key.name && entry.numeric == key.numeric))
+        .cloned()
+        .collect();
     Some(known_object(entries, None, true, TrustProved, false))
 }
 
@@ -365,7 +479,8 @@ pub fn list_with_item(receiver: &AbstractValue, index: &AbstractValue, value: &A
 ///   *s*" — no-arg defaults to the LAST item), `clear()` ("removes all
 ///   items from *s*"), `remove(x)` ("removes the first item from *s*
 ///   where `s[i]` is equal to *x*" — an ABSENT element declines rather
-///   than mutate on the real call's `ValueError`).
+///   than mutate on the real call's `ValueError`), `sort()` (ascending,
+///   known single-numeric elements only), `reverse()` (in place).
 /// - set: `add(elem)` ("Add element *elem* to the set"), `discard(elem)`
 ///   ("Remove element *elem* from the set if it is present" — silent
 ///   no-op on a miss), `remove(elem)` ("Remove element *elem* from the
@@ -390,11 +505,17 @@ pub fn list_with_item(receiver: &AbstractValue, index: &AbstractValue, value: &A
 ///   raise-not-mutate honesty), `popitem()` ("Remove and return a
 ///   `(key, value)` pair... in LIFO order" — the LAST inserted entry).
 ///
-/// `list.sort`/`list.reverse` are NOT modeled: they reorder without
-/// changing the multiset of elements, which the mission's own row list
-/// does not name and this file does not invent. `list`/`set` share the
-/// identical `Kind::List` receiver shape (this file's own module doc),
-/// so `add`/`discard`/`remove`/`update` on a plain-list receiver would
+/// `list.sort()` (no `key=`/`reverse=` keyword arguments) sorts a known
+/// list of known single-numeric elements ascending, the same order
+/// `builtin_models::sorted_call` already reads for the free function —
+/// `list.sort(*, key=None, reverse=False)`: "This method sorts the list
+/// in place, using only `<` comparisons between items" (stdtypes.rst).
+/// `list.reverse()` reverses a known list's elements in place —
+/// stdtypes.rst's Mutable-Sequence-Types table, `s.reverse()`:
+/// "reverses the items of *s* in place." Both answer `null_value()` as
+/// the call result (neither method returns a value). `list`/`set` share
+/// the identical `Kind::List` receiver shape (this file's own module
+/// doc), so `add`/`discard`/`remove`/`update` on a plain-list receiver
 /// also answer through the same rows — this domain has no separate set
 /// Kind to gate that on, and the method NAME is the only signal that a
 /// call is set-shaped.
@@ -514,8 +635,49 @@ fn list_mutated_receiver(method: &str, receiver: &AbstractValue, arguments: &[Ab
             let items = remove_first_element(&receiver.items, element)?;
             Some((list_literal_value(&items), null_value()))
         }
+        // `list.sort(*, key=None, reverse=False)` — the no-keyword-argument
+        // default row: ascending order, only `<` comparisons over known
+        // single-numeric elements (stdtypes.rst's own method entry).
+        "sort" if arguments.is_empty() => {
+            let sorted_items = sorted_numeric_items(&receiver.items)?;
+            Some((list_literal_value(&sorted_items), null_value()))
+        }
+        // `list.reverse()` — "reverses the items of *s* in place"
+        // (stdtypes.rst's Mutable-Sequence-Types table, `s.reverse()`).
+        "reverse" if arguments.is_empty() => {
+            let mut items = receiver.items.clone();
+            items.reverse();
+            Some((list_literal_value(&items), null_value()))
+        }
         _ => None,
     }
+}
+
+/// `items` sorted ascending by numeric value, or `None` the moment one
+/// element is not a single known Integer/Float/Boolean-sorted value —
+/// the same "known numeric elements only" acceptance
+/// `builtin_models::sorted_call` reads for the free `sorted()` function,
+/// repeated here rather than reaching across the crate boundary for one
+/// small helper (this file owns no dependency on `builtin_models.rs`).
+fn sorted_numeric_items(items: &[AbstractValue]) -> Option<Vec<AbstractValue>> {
+    let mut pairs: Vec<(f64, AbstractValue)> = Vec::with_capacity(items.len());
+    for element in items {
+        if element.kind != Kind::Values {
+            return None;
+        }
+        if element.values.len() != 1 {
+            return None;
+        }
+        if !matches!(
+            element.kind_tag,
+            Some(PrimitiveKind::Integer) | Some(PrimitiveKind::Float) | Some(PrimitiveKind::Boolean)
+        ) {
+            return None;
+        }
+        pairs.push((element.values[0], element.clone()));
+    }
+    pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).expect("known numeric values are never NaN"));
+    Some(pairs.into_iter().map(|(_, value)| value).collect())
 }
 
 /// Whether `needle` is a member of `items` by exact-value equality —
@@ -529,6 +691,16 @@ fn list_mutated_receiver(method: &str, receiver: &AbstractValue, arguments: &[Ab
 /// would invert the existing `expressions.rs -> collection_models.rs`
 /// direction into a cycle).
 fn element_contains(items: &[AbstractValue], needle: &AbstractValue) -> Option<bool> {
+    // an EMPTY collection contains nothing, regardless of the needle's
+    // own shape — this is trivially true by the definition of
+    // membership, so a needle this file otherwise cannot compare
+    // equality for (e.g. a class instance, `Kind::Object`) still
+    // answers `false` against an empty receiver rather than declining
+    // (weakref.WeakSet's own `bag.add(key)` on a freshly-built empty
+    // set, `expressions.rs`'s corpus this function serves).
+    if items.is_empty() {
+        return Some(false);
+    }
     if needle.kind != Kind::Values {
         return None;
     }
@@ -583,7 +755,10 @@ fn dict_mutated_receiver(method: &str, receiver: &AbstractValue, arguments: &[Ab
             }
             let mut entries = receiver.keys.clone();
             for incoming in &other.keys {
-                if let Some(existing) = entries.iter_mut().find(|entry| entry.name == incoming.name) {
+                if let Some(existing) = entries
+                    .iter_mut()
+                    .find(|entry| entry.name == incoming.name && entry.numeric == incoming.numeric)
+                {
                     existing.value = incoming.value.clone();
                 } else {
                     entries.push(incoming.clone());
@@ -598,14 +773,15 @@ fn dict_mutated_receiver(method: &str, receiver: &AbstractValue, arguments: &[Ab
                 [key, default] => (key, Some(default)),
                 _ => return None,
             };
-            let key_text = known_string_key(key_expr)?;
-            if let Some(found) = dict_key_read(&receiver.keys, &key_text) {
+            let key = known_dict_key(key_expr)?;
+            if let Some(found) = dict_key_read(&receiver.keys, &key) {
                 return Some((receiver.clone(), found));
             }
             let default_value = default.cloned().unwrap_or_else(null_value);
             let mut entries = receiver.keys.clone();
             entries.push(ObjectKey {
-                name: key_text,
+                name: key.name,
+                numeric: key.numeric,
                 value: default_value.clone(),
             });
             Some((known_object(entries, None, true, TrustProved, false), default_value))
@@ -616,9 +792,14 @@ fn dict_mutated_receiver(method: &str, receiver: &AbstractValue, arguments: &[Ab
                 [key, default] => (key, Some(default)),
                 _ => return None,
             };
-            let key_text = known_string_key(key_expr)?;
-            if let Some(found) = dict_key_read(&receiver.keys, &key_text) {
-                let entries: Vec<ObjectKey> = receiver.keys.iter().filter(|entry| entry.name != key_text).cloned().collect();
+            let key = known_dict_key(key_expr)?;
+            if let Some(found) = dict_key_read(&receiver.keys, &key) {
+                let entries: Vec<ObjectKey> = receiver
+                    .keys
+                    .iter()
+                    .filter(|entry| !(entry.name == key.name && entry.numeric == key.numeric))
+                    .cloned()
+                    .collect();
                 return Some((known_object(entries, None, true, TrustProved, false), found));
             }
             // an absent key with no default RAISES KeyError — this row
@@ -630,7 +811,12 @@ fn dict_mutated_receiver(method: &str, receiver: &AbstractValue, arguments: &[Ab
         "popitem" if arguments.is_empty() => {
             let last = receiver.keys.last()?.clone();
             let entries: Vec<ObjectKey> = receiver.keys[..receiver.keys.len() - 1].to_vec();
-            let pair = list_literal_value(&[string_key_value(&last.name), last.value]);
+            let key_value = if last.numeric {
+                integer_key_value(&last.name)?
+            } else {
+                string_key_value(&last.name)
+            };
+            let pair = list_literal_value(&[key_value, last.value]);
             Some((known_object(entries, None, true, TrustProved, false), pair))
         }
         _ => None,
@@ -647,6 +833,18 @@ fn string_key_value(text: &str) -> AbstractValue {
     known_values(code_points, PrimitiveKind::String, TrustProved)
 }
 
+/// An Integer-sorted AbstractValue for `popitem`'s `(key, value)` pair
+/// when the popped entry is a numeric-keyed dict slot (`ObjectKey.name`
+/// is the key's own plain decimal spelling, `DictKey::integer`'s own
+/// doc) — parses the digits back to the `f64` the domain's Integer
+/// values carry. `None` only if `name` is not a valid decimal spelling,
+/// which never happens for an entry this file itself built via
+/// `DictKey::integer`.
+fn integer_key_value(name: &str) -> Option<AbstractValue> {
+    let parsed: i64 = name.parse().ok()?;
+    Some(known_values(vec![parsed as f64], PrimitiveKind::Integer, TrustProved))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -658,6 +856,10 @@ mod tests {
     fn string(text: &str) -> AbstractValue {
         let code_points: Vec<f64> = text.chars().map(|c| c as u32 as f64).collect();
         known_values(code_points, PrimitiveKind::String, TrustProved)
+    }
+
+    fn key(text: &str) -> DictKey {
+        DictKey::string(text)
     }
 
     // --- literal round-trips ---
@@ -679,7 +881,7 @@ mod tests {
     #[test]
     fn dict_literal_round_trips_string_keyed_entries() {
         let built = dict_literal_value(
-            &[Some("a".to_string()), Some("b".to_string())],
+            &[Some(key("a")), Some(key("b"))],
             &[integer(1.0), integer(2.0)],
         );
         assert_eq!(built.kind, Kind::Object);
@@ -689,18 +891,44 @@ mod tests {
 
     #[test]
     fn dict_literal_with_a_computed_key_answers_unknown() {
-        let built = dict_literal_value(&[None, Some("b".to_string())], &[integer(1.0), integer(2.0)]);
+        let built = dict_literal_value(&[None, Some(key("b"))], &[integer(1.0), integer(2.0)]);
         assert_eq!(built.kind, Kind::Unknown);
     }
 
     #[test]
     fn dict_literal_keeps_the_last_value_for_a_repeated_key() {
         let built = dict_literal_value(
-            &[Some("a".to_string()), Some("a".to_string())],
+            &[Some(key("a")), Some(key("a"))],
             &[integer(1.0), integer(2.0)],
         );
         assert_eq!(built.keys.len(), 1);
         assert_eq!(subscript_read(&built, &string("a")), Some(integer(2.0)));
+    }
+
+    #[test]
+    fn dict_literal_int_key_reads_by_int_subscript() {
+        // {15: 115} — the a-statements.py dict_comprehension row's own
+        // shape: a known Integer key builds a numeric ObjectKey, and a
+        // matching Integer subscript reads it back.
+        let built = dict_literal_value(&[Some(DictKey::integer(15))], &[integer(115.0)]);
+        assert_eq!(built.keys.len(), 1);
+        assert_eq!(built.keys[0].name, "15");
+        assert!(built.keys[0].numeric);
+        assert_eq!(subscript_read(&built, &integer(15.0)), Some(integer(115.0)));
+    }
+
+    #[test]
+    fn dict_literal_int_key_and_string_key_of_the_same_spelling_do_not_collide() {
+        // {"15": 1, 15: 2} — CPython holds BOTH entries (1 == "15" is
+        // False; only values that compare equal, like 1/1.0/True, share
+        // one dict slot, stdtypes.rst's own Mapping Types note).
+        let built = dict_literal_value(
+            &[Some(key("15")), Some(DictKey::integer(15))],
+            &[integer(1.0), integer(2.0)],
+        );
+        assert_eq!(built.keys.len(), 2);
+        assert_eq!(subscript_read(&built, &string("15")), Some(integer(1.0)));
+        assert_eq!(subscript_read(&built, &integer(15.0)), Some(integer(2.0)));
     }
 
     // --- positive and negative indexing ---
@@ -729,14 +957,24 @@ mod tests {
 
     #[test]
     fn subscript_read_string_key_into_dict() {
-        let dict = dict_literal_value(&[Some("k".to_string())], &[integer(5.0)]);
+        let dict = dict_literal_value(&[Some(key("k"))], &[integer(5.0)]);
         assert_eq!(subscript_read(&dict, &string("k")), Some(integer(5.0)));
     }
 
     #[test]
     fn subscript_read_missing_dict_key_declines() {
-        let dict = dict_literal_value(&[Some("k".to_string())], &[integer(5.0)]);
+        let dict = dict_literal_value(&[Some(key("k"))], &[integer(5.0)]);
         assert_eq!(subscript_read(&dict, &string("missing")), None);
+    }
+
+    #[test]
+    fn subscript_read_int_key_does_not_match_a_string_index() {
+        // an Object receiver keyed numerically stays a dict read — a
+        // known-Integer index matches only a numeric ObjectKey, never a
+        // string-spelled one, and vice versa
+        let dict = dict_literal_value(&[Some(DictKey::integer(15))], &[integer(115.0)]);
+        assert_eq!(subscript_read(&dict, &string("15")), None);
+        assert_eq!(subscript_read(&dict, &integer(15.0)), Some(integer(115.0)));
     }
 
     // --- len() ---
@@ -752,7 +990,7 @@ mod tests {
     #[test]
     fn len_of_dict() {
         let dict = dict_literal_value(
-            &[Some("a".to_string()), Some("b".to_string())],
+            &[Some(key("a")), Some(key("b"))],
             &[integer(1.0), integer(2.0)],
         );
         let got = len_result(&dict).expect("len(dict) must decide");
@@ -774,21 +1012,28 @@ mod tests {
 
     #[test]
     fn dict_get_present_key_answers_its_value() {
-        let dict = dict_literal_value(&[Some("k".to_string())], &[integer(5.0)]);
+        let dict = dict_literal_value(&[Some(key("k"))], &[integer(5.0)]);
         let got = dict_get_result(&dict, &string("k"), None).expect("get(present) must decide");
         assert_eq!(got, integer(5.0));
     }
 
     #[test]
     fn dict_get_absent_key_with_no_default_answers_null() {
-        let dict = dict_literal_value(&[Some("k".to_string())], &[integer(5.0)]);
+        let dict = dict_literal_value(&[Some(key("k"))], &[integer(5.0)]);
         let got = dict_get_result(&dict, &string("missing"), None).expect("get(absent) must decide");
         assert_eq!(got.kind, Kind::Null);
     }
 
     #[test]
+    fn dict_get_int_key_answers_its_value() {
+        let dict = dict_literal_value(&[Some(DictKey::integer(15))], &[integer(115.0)]);
+        let got = dict_get_result(&dict, &integer(15.0), None).expect("get(present int key) must decide");
+        assert_eq!(got, integer(115.0));
+    }
+
+    #[test]
     fn dict_get_absent_key_with_default_answers_the_default() {
-        let dict = dict_literal_value(&[Some("k".to_string())], &[integer(5.0)]);
+        let dict = dict_literal_value(&[Some(key("k"))], &[integer(5.0)]);
         let fallback = integer(0.0);
         let got = dict_get_result(&dict, &string("missing"), Some(&fallback))
             .expect("get(absent, default) must decide");
@@ -799,17 +1044,65 @@ mod tests {
 
     #[test]
     fn dict_with_item_overwrites_an_existing_key() {
-        let dict = dict_literal_value(&[Some("a".to_string())], &[integer(1.0)]);
+        let dict = dict_literal_value(&[Some(key("a"))], &[integer(1.0)]);
         let written = dict_with_item(&dict, &string("a"), &integer(9.0)).expect("write must decide");
         assert_eq!(subscript_read(&written, &string("a")), Some(integer(9.0)));
     }
 
     #[test]
     fn dict_with_item_appends_a_new_key() {
-        let dict = dict_literal_value(&[Some("a".to_string())], &[integer(1.0)]);
+        let dict = dict_literal_value(&[Some(key("a"))], &[integer(1.0)]);
         let written = dict_with_item(&dict, &string("b"), &integer(2.0)).expect("write must decide");
         assert_eq!(written.keys.len(), 2);
         assert_eq!(subscript_read(&written, &string("b")), Some(integer(2.0)));
+    }
+
+    #[test]
+    fn dict_with_item_writes_an_int_key_without_colliding_a_string_key_of_the_same_spelling() {
+        let dict = dict_literal_value(&[Some(key("15"))], &[integer(1.0)]);
+        let written = dict_with_item(&dict, &integer(15.0), &integer(2.0)).expect("write must decide");
+        assert_eq!(written.keys.len(), 2);
+        assert_eq!(subscript_read(&written, &string("15")), Some(integer(1.0)));
+        assert_eq!(subscript_read(&written, &integer(15.0)), Some(integer(2.0)));
+    }
+
+    #[test]
+    fn dict_without_item_removes_a_present_key() {
+        let dict = dict_literal_value(
+            &[Some(key("a")), Some(key("b"))],
+            &[integer(1.0), integer(2.0)],
+        );
+        let written = dict_without_item(&dict, &string("a")).expect("del must decide");
+        assert_eq!(written.keys.len(), 1);
+        assert_eq!(subscript_read(&written, &string("b")), Some(integer(2.0)));
+        assert_eq!(subscript_read(&written, &string("a")), None);
+    }
+
+    #[test]
+    fn dict_without_item_absent_key_declines() {
+        // del on a missing key RAISES KeyError at runtime — this function
+        // does not mutate on a raise, matching provable_raise's own
+        // absent-key row for a plain subscript read
+        let dict = dict_literal_value(&[Some(key("a"))], &[integer(1.0)]);
+        assert_eq!(dict_without_item(&dict, &string("missing")), None);
+    }
+
+    #[test]
+    fn dict_without_item_int_key_does_not_remove_a_string_key_of_the_same_spelling() {
+        let dict = dict_literal_value(
+            &[Some(key("15")), Some(DictKey::integer(15))],
+            &[integer(1.0), integer(2.0)],
+        );
+        let written = dict_without_item(&dict, &integer(15.0)).expect("del must decide");
+        assert_eq!(written.keys.len(), 1);
+        assert_eq!(subscript_read(&written, &string("15")), Some(integer(1.0)));
+        assert_eq!(subscript_read(&written, &integer(15.0)), None);
+    }
+
+    #[test]
+    fn dict_without_item_non_dict_receiver_declines() {
+        let list = list_literal_value(&[integer(1.0)]);
+        assert_eq!(dict_without_item(&list, &string("a")), None);
     }
 
     #[test]
@@ -888,6 +1181,22 @@ mod tests {
         assert_eq!(new_receiver.items, vec![integer(1.0)]);
     }
 
+    /// `bag.add(key)` on an EMPTY set with a non-`Kind::Values` element
+    /// (a class instance — weakref.WeakSet's own `.add()` shape,
+    /// j-stdlib-surfaces.py's `weak_set_contains` row) still succeeds:
+    /// an empty receiver trivially contains nothing, regardless of the
+    /// new element's own shape, so `element_contains`'s empty-receiver
+    /// short-circuit answers `false` without needing to compare the
+    /// opaque element's equality at all.
+    #[test]
+    fn mutated_receiver_set_add_an_opaque_element_to_an_empty_set_succeeds() {
+        let empty_set = list_literal_value(&[]);
+        let opaque_instance = refined_domain::abstract_value::opaque_value("a class instance");
+        let (new_receiver, _) =
+            mutated_receiver("add", &empty_set, &[opaque_instance]).expect("add of an opaque element to an empty set must decide");
+        assert_eq!(new_receiver.items.len(), 1);
+    }
+
     #[test]
     fn mutated_receiver_set_discard_present_element_removes_it() {
         let set = list_literal_value(&[integer(1.0), integer(2.0)]);
@@ -929,9 +1238,9 @@ mod tests {
 
     #[test]
     fn mutated_receiver_dict_update_merges_and_overwrites() {
-        let dict = dict_literal_value(&[Some("a".to_string())], &[integer(1.0)]);
+        let dict = dict_literal_value(&[Some(key("a"))], &[integer(1.0)]);
         let other = dict_literal_value(
-            &[Some("a".to_string()), Some("b".to_string())],
+            &[Some(key("a")), Some(key("b"))],
             &[integer(9.0), integer(2.0)],
         );
         let (new_receiver, _) = mutated_receiver("update", &dict, &[other]).expect("update must decide");
@@ -941,14 +1250,14 @@ mod tests {
 
     #[test]
     fn mutated_receiver_dict_clear() {
-        let dict = dict_literal_value(&[Some("a".to_string())], &[integer(1.0)]);
+        let dict = dict_literal_value(&[Some(key("a"))], &[integer(1.0)]);
         let (new_receiver, _) = mutated_receiver("clear", &dict, &[]).expect("clear must decide");
         assert_eq!(new_receiver.keys.len(), 0);
     }
 
     #[test]
     fn mutated_receiver_dict_setdefault_present_key_leaves_the_dict_unchanged() {
-        let dict = dict_literal_value(&[Some("a".to_string())], &[integer(1.0)]);
+        let dict = dict_literal_value(&[Some(key("a"))], &[integer(1.0)]);
         let (new_receiver, result) =
             mutated_receiver("setdefault", &dict, &[string("a"), integer(0.0)]).expect("setdefault must decide");
         assert_eq!(new_receiver.keys.len(), 1);
@@ -957,7 +1266,7 @@ mod tests {
 
     #[test]
     fn mutated_receiver_dict_setdefault_absent_key_extends_and_answers_the_default() {
-        let dict = dict_literal_value(&[Some("a".to_string())], &[integer(1.0)]);
+        let dict = dict_literal_value(&[Some(key("a"))], &[integer(1.0)]);
         let (new_receiver, result) =
             mutated_receiver("setdefault", &dict, &[string("b"), integer(0.0)]).expect("setdefault must decide");
         assert_eq!(new_receiver.keys.len(), 2);
@@ -966,7 +1275,7 @@ mod tests {
 
     #[test]
     fn mutated_receiver_dict_pop_present_key_removes_it() {
-        let dict = dict_literal_value(&[Some("a".to_string())], &[integer(1.0)]);
+        let dict = dict_literal_value(&[Some(key("a"))], &[integer(1.0)]);
         let (new_receiver, popped) = mutated_receiver("pop", &dict, &[string("a")]).expect("pop must decide");
         assert_eq!(new_receiver.keys.len(), 0);
         assert_eq!(popped, integer(1.0));
@@ -974,7 +1283,7 @@ mod tests {
 
     #[test]
     fn mutated_receiver_dict_pop_absent_key_with_no_default_declines() {
-        let dict = dict_literal_value(&[Some("a".to_string())], &[integer(1.0)]);
+        let dict = dict_literal_value(&[Some(key("a"))], &[integer(1.0)]);
         // an absent key with no default RAISES KeyError at runtime — this
         // function does not mutate on a raise, matching set.remove's row
         assert_eq!(mutated_receiver("pop", &dict, &[string("missing")]), None);
@@ -983,7 +1292,7 @@ mod tests {
     #[test]
     fn mutated_receiver_dict_popitem_removes_the_last_inserted_entry() {
         let dict = dict_literal_value(
-            &[Some("a".to_string()), Some("b".to_string())],
+            &[Some(key("a")), Some(key("b"))],
             &[integer(1.0), integer(2.0)],
         );
         let (new_receiver, pair) = mutated_receiver("popitem", &dict, &[]).expect("popitem must decide");
@@ -992,8 +1301,52 @@ mod tests {
     }
 
     #[test]
+    fn mutated_receiver_dict_popitem_int_key_answers_an_int_pair() {
+        let dict = dict_literal_value(&[Some(DictKey::integer(15))], &[integer(115.0)]);
+        let (new_receiver, pair) = mutated_receiver("popitem", &dict, &[]).expect("popitem must decide");
+        assert_eq!(new_receiver.keys.len(), 0);
+        assert_eq!(pair.items, vec![integer(15.0), integer(115.0)]);
+    }
+
+    #[test]
+    fn mutated_receiver_dict_setdefault_int_key_does_not_match_a_string_key_of_the_same_spelling() {
+        let dict = dict_literal_value(&[Some(key("15"))], &[integer(1.0)]);
+        let (new_receiver, result) = mutated_receiver("setdefault", &dict, &[integer(15.0), integer(0.0)])
+            .expect("setdefault must decide");
+        // "15" (string) is present, but the call's key is the INT 15 — a
+        // different entry, so setdefault inserts a second one and answers
+        // the default, never the string entry's value
+        assert_eq!(new_receiver.keys.len(), 2);
+        assert_eq!(result, integer(0.0));
+    }
+
+    #[test]
     fn mutated_receiver_unmodeled_method_declines() {
         let list = list_literal_value(&[integer(1.0)]);
+        assert_eq!(mutated_receiver("count", &list, &[integer(1.0)]), None);
+    }
+
+    // --- mutated_receiver: list.sort / list.reverse ---
+
+    #[test]
+    fn mutated_receiver_list_sort_ascending() {
+        let list = list_literal_value(&[integer(3.0), integer(1.0), integer(2.0)]);
+        let (new_receiver, result) = mutated_receiver("sort", &list, &[]).expect("sort must decide");
+        assert_eq!(new_receiver.items, vec![integer(1.0), integer(2.0), integer(3.0)]);
+        assert_eq!(result.kind, Kind::Null);
+    }
+
+    #[test]
+    fn mutated_receiver_list_sort_non_numeric_element_declines() {
+        let list = list_literal_value(&[string("b"), string("a")]);
         assert_eq!(mutated_receiver("sort", &list, &[]), None);
+    }
+
+    #[test]
+    fn mutated_receiver_list_reverse_reorders_in_place() {
+        let list = list_literal_value(&[integer(1.0), integer(2.0), integer(3.0)]);
+        let (new_receiver, result) = mutated_receiver("reverse", &list, &[]).expect("reverse must decide");
+        assert_eq!(new_receiver.items, vec![integer(3.0), integer(2.0), integer(1.0)]);
+        assert_eq!(result.kind, Kind::Null);
     }
 }

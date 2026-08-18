@@ -27,11 +27,22 @@
 //!   condition evaluates as false, the case block is not selected" and
 //!   matching continues to the next case.
 //!
-//! Sequence/Mapping/Class patterns are Undecidable this wave — no
-//! container state is carried by `AbstractValue` yet (`element_set`,
-//! `keys` exist but this file does not read into them for match
-//! purposes), so a sequence/mapping/class arm always declines rather
-//! than guess a shape.
+//! Sequence/Mapping/Class patterns are Undecidable for TAKEN/NOT-TAKEN
+//! this wave (`pattern_outcome` below) — deciding which arm runs would
+//! need a structural equality/length/key-presence question this file
+//! does not ask yet. Their CAPTURES, though, are nameable and (for a
+//! known List/Object subject) provable: `pattern_captures` names every
+//! bare-Name/star element a sequence pattern binds, every literal-key
+//! Name value (plus an optional `**rest`) a mapping pattern binds, and
+//! every keyword sub-pattern Name a class pattern binds; `pattern_
+//! bound_captures` reads the actual element/key/field value off a
+//! KNOWN List/Object subject when one is available. A class pattern's
+//! POSITIONAL sub-patterns (`Point(px, py)`) still decline entirely —
+//! resolving a position to a field name needs the class's own
+//! `__match_args__` order (`ClassModel.fields`), which this file has no
+//! way to look up (only `check.rs`'s `walk_match` holds the module's
+//! class table); naming a keyword sub-pattern needs no such lookup,
+//! since the keyword's own `attr` IS the field name.
 //!
 //! `PrimitiveKind` carries `Integer`/`Float` tags, but nothing in this
 //! package's expression evaluator (`expressions.rs`) emits them yet —
@@ -48,17 +59,22 @@
 
 use std::sync::Arc;
 
+use refined_domain::abstract_value::known_values;
+use refined_domain::abstract_value::unknown;
 use refined_domain::abstract_value::AbstractValue;
 use refined_domain::abstract_value::Kind;
 use refined_domain::abstract_value::PrimitiveKind;
+use refined_domain::trust_grades::TrustProved;
 use refined_kernel::kernel_interface::RefinedTSKernel;
 use ruff_python_ast::Expr;
 use ruff_python_ast::MatchCase;
 use ruff_python_ast::Pattern;
 use ruff_python_ast::Singleton;
 
+use crate::refinedpy::collection_models::subscript_read;
 use crate::refinedpy::env::Environment;
 use crate::refinedpy::expressions::evaluate_expression;
+use crate::refinedpy::instances::field_read;
 
 /// What a match arm's pattern (and, where present, its guard) decided
 /// about a known subject.
@@ -315,6 +331,357 @@ fn single_numeric_value(value: &AbstractValue) -> Option<f64> {
     }
 }
 
+/// The exact value a pattern's own LITERAL shape proves about a taken
+/// arm's subject — independent of whether the concrete subject is
+/// known (unlike `pattern_outcome`, which requires a known subject to
+/// decide TAKEN/NOT-TAKEN). This is the pattern's proof read
+/// syntactically: a `MatchValue` proves exactly its own literal
+/// expression's value, TAGGED as that literal's own evaluated
+/// `PrimitiveKind` (`evaluate_expression`'s `number_literal_value`
+/// convention — an int literal tags `Integer`, a float literal tags
+/// `Float` — so `case 40:` proves an `Integer`-tagged 40, never a
+/// bare `Number`); a `MatchSingleton` proves `True`/`False` as the
+/// Boolean-tagged 1.0/0.0 CPython's `is`-identity singletons (`None`
+/// proves no NUMERIC value — a null subject is never a member of a
+/// numeric refined set, so it contributes nothing here, matching
+/// `narrowing.rs`'s own "None is never a Values member" reading);
+/// `MatchOr` proves the UNION of every alternative's own proof (PEP
+/// 634's rule that all alternatives bind the same names does not
+/// extend to proving the same value — `18 | 21 | 40` proves any of the
+/// three) — every alternative must prove the SAME tag, or the whole
+/// pattern declines (an honest narrow scope: this function never
+/// invents a `KindUnion` to paper over a genuinely mixed-sort
+/// alternative list); `MatchAs` recurses into its own inner pattern
+/// when present, or proves NOTHING when it is a bare capture/wildcard
+/// (a bare `case x:` states no literal fact about the subject at
+/// all — the caller's job to leave the subject unnarrowed in that
+/// case, never to invent a value). Every other pattern shape
+/// (Sequence/Mapping/Class/Star) proves nothing this function reads —
+/// `None`.
+///
+/// `check.rs`'s match-join fallback (`walk_match`) calls this to
+/// narrow a captured name — or the subject itself when the pattern
+/// captures nothing — down from the coarse pre-match claim to exactly
+/// what the arm's own pattern proves, the same "a narrowing must be
+/// the pattern's own proved claim" discipline `narrowing.rs`'s
+/// isinstance/comparison leaves already follow. The returned value's
+/// trust grade is `TrustProved` — the pattern's own literal is read
+/// exactly, the same grade `number_literal_value` gives every numeric
+/// literal.
+pub fn pattern_proved_value(pattern: &Pattern, environment: &Environment, kernel: &Arc<RefinedTSKernel>) -> Option<AbstractValue> {
+    match pattern {
+        Pattern::MatchValue(value_pattern) => {
+            let literal_value = evaluate_expression(&value_pattern.value, environment, kernel);
+            if literal_value.kind != Kind::Values || literal_value.values.len() != 1 {
+                return None;
+            }
+            let kind_tag = literal_value.kind_tag?;
+            if !matches!(
+                kind_tag,
+                PrimitiveKind::Number | PrimitiveKind::Integer | PrimitiveKind::Float | PrimitiveKind::Boolean
+            ) {
+                return None;
+            }
+            Some(literal_value)
+        }
+        Pattern::MatchSingleton(singleton_pattern) => match singleton_pattern.value {
+            Singleton::True => Some(known_values(vec![1.0], PrimitiveKind::Boolean, TrustProved)),
+            Singleton::False => Some(known_values(vec![0.0], PrimitiveKind::Boolean, TrustProved)),
+            Singleton::None => None,
+        },
+        Pattern::MatchOr(or_pattern) => {
+            let mut alternatives = or_pattern.patterns.iter();
+            let first = pattern_proved_value(alternatives.next()?, environment, kernel)?;
+            let mut values = first.values.clone();
+            let kind_tag = first.kind_tag;
+            for alternative in alternatives {
+                let proved = pattern_proved_value(alternative, environment, kernel)?;
+                if proved.kind_tag != kind_tag {
+                    // a genuinely mixed-sort alternative list — never
+                    // guessed at, an honest decline
+                    return None;
+                }
+                for value in proved.values {
+                    if !values.contains(&value) {
+                        values.push(value);
+                    }
+                }
+            }
+            Some(known_values(values, kind_tag?, TrustProved))
+        }
+        Pattern::MatchAs(as_pattern) => match as_pattern.pattern.as_deref() {
+            Some(inner) => pattern_proved_value(inner, environment, kernel),
+            None => None,
+        },
+        Pattern::MatchSequence(_) | Pattern::MatchMapping(_) | Pattern::MatchClass(_) | Pattern::MatchStar(_) => None,
+    }
+}
+
+/// The bare names one `case` pattern captures — a SYNTACTIC question,
+/// answered without deciding whether the pattern would actually take
+/// (that question is `pattern_outcome`'s, not this function's).
+/// `Pattern::MatchValue`/`MatchSingleton` bind nothing. `Pattern::MatchAs`
+/// binds its own `name` (a bare capture/wildcard has no inner pattern)
+/// plus whatever its inner pattern (if any) itself binds.
+/// `Pattern::MatchOr` recurses into its FIRST alternative only — Python's
+/// own grammar rule (compound_stmts.rst, "the same set of names must be
+/// captured by all the alternatives") makes every alternative's own
+/// capture set identical, so any one alternative names the whole
+/// pattern's captures.
+///
+/// `Pattern::MatchSequence` names every bare-Name capture in its
+/// `patterns` list positionally, plus a `MatchStar` element's own name
+/// (`case [first, *rest]:` names both `first` and `rest`; a wildcard
+/// star `*_` names nothing, matching PEP 634's "`_` never binds"). Any
+/// element that is not itself a bare-Name/wildcard `MatchAs` (a nested
+/// literal, sequence, or class sub-pattern) makes the WHOLE sequence
+/// pattern decline — this function reads only the flat bare-capture
+/// case, never recurses past one level into a structural sub-pattern.
+///
+/// `Pattern::MatchMapping` names every value-side capture whose KEY is
+/// a literal (a `MatchValue`/`MatchSingleton`-free syntactic literal —
+/// in practice a string, this corpus's only mapping-key shape) and
+/// whose value-side pattern is itself a bare-Name/wildcard `MatchAs`,
+/// plus the `**rest` capture (`rest: Option<Identifier>`) when present.
+/// A non-literal key, or a value-side pattern that is not a bare
+/// capture, declines the whole mapping pattern.
+///
+/// `Pattern::MatchClass` binds nothing ITSELF (a bare `case int():`
+/// names nothing). It is nameable in two shapes: NO sub-patterns at
+/// all (`case int() as n:`, `arguments.patterns`/`.keywords` both
+/// empty), or KEYWORD sub-patterns ONLY, each itself a bare-Name/
+/// wildcard `MatchAs` (`case Point(x=px):` names `px`) — a keyword's
+/// own `attr` IS the field name, so naming it needs no class lookup.
+/// POSITIONAL sub-patterns (`case Point(px, py):`) always decline:
+/// resolving a position to a field name needs the class's own
+/// `__match_args__` order (`ClassModel.fields`, pydantic's own
+/// declaration-order convention), which this function has no class
+/// table to consult — `check.rs::walk_match` is the only caller with
+/// one, and threading it through would widen this function's contract
+/// for a shape this corpus's rows do not need decided.
+pub fn pattern_captures(pattern: &Pattern) -> Option<Vec<String>> {
+    match pattern {
+        Pattern::MatchValue(_) | Pattern::MatchSingleton(_) => Some(Vec::new()),
+        Pattern::MatchAs(as_pattern) => {
+            let mut names = match as_pattern.pattern.as_deref() {
+                Some(inner) => pattern_captures(inner)?,
+                None => Vec::new(),
+            };
+            if let Some(name) = as_pattern.name.as_ref() {
+                names.push(name.id.as_str().to_owned());
+            }
+            Some(names)
+        }
+        Pattern::MatchOr(or_pattern) => {
+            let first = or_pattern.patterns.first()?;
+            pattern_captures(first)
+        }
+        Pattern::MatchSequence(sequence_pattern) => {
+            let mut names = Vec::new();
+            for element in &sequence_pattern.patterns {
+                match element {
+                    Pattern::MatchStar(star) => {
+                        if let Some(name) = star.name.as_ref() {
+                            names.push(name.id.as_str().to_owned());
+                        }
+                    }
+                    Pattern::MatchAs(as_pattern) if as_pattern.pattern.is_none() => {
+                        if let Some(name) = as_pattern.name.as_ref() {
+                            names.push(name.id.as_str().to_owned());
+                        }
+                    }
+                    // a nested literal/sequence/mapping/class sub-pattern
+                    // — beyond this function's flat bare-capture scope
+                    _ => return None,
+                }
+            }
+            Some(names)
+        }
+        Pattern::MatchMapping(mapping_pattern) => {
+            if mapping_pattern.keys.len() != mapping_pattern.patterns.len() {
+                return None;
+            }
+            let mut names = Vec::new();
+            for (key, value_pattern) in mapping_pattern.keys.iter().zip(mapping_pattern.patterns.iter()) {
+                if !is_literal_mapping_key(key) {
+                    return None;
+                }
+                let Pattern::MatchAs(as_pattern) = value_pattern else {
+                    return None;
+                };
+                if as_pattern.pattern.is_some() {
+                    return None;
+                }
+                if let Some(name) = as_pattern.name.as_ref() {
+                    names.push(name.id.as_str().to_owned());
+                }
+            }
+            if let Some(rest) = mapping_pattern.rest.as_ref() {
+                names.push(rest.id.as_str().to_owned());
+            }
+            Some(names)
+        }
+        Pattern::MatchClass(class_pattern) => {
+            if !class_pattern.arguments.patterns.is_empty() {
+                // positional sub-patterns need __match_args__ field
+                // order — not this function's business, see the doc above
+                return None;
+            }
+            let mut names = Vec::new();
+            for keyword in &class_pattern.arguments.keywords {
+                let Pattern::MatchAs(as_pattern) = &keyword.pattern else {
+                    return None;
+                };
+                if as_pattern.pattern.is_some() {
+                    return None;
+                }
+                if let Some(name) = as_pattern.name.as_ref() {
+                    names.push(name.id.as_str().to_owned());
+                }
+            }
+            Some(names)
+        }
+        Pattern::MatchStar(_) => None,
+    }
+}
+
+/// Whether a `MatchMapping` key expression is a literal this file can
+/// read as a fixed key spelling — a string literal, the only key shape
+/// this corpus's mapping-pattern rows use (`case {"age": bound_age}:`).
+/// Any other expression shape (a dotted constant, a number, an
+/// f-string) answers `false` — not read this wave.
+fn is_literal_mapping_key(key: &Expr) -> bool {
+    matches!(key, Expr::StringLiteral(_))
+}
+
+/// The (name, value) pair every capture `pattern_captures` names,
+/// filled in with the value each name PROVABLY holds when `subject` is
+/// known — the value-bearing counterpart naming alone cannot answer.
+/// `None` means `pattern` itself has no nameable captures — this
+/// function decides `Some`/`None` on the SAME conditions
+/// `pattern_captures` does (a caller needing only the names, never the
+/// values, still has that lighter-weight function to call; `check.rs::
+/// walk_match`'s join-fallback path calls THIS one directly, since it
+/// always needs both in the same pass).
+///
+/// A `MatchAs`'s own captured name binds to `pattern_proved_value`'s
+/// proof for the pattern rooted at that `as` (e.g. `(40 | 41) as
+/// chosen` binds `chosen` to `{40, 41}`, not the raw subject) when one
+/// exists, falling back to `subject` itself for a bare capture/wildcard
+/// (`pattern_proved_value` proves nothing for those, by design — the
+/// SAME fallback `check.rs::walk_match` already applies for a
+/// literal/singleton/or/as pattern with no sequence/mapping/class
+/// shape involved).
+///
+/// A capture whose OWN value cannot be proved from `subject` (an
+/// unknown/wrong-kind receiver, an absent key, an out-of-range
+/// position) binds `unknown()` for that one name rather than dropping
+/// it or guessing — `assignability::judge`'s own law never fires an
+/// `Unknown` value (only `Object`/`List`/`Null` structural mismatches
+/// fire against a scalar declared set), so an unproved capture is
+/// SILENT-SAFE: it reaches the sink Undetermined, never a false Fire.
+pub fn pattern_bound_captures(
+    pattern: &Pattern,
+    subject: &AbstractValue,
+    environment: &Environment,
+    kernel: &Arc<RefinedTSKernel>,
+) -> Option<Vec<(String, AbstractValue)>> {
+    match pattern {
+        Pattern::MatchValue(_) | Pattern::MatchSingleton(_) => Some(Vec::new()),
+        Pattern::MatchAs(as_pattern) => {
+            let mut bound = match as_pattern.pattern.as_deref() {
+                Some(inner) => pattern_bound_captures(inner, subject, environment, kernel)?,
+                None => Vec::new(),
+            };
+            if let Some(name) = as_pattern.name.as_ref() {
+                let proved = pattern_proved_value(pattern, environment, kernel);
+                let own_value = proved.unwrap_or_else(|| subject.clone());
+                bound.push((name.id.as_str().to_owned(), own_value));
+            }
+            Some(bound)
+        }
+        Pattern::MatchOr(or_pattern) => {
+            let first = or_pattern.patterns.first()?;
+            pattern_bound_captures(first, subject, environment, kernel)
+        }
+        Pattern::MatchSequence(sequence_pattern) => {
+            let items = if subject.kind == Kind::List { Some(&subject.items) } else { None };
+            let mut bound = Vec::new();
+            for (position, element) in sequence_pattern.patterns.iter().enumerate() {
+                match element {
+                    Pattern::MatchStar(star) => {
+                        if let Some(name) = star.name.as_ref() {
+                            // the remainder is a LIST, never a scalar this
+                            // corpus's rows read at a refined sink — bound
+                            // opaque rather than sliced out of `items`
+                            bound.push((name.id.as_str().to_owned(), unknown()));
+                        }
+                    }
+                    Pattern::MatchAs(as_pattern) if as_pattern.pattern.is_none() => {
+                        if let Some(name) = as_pattern.name.as_ref() {
+                            let element_value = items
+                                .and_then(|items| items.get(position))
+                                .cloned()
+                                .unwrap_or_else(unknown);
+                            bound.push((name.id.as_str().to_owned(), element_value));
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+            Some(bound)
+        }
+        Pattern::MatchMapping(mapping_pattern) => {
+            if mapping_pattern.keys.len() != mapping_pattern.patterns.len() {
+                return None;
+            }
+            let mut bound = Vec::new();
+            for (key, value_pattern) in mapping_pattern.keys.iter().zip(mapping_pattern.patterns.iter()) {
+                if !is_literal_mapping_key(key) {
+                    return None;
+                }
+                let Pattern::MatchAs(as_pattern) = value_pattern else {
+                    return None;
+                };
+                if as_pattern.pattern.is_some() {
+                    return None;
+                }
+                if let Some(name) = as_pattern.name.as_ref() {
+                    let key_value = evaluate_expression(key, environment, kernel);
+                    let bound_value = subscript_read(subject, &key_value).unwrap_or_else(unknown);
+                    bound.push((name.id.as_str().to_owned(), bound_value));
+                }
+            }
+            if let Some(rest) = mapping_pattern.rest.as_ref() {
+                // `**rest` collects the remaining keys into a DICT, never
+                // a scalar this corpus's rows read at a refined sink
+                bound.push((rest.id.as_str().to_owned(), unknown()));
+            }
+            Some(bound)
+        }
+        Pattern::MatchClass(class_pattern) => {
+            if !class_pattern.arguments.patterns.is_empty() {
+                return None;
+            }
+            let mut bound = Vec::new();
+            for keyword in &class_pattern.arguments.keywords {
+                let Pattern::MatchAs(as_pattern) = &keyword.pattern else {
+                    return None;
+                };
+                if as_pattern.pattern.is_some() {
+                    return None;
+                }
+                if let Some(name) = as_pattern.name.as_ref() {
+                    let field_value = field_read(subject, keyword.attr.id.as_str()).unwrap_or_else(unknown);
+                    bound.push((name.id.as_str().to_owned(), field_value));
+                }
+            }
+            Some(bound)
+        }
+        Pattern::MatchStar(_) => None,
+    }
+}
+
 /// Walk every arm of a match statement in order, deciding each with
 /// `arm_outcome`, and enforcing the poisoning rule `apply_guard`'s doc
 /// states: once an arm's guard is Undecidable, every LATER arm is also
@@ -560,5 +927,156 @@ mod tests {
             match_taken_environment(&subject, &cases, &environment, &kernel).is_none(),
             "3 matches neither arm and there is no wildcard fallthrough"
         );
+    }
+
+    // --- pattern_captures / pattern_bound_captures ---
+
+    #[test]
+    fn pattern_captures_names_sequence_elements_and_star_positionally() {
+        let cases = match_cases("match x:\n    case [first, *rest]:\n        pass\n");
+        let names = pattern_captures(&cases[0].pattern).expect("bare-Name/star elements are nameable");
+        assert_eq!(names, vec!["first".to_owned(), "rest".to_owned()]);
+    }
+
+    #[test]
+    fn pattern_captures_wildcard_star_names_nothing() {
+        let cases = match_cases("match x:\n    case [*_]:\n        pass\n");
+        let names = pattern_captures(&cases[0].pattern).expect("a wildcard star is nameable");
+        assert!(names.is_empty(), "`*_` never binds: {names:?}");
+    }
+
+    #[test]
+    fn pattern_captures_declines_a_sequence_with_a_nested_literal() {
+        let cases = match_cases("match x:\n    case [1, b]:\n        pass\n");
+        assert!(
+            pattern_captures(&cases[0].pattern).is_none(),
+            "a nested literal sub-pattern is past this function's flat bare-capture scope"
+        );
+    }
+
+    #[test]
+    fn pattern_captures_names_mapping_literal_key_values_and_rest() {
+        let cases = match_cases("match x:\n    case {\"age\": bound_age, **rest}:\n        pass\n");
+        let names = pattern_captures(&cases[0].pattern).expect("literal-key Name values plus **rest are nameable");
+        assert_eq!(names, vec!["bound_age".to_owned(), "rest".to_owned()]);
+    }
+
+    #[test]
+    fn pattern_captures_names_class_keyword_subpatterns() {
+        let cases = match_cases("match x:\n    case Point(x=px):\n        pass\n");
+        let names = pattern_captures(&cases[0].pattern).expect("a keyword sub-pattern's own attr needs no class lookup");
+        assert_eq!(names, vec!["px".to_owned()]);
+    }
+
+    #[test]
+    fn pattern_captures_declines_a_class_pattern_with_positional_subpatterns() {
+        let cases = match_cases("match x:\n    case Point(px, py):\n        pass\n");
+        assert!(
+            pattern_captures(&cases[0].pattern).is_none(),
+            "a position needs __match_args__ order, which this function has no class table to read"
+        );
+    }
+
+    #[test]
+    fn pattern_bound_captures_reads_list_elements_positionally_off_a_known_list_subject() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let cases = match_cases("match x:\n    case [a, b]:\n        pass\n");
+        let subject = refined_domain::known_constructors::known_list(
+            vec![
+                known_values(vec![200.0], PrimitiveKind::Integer, TrustProved),
+                known_values(vec![10.0], PrimitiveKind::Integer, TrustProved),
+            ],
+            TrustProved,
+        );
+        let environment = empty_environment();
+        let bound = pattern_bound_captures(&cases[0].pattern, &subject, &environment, &kernel)
+            .expect("bare-Name elements are nameable");
+        assert_eq!(bound[0], ("a".to_owned(), known_values(vec![200.0], PrimitiveKind::Integer, TrustProved)));
+        assert_eq!(bound[1], ("b".to_owned(), known_values(vec![10.0], PrimitiveKind::Integer, TrustProved)));
+    }
+
+    #[test]
+    fn pattern_bound_captures_binds_unknown_when_the_subject_is_not_a_known_list() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let cases = match_cases("match x:\n    case [a, b]:\n        pass\n");
+        let subject = unknown();
+        let environment = empty_environment();
+        let bound = pattern_bound_captures(&cases[0].pattern, &subject, &environment, &kernel)
+            .expect("bare-Name elements are still nameable over an unknown subject");
+        assert_eq!(bound[0].1.kind, Kind::Unknown, "an unproved element binds unknown(), never a guess");
+        assert_eq!(bound[1].1.kind, Kind::Unknown);
+    }
+
+    #[test]
+    fn pattern_bound_captures_reads_a_mapping_value_off_a_known_dict_subject() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let cases = match_cases("match x:\n    case {\"age\": bound_age}:\n        pass\n");
+        let subject = refined_domain::known_constructors::known_object(
+            vec![refined_domain::abstract_value::ObjectKey {
+                name: "age".to_owned(),
+                numeric: false,
+                value: known_values(vec![200.0], PrimitiveKind::Integer, TrustProved),
+            }],
+            None,
+            true,
+            TrustProved,
+            false,
+        );
+        let environment = empty_environment();
+        let bound = pattern_bound_captures(&cases[0].pattern, &subject, &environment, &kernel)
+            .expect("a literal-key Name value is nameable");
+        assert_eq!(bound, vec![("bound_age".to_owned(), known_values(vec![200.0], PrimitiveKind::Integer, TrustProved))]);
+    }
+
+    #[test]
+    fn pattern_bound_captures_reads_a_class_field_off_a_known_instance_subject() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let cases = match_cases("match x:\n    case Point(x=px):\n        pass\n");
+        let subject = refined_domain::known_constructors::known_object(
+            vec![refined_domain::abstract_value::ObjectKey {
+                name: "x".to_owned(),
+                numeric: false,
+                value: known_values(vec![200.0], PrimitiveKind::Integer, TrustProved),
+            }],
+            None,
+            true,
+            TrustProved,
+            false,
+        );
+        let environment = empty_environment();
+        let bound = pattern_bound_captures(&cases[0].pattern, &subject, &environment, &kernel)
+            .expect("a keyword sub-pattern's field is nameable");
+        assert_eq!(bound, vec![("px".to_owned(), known_values(vec![200.0], PrimitiveKind::Integer, TrustProved))]);
+    }
+
+    #[test]
+    fn pattern_bound_captures_still_declines_positional_class_subpatterns() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let cases = match_cases("match x:\n    case Point(px, py):\n        pass\n");
+        let subject = unknown();
+        let environment = empty_environment();
+        assert!(
+            pattern_bound_captures(&cases[0].pattern, &subject, &environment, &kernel).is_none(),
+            "positional sub-patterns still need __match_args__ order this function cannot read"
+        );
+    }
+
+    /// `(40 | 41) as chosen` — the MatchAs-wrapped-MatchOr shape
+    /// t-match-patterns.py's `match_as_subpattern_binding` row uses:
+    /// `chosen` binds to `pattern_proved_value`'s own proof (`{40, 41}`),
+    /// never the raw (here unknown) subject.
+    #[test]
+    fn pattern_bound_captures_binds_an_as_wrapped_or_pattern_to_its_proved_value() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let cases = match_cases("match x:\n    case (40 | 41) as chosen:\n        pass\n");
+        let subject = unknown();
+        let environment = empty_environment();
+        let bound = pattern_bound_captures(&cases[0].pattern, &subject, &environment, &kernel)
+            .expect("an as-capture over an or-pattern is nameable");
+        assert_eq!(bound.len(), 1);
+        assert_eq!(bound[0].0, "chosen");
+        let mut values = bound[0].1.values.clone();
+        values.sort_by(f64::total_cmp);
+        assert_eq!(values, vec![40.0, 41.0], "chosen must bind the pattern's own proved value, not the raw subject");
     }
 }
