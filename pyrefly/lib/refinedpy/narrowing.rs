@@ -217,7 +217,16 @@ fn narrow(condition: &Expr, environment: &mut Environment, kernel: &Arc<RefinedT
         }
         Expr::BoolOp(bool_op) => narrow_bool_op(bool_op, environment, kernel, truth),
         Expr::Compare(compare) => narrow_compare(compare, environment, truth),
-        Expr::Call(call) => narrow_isinstance_call(call, environment, truth),
+        Expr::Call(call) => {
+            if recognizes_type_guard_call(call, environment) {
+                // a call to a `TypeGuard[X]`/`TypeIs[X]`-annotated
+                // predicate — recognized, but declined, see
+                // `recognizes_type_guard_call`'s own doc for why this
+                // function must not trust the annotation
+                return;
+            }
+            narrow_isinstance_call(call, environment, truth);
+        }
         // Calls other than isinstance, attributes, walrus, `in`, string
         // comparisons, and everything else this wave does not read: no
         // narrowing, the honest default.
@@ -442,6 +451,48 @@ fn narrow_is_none(left: &Expr, op: CmpOp, right: &Expr, environment: &mut Enviro
         let grade = trust_level_of(&current);
         environment.bind(name, known_values(Vec::new(), kind_tag, grade));
     }
+}
+
+/// Whether `call` is a same-module call to a function whose OWN return
+/// annotation is `TypeGuard[X]`/`TypeIs[X]` (typing.rst's user-defined
+/// type guard: "a special form... that can be used to annotate the
+/// return type of a user-defined type guard function") — recognized
+/// SYNTACTICALLY only, never narrowed. `typing.TypeGuard`/`TypeIs`
+/// state a CLAIM the function's own signature makes; PROVING the claim
+/// needs "for which inputs does this body's own control flow return
+/// True" — a predicate-precondition question `summaries::interpret_body`
+/// answers nothing like (that machinery interprets a body given
+/// CONCRETE argument values and reads back the value it returns, never
+/// the inverse: which inputs make a KNOWN return value true). Narrowing
+/// on the annotation alone would be UNSOUND — f-type-nodes.py's own
+/// `dishonest_predicate` row is exactly this: `claims_age`'s signature
+/// states `TypeGuard[Age]`, but its body only proves `isinstance(v,
+/// int)`, strictly weaker than `Age`; trusting the claim would wrongly
+/// narrow `value` all the way to `Age` and read the row SILENT, when
+/// the row expects a fire. This function's ONLY job is to recognize the
+/// shape so the `Expr::Call` dispatch can decline explicitly (a
+/// documented boundary) rather than silently falling through as an
+/// unrecognized call — recognizing changes no narrowing outcome by
+/// itself; a future TRUSTED narrowing needs the body's own proven
+/// return-set, which is a genuinely new capability, not an extension of
+/// this function.
+fn recognizes_type_guard_call(call: &ruff_python_ast::ExprCall, environment: &Environment) -> bool {
+    let Expr::Name(callee) = call.func.as_ref() else {
+        return false;
+    };
+    let Some(def) = environment.functions().and_then(|table| table.def(callee.id.as_str())) else {
+        return false;
+    };
+    let Some(returns) = def.returns.as_deref() else {
+        return false;
+    };
+    let Expr::Subscript(subscript) = returns else {
+        return false;
+    };
+    let Expr::Name(head) = subscript.value.as_ref() else {
+        return false;
+    };
+    matches!(head.id.as_str(), "TypeGuard" | "TypeIs")
 }
 
 /// `isinstance(name, int | float | bool)` (mission point 6): filters a
@@ -1011,6 +1062,84 @@ mod tests {
             return;
         };
         assert!(narrowed.read("x").is_none());
+    }
+
+    // ── TypeGuard/TypeIs: recognized, never trusted ───────────────────
+
+    /// An environment carrying a same-module function table with one
+    /// `def`, parsed from `source` — the shape `recognizes_type_guard_
+    /// call` reads via `environment.functions()`.
+    fn environment_with_function_table(source: &str) -> Environment {
+        let module = ruff_python_parser::parse_module(source).expect("test source must parse").into_syntax();
+        let table = crate::refinedpy::function_table::function_table(&module);
+        let mut environment = Environment::new(HashSet::new());
+        environment.set_functions(Arc::new(table));
+        environment
+    }
+
+    /// A call to a `TypeGuard[X]`-annotated same-module predicate must
+    /// leave an unbound name untouched — the annotation alone proves
+    /// nothing this file trusts (`recognizes_type_guard_call`'s own
+    /// doc): narrowing on the claim, unverified, would read
+    /// `dishonest_predicate` silent when the row expects a fire.
+    #[test]
+    fn test_type_guard_call_does_not_narrow_an_unbound_name() {
+        let environment = environment_with_function_table(concat!(
+            "def is_age(v: object) -> TypeGuard[Age]:\n",
+            "    return isinstance(v, int)\n",
+        ));
+        let Some(narrowed) = assumed("is_age(value)", environment, true) else {
+            return;
+        };
+        assert!(narrowed.read("value").is_none(), "an unproved claim must not seed a binding");
+    }
+
+    /// The same recognition for `TypeIs[X]` (typing.rst's narrower
+    /// sibling of `TypeGuard`) — the same syntactic shape, same decline.
+    #[test]
+    fn test_type_is_call_does_not_narrow_an_unbound_name() {
+        let environment = environment_with_function_table(concat!(
+            "def is_age(v: object) -> TypeIs[Age]:\n",
+            "    return isinstance(v, int)\n",
+        ));
+        let Some(narrowed) = assumed("is_age(value)", environment, true) else {
+            return;
+        };
+        assert!(narrowed.read("value").is_none());
+    }
+
+    /// A call to a function with NO `TypeGuard`/`TypeIs` return
+    /// annotation is not recognized by this reader at all — it falls
+    /// through to `narrow_isinstance_call`'s own decline for a
+    /// non-`isinstance` callee, the same untouched outcome, but through
+    /// the ordinary path rather than this one.
+    #[test]
+    fn test_plain_predicate_call_is_not_recognized_as_a_type_guard() {
+        let environment = environment_with_function_table(concat!(
+            "def is_age(v: object) -> bool:\n",
+            "    return isinstance(v, int)\n",
+        ));
+        let Some(narrowed) = assumed("is_age(value)", environment, true) else {
+            return;
+        };
+        assert!(narrowed.read("value").is_none());
+    }
+
+    /// An EXISTING binding of a name a `TypeGuard` call names is also
+    /// left untouched — the decline applies regardless of whether the
+    /// name was previously bound.
+    #[test]
+    fn test_type_guard_call_does_not_narrow_an_existing_binding() {
+        let mut environment = environment_with_function_table(concat!(
+            "def is_age(v: object) -> TypeGuard[Age]:\n",
+            "    return isinstance(v, int)\n",
+        ));
+        environment.bind("value", known_values(vec![200.0], PrimitiveKind::Number, TrustProved));
+        let Some(narrowed) = assumed("is_age(value)", environment, true) else {
+            return;
+        };
+        let value = narrowed.read("value").expect("value stays bound");
+        assert_eq!(value.values, vec![200.0], "the pre-existing binding survives unchanged");
     }
 
     // ── the SET channel ──────────────────────────────────────────────

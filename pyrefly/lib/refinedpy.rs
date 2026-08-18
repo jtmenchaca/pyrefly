@@ -23,6 +23,7 @@ pub mod function_table;
 pub mod instances;
 pub mod kernel_path;
 pub mod loops;
+pub mod markers;
 pub mod match_arms;
 pub mod math_models;
 pub mod narrowing;

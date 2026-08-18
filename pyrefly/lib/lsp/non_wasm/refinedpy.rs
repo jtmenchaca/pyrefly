@@ -30,6 +30,9 @@ use refined_kernel::kernel_interface::RefinedTSKernel;
 use crate::refinedpy::check::findings_for_module;
 use crate::refinedpy::check::findings_for_module_with_resolver;
 use crate::refinedpy::cross_module::disk_resolver;
+use crate::refinedpy::markers::line_col;
+use crate::refinedpy::markers::line_starts_of;
+use crate::refinedpy::markers::markers_of;
 use crate::state::state::Transaction;
 
 /// Resolved once before the LSP loop serves requests; `None` when no
@@ -95,7 +98,20 @@ pub fn append_refinedpy_diagnostics(
         }
         None => findings_for_module(&ast, &kernel),
     };
+    // A fire on a line named by a `# refinedpy: expect-error` marker is
+    // an expectation held — the check CLI's own matching rule — so the
+    // editor stays silent on it. RTS7002 always shows: it says nothing
+    // was determined, which no marker is allowed to swallow.
+    let source = module_info.contents();
+    let markers = markers_of(source);
+    let line_starts = line_starts_of(source);
     for finding in findings {
+        if finding.code != "RTS7002" {
+            let (line, _) = line_col(&line_starts, usize::from(finding.range.start()));
+            if markers.iter().any(|marker| marker.expected_line == line) {
+                continue;
+            }
+        }
         items.push(Diagnostic {
             range: module_info.to_lsp_range(finding.range),
             severity: Some(DiagnosticSeverity::ERROR),

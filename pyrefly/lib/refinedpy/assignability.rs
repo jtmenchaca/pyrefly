@@ -703,6 +703,7 @@ mod tests {
             spelling: "Age".to_owned(),
             admits_none: false,
             element: None,
+            generator: None,
         }
     }
 
@@ -714,6 +715,7 @@ mod tests {
             spelling: "Age | None".to_owned(),
             admits_none: true,
             element: None,
+            generator: None,
         }
     }
 
@@ -778,6 +780,7 @@ mod tests {
             spelling: "Weight".to_owned(),
             admits_none: false,
             element: None,
+            generator: None,
         };
         let thirty_float = known_values(vec![30.0], PrimitiveKind::Float, TrustProved);
         assert!(matches!(judge(&thirty_float, &declared, &kernel), Verdict::Silent));
@@ -796,6 +799,7 @@ mod tests {
             spelling: "Label".to_owned(),
             admits_none: false,
             element: None,
+            generator: None,
         }
     }
 
@@ -810,6 +814,7 @@ mod tests {
             spelling: "AnyString".to_owned(),
             admits_none: false,
             element: None,
+            generator: None,
         }
     }
 
@@ -863,6 +868,7 @@ mod tests {
             spelling: "ChartLayout".to_owned(),
             admits_none: false,
             element: None,
+            generator: None,
         }
     }
 
@@ -913,6 +919,7 @@ mod tests {
             spelling: "Literal['horizontal', 'vertical']".to_owned(),
             admits_none: false,
             element: None,
+            generator: None,
         };
         let value = refined_domain::abstract_value::null_value();
         let Verdict::Fire(message) = judge(&value, &two_member_declared, &kernel) else {
@@ -990,6 +997,7 @@ mod tests {
             spelling: "Grade".to_owned(),
             admits_none: false,
             element: None,
+            generator: None,
         }
     }
 
@@ -1108,6 +1116,7 @@ mod tests {
             spelling: "Anything".to_owned(),
             admits_none: false,
             element: None,
+            generator: None,
         };
         let value = refined_domain::abstract_value::opaque_value("a function value");
         assert!(matches!(judge(&value, &declared, &kernel), Verdict::Undetermined(_)));
@@ -1241,6 +1250,7 @@ mod tests {
             spelling: "Weight".to_owned(),
             admits_none: false,
             element: None,
+            generator: None,
         };
         let value = refined_domain::abstract_value::float_sorted_unknown();
         let message = fire_message(judge(&value, &declared, &kernel));
@@ -1358,6 +1368,7 @@ mod tests {
             spelling: "Weight".to_owned(),
             admits_none: false,
             element: None,
+            generator: None,
         };
         let value = known_values(vec![1.0], PrimitiveKind::Boolean, TrustProved);
         assert!(matches!(judge(&value, &declared, &kernel), Verdict::Silent));
@@ -1388,6 +1399,7 @@ mod tests {
             spelling: "Digits".to_owned(),
             admits_none: false,
             element: None,
+            generator: None,
         }
     }
 
@@ -1437,6 +1449,7 @@ mod tests {
             spelling: "dict[str, Age]".to_owned(),
             admits_none: false,
             element: Some(Box::new(age_refinement())),
+            generator: None,
         }
     }
 

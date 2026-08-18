@@ -64,6 +64,20 @@ pub fn print_panic(info: &PanicHookInfo<'_>) {
 /// a) a lot of work, and b) almost impossible to test.
 pub fn exit_on_panic() {
     std::panic::set_hook(Box::new(move |info| {
+        // A refined-kernel refusal panics with a `kernel: …` message
+        // (refined_kernel's wire_decode) and is caught by the asking
+        // site, which reports the row as undetermined. That unwinding
+        // is the designed refusal channel, not a Pyrefly bug — exiting
+        // here would kill the whole server on the first question the
+        // kernel declines to answer.
+        let message = info
+            .payload()
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str));
+        if message.is_some_and(|text| text.starts_with("kernel: ")) {
+            return;
+        }
         print_panic(info);
         std::process::exit(PANIC_EXIT_CODE as i32);
     }));

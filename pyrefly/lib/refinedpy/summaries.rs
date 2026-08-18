@@ -82,6 +82,8 @@ use crate::refinedpy::instances::field_read;
 use crate::refinedpy::instances::field_write;
 use crate::refinedpy::instances::self_attribute_name;
 use crate::refinedpy::instances::ClassModel;
+use crate::refinedpy::match_arms;
+use crate::refinedpy::narrowing;
 use crate::refinedpy::surface::surface_imports;
 
 /// The deepest a call chain interprets before declining outright. A
@@ -164,7 +166,7 @@ pub fn call_result_with_enclosing(
     if let Some(enclosing) = enclosing {
         seed_free_variables(def, enclosing, &mut environment);
     }
-    let Some(()) = bind_parameters(def, arguments, kernel, &mut environment) else {
+    let Some(()) = bind_parameters(def, arguments, kernel, &mut environment, enclosing) else {
         return return_sort_fallback(def);
     };
 
@@ -207,7 +209,7 @@ pub fn call_result_with_enclosing(
         if let Some(enclosing) = enclosing {
             seed_free_variables(def, enclosing, &mut probe_environment);
         }
-        if bind_parameters(def, arguments, kernel, &mut probe_environment).is_none() {
+        if bind_parameters(def, arguments, kernel, &mut probe_environment, enclosing).is_none() {
             return return_sort_fallback(def);
         }
         let mut probe_returns: Vec<AbstractValue> = Vec::new();
@@ -326,7 +328,7 @@ pub fn call_effects(
 
     let mut effect_environment = fresh_body_environment(def, table, depth);
     seed_free_variables(def, enclosing, &mut effect_environment);
-    if bind_parameters(def, arguments, kernel, &mut effect_environment).is_none() {
+    if bind_parameters(def, arguments, kernel, &mut effect_environment, Some(enclosing)).is_none() {
         return Some((value, Vec::new()));
     }
     let mut effects: Vec<(String, AbstractValue)> = Vec::new();
@@ -659,7 +661,7 @@ pub fn iterable_element_sort(def: &StmtFunctionDef) -> Option<AbstractValue> {
 /// costs nothing since it is equally not a readable effect. `None`
 /// when the body is empty, or contains nothing but docstring-shaped
 /// statements.
-fn first_non_docstring_statement(body: &[Stmt]) -> Option<&Stmt> {
+pub(crate) fn first_non_docstring_statement(body: &[Stmt]) -> Option<&Stmt> {
     body.iter().find(|stmt| !is_bare_string_literal_statement(stmt))
 }
 
@@ -679,6 +681,24 @@ fn is_bare_string_literal_statement(stmt: &Stmt) -> bool {
 /// copying free names — rather than also re-deriving the parameter
 /// list.
 fn seed_free_variables(def: &StmtFunctionDef, enclosing: &Environment, into: &mut Environment) {
+    for (name, value) in free_variable_snapshot(def, enclosing) {
+        into.bind(&name, value);
+    }
+}
+
+/// `def`'s own free-name reads, each paired with whatever value
+/// `enclosing` currently holds for it — the same copy `seed_free_
+/// variables` performs, but returned as a standalone snapshot rather
+/// than written directly into a callee environment. `env.rs`'s
+/// `closure_snapshot` calls this at the moment a nested def/lambda
+/// VALUE is created (rather than at the moment it is CALLED), so a
+/// retained callable's closure is pinned to its own definition site,
+/// matching Python's own scoping rule instead of whatever happens to
+/// be bound wherever it is later invoked.
+pub(crate) fn free_variable_snapshot(
+    def: &StmtFunctionDef,
+    enclosing: &Environment,
+) -> std::collections::HashMap<String, AbstractValue> {
     let mut locally_bound = std::collections::HashSet::new();
     for parameter in def
         .parameters
@@ -696,11 +716,31 @@ fn seed_free_variables(def: &StmtFunctionDef, enclosing: &Environment, into: &mu
         locally_bound.insert(kwarg.name.id.as_str().to_owned());
     }
     collect_bound_names(&def.body, &mut locally_bound);
+    let mut snapshot = std::collections::HashMap::new();
     for free_name in free_names_read(&def.body, &locally_bound) {
         if let Some(value) = enclosing.read(&free_name) {
-            into.bind(&free_name, value.clone());
+            snapshot.insert(free_name, value.clone());
         }
     }
+    snapshot
+}
+
+/// Every bare `Expr::Name` a parameter's own default expression reads —
+/// the candidate names `bind_parameters` tries against the call site's
+/// `enclosing` environment before evaluating any default. A default
+/// expression can only ever reference an outer name (never one of
+/// `def`'s own parameters or locals, which do not exist yet at def
+/// time), so this walks with an EMPTY locally-bound set, unlike
+/// `free_names_read`'s own body-wide walk.
+fn default_expression_free_names(parameters: &[&ruff_python_ast::ParameterWithDefault]) -> Vec<String> {
+    let empty = std::collections::HashSet::new();
+    let mut names = Vec::new();
+    for parameter in parameters {
+        if let Some(default_expr) = parameter.default.as_deref() {
+            collect_names_in_expr(default_expr, &empty, &mut names);
+        }
+    }
+    names
 }
 
 /// Every bare `Expr::Name` read inside `body` whose name is NOT in
@@ -960,6 +1000,7 @@ fn bind_parameters(
     arguments: &[AbstractValue],
     kernel: &Arc<RefinedTSKernel>,
     environment: &mut Environment,
+    enclosing: Option<&Environment>,
 ) -> Option<()> {
     let (kwargs_value, arguments) = match def.parameters.kwarg.as_ref() {
         Some(_) => {
@@ -979,7 +1020,24 @@ fn bind_parameters(
     if def.parameters.vararg.is_none() && arguments.len() > covered {
         return None;
     }
-    let default_environment = Environment::new(std::collections::HashSet::new());
+    // A default expression reads against the CALL SITE's own enclosing
+    // environment (module-level bindings, and any name a nested def's
+    // own outer scope holds) — `_DEFAULT_BUCKET` in `bucket: list[int] =
+    // _DEFAULT_BUCKET` is a module-level name, not a parameter or local
+    // of the def itself, so a bare empty environment can never read it.
+    // Copying `enclosing`'s OWN bindings wholesale is safe here (never
+    // `def`'s own locally-bound names, since a default expression is
+    // evaluated once at def time, before any of `def`'s own parameters
+    // or body statements exist) — the same one-directional copy
+    // `seed_free_variables` performs for a nested def's free reads.
+    let mut default_environment = Environment::new(std::collections::HashSet::new());
+    if let Some(enclosing) = enclosing {
+        for free_name in default_expression_free_names(&parameters) {
+            if let Some(value) = enclosing.read(&free_name) {
+                default_environment.bind(&free_name, value.clone());
+            }
+        }
+    }
     for (index, parameter) in parameters.iter().enumerate() {
         let value = if let Some(argument) = arguments.get(index) {
             argument.clone()
@@ -1021,12 +1079,15 @@ fn bind_parameters(
 pub(crate) type SuperResolver<'a> = dyn Fn(&str, &[AbstractValue], &Environment) -> Option<AbstractValue> + 'a;
 
 /// Interprets `body`'s statements in order against `environment`,
-/// restricted forms only. Returns `Some(true)` when control can fall
-/// off the end of `body` (so the caller should contribute a
-/// `null_value()` return), `Some(false)` when every path through `body`
-/// ends in a recorded `Return`, and `None` the moment a statement
-/// outside the restricted forms is met — the whole call declines then,
-/// matching `loops.rs::run_restricted_body`'s all-or-nothing posture.
+/// restricted forms only (`Assign`/`AnnAssign`/`AugAssign`/`Pass`/`Expr`/
+/// `If`/`Return`/`ClassDef`/`Nonlocal`/a bounded `For` over a known
+/// `Kind::List` — see `Stmt::For`'s own arm below). Returns `Some(true)`
+/// when control can fall off the end of `body` (so the caller should
+/// contribute a `null_value()` return), `Some(false)` when every path
+/// through `body` ends in a recorded `Return`, and `None` the moment a
+/// statement outside the restricted forms is met — the whole call
+/// declines then, matching `loops.rs::run_restricted_body`'s all-or-
+/// nothing posture.
 ///
 /// `super_resolver` is `Some` only when `instances::method_call_result`
 /// is interpreting a method body; a bare `call_result` passes `None`
@@ -1060,6 +1121,16 @@ pub(crate) fn interpret_body(
             Stmt::Return(ret) => {
                 let value = match ret.value.as_deref() {
                     Some(value_expr) => {
+                        // RETAINED CALLABLES: a bare `return lambda ...:
+                        // ...` (e-class-and-function.py's `make_adder`)
+                        // registers the lambda's own body into
+                        // `environment` before the immutable `evaluate_
+                        // return_value`/`evaluate_expression` path below
+                        // reads it as a value — the same "register just
+                        // before the immutable read" rule `check.rs::
+                        // sink_value` follows for its own statement
+                        // forms.
+                        crate::refinedpy::expressions::register_retained_callables(value_expr, environment);
                         evaluate_return_value(value_expr, environment, kernel, super_resolver)?
                     }
                     None => null_value(),
@@ -1069,6 +1140,139 @@ pub(crate) fn interpret_body(
                 }
                 returns.push(value);
                 return Some(false);
+            }
+            // A NESTED `def` INSIDE A SUMMARIZED BODY (e-class-and-
+            // function.py's `make_counter`'s own `def bump(...)`,
+            // r-ast-census.py's `with_paramspec_presence`'s own `def
+            // wrapper(...)`): retains the def's own body under its own
+            // range key, with a CLOSURE snapshot of every free name the
+            // def's body reads (`free_variable_snapshot`) — taken HERE,
+            // at the moment the def statement executes, never at the
+            // moment a later call reaches it (`RetainedCallable`'s own
+            // doc: Python pins a closure to its DEFINING scope). The
+            // name binds to the retained-callable value the same way an
+            // ordinary `Stmt::Assign` binds a name to whatever it
+            // evaluates to — a later `return bump`/`return wrapper`
+            // reads this binding through the ordinary `Expr::Name` arm,
+            // no special case needed there.
+            Stmt::FunctionDef(def) => {
+                let closure = free_variable_snapshot(def, environment);
+                let key = ruff_text_size::Ranged::range(def).start().to_u32();
+                environment.record_retained_callable(key, crate::refinedpy::env::RetainedCallable::from_def(def, closure));
+                environment.bind(def.name.id.as_str(), crate::refinedpy::env::retained_callable_value(key));
+            }
+            // `for <name> in <iterable>: <body>` — bounded to a KNOWN
+            // `Kind::List` receiver with every item known (the same
+            // honesty `loops.rs::iterable_values`'s catch-all arm gives a
+            // bare-Name iterable, reimplemented locally per this file's
+            // own "no importing loops.rs" precedent, `generator_yields`'s
+            // own doc). A `*rest: int` vararg parameter binds exactly
+            // this shape at a CALL SITE (`bind_parameters`'s own vararg
+            // row — a known-length tuple of the caller's own trailing
+            // arguments, `tuple_literal_value` producing `Kind::List`),
+            // so a callee whose body sums its own rest parameter now
+            // summarizes instead of declining the whole call. The body
+            // runs once per element, in order, on the SAME environment
+            // (each element's own binding overwrites the last, matching
+            // `loops.rs`'s own left-to-right iteration order) — a
+            // `Stmt::Return` on any iteration ends the loop immediately
+            // (real CPython: a `return` inside a `for` body exits the
+            // function, no further elements bind), reported through the
+            // ordinary `returns` accumulator. Any other iterable shape
+            // (unknown, a non-List value, an element that is itself
+            // unknown), a non-bare-Name target, or a non-empty `else`
+            // clause declines the WHOLE call — never a partial summary.
+            Stmt::For(for_stmt) => {
+                if !for_stmt.orelse.is_empty() {
+                    return None;
+                }
+                let Expr::Name(target_name) = for_stmt.target.as_ref() else {
+                    return None;
+                };
+                let receiver = evaluate_expression(for_stmt.iter.as_ref(), environment, kernel);
+                if receiver.kind != Kind::List || receiver.items.iter().any(|item| item.kind == Kind::Unknown) {
+                    return None;
+                }
+                let mut ended_early = false;
+                for element in receiver.items.clone() {
+                    environment.bind(target_name.id.as_str(), element);
+                    let falls_through = interpret_body(&for_stmt.body, kernel, depth, environment, returns, super_resolver)?;
+                    if !falls_through {
+                        ended_early = true;
+                        break;
+                    }
+                }
+                if ended_early {
+                    return Some(false);
+                }
+            }
+            // `match subject: case ... case ...` — mirrors `check.rs::
+            // walk_match`'s own two-path reading, restricted to this
+            // interpreter's return-collecting shape. A DECIDED subject
+            // (`match_arms::match_taken_environment`) walks only the one
+            // taken arm. Every match this corpus's callee bodies build
+            // uses a STRING-literal `MatchValue` pattern (`case "left":`),
+            // which `match_arms.rs` never decides (its own `single_
+            // numeric_value` reads Number/Boolean-tagged subjects only —
+            // see that file's own doc), so in practice this call always
+            // falls to the JOIN path below: every case forks the incoming
+            // environment, binds whatever `match_arms::pattern_bound_
+            // captures` can name (a plain literal/wildcard pattern names
+            // none — `Some(Vec::new())` — so this never actually blocks on
+            // an unnameable capture for the shapes this corpus builds),
+            // interprets that arm's body, and every surviving arm (one
+            // that falls through rather than returning) joins through
+            // `Environment::join`, the same discipline `interpret_
+            // undecided_arms` gives an `if`/`elif`/`else` chain. A case
+            // whose own pattern cannot even be NAMED (a sequence/mapping/
+            // class pattern past `pattern_bound_captures`'s own flat-
+            // capture scope) declines the whole call — this restricted
+            // interpreter has no blocker-recording channel to fall back
+            // to the way `check.rs`'s full walk does.
+            Stmt::Match(match_stmt) => {
+                let subject_value = evaluate_expression(match_stmt.subject.as_ref(), environment, kernel);
+                if let Some((taken_index, mut arm_env)) =
+                    match_arms::match_taken_environment(&subject_value, &match_stmt.cases, environment, kernel)
+                {
+                    let falls_through = interpret_body(
+                        &match_stmt.cases[taken_index].body,
+                        kernel,
+                        depth,
+                        &mut arm_env,
+                        returns,
+                        super_resolver,
+                    )?;
+                    *environment = arm_env;
+                    if !falls_through {
+                        return Some(false);
+                    }
+                    continue;
+                }
+                let mut surviving: Vec<Environment> = Vec::new();
+                for case in &match_stmt.cases {
+                    let bound_captures =
+                        match_arms::pattern_bound_captures(&case.pattern, &subject_value, environment, kernel)?;
+                    let mut arm_environment = environment.fork();
+                    for (name, value) in bound_captures {
+                        arm_environment.bind(&name, value);
+                    }
+                    let falls_through =
+                        interpret_body(&case.body, kernel, depth, &mut arm_environment, returns, super_resolver)?;
+                    if falls_through {
+                        surviving.push(arm_environment);
+                    }
+                }
+                *environment = match surviving.len() {
+                    0 => return Some(false),
+                    1 => surviving.into_iter().next().unwrap(),
+                    _ => {
+                        let mut joined = surviving.remove(0);
+                        for arm in surviving {
+                            joined = Environment::join(joined, &arm);
+                        }
+                        joined
+                    }
+                };
             }
             Stmt::ClassDef(def) => interpret_class_def(def, kernel, environment)?,
             // `nonlocal <name>[, ...]` — a DECLARATION, not a value-producing
@@ -1454,6 +1658,19 @@ fn interpret_if(
 /// Interprets every arm on its own fork once a test could not be
 /// decided — used from the first undecidable test onward, since a
 /// later arm's own reachability itself depends on the undecided one.
+///
+/// Each arm's own fork is narrowed by `narrowing::assume` before its
+/// body interprets — CPython only reaches arm N once every EARLIER
+/// test proved false, so arm N's fork is narrowed `false` by each of
+/// those, THEN `true` by its own test (when it has one; a bare `else`
+/// arm carries no test of its own to narrow by). This is what lets
+/// e-class-and-function.py's `pick_years` read `return value` inside
+/// `if isinstance(value, int):` with `value` still carrying its
+/// concrete argument (`isinstance`'s own test is undecidable at the
+/// TRUTHINESS level — `evaluate_expression` has no `isinstance` model
+/// — but `assume`'s narrowing channel reads the SAME call shape and
+/// tightens the binding directly), mirroring `check.rs::walk_if`'s own
+/// per-arm `assume` call for the ordinary walk.
 fn interpret_undecided_arms(
     arms: &[(Option<&Expr>, &[Stmt])],
     kernel: &Arc<RefinedTSKernel>,
@@ -1464,16 +1681,37 @@ fn interpret_undecided_arms(
 ) -> Option<bool> {
     let mut surviving: Vec<Environment> = Vec::new();
     let mut has_catch_all = false;
-    for (test, body) in arms {
+    for (arm_index, (test, body)) in arms.iter().enumerate() {
         has_catch_all = has_catch_all || test.is_none();
         let mut arm_environment = environment.fork();
+        for (earlier_test, _) in arms.iter().take(arm_index) {
+            if let Some(earlier_test) = earlier_test {
+                arm_environment = narrowing::assume(earlier_test, arm_environment, kernel, false);
+            }
+        }
+        if let Some(test_expr) = test {
+            arm_environment = narrowing::assume(test_expr, arm_environment, kernel, true);
+        }
         let falls_through = interpret_body(body, kernel, depth, &mut arm_environment, returns, super_resolver)?;
         if falls_through {
             surviving.push(arm_environment);
         }
     }
     if !has_catch_all {
-        surviving.push(environment.fork());
+        // No `else` at all (`if test: return ...` falling straight into
+        // the NEXT statement, e-class-and-function.py's `pick_years` —
+        // `if isinstance(value, int): return value` with no `else`,
+        // `return len(value)` is simply the statement after the `if`,
+        // not a second arm) — the implicit fallthrough is reached only
+        // when EVERY test in `arms` was false, so it is narrowed by all
+        // of them the same way an explicit later arm would be.
+        let mut fallthrough_environment = environment.fork();
+        for (test, _) in arms {
+            if let Some(test_expr) = test {
+                fallthrough_environment = narrowing::assume(test_expr, fallthrough_environment, kernel, false);
+            }
+        }
+        surviving.push(fallthrough_environment);
     }
 
     *environment = match surviving.len() {
@@ -1707,6 +1945,59 @@ mod tests {
         let result = call_result(&def, &[known_int(40.0), known_int(41.0)], None, &kernel, 0)
             .expect("*ages binds to the known (40, 41) tuple, and ages[0] reads through it");
         assert_eq!(result, known_int(40.0));
+    }
+
+    /// q-decline-names.py's own `sum_rest` shape: `*rest: int` binds to a
+    /// known tuple (`bind_parameters`'s own vararg row), and a `for`
+    /// loop over that SAME name now interprets instead of declining the
+    /// whole call — `Stmt::For`'s own arm in `interpret_body`.
+    #[test]
+    fn call_result_sums_a_for_loop_over_the_vararg_tuple() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let def = parsed_def(
+            "def sum_rest(first, *rest):\n    total = first\n    for value in rest:\n        total = total + value\n    return total\n",
+        );
+        let result = call_result(&def, &[known_int(40.0), known_int(0.0)], None, &kernel, 0)
+            .expect("a for loop over the known vararg tuple must interpret");
+        assert_eq!(result, known_int(40.0));
+    }
+
+    /// The same shape with more than one rest element, pinning the
+    /// left-to-right accumulation order (`bind_parameters`'s own tuple
+    /// order, `tuple_literal_value` producing `Kind::List` in source
+    /// argument order).
+    #[test]
+    fn call_result_for_loop_accumulates_every_vararg_element_in_order() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let def = parsed_def(
+            "def sum_rest(first, *rest):\n    total = first\n    for value in rest:\n        total = total + value\n    return total\n",
+        );
+        let result = call_result(&def, &[known_int(1.0), known_int(2.0), known_int(3.0)], None, &kernel, 0)
+            .expect("every vararg element must accumulate");
+        assert_eq!(result, known_int(6.0));
+    }
+
+    /// A `for` loop over a receiver that is not a known `Kind::List` (a
+    /// bare, unmodeled parameter here) still declines the whole call —
+    /// the new `Stmt::For` arm never guesses at an unread iterable.
+    #[test]
+    fn call_result_for_loop_over_a_non_list_receiver_declines() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let def = parsed_def("def sum_values(values):\n    total = 0\n    for value in values:\n        total = total + value\n    return total\n");
+        assert!(call_result(&def, &[unknown()], None, &kernel, 0).is_none());
+    }
+
+    /// A `return` inside a `for` body ends the loop immediately —
+    /// CPython's own semantics — so a LATER element never runs; this
+    /// pins that the loop stops at the first iteration's own return
+    /// rather than continuing to accumulate past it.
+    #[test]
+    fn call_result_for_loop_return_ends_the_loop_on_the_first_element() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let def = parsed_def("def first_rest(first, *rest):\n    for value in rest:\n        return value\n    return first\n");
+        let result = call_result(&def, &[known_int(1.0), known_int(2.0), known_int(3.0)], None, &kernel, 0)
+            .expect("a return inside the for body must decide the call");
+        assert_eq!(result, known_int(2.0), "the loop returns on its first element, 2, never reaching 3");
     }
 
     /// A def with both a plain parameter and a `*args` tail: the plain

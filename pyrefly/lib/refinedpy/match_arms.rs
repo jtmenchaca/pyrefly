@@ -34,15 +34,13 @@
 //! known List/Object subject) provable: `pattern_captures` names every
 //! bare-Name/star element a sequence pattern binds, every literal-key
 //! Name value (plus an optional `**rest`) a mapping pattern binds, and
-//! every keyword sub-pattern Name a class pattern binds; `pattern_
-//! bound_captures` reads the actual element/key/field value off a
-//! KNOWN List/Object subject when one is available. A class pattern's
-//! POSITIONAL sub-patterns (`Point(px, py)`) still decline entirely —
-//! resolving a position to a field name needs the class's own
-//! `__match_args__` order (`ClassModel.fields`), which this file has no
-//! way to look up (only `check.rs`'s `walk_match` holds the module's
-//! class table); naming a keyword sub-pattern needs no such lookup,
-//! since the keyword's own `attr` IS the field name.
+//! every keyword OR positional sub-pattern Name a class pattern binds.
+//! `pattern_bound_captures` reads the actual element/key/field value off
+//! a KNOWN List/Object subject when one is available. A class pattern's
+//! POSITIONAL sub-patterns (`Point(px, py)`) resolve through the class's
+//! own `__match_args__` order (`ClassModel.fields`, `class_pattern_fields`'s
+//! own doc) when a class table is available; a keyword sub-pattern needs
+//! no such lookup, since the keyword's own `attr` IS the field name.
 //!
 //! `PrimitiveKind` carries `Integer`/`Float` tags, but nothing in this
 //! package's expression evaluator (`expressions.rs`) emits them yet —
@@ -57,6 +55,7 @@
 //! is the one place that gains a new arm — every other function here
 //! goes through it rather than re-deriving the identity check.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use refined_domain::abstract_value::known_values;
@@ -75,6 +74,26 @@ use crate::refinedpy::collection_models::subscript_read;
 use crate::refinedpy::env::Environment;
 use crate::refinedpy::expressions::evaluate_expression;
 use crate::refinedpy::instances::field_read;
+use crate::refinedpy::instances::ClassModel;
+
+/// The field names a `MatchClass` pattern's own class name resolves to,
+/// in `__match_args__`/declaration order — `None` when `classes` carries
+/// no table, the pattern's `cls` expression is not a bare Name, or the
+/// name is not in the table (an imported/builtin class this checker's
+/// class table never populates, e.g. `case int():`). Shared by
+/// `pattern_captures` and `pattern_bound_captures` so a positional
+/// class pattern's field-order lookup is written once.
+fn class_pattern_fields<'a>(
+    class_pattern: &ruff_python_ast::PatternMatchClass,
+    classes: Option<&'a HashMap<String, ClassModel>>,
+) -> Option<&'a [crate::refinedpy::instances::ClassField]> {
+    let Expr::Name(class_name) = class_pattern.cls.as_ref() else {
+        return None;
+    };
+    let classes = classes?;
+    let model = classes.get(class_name.id.as_str())?;
+    Some(&model.fields)
+}
 
 /// What a match arm's pattern (and, where present, its guard) decided
 /// about a known subject.
@@ -452,19 +471,23 @@ pub fn pattern_proved_value(pattern: &Pattern, environment: &Environment, kernel
 /// empty), or KEYWORD sub-patterns ONLY, each itself a bare-Name/
 /// wildcard `MatchAs` (`case Point(x=px):` names `px`) — a keyword's
 /// own `attr` IS the field name, so naming it needs no class lookup.
-/// POSITIONAL sub-patterns (`case Point(px, py):`) always decline:
-/// resolving a position to a field name needs the class's own
-/// `__match_args__` order (`ClassModel.fields`, pydantic's own
-/// declaration-order convention), which this function has no class
-/// table to consult — `check.rs::walk_match` is the only caller with
-/// one, and threading it through would widen this function's contract
-/// for a shape this corpus's rows do not need decided.
-pub fn pattern_captures(pattern: &Pattern) -> Option<Vec<String>> {
+/// POSITIONAL sub-patterns (`case Point(px, py):`) resolve through the
+/// class's own `__match_args__` order (`ClassModel.fields`, pydantic's
+/// own declaration-order convention, `class_pattern_fields`'s own doc):
+/// each positional bare-Name/wildcard sub-pattern names the field at its
+/// own position. A pattern with MORE positions than the class has
+/// fields declines whole (Python itself raises `TypeError` for this
+/// shape at runtime; this function never guesses a truncated binding).
+/// `classes` is `None` when no caller has a class table to offer (this
+/// function's own tests, and any future caller outside a match walk) —
+/// every positional pattern then declines exactly as before this
+/// capability existed.
+pub fn pattern_captures(pattern: &Pattern, classes: Option<&HashMap<String, ClassModel>>) -> Option<Vec<String>> {
     match pattern {
         Pattern::MatchValue(_) | Pattern::MatchSingleton(_) => Some(Vec::new()),
         Pattern::MatchAs(as_pattern) => {
             let mut names = match as_pattern.pattern.as_deref() {
-                Some(inner) => pattern_captures(inner)?,
+                Some(inner) => pattern_captures(inner, classes)?,
                 None => Vec::new(),
             };
             if let Some(name) = as_pattern.name.as_ref() {
@@ -474,7 +497,7 @@ pub fn pattern_captures(pattern: &Pattern) -> Option<Vec<String>> {
         }
         Pattern::MatchOr(or_pattern) => {
             let first = or_pattern.patterns.first()?;
-            pattern_captures(first)
+            pattern_captures(first, classes)
         }
         Pattern::MatchSequence(sequence_pattern) => {
             let mut names = Vec::new();
@@ -522,12 +545,26 @@ pub fn pattern_captures(pattern: &Pattern) -> Option<Vec<String>> {
             Some(names)
         }
         Pattern::MatchClass(class_pattern) => {
-            if !class_pattern.arguments.patterns.is_empty() {
-                // positional sub-patterns need __match_args__ field
-                // order — not this function's business, see the doc above
-                return None;
-            }
             let mut names = Vec::new();
+            if !class_pattern.arguments.patterns.is_empty() {
+                let fields = class_pattern_fields(class_pattern, classes)?;
+                if class_pattern.arguments.patterns.len() > fields.len() {
+                    // more positions than the class declares fields —
+                    // Python itself raises TypeError for this shape
+                    return None;
+                }
+                for sub_pattern in class_pattern.arguments.patterns.iter() {
+                    let Pattern::MatchAs(as_pattern) = sub_pattern else {
+                        return None;
+                    };
+                    if as_pattern.pattern.is_some() {
+                        return None;
+                    }
+                    if let Some(name) = as_pattern.name.as_ref() {
+                        names.push(name.id.as_str().to_owned());
+                    }
+                }
+            }
             for keyword in &class_pattern.arguments.keywords {
                 let Pattern::MatchAs(as_pattern) = &keyword.pattern else {
                     return None;
@@ -660,10 +697,28 @@ pub fn pattern_bound_captures(
             Some(bound)
         }
         Pattern::MatchClass(class_pattern) => {
-            if !class_pattern.arguments.patterns.is_empty() {
-                return None;
-            }
             let mut bound = Vec::new();
+            if !class_pattern.arguments.patterns.is_empty() {
+                let classes = environment.classes().map(|classes| classes.as_ref());
+                let fields = class_pattern_fields(class_pattern, classes)?;
+                if class_pattern.arguments.patterns.len() > fields.len() {
+                    // more positions than the class declares fields —
+                    // Python itself raises TypeError for this shape
+                    return None;
+                }
+                for (field, sub_pattern) in fields.iter().zip(class_pattern.arguments.patterns.iter()) {
+                    let Pattern::MatchAs(as_pattern) = sub_pattern else {
+                        return None;
+                    };
+                    if as_pattern.pattern.is_some() {
+                        return None;
+                    }
+                    if let Some(name) = as_pattern.name.as_ref() {
+                        let field_value = field_read(subject, field.name.as_str()).unwrap_or_else(unknown);
+                        bound.push((name.id.as_str().to_owned(), field_value));
+                    }
+                }
+            }
             for keyword in &class_pattern.arguments.keywords {
                 let Pattern::MatchAs(as_pattern) = &keyword.pattern else {
                     return None;
@@ -934,14 +989,14 @@ mod tests {
     #[test]
     fn pattern_captures_names_sequence_elements_and_star_positionally() {
         let cases = match_cases("match x:\n    case [first, *rest]:\n        pass\n");
-        let names = pattern_captures(&cases[0].pattern).expect("bare-Name/star elements are nameable");
+        let names = pattern_captures(&cases[0].pattern, None).expect("bare-Name/star elements are nameable");
         assert_eq!(names, vec!["first".to_owned(), "rest".to_owned()]);
     }
 
     #[test]
     fn pattern_captures_wildcard_star_names_nothing() {
         let cases = match_cases("match x:\n    case [*_]:\n        pass\n");
-        let names = pattern_captures(&cases[0].pattern).expect("a wildcard star is nameable");
+        let names = pattern_captures(&cases[0].pattern, None).expect("a wildcard star is nameable");
         assert!(names.is_empty(), "`*_` never binds: {names:?}");
     }
 
@@ -949,7 +1004,7 @@ mod tests {
     fn pattern_captures_declines_a_sequence_with_a_nested_literal() {
         let cases = match_cases("match x:\n    case [1, b]:\n        pass\n");
         assert!(
-            pattern_captures(&cases[0].pattern).is_none(),
+            pattern_captures(&cases[0].pattern, None).is_none(),
             "a nested literal sub-pattern is past this function's flat bare-capture scope"
         );
     }
@@ -957,23 +1012,71 @@ mod tests {
     #[test]
     fn pattern_captures_names_mapping_literal_key_values_and_rest() {
         let cases = match_cases("match x:\n    case {\"age\": bound_age, **rest}:\n        pass\n");
-        let names = pattern_captures(&cases[0].pattern).expect("literal-key Name values plus **rest are nameable");
+        let names = pattern_captures(&cases[0].pattern, None).expect("literal-key Name values plus **rest are nameable");
         assert_eq!(names, vec!["bound_age".to_owned(), "rest".to_owned()]);
     }
 
     #[test]
     fn pattern_captures_names_class_keyword_subpatterns() {
         let cases = match_cases("match x:\n    case Point(x=px):\n        pass\n");
-        let names = pattern_captures(&cases[0].pattern).expect("a keyword sub-pattern's own attr needs no class lookup");
+        let names =
+            pattern_captures(&cases[0].pattern, None).expect("a keyword sub-pattern's own attr needs no class lookup");
         assert_eq!(names, vec!["px".to_owned()]);
     }
 
     #[test]
-    fn pattern_captures_declines_a_class_pattern_with_positional_subpatterns() {
+    fn pattern_captures_declines_a_class_pattern_with_positional_subpatterns_and_no_class_table() {
         let cases = match_cases("match x:\n    case Point(px, py):\n        pass\n");
         assert!(
-            pattern_captures(&cases[0].pattern).is_none(),
-            "a position needs __match_args__ order, which this function has no class table to read"
+            pattern_captures(&cases[0].pattern, None).is_none(),
+            "a position needs __match_args__ order, which no class table here can supply"
+        );
+    }
+
+    #[test]
+    fn pattern_captures_names_class_positional_subpatterns_from_match_args_order() {
+        let cases = match_cases("match x:\n    case Point(px, py):\n        pass\n");
+        let mut fields = HashMap::new();
+        fields.insert(
+            "Point".to_owned(),
+            ClassModel {
+                name: "Point".to_owned(),
+                fields: vec![
+                    crate::refinedpy::instances::ClassField { name: "x".to_owned(), declared: None, default: None },
+                    crate::refinedpy::instances::ClassField { name: "y".to_owned(), declared: None, default: None },
+                ],
+                properties: HashMap::new(),
+                methods: HashMap::new(),
+                parent_methods: HashMap::new(),
+                class_attributes: Vec::new(),
+            },
+        );
+        let names = pattern_captures(&cases[0].pattern, Some(&fields))
+            .expect("__match_args__ order names each position");
+        assert_eq!(names, vec!["px".to_owned(), "py".to_owned()]);
+    }
+
+    #[test]
+    fn pattern_captures_declines_a_class_pattern_with_more_positions_than_fields() {
+        let cases = match_cases("match x:\n    case Point(px, py, pz):\n        pass\n");
+        let mut fields = HashMap::new();
+        fields.insert(
+            "Point".to_owned(),
+            ClassModel {
+                name: "Point".to_owned(),
+                fields: vec![
+                    crate::refinedpy::instances::ClassField { name: "x".to_owned(), declared: None, default: None },
+                    crate::refinedpy::instances::ClassField { name: "y".to_owned(), declared: None, default: None },
+                ],
+                properties: HashMap::new(),
+                methods: HashMap::new(),
+                parent_methods: HashMap::new(),
+                class_attributes: Vec::new(),
+            },
+        );
+        assert!(
+            pattern_captures(&cases[0].pattern, Some(&fields)).is_none(),
+            "three positions against a two-field class never truncates to a guess"
         );
     }
 
@@ -1050,14 +1153,87 @@ mod tests {
     }
 
     #[test]
-    fn pattern_bound_captures_still_declines_positional_class_subpatterns() {
+    fn pattern_bound_captures_declines_positional_class_subpatterns_with_no_class_table() {
         let Some(kernel) = loaded_kernel() else { return };
         let cases = match_cases("match x:\n    case Point(px, py):\n        pass\n");
         let subject = unknown();
         let environment = empty_environment();
         assert!(
             pattern_bound_captures(&cases[0].pattern, &subject, &environment, &kernel).is_none(),
-            "positional sub-patterns still need __match_args__ order this function cannot read"
+            "positional sub-patterns need __match_args__ order, which no class table here can supply"
+        );
+    }
+
+    #[test]
+    fn pattern_bound_captures_reads_positional_class_fields_off_a_known_instance_subject() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let cases = match_cases("match x:\n    case Point(px, py):\n        pass\n");
+        let subject = refined_domain::known_constructors::known_object(
+            vec![
+                refined_domain::abstract_value::ObjectKey {
+                    name: "x".to_owned(),
+                    numeric: false,
+                    value: known_values(vec![200.0], PrimitiveKind::Integer, TrustProved),
+                },
+                refined_domain::abstract_value::ObjectKey {
+                    name: "y".to_owned(),
+                    numeric: false,
+                    value: known_values(vec![10.0], PrimitiveKind::Integer, TrustProved),
+                },
+            ],
+            None,
+            true,
+            TrustProved,
+            false,
+        );
+        let mut environment = empty_environment();
+        let mut fields = HashMap::new();
+        fields.insert(
+            "Point".to_owned(),
+            ClassModel {
+                name: "Point".to_owned(),
+                fields: vec![
+                    crate::refinedpy::instances::ClassField { name: "x".to_owned(), declared: None, default: None },
+                    crate::refinedpy::instances::ClassField { name: "y".to_owned(), declared: None, default: None },
+                ],
+                properties: HashMap::new(),
+                methods: HashMap::new(),
+                parent_methods: HashMap::new(),
+                class_attributes: Vec::new(),
+            },
+        );
+        environment.set_classes(Arc::new(fields));
+        let bound = pattern_bound_captures(&cases[0].pattern, &subject, &environment, &kernel)
+            .expect("positional sub-patterns resolve through __match_args__ order");
+        assert_eq!(bound[0], ("px".to_owned(), known_values(vec![200.0], PrimitiveKind::Integer, TrustProved)));
+        assert_eq!(bound[1], ("py".to_owned(), known_values(vec![10.0], PrimitiveKind::Integer, TrustProved)));
+    }
+
+    #[test]
+    fn pattern_bound_captures_declines_positional_class_subpatterns_past_field_count() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let cases = match_cases("match x:\n    case Point(px, py, pz):\n        pass\n");
+        let subject = unknown();
+        let mut environment = empty_environment();
+        let mut fields = HashMap::new();
+        fields.insert(
+            "Point".to_owned(),
+            ClassModel {
+                name: "Point".to_owned(),
+                fields: vec![
+                    crate::refinedpy::instances::ClassField { name: "x".to_owned(), declared: None, default: None },
+                    crate::refinedpy::instances::ClassField { name: "y".to_owned(), declared: None, default: None },
+                ],
+                properties: HashMap::new(),
+                methods: HashMap::new(),
+                parent_methods: HashMap::new(),
+                class_attributes: Vec::new(),
+            },
+        );
+        environment.set_classes(Arc::new(fields));
+        assert!(
+            pattern_bound_captures(&cases[0].pattern, &subject, &environment, &kernel).is_none(),
+            "three positions against a two-field class never truncates to a guess"
         );
     }
 

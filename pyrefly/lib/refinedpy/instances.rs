@@ -1316,12 +1316,21 @@ pub fn method_def_of<'a>(model: &'a ClassModel, name: &str) -> Option<&'a StmtFu
 /// statement `interpret_body` does not read, an unresolved `super()`
 /// call, an unreadable return) answers `None` — an honest decline,
 /// never a guessed instance.
+///
+/// `classes` seeds the method body's own environment with the module's
+/// class table (`environment.set_classes`), the same way `table` seeds
+/// the function table — without it, `self.<other_method>()` and any
+/// property read inside the body has no class to resolve `self`'s own
+/// type against, and declines even though the class and method both
+/// exist. `None` when the caller has no class table to offer (a plain
+/// unit test constructing a method call directly, for instance).
 pub fn method_call_result(
     instance: &AbstractValue,
     model: &ClassModel,
     method: &StmtFunctionDef,
     arguments: &[AbstractValue],
     table: Option<&Arc<FunctionTable>>,
+    classes: Option<&Arc<HashMap<String, ClassModel>>>,
     kernel: &Arc<RefinedTSKernel>,
     depth: u32,
 ) -> Option<(AbstractValue, AbstractValue)> {
@@ -1336,24 +1345,53 @@ pub fn method_call_result(
     {
         return None;
     }
-    let parameters: Vec<_> = method
+    // `@staticmethod` declares no `self`/`cls` receiver slot at all
+    // (datamodel.rst's own "Static method objects": "a static method
+    // does not receive an implicit first argument") — every declared
+    // parameter binds positionally to `arguments`, exactly like an
+    // ordinary same-module `def`, with no receiver consumed. Every
+    // other member `def` (including `@classmethod`, out of this
+    // function's own scope — its first parameter is `cls`, still a
+    // receiver slot, just bound to the class rather than the instance)
+    // keeps the `self`-splitting shape below.
+    let is_static = method
+        .decorator_list
+        .iter()
+        .any(|decorator| matches!(&decorator.expression, Expr::Name(name) if name.id.as_str() == "staticmethod"));
+
+    let all_parameters: Vec<_> = method
         .parameters
         .posonlyargs
         .iter()
         .chain(method.parameters.args.iter())
         .collect();
-    // the first parameter is `self` by convention (matching
-    // `init_derived_fields`'s own first-parameter reading) — a method
-    // with no parameter at all is not a bound instance method this
-    // function can seed `self` for.
-    let (_self_parameter, rest) = parameters.split_first()?;
+    // the first parameter is `self` by convention for an ordinary
+    // instance method (matching `init_derived_fields`'s own
+    // first-parameter reading) — a method with no parameter at all is
+    // not a bound instance method this function can seed a receiver
+    // for. A `@classmethod`'s own first parameter is spelled `cls`
+    // instead, still a receiver slot, just bound to the class rather
+    // than the instance — `receiver_parameter_name` carries the ACTUAL
+    // spelling forward so a `cls.<attr>` read/write inside the body
+    // resolves, alongside the literal `"self"` binding every other
+    // reader in this file (`self_attribute_name`, `interpret_assign`'s
+    // own self-write recognition) already hardcodes.
+    let (receiver_parameter_name, rest): (Option<&str>, Vec<_>) = if is_static {
+        (None, all_parameters)
+    } else {
+        let (self_parameter, rest) = all_parameters.split_first()?;
+        (Some(self_parameter.parameter.name.id.as_str()), rest.to_vec())
+    };
     if arguments.len() > rest.len() {
         return None;
     }
 
     let mut locally_bound = std::collections::HashSet::new();
-    locally_bound.insert("self".to_owned());
-    for parameter in rest {
+    if let Some(receiver_parameter_name) = receiver_parameter_name {
+        locally_bound.insert("self".to_owned());
+        locally_bound.insert(receiver_parameter_name.to_owned());
+    }
+    for parameter in &rest {
         locally_bound.insert(parameter.parameter.name.id.as_str().to_owned());
     }
     collect_bound_names(&method.body, &mut locally_bound);
@@ -1364,7 +1402,15 @@ pub fn method_call_result(
     if let Some(table) = table {
         environment.set_functions(table.clone());
     }
-    environment.bind("self", instance.clone());
+    if let Some(classes) = classes {
+        environment.set_classes(classes.clone());
+    }
+    if let Some(receiver_parameter_name) = receiver_parameter_name {
+        environment.bind("self", instance.clone());
+        if receiver_parameter_name != "self" {
+            environment.bind(receiver_parameter_name, instance.clone());
+        }
+    }
 
     let default_environment = Environment::new(Default::default());
     for (index, parameter) in rest.iter().enumerate() {
@@ -1390,7 +1436,7 @@ pub fn method_call_result(
             class_attributes: Vec::new(),
         };
         let (_after, result) =
-            method_call_result(&working_instance, &parentless, parent_def, args, table, kernel, depth + 1)?;
+            method_call_result(&working_instance, &parentless, parent_def, args, table, classes, kernel, depth + 1)?;
         Some(result)
     };
 
@@ -1403,13 +1449,18 @@ pub fn method_call_result(
     let mut answers = returns.into_iter();
     let first = answers.next()?;
     let result = answers.fold(first, |acc, next| refined_domain::lattice_operations::join_known(acc, next));
-    let working_instance = environment.read("self")?.clone();
+    // A static method binds no `self` at all — there is no receiver for
+    // its own body to mutate, so the "working instance" half of the
+    // answer is simply `instance` unchanged (the caller's own
+    // class-object value, echoed back rather than read out of an
+    // environment slot that was never bound).
+    let working_instance = if is_static { instance.clone() } else { environment.read("self")?.clone() };
     Some((working_instance, result))
 }
 
 /// A generator body's own yielded values, in order — `Some(Vec::new())`
 /// for a body that yields nothing on its only path, `None` when the
-/// body is outside the two shapes this function reads (a conditional
+/// body is outside the two shapes this function reads (a CONDITIONAL
 /// yield, `yield from`, any restricted-body statement this function
 /// itself does not walk). Models ONLY the yields themselves; a
 /// `next(gen)` call's OWN read of "the first yield" is the WIRING
@@ -1419,7 +1470,8 @@ pub fn method_call_result(
 /// gen():` walk, should that wiring choose to).
 ///
 /// Two accepted top-level statement shapes, walked in source order and
-/// merged into one ordered list:
+/// merged into one ordered list (a LEADING docstring is skipped first,
+/// `yields_of_body`'s own doc):
 ///
 /// 1. A STRAIGHT-LINE `yield <expr>` statement (an `Expr` statement
 ///    whose value is `Expr::Yield`) — the yielded value evaluates
@@ -1451,7 +1503,15 @@ pub fn method_call_result(
 /// Any other statement shape (an `if`, a `while`, a nested `for` whose
 /// iterable is not one of the two literal forms, a `for` whose body is
 /// not exactly one `yield`, …) declines the WHOLE body — `None`, never a
-/// partial list.
+/// partial list. A CONDITIONAL yield (`if <test>: yield <expr>`) is a
+/// deliberate, permanent decline — q-decline-names.py's own
+/// `age_generator` row states this as one of its file's two genuine
+/// soundness boundaries: "a generator whose yield sits under a
+/// CONDITION is beyond the straight-line summary the checker reads."
+/// This function must never join an `if`/`else`'s own yields into one
+/// answer, even though the values involved would often be sound to
+/// join — the row's own purpose is to teach that this shape stays
+/// undetermined.
 ///
 /// `arguments`/`table`/`kernel`/`depth` mirror `summaries::call_result`
 /// exactly (parameters bind positionally, the module's function table
@@ -1503,15 +1563,35 @@ pub fn generator_yields(
         environment.bind(parameter.parameter.name.id.as_str(), value);
     }
 
+    yields_of_body(&def.body, &mut environment, kernel)
+}
+
+/// `generator_yields`'s own body walk, over `def.body` — see that
+/// function's own doc for the two accepted statement shapes and why a
+/// CONDITIONAL yield is never one of them.
+///
+/// A LEADING docstring (a bare string-literal `Expr` statement,
+/// `summaries::first_non_docstring_statement`'s own shape) is skipped
+/// before the walk starts — a docstring is documentation, never a
+/// readable effect (that function's own doc), so a generator whose body
+/// opens with one must not decline solely because its first statement is
+/// not `Expr::Yield`.
+fn yields_of_body(body: &[Stmt], environment: &mut Environment, kernel: &Arc<RefinedTSKernel>) -> Option<Vec<AbstractValue>> {
+    let Some(first) = crate::refinedpy::summaries::first_non_docstring_statement(body) else {
+        // nothing but leading docstrings — no yield anywhere
+        return Some(Vec::new());
+    };
+    let skip = body.iter().position(|stmt| std::ptr::eq(stmt, first)).expect("first came from this same body");
+    let body = &body[skip..];
     let mut yields = Vec::new();
-    for stmt in &def.body {
+    for stmt in body {
         match stmt {
             Stmt::Expr(expr_stmt) => {
                 let Expr::Yield(yield_expr) = expr_stmt.value.as_ref() else {
                     return None;
                 };
                 let value = match yield_expr.value.as_deref() {
-                    Some(value_expr) => evaluate_expression(value_expr, &environment, kernel),
+                    Some(value_expr) => evaluate_expression(value_expr, environment, kernel),
                     None => refined_domain::abstract_value::null_value(),
                 };
                 if value.kind == Kind::Unknown {
@@ -1521,10 +1601,10 @@ pub fn generator_yields(
             }
             // a bare `return` inside a generator ends iteration without
             // yielding (datamodel.rst's generator-function entry) — no
-            // more values after it, and a straight-line body's own
-            // return-with-a-value shape (StopIteration's `.value`) is
-            // outside this function's scope (never read by `next()`'s
-            // own first-value contract).
+            // more statements after it are read, and a straight-line
+            // body's own return-with-a-value shape (`StopIteration`'s
+            // `.value`) is outside this function's scope (never read by
+            // `next()`'s own first-value contract).
             Stmt::Return(_) => break,
             // `for <name> in <literal iterable>: yield <expr>` — see
             // this function's own doc, shape 2.
@@ -1547,7 +1627,7 @@ pub fn generator_yields(
                 let elements = literal_iterable_values(for_stmt.iter.as_ref())?;
                 for element in elements {
                     environment.bind(target_name.id.as_str(), element);
-                    let value = evaluate_expression(value_expr, &environment, kernel);
+                    let value = evaluate_expression(value_expr, environment, kernel);
                     if value.kind == Kind::Unknown {
                         return None;
                     }
@@ -1712,6 +1792,7 @@ mod tests {
             spelling: "Age".to_owned(),
             admits_none: false,
             element: None,
+            generator: None,
         }
     }
 
@@ -2342,12 +2423,12 @@ mod tests {
         let instance = judge_construction(kid, &[(integer_value(40.0), range_of("40"))], &[], &kernel).instance;
 
         let effective = method_def_of(kid, "label").expect("label is declared");
-        let (_after, effective_result) = method_call_result(&instance, kid, effective, &[], None, &kernel, 0)
+        let (_after, effective_result) = method_call_result(&instance, kid, effective, &[], None, None, &kernel, 0)
             .expect("the child's own label() must interpret");
         assert_eq!(effective_result, integer_value(2.0), "method_def_of answers the CHILD's own override");
 
         let inherited = kid.parent_methods.get("label").expect("parent_methods keeps the parent's own def");
-        let (_after, inherited_result) = method_call_result(&instance, kid, inherited, &[], None, &kernel, 0)
+        let (_after, inherited_result) = method_call_result(&instance, kid, inherited, &[], None, None, &kernel, 0)
             .expect("the parent's own label() must interpret");
         assert_eq!(inherited_result, integer_value(1.0), "parent_methods is unaffected by the child's override");
     }
@@ -2375,7 +2456,7 @@ mod tests {
         let outlaw = table.get("Outlaw").expect("Outlaw class recorded");
         let instance = judge_construction(outlaw, &[(integer_value(40.0), range_of("40"))], &[], &kernel).instance;
         let method = method_def_of(outlaw, "spoil").expect("spoil is declared");
-        let (after, _result) = method_call_result(&instance, outlaw, method, &[], None, &kernel, 0)
+        let (after, _result) = method_call_result(&instance, outlaw, method, &[], None, None, &kernel, 0)
             .expect("spoil's straight-line self-write must interpret");
         assert_eq!(field_read(&after, "age"), Some(integer_value(200.0)), "the write survives on the returned instance");
     }
@@ -2406,7 +2487,7 @@ mod tests {
         let kid = table.get("KidYears").expect("KidYears class recorded");
         let instance = judge_construction(kid, &[(integer_value(40.0), range_of("40"))], &[], &kernel).instance;
         let method = method_def_of(kid, "call_super_method").expect("call_super_method is declared");
-        let (_after, result) = method_call_result(&instance, kid, method, &[], None, &kernel, 0)
+        let (_after, result) = method_call_result(&instance, kid, method, &[], None, None, &kernel, 0)
             .expect("the super().years() call must resolve through parent_methods");
         assert_eq!(result, integer_value(41.0), "super().years() answers 40, plus 1");
     }
@@ -2443,7 +2524,7 @@ mod tests {
             "        yield value\n",
         ));
         let def = module.body.into_iter().next().expect("one top-level def").function_def_stmt().expect("is a def");
-        let yields = generator_yields(&def, &[], None, &kernel, 0).expect("the stream() for-loop shape must decide");
+        let yields = generator_yields(&def, &[], None, None, &kernel, 0).expect("the stream() for-loop shape must decide");
         assert_eq!(yields, vec![integer_value(10.0), integer_value(20.0), integer_value(30.0)]);
     }
 
@@ -2459,7 +2540,7 @@ mod tests {
             "        yield value + 100\n",
         ));
         let def = module.body.into_iter().next().expect("one top-level def").function_def_stmt().expect("is a def");
-        let yields = generator_yields(&def, &[], None, &kernel, 0).expect("the transformed-yield shape must decide");
+        let yields = generator_yields(&def, &[], None, None, &kernel, 0).expect("the transformed-yield shape must decide");
         assert_eq!(yields, vec![integer_value(110.0), integer_value(120.0)]);
     }
 
@@ -2476,7 +2557,7 @@ mod tests {
             "        yield value\n",
         ));
         let def = module.body.into_iter().next().expect("one top-level def").function_def_stmt().expect("is a def");
-        let yields = generator_yields(&def, &[], None, &kernel, 0).expect("the mixed shape must decide");
+        let yields = generator_yields(&def, &[], None, None, &kernel, 0).expect("the mixed shape must decide");
         assert_eq!(yields, vec![integer_value(1.0), integer_value(2.0), integer_value(3.0)]);
     }
 
@@ -2494,4 +2575,64 @@ mod tests {
         let def = module.body.into_iter().next().expect("one top-level def").function_def_stmt().expect("is a def");
         assert!(generator_yields(&def, &[unknown()], None, &kernel, 0).is_none());
     }
+
+    // --- generator_yields: the conditional-yield shape stays a decline ---
+
+    /// q-decline-names.py's own `age_generator` shape: `if bool([]): yield
+    /// 40` with NO `else`, followed by an unconditional `yield 41`. This
+    /// row is one of the corpus's own two genuine soundness boundaries —
+    /// the conditional yield must decline the WHOLE body, never join the
+    /// if-branch's value with what follows it.
+    #[test]
+    fn generator_yields_declines_a_conditional_yield() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "def age_generator():\n",
+            "    if bool([]):\n",
+            "        yield 40\n",
+            "    yield 41\n",
+        ));
+        let def = module.body.into_iter().next().expect("one top-level def").function_def_stmt().expect("is a def");
+        assert!(
+            generator_yields(&def, &[], None, None, &kernel, 0).is_none(),
+            "a yield under a condition is a permanent decline, not a shape this function joins"
+        );
+    }
+
+    // --- generator_yields: a leading docstring is skipped ---
+
+    /// A generator whose body opens with a docstring, then a plain
+    /// straight-line `yield`, must summarize exactly as it would with no
+    /// docstring at all — the docstring states no readable effect.
+    #[test]
+    fn generator_yields_skips_a_leading_docstring_before_a_straight_line_yield() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "def documented():\n",
+            "    \"\"\"a docstring, not a yield\"\"\"\n",
+            "    yield 40\n",
+        ));
+        let def = module.body.into_iter().next().expect("one top-level def").function_def_stmt().expect("is a def");
+        let yields = generator_yields(&def, &[], None, None, &kernel, 0)
+            .expect("a leading docstring must not decline the body");
+        assert_eq!(yields, vec![integer_value(40.0)]);
+    }
+
+    /// The same docstring-skip over the `for`-loop shape (shape 2) —
+    /// the docstring sits before the loop, not inside it.
+    #[test]
+    fn generator_yields_skips_a_leading_docstring_before_a_for_loop_yield() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "def documented_stream():\n",
+            "    \"\"\"a docstring, not a yield\"\"\"\n",
+            "    for value in (10, 20):\n",
+            "        yield value\n",
+        ));
+        let def = module.body.into_iter().next().expect("one top-level def").function_def_stmt().expect("is a def");
+        let yields = generator_yields(&def, &[], None, None, &kernel, 0)
+            .expect("a leading docstring must not decline the for-loop shape");
+        assert_eq!(yields, vec![integer_value(10.0), integer_value(20.0)]);
+    }
+
 }

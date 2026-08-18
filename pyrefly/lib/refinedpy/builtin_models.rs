@@ -524,6 +524,39 @@ fn exception_single_string_message(instance: &AbstractValue) -> Option<AbstractV
     None
 }
 
+/// `object()` — library/functions.html#object: "This is the ultimate
+/// base class of all other classes... When the constructor is called,
+/// it returns a new featureless object. The constructor does not accept
+/// any arguments." A featureless object has no fields this domain could
+/// enumerate, so the answer is `opaque_value` — the same "kind of thing
+/// known, contents not" shape `type(object)` already answers above —
+/// tagged `source: "object()"` so a dict-display key built from this
+/// value (`known_dict_key`'s identity arm, `collection_models.rs`) can
+/// recognize it as a stable, non-string/int key: `stdtypes.rst`'s
+/// mapping-key rule states a dict key only needs to be hashable, never a
+/// string or number, and a fresh `object()` is hashable by identity
+/// alone (no `__eq__`/`__hash__` override, `object`'s own doc — "has
+/// methods that are common to all instances," none of which redefine
+/// equality).
+///
+/// Scope: this tags every `object()` call the SAME way, so it only
+/// answers a sound identity for the corpus shape actually read — ONE
+/// `object()` call, bound to a name once and read back by that name
+/// (never re-evaluated) — never two DIFFERENT `object()` call sites
+/// compared as keys within the same dict. Telling two live `object()`
+/// values apart needs a per-call-site tag threaded from the call
+/// expression itself (`expressions.rs::evaluate_call`), which this file
+/// has no access to (it only sees the callee name and the evaluated,
+/// argument-less call).
+fn object_call(arguments: &[AbstractValue]) -> Option<AbstractValue> {
+    if !arguments.is_empty() {
+        return None;
+    }
+    let mut instance = opaque_value("a featureless object");
+    instance.source = "object()".to_owned();
+    Some(instance)
+}
+
 /// The dispatcher: a call to Python builtin `function` with already-
 /// evaluated `arguments`. `None` means "not modeled here" — the caller
 /// declines honestly rather than reading this as "the call is unknown to
@@ -568,6 +601,7 @@ pub fn builtin_call_result(function: &str, arguments: &[AbstractValue]) -> Optio
         // `type(name, bases, dict)` class-creation form is not this row
         // (a different arity, out of scope).
         "type" if arguments.len() == 1 => Some(opaque_value("a type object")),
+        "object" => object_call(arguments),
         _ => None,
     }
 }
@@ -900,5 +934,21 @@ mod tests {
         instance.source = "exception".to_owned();
         let got = builtin_call_result("str", &[instance]);
         assert!(got.is_none(), "a zero-argument exception's __str__ (empty string) is not modeled: {got:?}");
+    }
+
+    #[test]
+    fn object_call_answers_an_opaque_value_tagged_for_identity_keying() {
+        let got = builtin_call_result("object", &[]).expect("object() models");
+        assert_eq!(got.kind, Kind::Object);
+        assert_eq!(got.kind_word, Some("a featureless object"));
+        assert_eq!(got.source, "object()");
+    }
+
+    #[test]
+    fn object_call_with_an_argument_declines() {
+        // library/functions.html#object: "The constructor does not
+        // accept any arguments."
+        let got = builtin_call_result("object", &[integer(1.0)]);
+        assert!(got.is_none(), "object(x) should decline: {got:?}");
     }
 }

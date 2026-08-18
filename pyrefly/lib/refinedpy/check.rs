@@ -26,14 +26,14 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use refined_domain::abstract_value::{known_set, known_values, opaque_value, unknown, AbstractValue, Kind, PrimitiveKind, SetKindTag};
+use refined_domain::abstract_value::{known_set, known_values, unknown, AbstractValue, Kind, ObjectKey, PrimitiveKind, SetKindTag};
 use refined_domain::trust_grades::{TrustProved, TrustSpec};
 use refined_kernel::kernel_interface::RefinedTSKernel;
 use refined_sets::refinement_forms::{requires_integer, RefinedSet};
 use ruff_python_ast::{
-    Alias, AtomicNodeIndex, CmpOp, ExceptHandler, Expr, ExprAttribute, ExprSubscript, ModModule, Parameters,
-    Stmt, StmtAnnAssign, StmtAssign, StmtAugAssign, StmtClassDef, StmtFunctionDef, StmtIf,
-    StmtMatch, StmtReturn, StmtTry, StmtWith, WithItem,
+    Alias, AtomicNodeIndex, CmpOp, ExceptHandler, ExceptHandlerExceptHandler, Expr, ExprAttribute, ExprSubscript,
+    ModModule, Parameters, Stmt, StmtAnnAssign, StmtAssign, StmtAugAssign, StmtClassDef, StmtFunctionDef, StmtIf,
+    StmtMatch, StmtRaise, StmtReturn, StmtTry, StmtWith, WithItem,
 };
 use ruff_text_size::{Ranged, TextRange};
 
@@ -41,7 +41,7 @@ use crate::refinedpy::assignability::{judge, Verdict};
 use crate::refinedpy::collection_models::{dict_get_result, dict_with_item, dict_without_item, list_literal_value, list_with_item, mutated_receiver, subscript_read};
 use crate::refinedpy::cross_module::{module_surface, ModuleResolver, IMPORT_DEPTH_CAP};
 use crate::refinedpy::env::Environment;
-use crate::refinedpy::expressions::{binary_arithmetic_value, evaluate_expression, provable_raise};
+use crate::refinedpy::expressions::{binary_arithmetic_value, evaluate_expression, fieldless_exception_value, provable_raise, register_retained_callables};
 use crate::refinedpy::function_table::{function_table, merged, FunctionTable};
 use crate::refinedpy::instances;
 use crate::refinedpy::instances::{class_table, judge_construction, ClassModel, ConstructionVerdict};
@@ -280,7 +280,7 @@ fn walk_body(
     context: &WalkContext,
     out: &mut Vec<Finding>,
 ) {
-    walk_body_with_self_binding(body, parameters, return_refinement, self_model, None, context, out);
+    walk_body_with_self_binding(body, parameters, return_refinement, None, self_model, None, context, out);
 }
 
 /// `walk_body`'s full construction, plus one extra optional step:
@@ -296,6 +296,7 @@ fn walk_body_with_self_binding(
     body: &[Stmt],
     parameters: Option<&Parameters>,
     return_refinement: Option<&DeclaredRefinement>,
+    yield_refinement: Option<&DeclaredRefinement>,
     self_model: Option<&ClassModel>,
     self_binding: Option<&AbstractValue>,
     context: &WalkContext,
@@ -342,6 +343,20 @@ fn walk_body_with_self_binding(
     }
     if let Some(parameters) = parameters {
         seed_parameters(parameters, context, &mut environment);
+        // `*args`/`**kwargs`'s own names — a bare-Name forward of either
+        // (`f(*args)`, `f(**kwargs)`) hands CPython exactly what THIS
+        // body itself received, never an independently-grown collection
+        // (`expressions.rs::call_provable_raise`'s own "unbounded
+        // starred argument" check reads this set to stay silent on a
+        // ParamSpec-forwarding row like r-ast-census.py's `wrapper`).
+        let mut variadic_names = HashSet::new();
+        if let Some(vararg) = parameters.vararg.as_ref() {
+            variadic_names.insert(vararg.name.id.as_str().to_owned());
+        }
+        if let Some(kwarg) = parameters.kwarg.as_ref() {
+            variadic_names.insert(kwarg.name.id.as_str().to_owned());
+        }
+        environment.set_variadic_parameter_names(Arc::new(variadic_names));
     }
     if let Some(self_value) = self_binding {
         environment.bind("self", self_value.clone());
@@ -386,6 +401,7 @@ fn walk_body_with_self_binding(
         walk_statement(
             stmt,
             return_refinement,
+            yield_refinement,
             context,
             &mut environment,
             &mut aug_assign_refinements,
@@ -426,6 +442,16 @@ fn merged_classes_for_body(body: &[Stmt], context: &WalkContext) -> Arc<HashMap<
 /// for a shape outside this wave's fixture rows, not a soundness gap
 /// (a parent-less child still reads its own AnnAssign/`__init__`
 /// fields correctly, only the inherited-field merge is skipped).
+///
+/// A class nested inside a NESTED `def` (`body`'s own top-level `def`
+/// whose body declares a class one level further down — a nested
+/// closure-factory shape returning an instance of a class local to
+/// itself) is collected too: every top-level `Stmt::FunctionDef`'s body
+/// is scanned the same way, recursively, so a class declared at any
+/// nesting depth of nested defs is visible once its instance crosses
+/// back out to an outer scope. A direct top-level class NAME wins over
+/// a same-named class found one level deeper (the nearer scope shadows
+/// the farther one, Python's own scoping rule).
 fn local_class_table(
     body: &[Stmt],
     aliases: &HashMap<String, RefinedSet>,
@@ -444,7 +470,16 @@ fn local_class_table(
         range: TextRange::default(),
         body: local_defs,
     };
-    class_table(&synthetic, aliases, imports, kernel)
+    let mut classes = class_table(&synthetic, aliases, imports, kernel);
+    for stmt in body {
+        if let Stmt::FunctionDef(def) = stmt {
+            let nested = local_class_table(&def.body, aliases, imports, kernel);
+            for (name, model) in nested {
+                classes.entry(name).or_insert(model);
+            }
+        }
+    }
+    classes
 }
 
 /// Whether `def`'s first parameter is named `self` — the corpus's own
@@ -482,16 +517,69 @@ fn walk_method_def(def: &StmtFunctionDef, class: &ClassModel, context: &WalkCont
     let return_refinement = def.returns.as_deref().and_then(|annotation| {
         declared_refinement(annotation, context.aliases, context.imports, &outer_environment)
     });
+    let (return_refinement, yield_refinement) = generator_body_refinements(def, return_refinement);
     let self_instance = judge_construction(class, &[], &[], context.kernel).instance;
     walk_body_with_self_binding(
         &def.body,
         Some(def.parameters.as_ref()),
         return_refinement.as_ref(),
+        yield_refinement.as_ref(),
         None,
         Some(&self_instance),
         context,
         out,
     );
+}
+
+/// Splits a `def`'s own resolved `-> Annotation` refinement into the two
+/// checked positions its BODY judges against, once the body is
+/// GENERATOR-shaped (`is_generator_shaped`'s own doc — a `yield`
+/// anywhere, straight-line or one level inside a `for`/`async for`).
+/// `Generator[Y, S, R]`/`AsyncGenerator[Y, S]`/`Iterator[Y]`/`Iterable[Y]`
+/// carry their two positions in `DeclaredRefinement::generator`
+/// (`typereading.rs`'s own doc); every `yield <expr>` in this body
+/// judges against `generator.yield_type`, every `return <expr>` against
+/// `generator.return_type` (`None` for `AsyncGenerator`/`Iterator`/
+/// `Iterable` — no return type is judged there at all, the same "no
+/// annotation → no judging" rule `walk_return` already states). A
+/// NON-generator body, or a generator-shaped body whose own `->
+/// Annotation` did not read as one of the four generator forms
+/// (`generator` is `None`), returns `declared` UNCHANGED as the return
+/// position and no yield position — ordinary Python, nothing new judges.
+fn generator_body_refinements(
+    def: &StmtFunctionDef,
+    declared: Option<DeclaredRefinement>,
+) -> (Option<DeclaredRefinement>, Option<DeclaredRefinement>) {
+    if !is_generator_shaped(&def.body) {
+        return (declared, None);
+    }
+    let Some(generator) = declared.and_then(|declared| declared.generator) else {
+        return (None, None);
+    };
+    (generator.return_type, Some(generator.yield_type))
+}
+
+/// Whether `body` contains a `yield`/`yield from` anywhere that makes
+/// CPython compile the enclosing `def` as a generator function
+/// (datamodel.rst, "Generator functions") — the SAME routing fact
+/// `expressions.rs::is_generator_def` reads for the call-answering side
+/// of this feature, reimplemented locally per this file's own
+/// "no importing across files for a one-line routing check" convention
+/// (`loops.rs`'s own `generator_call_values` doc states the identical
+/// precedent). Recognizes a top-level `Stmt::Expr(Expr::Yield |
+/// Expr::YieldFrom)` and the same one-level-inside-a-`for`-loop nesting
+/// `is_generator_def` reads (ruff collapses `for`/`async for` into one
+/// `Stmt::For` node) — this is a ROUTING check only, not a claim about
+/// which yields this checker can JUDGE: an unreadable yield shape still
+/// walks through the ordinary blocker path once routed here.
+fn is_generator_shaped(body: &[Stmt]) -> bool {
+    body.iter().any(|stmt| match stmt {
+        Stmt::Expr(expr_stmt) => matches!(expr_stmt.value.as_ref(), Expr::Yield(_) | Expr::YieldFrom(_)),
+        Stmt::For(for_stmt) => for_stmt.body.iter().any(|inner| {
+            matches!(inner, Stmt::Expr(expr_stmt) if matches!(expr_stmt.value.as_ref(), Expr::Yield(_) | Expr::YieldFrom(_)))
+        }),
+        _ => false,
+    })
 }
 
 /// A function body's own parameters whose annotation reads through
@@ -559,6 +647,7 @@ fn record_blocker(blocked: &mut bool, range: TextRange, sentence: String, out: &
 fn walk_statement(
     stmt: &Stmt,
     return_refinement: Option<&DeclaredRefinement>,
+    yield_refinement: Option<&DeclaredRefinement>,
     context: &WalkContext,
     environment: &mut Environment,
     aug_assign_refinements: &mut HashMap<String, DeclaredRefinement>,
@@ -587,6 +676,24 @@ fn walk_statement(
         Stmt::AugAssign(assign) => {
             forget_target_from_provably_unbound(assign.target.as_ref(), provably_unbound);
             walk_aug_assign(assign, context, environment, aug_assign_refinements, blocked, out);
+        }
+        // `yield`/`yield from` — tried before the ordinary Stmt::Expr
+        // handling below: a yield is not a call and carries no receiver,
+        // method, or mutation shape any of those channels recognize, so
+        // routing it there would only ever reach `sink_value`'s plain
+        // `evaluate_expression` fallback with no yield-position judging
+        // at all. `walk_yield` owns judging it against the enclosing
+        // generator's own declared yield set.
+        Stmt::Expr(expr_stmt) if matches!(expr_stmt.value.as_ref(), Expr::Yield(_) | Expr::YieldFrom(_)) => {
+            walk_yield(
+                expr_stmt.value.as_ref(),
+                yield_refinement,
+                context,
+                aug_assign_refinements,
+                environment,
+                blocked,
+                out,
+            );
         }
         Stmt::Expr(expr_stmt) => {
             bind_walrus_targets(expr_stmt.value.as_ref(), context, aug_assign_refinements, environment, out);
@@ -678,6 +785,7 @@ fn walk_statement(
             walk_if(
                 if_stmt,
                 return_refinement,
+                yield_refinement,
                 context,
                 environment,
                 aug_assign_refinements,
@@ -717,13 +825,14 @@ fn walk_statement(
         }
         Stmt::For(_) | Stmt::While(_) => {
             provably_unbound.clear();
-            walk_loop(stmt, return_refinement, context, environment, aug_assign_refinements, blocked, out);
+            walk_loop(stmt, return_refinement, yield_refinement, context, environment, aug_assign_refinements, blocked, out);
         }
         Stmt::Match(match_stmt) => {
             provably_unbound.clear();
             walk_match(
                 match_stmt,
                 return_refinement,
+                yield_refinement,
                 context,
                 environment,
                 aug_assign_refinements,
@@ -736,6 +845,7 @@ fn walk_statement(
             walk_with(
                 with_stmt,
                 return_refinement,
+                yield_refinement,
                 context,
                 environment,
                 aug_assign_refinements,
@@ -748,6 +858,7 @@ fn walk_statement(
             walk_try(
                 try_stmt,
                 return_refinement,
+                yield_refinement,
                 context,
                 environment,
                 aug_assign_refinements,
@@ -861,6 +972,154 @@ fn walk_return(
     }
 }
 
+/// `yield value` / bare `yield` / `yield from value`, against the
+/// enclosing generator's own YIELD position (`Generator[Y, S, R]`'s
+/// first element, `AsyncGenerator[Y, S]`'s/`Iterator[Y]`'s/
+/// `Iterable[Y]`'s only element — `typereading.rs::GeneratorRefinement`,
+/// threaded down as `yield_refinement` by `generator_body_refinements`).
+/// No declared yield position (`yield_refinement` is `None` — an
+/// ordinary, non-generator-annotated body, or a generator body whose own
+/// `-> Annotation` did not read as one of the four generator forms)
+/// means nothing judges here, the mission's "no annotation → no
+/// judging" rule applied to this checked position instead of `return`'s.
+/// A BARE `yield` (`Expr::Yield` with no operand) yields `None`
+/// (datamodel.rst's generator-iterator protocol: `next()` on a bare
+/// `yield` hands back `None`) — judged as `Kind::Null` against the
+/// declared yield set exactly like any other absent value, so a
+/// non-`Optional` yield type still fires on it. `yield from <expr>`
+/// DELEGATES: every value the inner generator yields flows out of this
+/// generator too, so EACH ONE judges against this generator's own
+/// declared yield set (`delegated_generator_yields`'s own two-reading
+/// doc: the callee's actual body-walked yields where they read, its
+/// declared annotation's yield set otherwise) — the first Fire wins,
+/// matching `judge`'s own dict/list element-law convention of reporting
+/// the first escaping member rather than joining every member's verdict.
+fn walk_yield(
+    yield_expr: &Expr,
+    yield_refinement: Option<&DeclaredRefinement>,
+    context: &WalkContext,
+    aug_assign_refinements: &HashMap<String, DeclaredRefinement>,
+    environment: &mut Environment,
+    blocked: &mut bool,
+    out: &mut Vec<Finding>,
+) {
+    let Some(declared) = yield_refinement else {
+        return;
+    };
+    match yield_expr {
+        Expr::Yield(yield_node) => {
+            let range = yield_node.range();
+            let value = match yield_node.value.as_deref() {
+                Some(value_expr) => {
+                    bind_walrus_targets(value_expr, context, aug_assign_refinements, environment, out);
+                    let Some(value) = sink_value(value_expr, context, environment, aug_assign_refinements, out) else {
+                        // a provable raise already pushed its own RTS7001 —
+                        // this yield never produces a value to judge.
+                        return;
+                    };
+                    value
+                }
+                // bare `yield` — the generator hands back None here.
+                None => refined_domain::abstract_value::null_value(),
+            };
+            judge_at(&value, declared, range, context, blocked, out);
+        }
+        Expr::YieldFrom(yield_from) => {
+            let range = yield_from.range();
+            let Some(elements) = delegated_generator_yields(yield_from.value.as_ref(), context, environment) else {
+                record_blocker(
+                    blocked,
+                    range,
+                    "this yield from's own delegate does not yet state a readable yield set".to_owned(),
+                    out,
+                );
+                return;
+            };
+            for element in &elements {
+                judge_at(element, declared, range, context, blocked, out);
+                // the first Fire this loop pushes is the row's own
+                // verdict — later elements still walk (so a LATER
+                // element's own Undetermined can still set the body's
+                // blocker when no earlier element fired), but a second
+                // Fire at the same range would only restate the same
+                // row twice, so this loop does not stop early; judge_at
+                // itself never double-reports past `blocked` for the
+                // Undetermined branch, and a Fire is idempotent to
+                // report once per offending element in the rare case
+                // more than one escapes (matching the dict/list element
+                // law's own "first Fire" framing loosely, since a
+                // delegate's own elements are not individually
+                // addressable the way a dict key/list index is).
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Judges one value at `range` against `declared`, pushing a Fire or
+/// recording the body's blocker candidate — `walk_return`'s own
+/// Fire/Silent/Undetermined tail, factored out so `walk_yield`'s two
+/// call shapes (a plain yield's one value, a delegation's several) share
+/// it instead of repeating the match.
+fn judge_at(
+    value: &AbstractValue,
+    declared: &DeclaredRefinement,
+    range: TextRange,
+    context: &WalkContext,
+    blocked: &mut bool,
+    out: &mut Vec<Finding>,
+) {
+    match judge(value, declared, context.kernel) {
+        Verdict::Fire(message) => out.push(Finding { range, code: "RTS7001", message }),
+        Verdict::Silent => {}
+        Verdict::Undetermined(sentence) => {
+            record_blocker(blocked, range, sentence, out);
+        }
+    }
+}
+
+/// `yield from <expr>`'s own delegate, read to the values it hands this
+/// generator's caller. `<expr>` must be a bare same-module call
+/// (`gen()`) — any other delegate shape (a non-Name callee, a call to a
+/// name with no same-module `def`) declines whole, this row's own
+/// blocker. Two readings, tried in order, mirroring refined-ts-go's own
+/// `GeneratorElementOf` (walk/generator_element.go): the callee's own
+/// ACTUAL yields, walked fresh through `instances::generator_yields`
+/// (straight-line/single-for-loop bodies only — that function's own
+/// doc), state the TIGHTEST claim this checker can prove (a callee
+/// declared `-> Generator[int, None, None]` whose body only ever yields
+/// `40` hands this delegation exactly `[40]`, not the unbounded `int`
+/// ray its own annotation states) and are read FIRST for that reason;
+/// the callee's own DECLARED yield set (`typereading::declared_refinement`'s
+/// generator arm) is the fallback once the body-walk declines (a
+/// conditional yield, a parameter-shaped body, any restricted-
+/// interpreter shape `generator_yields` does not read) — the annotation
+/// is still a real claim about every value the callee could ever hand
+/// back, so a callee whose actual body this walk cannot run still judges
+/// against what it PROMISES.
+fn delegated_generator_yields(
+    delegate: &Expr,
+    context: &WalkContext,
+    environment: &Environment,
+) -> Option<Vec<AbstractValue>> {
+    let Expr::Call(call) = delegate else {
+        return None;
+    };
+    let Expr::Name(callee_name) = call.func.as_ref() else {
+        return None;
+    };
+    let def = context.functions.def(callee_name.id.as_str())?;
+    if let Some(yields) =
+        instances::generator_yields(def, &[], environment.functions(), context.kernel, environment.call_depth())
+    {
+        return Some(yields);
+    }
+    let outer_environment = Environment::new(HashSet::new());
+    let declared = declared_refinement(def.returns.as_deref()?, context.aliases, context.imports, &outer_environment)?;
+    let yield_type = declared.generator?.yield_type;
+    Some(vec![known_set(yield_type.set, None, TrustSpec, SetKindTag::None)])
+}
+
 /// A nested `def`: reads its own `-> Annotation` (if any) through
 /// `declared_refinement` against the OUTER environment (a return
 /// annotation naming a module-level alias resolves the same way any
@@ -871,10 +1130,13 @@ fn walk_function_def(def: &StmtFunctionDef, context: &WalkContext, out: &mut Vec
     let return_refinement = def.returns.as_deref().and_then(|annotation| {
         declared_refinement(annotation, context.aliases, context.imports, &outer_environment)
     });
-    walk_body(
+    let (return_refinement, yield_refinement) = generator_body_refinements(def, return_refinement);
+    walk_body_with_self_binding(
         &def.body,
         Some(def.parameters.as_ref()),
         return_refinement.as_ref(),
+        yield_refinement.as_ref(),
+        None,
         None,
         context,
         out,
@@ -1077,6 +1339,7 @@ fn walk_class_def(def: &StmtClassDef, enclosing_environment: &mut Environment, c
 fn walk_if(
     if_stmt: &StmtIf,
     return_refinement: Option<&DeclaredRefinement>,
+    yield_refinement: Option<&DeclaredRefinement>,
     context: &WalkContext,
     environment: &mut Environment,
     aug_assign_refinements: &mut HashMap<String, DeclaredRefinement>,
@@ -1125,6 +1388,7 @@ fn walk_if(
                     walk_statement(
                         stmt,
                         return_refinement,
+                        yield_refinement,
                         context,
                         &mut arm_environment,
                         aug_assign_refinements,
@@ -1146,6 +1410,7 @@ fn walk_if(
             walk_statement(
                 stmt,
                 return_refinement,
+                yield_refinement,
                 context,
                 &mut arm_environment,
                 aug_assign_refinements,
@@ -1251,6 +1516,7 @@ fn arm_terminates(body: &[Stmt]) -> bool {
 fn walk_loop(
     stmt: &Stmt,
     return_refinement: Option<&DeclaredRefinement>,
+    yield_refinement: Option<&DeclaredRefinement>,
     context: &WalkContext,
     environment: &mut Environment,
     aug_assign_refinements: &mut HashMap<String, DeclaredRefinement>,
@@ -1312,6 +1578,7 @@ fn walk_loop(
             walk_statement(
                 orelse_stmt,
                 return_refinement,
+                yield_refinement,
                 context,
                 environment,
                 aug_assign_refinements,
@@ -1367,6 +1634,7 @@ fn walk_loop(
 fn walk_match(
     match_stmt: &StmtMatch,
     return_refinement: Option<&DeclaredRefinement>,
+    yield_refinement: Option<&DeclaredRefinement>,
     context: &WalkContext,
     environment: &mut Environment,
     aug_assign_refinements: &mut HashMap<String, DeclaredRefinement>,
@@ -1382,6 +1650,7 @@ fn walk_match(
             walk_statement(
                 stmt,
                 return_refinement,
+                yield_refinement,
                 context,
                 &mut arm_env,
                 aug_assign_refinements,
@@ -1461,6 +1730,7 @@ fn walk_match(
             walk_statement(
                 stmt,
                 return_refinement,
+                yield_refinement,
                 context,
                 &mut arm_env,
                 aug_assign_refinements,
@@ -1513,6 +1783,7 @@ fn walk_match(
 fn walk_with(
     with_stmt: &StmtWith,
     return_refinement: Option<&DeclaredRefinement>,
+    yield_refinement: Option<&DeclaredRefinement>,
     context: &WalkContext,
     environment: &mut Environment,
     aug_assign_refinements: &mut HashMap<String, DeclaredRefinement>,
@@ -1534,6 +1805,7 @@ fn walk_with(
         walk_statement(
             stmt,
             return_refinement,
+            yield_refinement,
             context,
             environment,
             aug_assign_refinements,
@@ -1576,7 +1848,7 @@ fn enter_method_result(
     let method_name = if is_async { "__aenter__" } else { "__enter__" };
     let method = instances::method_def_of(model, method_name)?;
     let (new_instance, result) =
-        instances::method_call_result(receiver, model, method, &[], Some(&context.functions), context.kernel, environment.call_depth())?;
+        instances::method_call_result(receiver, model, method, &[], Some(&context.functions), Some(&context.classes), context.kernel, environment.call_depth())?;
     if let Expr::Name(receiver_name) = receiver_expr {
         environment.bind(receiver_name.id.as_str(), new_instance);
     }
@@ -1625,6 +1897,7 @@ fn bind_with_target(target: &Expr, value: AbstractValue, environment: &mut Envir
 fn walk_try(
     try_stmt: &StmtTry,
     return_refinement: Option<&DeclaredRefinement>,
+    yield_refinement: Option<&DeclaredRefinement>,
     context: &WalkContext,
     environment: &mut Environment,
     aug_assign_refinements: &mut HashMap<String, DeclaredRefinement>,
@@ -1639,6 +1912,7 @@ fn walk_try(
         walk_statement(
             stmt,
             return_refinement,
+            yield_refinement,
             context,
             &mut try_env,
             aug_assign_refinements,
@@ -1658,6 +1932,7 @@ fn walk_try(
         walk_statement(
             stmt,
             return_refinement,
+            yield_refinement,
             context,
             &mut try_env,
             aug_assign_refinements,
@@ -1682,23 +1957,25 @@ fn walk_try(
             forget_names_bound_by_stmt(stmt, &mut handler_env);
         }
         // HANDLER AS-NAME: `except Exception as error:` binds `error` to
-        // an OPAQUE caught-exception value at handler entry — not a
-        // forget — so a read inside the handler body (e.g.
-        // `try_except_binding`'s `age = error`) has something to judge
-        // rather than reading Undetermined. `opaque_value` carries the
-        // "not a scalar/set/object/list this domain models" standing
-        // every existing opaque reader already treats as Unknown, so an
-        // assignability ask against a scalar-ground declared set fires
-        // through that law once it exists — this table only builds the
-        // value and binds it.
+        // a caught-exception value at handler entry — not a forget — so
+        // a read inside the handler body (e.g. `try_except_binding`'s
+        // `age = error`) has something to judge rather than reading
+        // Undetermined. `caught_exception_value` gives the MOST SPECIFIC
+        // value this walk can prove: a tagged, `args`-carrying (and,
+        // where a sole matching `raise ... from` names it, `__cause__`-
+        // carrying) exception when the try body's own raise is
+        // findable, else the plain opaque marker every other unmodeled
+        // instance already reads as Unknown.
         if let Some(name) = handler.name.as_ref() {
-            handler_env.bind(name.id.as_str(), opaque_value("a caught exception"));
+            let caught = caught_exception_value(handler, &try_stmt.body, environment, context);
+            handler_env.bind(name.id.as_str(), caught);
         }
         let mut handler_provably_unbound: HashSet<String> = HashSet::new();
         for stmt in &handler.body {
             walk_statement(
                 stmt,
                 return_refinement,
+                yield_refinement,
                 context,
                 &mut handler_env,
                 aug_assign_refinements,
@@ -1732,6 +2009,7 @@ fn walk_try(
         walk_statement(
             stmt,
             return_refinement,
+            yield_refinement,
             context,
             environment,
             aug_assign_refinements,
@@ -1740,6 +2018,189 @@ fn walk_try(
             out,
         );
     }
+}
+
+/// The value one `except <type> as <name>:` handler's own `<name>`
+/// binds — the most specific value this walk can prove about the
+/// exception CPython would actually deliver there. `handler`'s own
+/// `type_` (a bare `Name`, the only shape this reader matches — a
+/// tuple-of-types `except (A, B):` or an attribute `except mod.Err:`
+/// falls through to the fieldless answer) names the exception CLASS the
+/// search below looks for: `find_raise_from`, walking `try_body` in
+/// source order (recursing into a nested `Stmt::Try`'s own body, since
+/// `raise ... from` can sit arbitrarily deep — j-stdlib-surfaces.py's
+/// own `exception_cause` nests one level), returns the SOLE `Stmt::Raise`
+/// whose `exc` is a call to that exact class name, or `None` when there
+/// is none or more than one (an ambiguous try body proves no ONE raise
+/// reaches this handler over another). A found raise's `exc` evaluates
+/// through the ordinary `evaluate_expression` path — already routed
+/// through `exception_construction_value` for a recognized builtin
+/// exception constructor (`expressions.rs`'s own `is_builtin_exception_
+/// constructor` gate) — and its own `cause`, when present, resolves
+/// through `resolve_cause_name`: a bare Name matching an ENCLOSING
+/// handler's own `as`-name recurses into THAT handler's nested try via
+/// this same function (j-stdlib-surfaces.py's `inner` naming the INNER
+/// try's own caught `ValueError`); any other cause shape (a fresh
+/// construction, an unrecognized name) evaluates plainly against
+/// `environment`. No raise found, no cause resolvable, or `exc` itself
+/// not a recognized exception constructor: `fieldless_exception_value`
+/// — the honest "an exception, but this walk cannot prove its fields"
+/// answer, never the fully opaque `opaque_value` (which cannot even be
+/// recognized as an exception downstream).
+fn caught_exception_value(
+    handler: &ExceptHandlerExceptHandler,
+    try_body: &[Stmt],
+    environment: &Environment,
+    context: &WalkContext,
+) -> AbstractValue {
+    let Some(Expr::Name(caught_type)) = handler.type_.as_deref() else {
+        return fieldless_exception_value();
+    };
+    let Some(raise) = find_raise_from(try_body, caught_type.id.as_str()) else {
+        return fieldless_exception_value();
+    };
+    let Some(exc) = raise.exc.as_deref() else {
+        return fieldless_exception_value();
+    };
+    let mut value = evaluate_expression(exc, environment, context.kernel);
+    if value.kind != Kind::Object || value.source != "exception" {
+        return fieldless_exception_value();
+    }
+    if let Some(cause) = raise.cause.as_deref() {
+        let cause_value = resolve_cause_name(cause, try_body, environment, context);
+        value.keys.push(ObjectKey {
+            name: "__cause__".to_owned(),
+            numeric: false,
+            value: cause_value,
+        });
+    }
+    value
+}
+
+/// The sole `raise <exc> from <cause>` (or bare `raise <exc>`) whose
+/// `exc` is a call to `class_name`, searched in source order through
+/// `body`'s own statements — recursing into a nested `Stmt::Try`'s
+/// `body`/`handlers`/`orelse`/`finalbody` (every place CPython itself
+/// could reach a raise from within a try construct) and an `if`
+/// statement's own arms (the same shape `walk_if` itself walks
+/// unconditionally). `None` when no raise names that class, or more
+/// than one does — this function proves nothing about WHICH raise
+/// reaches the handler when the body's own control flow leaves that
+/// ambiguous, so it answers only the unambiguous one-match case.
+fn find_raise_from<'a>(body: &'a [Stmt], class_name: &str) -> Option<&'a StmtRaise> {
+    let mut found: Option<&'a StmtRaise> = None;
+    for stmt in body {
+        for raise in raises_in_stmt(stmt) {
+            let Some(Expr::Call(call)) = raise.exc.as_deref() else {
+                continue;
+            };
+            let Expr::Name(callee) = call.func.as_ref() else {
+                continue;
+            };
+            if callee.id.as_str() != class_name {
+                continue;
+            }
+            if found.is_some() {
+                // more than one raise names this class — ambiguous
+                return None;
+            }
+            found = Some(raise);
+        }
+    }
+    found
+}
+
+/// Every `Stmt::Raise` reachable inside one statement, recursing into
+/// the compound shapes a raise can sit under — `Stmt::Try` (its own
+/// `body`/`handlers`/`orelse`/`finalbody`, in that order) and `Stmt::If`
+/// (its own `body` plus every `elif`/`else` clause's own body) — the two
+/// shapes this corpus's own rows nest a raise inside. Any other compound
+/// statement (a `for`/`while`/`with`/`match`) is not walked into: this
+/// reader is scoped to the try/if nesting `caught_exception_value`'s own
+/// rows use, not a general statement-tree walk.
+fn raises_in_stmt(stmt: &Stmt) -> Vec<&StmtRaise> {
+    match stmt {
+        Stmt::Raise(raise) => vec![raise],
+        Stmt::Try(try_stmt) => {
+            let mut found = Vec::new();
+            for inner in &try_stmt.body {
+                found.extend(raises_in_stmt(inner));
+            }
+            for handler in &try_stmt.handlers {
+                let ExceptHandler::ExceptHandler(handler) = handler;
+                for inner in &handler.body {
+                    found.extend(raises_in_stmt(inner));
+                }
+            }
+            for inner in &try_stmt.orelse {
+                found.extend(raises_in_stmt(inner));
+            }
+            for inner in &try_stmt.finalbody {
+                found.extend(raises_in_stmt(inner));
+            }
+            found
+        }
+        Stmt::If(if_stmt) => {
+            let mut found = Vec::new();
+            for inner in &if_stmt.body {
+                found.extend(raises_in_stmt(inner));
+            }
+            for clause in &if_stmt.elif_else_clauses {
+                for inner in &clause.body {
+                    found.extend(raises_in_stmt(inner));
+                }
+            }
+            found
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The value a `raise ... from <cause>` expression's own `cause` names —
+/// `caught_exception_value`'s own cause-resolution step. A bare Name
+/// matching an ENCLOSING `except ... as <name>:` handler nested inside
+/// `try_body` recurses into that handler's own nested try (its `type_`
+/// naming which class to search for, `caught_exception_value` again),
+/// so a chain of `raise ... from` across nested try/except blocks
+/// resolves end to end (j-stdlib-surfaces.py's `inner` naming the INNER
+/// try's own caught `ValueError`). Any other cause shape (a fresh
+/// construction, a name this search cannot trace to an enclosing
+/// handler) evaluates plainly through `evaluate_expression` — sound
+/// either way, since an unrecognized cause still reads SOME value, just
+/// not necessarily the exact tagged exception shape.
+fn resolve_cause_name(cause: &Expr, try_body: &[Stmt], environment: &Environment, context: &WalkContext) -> AbstractValue {
+    if let Expr::Name(cause_name) = cause {
+        if let Some((nested_try, nested_handler)) = enclosing_handler_named(try_body, cause_name.id.as_str()) {
+            return caught_exception_value(nested_handler, &nested_try.body, environment, context);
+        }
+    }
+    evaluate_expression(cause, environment, context.kernel)
+}
+
+/// The nested `Stmt::Try` and its own `except ... as <name>:` handler,
+/// searched inside `body` — `resolve_cause_name`'s own lookup for a
+/// `raise ... from <name>` whose `name` was bound by an ENCLOSING
+/// handler rather than by ordinary code. Recurses into every nested
+/// `Stmt::Try`'s own `body` (the same one-level-deep nesting
+/// `find_raise_from`'s search already walks) so a chain of nested
+/// try/except resolves at any depth. `None` when no enclosing handler
+/// binds that name.
+fn enclosing_handler_named<'a>(body: &'a [Stmt], name: &str) -> Option<(&'a StmtTry, &'a ExceptHandlerExceptHandler)> {
+    for stmt in body {
+        let Stmt::Try(try_stmt) = stmt else {
+            continue;
+        };
+        for handler in &try_stmt.handlers {
+            let ExceptHandler::ExceptHandler(handler) = handler;
+            if handler.name.as_ref().is_some_and(|handler_name| handler_name.id.as_str() == name) {
+                return Some((try_stmt, handler));
+            }
+        }
+        if let Some(found) = enclosing_handler_named(&try_stmt.body, name) {
+            return Some(found);
+        }
+    }
+    None
 }
 
 /// The refused-write law, shared by every write sink that can fire
@@ -2264,6 +2725,7 @@ fn direct_alias_annotation(
         spelling: name.id.as_str().to_owned(),
         admits_none: false,
         element: None,
+        generator: None,
     })
 }
 
@@ -2828,6 +3290,15 @@ fn sink_value(
     aug_assign_refinements: &HashMap<String, DeclaredRefinement>,
     out: &mut Vec<Finding>,
 ) -> Option<AbstractValue> {
+    // RETAINED CALLABLES: a lambda nested in `expr` (a call argument —
+    // `pick(lambda s: s.age)` — or a constructor argument — `Person
+    // (lambda: 40)`) is registered into `environment` BEFORE any of the
+    // immutable evaluation paths below run — `construction_call_
+    // verdict`/`evaluate_expression` only ever read `&Environment`, so
+    // this is the last point with `&mut Environment` before the lambda
+    // is read as a value (`expressions.rs::register_retained_
+    // callables`'s own doc).
+    register_retained_callables(expr, environment);
     if let Some((range, message)) = provable_raise(expr, environment, context.kernel) {
         out.push(Finding { range, code: "RTS7001", message });
         return None;
@@ -2910,6 +3381,14 @@ fn callable_variable_call_result(
 /// this law — no receiver forgetting happens here; `sink_value`'s own
 /// caller (`walk_return`/`walk_ann_assign`/`walk_assign`) still forgets
 /// on the FIRST unproducible value the same way it always did.
+///
+/// The class table read here is `environment.classes()`, falling back
+/// to `context.classes` when the environment carries none: a class
+/// defined LOCALLY inside the walked body only lives in
+/// `environment.classes()` (`merged_classes_for_body`'s own merge over
+/// `context.classes`), so reading `context.classes` alone would miss it
+/// — the same locality gap `merged_classes_for_body`'s own doc names
+/// for `context.classes` elsewhere.
 fn instance_method_call_result(
     expr: &Expr,
     context: &WalkContext,
@@ -2928,11 +3407,20 @@ fn instance_method_call_result(
     if instance.kind != Kind::Object || instance.source.is_empty() {
         return None;
     }
-    let model = context.classes.get(instance.source.as_str())?;
+    let classes = environment.classes().unwrap_or(&context.classes);
+    let model = classes.get(instance.source.as_str())?;
     let method = instances::method_def_of(model, attribute.attr.as_str())?;
     let arguments = keyword_arguments_by_position(call, method, context, environment)?;
-    let (new_instance, result) =
-        instances::method_call_result(&instance, model, method, &arguments, Some(&context.functions), context.kernel, environment.call_depth())?;
+    let (new_instance, result) = instances::method_call_result(
+        &instance,
+        model,
+        method,
+        &arguments,
+        Some(&context.functions),
+        Some(classes),
+        context.kernel,
+        environment.call_depth(),
+    )?;
     environment.bind(receiver_name.id.as_str(), new_instance);
     Some(result)
 }
@@ -3242,6 +3730,7 @@ fn adapter_alias_verdict(
         spelling: class_name.id.as_str().to_owned(),
         admits_none: false,
         element: None,
+        generator: None,
     };
     let range = argument_expr.range();
     let mut value = evaluate_expression(argument_expr, environment, context.kernel);
@@ -4535,6 +5024,105 @@ mod tests {
         let fires: Vec<&Finding> = findings.iter().filter(|f| f.code == "RTS7001").collect();
         assert_eq!(fires.len(), 1, "{:?}", findings.iter().map(|f| &f.message).collect::<Vec<_>>());
         assert!(fires[0].message.contains("'200'"), "{}", fires[0].message);
+    }
+
+    // --- yield/return inside a Generator[...]-annotated body ---
+
+    /// i-more-expressions.py's own `yield_expression` shape:
+    /// `Generator[Age, None, Age]` makes both a `yield 200` and a
+    /// `return 200` checked positions — one fire each, an in-set
+    /// `yield 40` stays silent.
+    #[test]
+    fn a_yield_and_a_return_out_of_the_declared_generator_set_each_fire() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "from typing import Generator\n",
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Age = Annotated[int, Field(ge=0, le=120)]\n",
+            "def f() -> Generator[Age, None, Age]:\n",
+            "    yield 40\n",
+            "    yield 200\n",
+            "    return 200\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        let fires: Vec<&Finding> = findings.iter().filter(|f| f.code == "RTS7001").collect();
+        assert_eq!(fires.len(), 2, "{:?}", findings.iter().map(|f| &f.message).collect::<Vec<_>>());
+        assert!(fires[0].message.contains("'200'"), "{}", fires[0].message);
+        assert!(fires[1].message.contains("'200'"), "{}", fires[1].message);
+    }
+
+    /// A non-generator body's `-> Age` never turns a `yield` inside a
+    /// DIFFERENT, non-generator function into a checked position — this
+    /// test pins that `yield_refinement` stays `None` outside a
+    /// generator-shaped body by checking a plain `-> Age` function's own
+    /// return still judges normally alongside an unrelated generator.
+    #[test]
+    fn a_bare_yield_judges_as_none_against_the_declared_yield_set() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "from typing import Generator\n",
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Age = Annotated[int, Field(ge=0, le=120)]\n",
+            "def f() -> Generator[Age, None, Age]:\n",
+            "    yield\n",
+            "    return 40\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        let fires: Vec<&Finding> = findings.iter().filter(|f| f.code == "RTS7001").collect();
+        assert_eq!(fires.len(), 1, "{:?}", findings.iter().map(|f| &f.message).collect::<Vec<_>>());
+        assert!(fires[0].message.to_lowercase().contains("none"), "{}", fires[0].message);
+    }
+
+    /// `yield from` delegating to a same-module generator whose own body
+    /// yields an out-of-set value: the delegate's ACTUAL yields (read
+    /// through `instances::generator_yields`, tighter than its own bare
+    /// declared annotation) are what judge — `over_inner()`'s single
+    /// `yield 200` fires against the outer `Age` set.
+    #[test]
+    fn a_yield_from_delegate_whose_own_body_yields_out_of_set_fires() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "from typing import Generator\n",
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Age = Annotated[int, Field(ge=0, le=120)]\n",
+            "def over_inner() -> Generator[int, None, None]:\n",
+            "    yield 200\n",
+            "def f() -> Generator[Age, None, None]:\n",
+            "    yield from over_inner()\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        let fires: Vec<&Finding> = findings.iter().filter(|f| f.code == "RTS7001").collect();
+        assert_eq!(fires.len(), 1, "{:?}", findings.iter().map(|f| &f.message).collect::<Vec<_>>());
+        assert!(fires[0].message.contains("'200'"), "{}", fires[0].message);
+    }
+
+    /// A generator body's own IN-SET yields stay silent, including a
+    /// `yield from` delegate whose actual yields all sit inside the
+    /// outer set.
+    #[test]
+    fn a_generator_body_entirely_in_set_stays_silent() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "from typing import Generator\n",
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Age = Annotated[int, Field(ge=0, le=120)]\n",
+            "def inner() -> Generator[int, None, None]:\n",
+            "    yield 40\n",
+            "def f() -> Generator[Age, None, Age]:\n",
+            "    yield 40\n",
+            "    yield from inner()\n",
+            "    return 40\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        assert!(
+            findings.is_empty(),
+            "an entirely in-set generator body must stay silent: {:?}",
+            findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+        );
     }
 
     #[test]

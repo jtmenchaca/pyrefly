@@ -52,6 +52,10 @@
 //!   otherwise return False."
 //! - `find`: "Return the lowest index in the string where substring sub
 //!   is found... Return -1 if sub is not found."
+//! - `index`: "Like `str.find`, but raise `ValueError` when the
+//!   substring is not found" — this file answers only the FOUND case
+//!   (the same position `find` would); a miss is `provable_raise`'s row
+//!   (`expressions.rs`), never a fabricated value here.
 //! - `casefold`: "Casefolding is similar to lowercasing but more
 //!   aggressive" and follows Unicode's full case-folding table (Unicode
 //!   Standard section 3.13) — that table diverges from plain
@@ -167,6 +171,21 @@ pub fn string_method_result(
                 PrimitiveKind::Integer,
                 TrustProved,
             ))
+        }
+        // "Like str.find, but raise ValueError when the substring is not
+        // found." (str.index, one-arg row — no `start`/`end` bounds
+        // modeled, matching find's own one-arg scope). Only the FOUND
+        // case answers a value here: a miss raises at runtime, which
+        // `expressions.rs::call_provable_raise` already proves separately
+        // (this file's own `str.find` row already carries the shared
+        // code-point-index computation both rows read).
+        "index" if arguments.len() == 1 => {
+            let needle = exact_string_text(&arguments[0])?;
+            let position = find_code_point_index(&receiver_text, &needle);
+            if position < 0.0 {
+                return None;
+            }
+            Some(known_values(vec![position], PrimitiveKind::Integer, TrustProved))
         }
         // "Return a casefolded copy of the string... Casefolding is
         // similar to lowercasing but more aggressive because it is
@@ -403,6 +422,26 @@ mod tests {
         let needle = string_literal_value("l");
         let result = string_method_result("find", &receiver, &[needle]).expect("find must decide");
         assert_eq!(result.values, vec![2.0]);
+    }
+
+    /// str.index on a present needle answers the same position find
+    /// would — the c-reads-and-values.py string_index row's in-set leg.
+    #[test]
+    fn test_index_hit_answers_the_found_position() {
+        let receiver = string_literal_value("banana");
+        let needle = string_literal_value("a");
+        let result = string_method_result("index", &receiver, &[needle]).expect("index must decide");
+        assert_eq!(result.values, vec![1.0]);
+        assert_eq!(result.kind_tag, Some(PrimitiveKind::Integer));
+    }
+
+    /// str.index on a missing needle declines — the miss is a raise
+    /// (ValueError), not a value this function answers.
+    #[test]
+    fn test_index_miss_declines() {
+        let receiver = string_literal_value("banana");
+        let needle = string_literal_value("z");
+        assert_eq!(string_method_result("index", &receiver, &[needle]), None);
     }
 
     /// casefold on an ASCII-only receiver matches plain lowercasing

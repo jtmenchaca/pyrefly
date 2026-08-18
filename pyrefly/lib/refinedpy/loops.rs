@@ -302,6 +302,74 @@ fn for_loop_final_environment(
         return Some(LoopAnswer { environment: current, else_runs: !broke, returned: None });
     }
     abstract_element_sort_pass(for_stmt, environment, kernel, judge_context)
+        .or_else(|| custom_iterator_element_pass(for_stmt, environment, kernel, judge_context))
+}
+
+/// `for`/`async for` over a CUSTOM ITERATOR — a class instance whose own
+/// model declares the iterator protocol (`__aiter__`/`__anext__` for
+/// `async for`, `__iter__`/`__next__` for a plain `for`,
+/// b-body-expressions.py's own `Stream`/a-statements.py:555's `stream()`
+/// twin). The element is `__anext__`/`__next__`'s own declared return
+/// SORT (`typereading::base_sort_return_refinement`, the same bare-
+/// `int`/`float`/`str` reading `iterable_element_sort` gives a
+/// generator's own `-> AsyncIterator[int]` one subscript level up) —
+/// never the method body's own concretely INTERPRETED value, even when
+/// that body is a plain `return <literal>` a restricted interpreter
+/// could read exactly: the real iteration protocol has no length this
+/// checker can observe (the loop ends only when `__anext__`/`__next__`
+/// itself raises `StopIteration`, arbitrary code this module never
+/// executes), so trusting one concrete call's answer as "the" element
+/// would overstate what a single read of `__anext__` proves about every
+/// call the real loop could make. This mirrors `abstract_element_sort_
+/// pass`'s own doctrine exactly, applied to a class-based iterator
+/// instead of a same-module generator def: state the SORT, run the
+/// body once through the same judged executor, then JOIN the pre-loop
+/// and one-pass environments for the same zero-or-more honesty.
+///
+/// `None` when the iterable is not a bare call (`f(...)`), the callee
+/// does not resolve to a known class, the class's own model declares
+/// neither iterator-protocol pair, or the resolved `__anext__`/
+/// `__next__` method states no bare `int`/`float`/`str` return
+/// annotation this reader recognizes.
+fn custom_iterator_element_pass(
+    for_stmt: &StmtFor,
+    environment: &Environment,
+    kernel: &Arc<RefinedTSKernel>,
+    judge_context: &mut JudgeContext,
+) -> Option<LoopAnswer> {
+    let receiver = evaluate_expression(for_stmt.iter.as_ref(), environment, kernel);
+    if receiver.kind != Kind::Object || receiver.source.is_empty() {
+        return None;
+    }
+    let classes = environment.classes()?;
+    let model = classes.get(receiver.source.as_str())?;
+    let next_method_name = if instances::method_def_of(model, "__aiter__").is_some()
+        && instances::method_def_of(model, "__anext__").is_some()
+    {
+        "__anext__"
+    } else if instances::method_def_of(model, "__iter__").is_some()
+        && instances::method_def_of(model, "__next__").is_some()
+    {
+        "__next__"
+    } else {
+        return None;
+    };
+    let next_method = instances::method_def_of(model, next_method_name)?;
+    let declared = crate::refinedpy::typereading::base_sort_return_refinement(next_method.returns.as_deref()?)?;
+    let element = known_set(declared.set, None, TrustSpec, SetKindTag::None);
+
+    let mut one_pass = environment.fork();
+    if !bind_for_target(for_stmt.target.as_ref(), &element, &mut one_pass) {
+        return None;
+    }
+    match run_body_once(&for_stmt.body, &mut one_pass, kernel, judge_context)? {
+        BodyOutcome::Fell | BodyOutcome::Continued | BodyOutcome::Broke => {}
+        BodyOutcome::Returned(value, range) => {
+            return Some(LoopAnswer { environment: one_pass, else_runs: false, returned: Some((value, range)) });
+        }
+    }
+    let joined = Environment::join(environment.fork(), &one_pass);
+    Some(LoopAnswer { environment: joined, else_runs: true, returned: None })
 }
 
 /// ABSTRACT SORT-ELEMENT PASS: `for`/`async for` over a same-module
@@ -1661,6 +1729,7 @@ mod tests {
             spelling: "Age".to_owned(),
             admits_none: false,
             element: None,
+            generator: None,
         }
     }
 

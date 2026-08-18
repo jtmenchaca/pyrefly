@@ -118,16 +118,29 @@ pub fn tuple_literal_value(elements: &[AbstractValue]) -> AbstractValue {
 }
 
 /// One dict-display key's spelling and sort: a plain string key
-/// (`numeric: false`, `name` is the string's own text) or an int key
+/// (`numeric: false`, `name` is the string's own text), an int key
 /// (`numeric: true`, `name` is the key's plain decimal spelling, e.g.
-/// `"15"` for the key `15`) — the same (name, numeric) identity pair
-/// `ObjectKey` carries (`abstract_value.rs`'s own doc), read here
+/// `"15"` for the key `15`), or an IDENTITY key (`numeric: false`,
+/// `name` carries the identity tag under a reserved prefix — see
+/// `DictKey::identity`'s own doc) — the same (name, numeric) identity
+/// pair `ObjectKey` carries (`abstract_value.rs`'s own doc), read here
 /// before the value side of a dict-display/comprehension row is known.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DictKey {
     pub name: String,
     pub numeric: bool,
 }
+
+/// The reserved prefix an identity key's `name` always carries — chosen
+/// so it can never collide with a plain string key's own text: a
+/// Python string literal used as a dict key spells its own characters
+/// verbatim into `DictKey::string`'s `name`, and this prefix contains
+/// `\0` (NUL), a code point no `Doc/library/stdtypes.rst` string LITERAL
+/// row this file's callers build from source text can ever produce (a
+/// key read off actual Python source is always a sequence of ordinary
+/// printable/escape characters, never an embedded NUL from a
+/// `StringLiteral` node).
+const IDENTITY_KEY_PREFIX: &str = "\0identity:";
 
 impl DictKey {
     /// A plain string key, `numeric: false` — the ordinary case every
@@ -150,6 +163,24 @@ impl DictKey {
         DictKey {
             name: format!("{value}"),
             numeric: true,
+        }
+    }
+
+    /// An IDENTITY key, `numeric: false` — a dict key that is neither a
+    /// string nor an int, matched by PROVENANCE rather than by any
+    /// value comparison (stdtypes.rst's mapping rule only requires a
+    /// key be :term:`hashable`, never a string or number — a bare
+    /// `object()` sentinel, hashable by identity alone, is a legal dict
+    /// key this way). `tag` is the source-carried identity a value's
+    /// own `AbstractValue.source` field states (today, only
+    /// `object_call`'s fixed `"object()"` tag, `builtin_models.rs`) —
+    /// this constructor does not itself decide WHICH values are
+    /// identity-comparable; `known_dict_key`'s own identity arm decides
+    /// that, and this is just the spelling it wraps the tag in.
+    fn identity(tag: &str) -> DictKey {
+        DictKey {
+            name: format!("{IDENTITY_KEY_PREFIX}{tag}"),
+            numeric: false,
         }
     }
 }
@@ -240,22 +271,49 @@ fn known_string_key(value: &AbstractValue) -> Option<String> {
     )
 }
 
+/// An IDENTITY-KEYED value's own tag, if `value` is a `Kind::Object`
+/// value this file recognizes as identity-comparable rather than
+/// value-comparable: an opaque object (`kind_word` is `Some`, the
+/// `opaque_value` shape — a featureless `object()`, `builtin_models.rs`)
+/// carrying a non-empty `source`. `source` doubles as a constructed
+/// CLASS instance's own class-name tag elsewhere (`instances.rs`'s
+/// `judge_construction`), so this reads ONLY an opaque value's source,
+/// never a class instance's — a `Holder()`-style class instance used as
+/// an identity-only key needs its own per-CALL-SITE tag threaded from
+/// construction (`instances.rs`/`expressions.rs`, out of this file's
+/// reach), and reading a class instance's `source` here would wrongly
+/// treat every instance of the SAME class as the same key.
+fn identity_key_tag(value: &AbstractValue) -> Option<&str> {
+    if value.kind != Kind::Object || value.kind_word.is_none() || value.source.is_empty() {
+        return None;
+    }
+    Some(value.source.as_str())
+}
+
 /// An already-evaluated subscript/read index, read as a dict key: a
 /// known exact String reads as an ordinary string key (`numeric:
 /// false`), a known single Integer-sorted value reads as an int key
-/// (`numeric: true`, `DictKey::integer`'s own plain-decimal spelling)
-/// — the same two key sorts `dict_literal_value` accepts, so a
-/// `d[15]` subscript read matches the exact entry `{15: ...}` built.
-/// Boolean-sorted values are NOT accepted here, matching
-/// `known_integer_index`'s own scope note (no row in this file's
-/// corpus band needs `d[True]`). Any other shape (unknown, Float,
-/// String not exact) answers `None`.
+/// (`numeric: true`, `DictKey::integer`'s own plain-decimal spelling),
+/// or a recognized IDENTITY value (`identity_key_tag`'s own doc) reads
+/// as an identity key (`DictKey::identity`) — matched by provenance, the
+/// same way `stdtypes.rst`'s mapping rule admits any hashable value,
+/// never a string/number requirement. These are the three key sorts
+/// `dict_literal_value` accepts, so a `d[15]` subscript read matches the
+/// exact entry `{15: ...}` built, and `d[sentinel]` matches
+/// `{sentinel: ...}`. Boolean-sorted values are NOT accepted here,
+/// matching `known_integer_index`'s own scope note (no row in this
+/// file's corpus band needs `d[True]`). Any other shape (unknown, Float,
+/// String not exact, an ordinary dict/list/class-instance object)
+/// answers `None`.
 fn known_dict_key(value: &AbstractValue) -> Option<DictKey> {
     if let Some(text) = known_string_key(value) {
         return Some(DictKey::string(&text));
     }
     if value.kind == Kind::Values && value.values.len() == 1 && value.kind_tag == Some(PrimitiveKind::Integer) {
         return Some(DictKey::integer(value.values[0] as i64));
+    }
+    if let Some(tag) = identity_key_tag(value) {
+        return Some(DictKey::identity(tag));
     }
     None
 }
@@ -279,6 +337,27 @@ fn list_index_read(items: &[AbstractValue], index: i64) -> Option<AbstractValue>
     Some(items[adjusted as usize].clone())
 }
 
+/// `container[index]` on a known EXACT STRING receiver (`Kind::Values`
+/// tagged `PrimitiveKind::String`) with a known Integer index: the same
+/// negative-index adjustment `list_index_read` applies (expressions.rst,
+/// "Subscriptions" — the adjustment rule is stated once, for "built-in
+/// sequences" generally, and a string is one of those sequences,
+/// library/stdtypes.rst's Text Sequence Type section), landing on a
+/// SINGLE code point that answers a one-character `Kind::Values` String
+/// — the same shape `evaluate_slice`'s own sliced-string answer already
+/// builds (`expressions.rs`). An index still out of range after
+/// adjustment answers `None`: CPython raises `IndexError`
+/// (`subscript_provable_raise`'s own row already proves this case
+/// separately), which this domain has no read channel for.
+fn string_index_read(values: &[f64], index: i64) -> Option<AbstractValue> {
+    let length = values.len() as i64;
+    let adjusted = if index < 0 { index + length } else { index };
+    if adjusted < 0 || adjusted >= length {
+        return None;
+    }
+    Some(known_values(vec![values[adjusted as usize]], PrimitiveKind::String, TrustProved))
+}
+
 /// `container[key]` on a known DICT receiver (`Kind::Object`) with a
 /// known string OR int key: the value at that key's `ObjectKey` entry
 /// — matched by BOTH `name` and `numeric` (a string key and an int key
@@ -293,16 +372,60 @@ fn dict_key_read(keys: &[ObjectKey], key: &DictKey) -> Option<AbstractValue> {
         .map(|entry| entry.value.clone())
 }
 
+/// `container[key]` on a known DICT receiver with a key that is a
+/// FINITE UNION of known exact strings (`key = "age" if flag else
+/// "years"`'s own joined shape, `Kind::Set` — `lattice_operations
+/// ::join_known` of two distinct multi-codepoint exact strings builds
+/// exactly this union-of-`string_tuple` form, per that function's own
+/// tests). `stdtypes.rst`'s mapping-subscription rule reads a single
+/// key; this is the SOUND generalization when every branch's own key
+/// names a PRESENT entry: `person[key]` with `key` known to be `"age"`
+/// OR `"years"`, and both `person["age"]` and `person["years"]` present,
+/// answers the join of the two entries' own values — exactly the value
+/// the real subscription reads on whichever branch actually ran.  A key
+/// naming any string not present in `keys` declines the whole read
+/// (`None`, never a partial/guessed answer) — the same honesty a single
+/// missing key already gives `dict_key_read`. `word_tuples_of` is the
+/// existing exact-word enumerator `refined_sets::codepoint_sets` already
+/// proves against a union-of-`string_tuple` set (the string-equality
+/// narrowing rows use the identical reader); a set that is not this
+/// union-of-known-words shape (an unbounded range, an unrelated form)
+/// answers `None` from `word_tuples_of` itself, and this function
+/// declines in step.
+fn dict_key_set_read(keys: &[ObjectKey], index: &AbstractValue) -> Option<AbstractValue> {
+    if index.kind != Kind::Set || index.kind_tag.is_some_and(|tag| tag != PrimitiveKind::String) {
+        return None;
+    }
+    let words = refined_sets::codepoint_sets::word_tuples_of(&index.set)?;
+    if words.is_empty() {
+        return None;
+    }
+    let mut joined: Option<AbstractValue> = None;
+    for points in words {
+        let text: String = points.iter().filter_map(|point| char::from_u32(*point as i64 as u32)).collect();
+        let found = dict_key_read(keys, &DictKey::string(&text))?;
+        joined = Some(match joined {
+            Some(so_far) => refined_domain::lattice_operations::join_known(so_far, found),
+            None => found,
+        });
+    }
+    joined
+}
+
 /// `container[index]` — the subscription read (expressions.rst,
 /// "Subscriptions"): a known list/tuple (`Kind::List`) with a known
-/// Integer index, or a known dict (`Kind::Object`) with a known
-/// String- or Integer-sorted key (`known_dict_key`'s own doc — an
-/// Object receiver keyed numerically is still a DICT read, never the
-/// list/tuple positional-index path above: the two receiver kinds
-/// never share one dispatch arm). Every other receiver shape or
+/// Integer index, a known exact string (`Kind::Values` tagged
+/// `PrimitiveKind::String`) with a known Integer index
+/// (`string_index_read`'s own doc), or a known dict (`Kind::Object`)
+/// with a known String- or Integer-sorted key (`known_dict_key`'s own
+/// doc — an Object receiver keyed numerically is still a DICT read,
+/// never the list/tuple positional-index path above: the two receiver
+/// kinds never share one dispatch arm), or a dict keyed by a finite
+/// UNION of known strings where every named entry is present
+/// (`dict_key_set_read`'s own doc). Every other receiver shape or
 /// index/key shape answers `None` — an unknown receiver, a non-Integer
-/// index into a list, an unsupported key sort into a dict, or a slice
-/// — none of those are modeled here and this function declines
+/// index into a list or string, an unsupported key sort into a dict, or
+/// a slice — none of those are modeled here and this function declines
 /// honestly rather than guessing.
 pub fn subscript_read(container: &AbstractValue, index: &AbstractValue) -> Option<AbstractValue> {
     match container.kind {
@@ -310,10 +433,14 @@ pub fn subscript_read(container: &AbstractValue, index: &AbstractValue) -> Optio
             let position = known_integer_index(index)?;
             list_index_read(&container.items, position)
         }
-        Kind::Object => {
-            let key = known_dict_key(index)?;
-            dict_key_read(&container.keys, &key)
+        Kind::Values if container.kind_tag == Some(PrimitiveKind::String) => {
+            let position = known_integer_index(index)?;
+            string_index_read(&container.values, position)
         }
+        Kind::Object => match known_dict_key(index) {
+            Some(key) => dict_key_read(&container.keys, &key),
+            None => dict_key_set_read(&container.keys, index),
+        },
         _ => None,
     }
 }
@@ -931,6 +1058,105 @@ mod tests {
         assert_eq!(subscript_read(&built, &integer(15.0)), Some(integer(2.0)));
     }
 
+    // --- identity-keyed dict entries (an object() sentinel key) ---
+
+    fn identity_sentinel(tag: &str) -> AbstractValue {
+        let mut instance = refined_domain::abstract_value::opaque_value("a featureless object");
+        instance.source = tag.to_owned();
+        instance
+    }
+
+    #[test]
+    fn dict_literal_identity_key_reads_back_by_the_same_sentinel() {
+        let sentinel = identity_sentinel("object()");
+        let built = dict_literal_value(&[Some(DictKey::identity("object()"))], &[integer(40.0)]);
+        assert_eq!(subscript_read(&built, &sentinel), Some(integer(40.0)));
+    }
+
+    #[test]
+    fn dict_get_result_identity_key_present_answers_the_stored_value() {
+        let sentinel = identity_sentinel("object()");
+        let built = dict_literal_value(&[Some(DictKey::identity("object()"))], &[integer(40.0)]);
+        assert_eq!(dict_get_result(&built, &sentinel, None), Some(integer(40.0)));
+    }
+
+    #[test]
+    fn dict_get_result_identity_key_absent_answers_none_value() {
+        // a sentinel that was never inserted answers None, not the
+        // stored entry for a DIFFERENT sentinel's own tag
+        let stored = identity_sentinel("object()");
+        let other = identity_sentinel("a different opaque value");
+        let built = dict_literal_value(&[Some(DictKey::identity("object()"))], &[integer(40.0)]);
+        assert_eq!(dict_get_result(&built, &stored, None), Some(integer(40.0)));
+        assert_eq!(dict_get_result(&built, &other, None), Some(null_value()));
+    }
+
+    #[test]
+    fn dict_with_item_identity_key_round_trips_through_get() {
+        let sentinel = identity_sentinel("object()");
+        let empty = known_object(vec![], None, true, TrustProved, false);
+        let written = dict_with_item(&empty, &sentinel, &integer(200.0)).expect("identity-keyed write must decide");
+        assert_eq!(dict_get_result(&written, &sentinel, None), Some(integer(200.0)));
+    }
+
+    #[test]
+    fn known_dict_key_ignores_a_class_instances_source_tag() {
+        // a constructed class instance (judge_construction's own
+        // `instance.source = model.name` tag, instances.rs) is NOT an
+        // opaque value (no kind_word) — reading its source as an
+        // identity tag would wrongly treat every instance of the SAME
+        // class as one shared dict key, so known_dict_key must decline
+        // here rather than build a DictKey::identity from it.
+        let mut class_instance = known_object(vec![], None, true, TrustProved, false);
+        class_instance.source = "Holder".to_owned();
+        assert_eq!(known_dict_key(&class_instance), None);
+    }
+
+    // --- dict subscript keyed by a joined (Set-kind) string ---
+
+    fn joined_string_key(a: &str, b: &str) -> AbstractValue {
+        // `key = "age" if flag else "years"`'s own shape: join_known of
+        // two distinct multi-codepoint exact strings builds a Kind::Set
+        // over the union of their string_tuple forms (lattice_operations
+        // ::join_known's own tests pin this exact join path).
+        refined_domain::lattice_operations::join_known(string(a), string(b))
+    }
+
+    #[test]
+    fn subscript_read_joined_string_key_both_present_answers_the_shared_value() {
+        // {"age": 40, "years": 40} — both candidate keys map to the SAME
+        // value, so the join of the two entries reads exactly 40.
+        let built = dict_literal_value(
+            &[Some(key("age")), Some(key("years"))],
+            &[integer(40.0), integer(40.0)],
+        );
+        let joined_key = joined_string_key("age", "years");
+        assert_eq!(subscript_read(&built, &joined_key), Some(integer(40.0)));
+    }
+
+    #[test]
+    fn subscript_read_joined_string_key_different_values_answers_their_join() {
+        // {"age": 40, "years": 41} — the two candidate keys map to
+        // DIFFERENT values, so the read answers the join of both (the
+        // value the real subscription reads depends on which branch ran).
+        let built = dict_literal_value(
+            &[Some(key("age")), Some(key("years"))],
+            &[integer(40.0), integer(41.0)],
+        );
+        let joined_key = joined_string_key("age", "years");
+        let got = subscript_read(&built, &joined_key).expect("both candidate keys are present");
+        assert_eq!(got, refined_domain::lattice_operations::join_known(integer(40.0), integer(41.0)));
+    }
+
+    #[test]
+    fn subscript_read_joined_string_key_one_candidate_missing_declines() {
+        // {"age": 40} only — "years" names no entry, so the whole read
+        // declines rather than guessing at the missing branch's value.
+        let built = dict_literal_value(&[Some(key("age"))], &[integer(40.0)]);
+        let joined_key = joined_string_key("age", "years");
+        assert_eq!(subscript_read(&built, &joined_key), None);
+    }
+
     // --- positive and negative indexing ---
 
     #[test]
@@ -953,6 +1179,32 @@ mod tests {
         let list = list_literal_value(&[integer(10.0)]);
         assert_eq!(subscript_read(&list, &integer(1.0)), None);
         assert_eq!(subscript_read(&list, &integer(-2.0)), None);
+    }
+
+    #[test]
+    fn subscript_read_positive_index_into_exact_string() {
+        // word[0] on "banana" — single-character indexing, the
+        // c-reads-and-values.py string_index_access row's own shape.
+        let word = string("banana");
+        assert_eq!(subscript_read(&word, &integer(0.0)), Some(string("b")));
+        assert_eq!(subscript_read(&word, &integer(5.0)), Some(string("a")));
+    }
+
+    #[test]
+    fn subscript_read_negative_index_into_exact_string() {
+        // word[-1] selects the last character — the same negative-index
+        // adjustment list_index_read already applies.
+        let word = string("banana");
+        assert_eq!(subscript_read(&word, &integer(-1.0)), Some(string("a")));
+        assert_eq!(subscript_read(&word, &integer(-6.0)), Some(string("b")));
+    }
+
+    #[test]
+    fn subscript_read_out_of_range_string_index_declines() {
+        // word[99] — past the end; IndexError at runtime, no value here.
+        let word = string("banana");
+        assert_eq!(subscript_read(&word, &integer(99.0)), None);
+        assert_eq!(subscript_read(&word, &integer(-99.0)), None);
     }
 
     #[test]

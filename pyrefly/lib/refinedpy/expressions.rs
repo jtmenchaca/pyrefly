@@ -10,6 +10,7 @@
 //! is cited in PYREFLY-NUMERIC-B3-B4.md. This file is the contract the
 //! walk calls; the expressions unit fills it in construct by construct.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use refined_domain::abstract_value::float_sorted_unknown;
@@ -49,6 +50,7 @@ use crate::refinedpy::builtin_models;
 use crate::refinedpy::bytes_models;
 use crate::refinedpy::bytes_models::BytesAnswer;
 use crate::refinedpy::collection_models;
+use crate::refinedpy::env;
 use crate::refinedpy::env::Environment;
 use crate::refinedpy::instances;
 use crate::refinedpy::math_models;
@@ -123,12 +125,74 @@ pub fn evaluate_expression(
         // function is never itself a refined scalar/collection), so the
         // honest answer is opaque — "a function value," never a
         // specific scalar (b-body-expressions.py's
-        // `function_stored_as_local`). A lambda CALL (`f()`) is a
-        // separate concern this arm does not touch — `evaluate_call`'s
-        // own dispatch already declines a bound-name call to `unknown()`
-        // without ever reading this arm.
-        Expr::Lambda(_) => opaque_value("a function value"),
+        // `function_stored_as_local`).
+        //
+        // RETAINED CALLABLE: when `register_retained_callables` has
+        // already recorded this exact lambda's own body into
+        // `environment` (its statement-level caller runs that scan
+        // before reaching this evaluation — `check.rs::sink_value`,
+        // `summaries::interpret_body`'s `Stmt::Return` arm), the value
+        // additionally encodes the table key on `source`
+        // (`env::retained_callable_value`) so a later call through
+        // `evaluate_call`'s retained-callable arm can interpret the
+        // body instead of declining. A lambda `register_retained_
+        // callables` never reached (a shape outside its own recursion,
+        // or an environment with no such registration step at all —
+        // every existing test environment, unaffected) still answers
+        // the plain opaque value exactly as before this table existed.
+        Expr::Lambda(lambda) => match environment.retained_callable(lambda.range().start().to_u32()) {
+            Some(_) => env::retained_callable_value(lambda.range().start().to_u32()),
+            None => opaque_value("a function value"),
+        },
         _ => unknown(),
+    }
+}
+
+/// Walks `expr`'s own subtree for every `Expr::Lambda` reachable
+/// WITHOUT crossing a statement boundary (a call's own function/
+/// arguments/keywords, an attribute's own receiver, a lambda's own
+/// body — the shapes this corpus's five retained-callable rows
+/// actually nest a lambda inside: a call argument, a constructor
+/// argument), and records each one into `environment` with an EMPTY
+/// closure — every lambda literal this scan reaches reads no free
+/// name outside its own parameters (`e-class-and-function.py`'s
+/// `pick(lambda s: s.age)`, `b-body-expressions.py`'s
+/// `Person(lambda: 40)`), so there is nothing to seed. A `Stmt::Return`
+/// whose value is a BARE lambda (`return lambda age: age + step`,
+/// `make_adder`'s own row) is also reached here — a bare lambda is
+/// still an `Expr`, so this scan's own top-level match arm covers it
+/// with no separate case.
+///
+/// Called at the few STATEMENT-level points that hold `&mut
+/// Environment` just before the expression evaluates
+/// (`check.rs::sink_value`, `summaries::interpret_body`'s `Stmt::Return`
+/// arm) — `evaluate_expression` itself only ever reads `&Environment`,
+/// so a lambda nested inside a call/constructor argument has no other
+/// place to register before `evaluate_call`'s own argument evaluation
+/// reads it. Every other expression shape (a `BinOp`, a display, a
+/// comprehension, …) is not walked into — a lambda nested THERE is
+/// outside this wave's five rows and stays the plain opaque value,
+/// never a wrong answer, only a lambda this table does not yet retain.
+pub fn register_retained_callables(expr: &Expr, environment: &mut Environment) {
+    match expr {
+        Expr::Lambda(lambda) => {
+            register_retained_callables(lambda.body.as_ref(), environment);
+            let key = lambda.range().start().to_u32();
+            environment.record_retained_callable(key, env::RetainedCallable::from_lambda(lambda, HashMap::new()));
+        }
+        Expr::Call(call) => {
+            register_retained_callables(call.func.as_ref(), environment);
+            for argument in &call.arguments.args {
+                register_retained_callables(argument, environment);
+            }
+            for keyword in &call.arguments.keywords {
+                register_retained_callables(&keyword.value, environment);
+            }
+        }
+        Expr::Attribute(attribute) => {
+            register_retained_callables(attribute.value.as_ref(), environment);
+        }
+        _ => {}
     }
 }
 
@@ -1150,7 +1214,7 @@ fn is_builtin_exception_constructor(name: &str) -> bool {
 /// answers the `args` `ObjectKey` directly) and `str(...)`
 /// (`builtin_models::str_call`'s exception row, reading the SAME `args`
 /// field by name).
-fn exception_construction_value(arguments: &[AbstractValue]) -> AbstractValue {
+pub(crate) fn exception_construction_value(arguments: &[AbstractValue]) -> AbstractValue {
     let args = collection_models::list_literal_value(arguments);
     let mut instance = known_object(
         vec![ObjectKey {
@@ -1163,6 +1227,23 @@ fn exception_construction_value(arguments: &[AbstractValue]) -> AbstractValue {
         TrustProved,
         false,
     );
+    instance.source = "exception".to_owned();
+    instance
+}
+
+/// The tagged, FIELDLESS exception shape `check.rs`'s own
+/// `caught_exception_value` binds a caught exception name to when the
+/// try body's own raise cannot be found (a computed exception type, a
+/// bare `except:`, more than one matching raise, …): the same
+/// `source = "exception"` tag `exception_construction_value` gives a
+/// freshly-constructed exception, but with no `args`/`__cause__`
+/// field — a read through it (`.args`, `.__cause__`) finds nothing this
+/// domain models, the honest "not yet readable" answer, never a false
+/// Unknown-is-opaque read that a bare `opaque_value` would give (an
+/// opaque value carries no `source` at all, so it cannot even be
+/// recognized as an exception by a later `isinstance`/`str()` reader).
+pub(crate) fn fieldless_exception_value() -> AbstractValue {
+    let mut instance = known_object(Vec::new(), None, true, TrustProved, false);
     instance.source = "exception".to_owned();
     instance
 }
@@ -1513,7 +1594,90 @@ fn datetime_field(instance: &AbstractValue, name: &str) -> Option<f64> {
     Some(value)
 }
 
+/// `callee(...)` where `callee` is a retained-callable value
+/// (`env::retained_callable_key` reads `Some`) — resolves the call
+/// through the SAME restricted interpreter an ordinary same-module
+/// `def` call already uses (`summaries::call_result_with_enclosing`),
+/// never a second one built for this table. `None` ONLY when `callee`
+/// is not a retained-callable value at all — the signal `evaluate_
+/// call`'s own caller reads to fall through to its other dispatch
+/// arms. Once `callee` IS recognized as a retained-callable value,
+/// this function always answers `Some` — a table miss (`environment`
+/// never recorded this exact key) or an arity/interpretation decline
+/// answers `Some(unknown())`, never `None`, so a caller never
+/// mistakes "this really is a retained-callable call, and it
+/// declined" for "try the ordinary def/builtin dispatch instead,"
+/// which could read a stale or wrong same-module def of the same bare
+/// name.
+///
+/// The retained body's own CLOSURE snapshot (free names read from the
+/// environment AT THE MOMENT the value was created, `RetainedCallable`'s
+/// own doc) seeds a throwaway environment that
+/// `call_result_with_enclosing`'s `enclosing` parameter reads free
+/// names from — the same closure-reading contract that function
+/// already gives an ordinary nested `def`, reused rather than
+/// duplicated. Positional arguments read through `positional_
+/// arguments_for_def`, the same keyword-to-position mapping and arity
+/// checking an ordinary same-module call already gets — one binding
+/// law, not a second for retained callables.
+fn retained_callable_call_result(
+    callee: &AbstractValue,
+    call: &ruff_python_ast::ExprCall,
+    environment: &Environment,
+    kernel: &Arc<RefinedTSKernel>,
+) -> Option<AbstractValue> {
+    let key = env::retained_callable_key(callee)?;
+    let Some(retained) = environment.retained_callable(key) else {
+        return Some(unknown());
+    };
+    let def = retained.as_synthetic_def("<retained>", call.range());
+    let Some(positional) = positional_arguments_for_def(call, &def, environment, kernel) else {
+        return Some(unknown());
+    };
+    let answer = if retained.closure.is_empty() {
+        summaries::call_result_with_enclosing(&def, &positional, environment.functions(), kernel, environment.call_depth(), None)
+    } else {
+        let mut closure_environment = Environment::new(std::collections::HashSet::new());
+        for (name, value) in &retained.closure {
+            closure_environment.bind(name, value.clone());
+        }
+        summaries::call_result_with_enclosing(
+            &def,
+            &positional,
+            environment.functions(),
+            kernel,
+            environment.call_depth(),
+            Some(&closure_environment),
+        )
+    };
+    Some(answer.unwrap_or_else(unknown))
+}
+
 fn evaluate_call(call: &ruff_python_ast::ExprCall, environment: &Environment, kernel: &Arc<RefinedTSKernel>) -> AbstractValue {
+    // A RETAINED-CALLABLE CALL: `name(...)` where `name` reads a value
+    // `env::retained_callable_value` built — a lambda or nested `def`
+    // that reached this call site through a binding path other than
+    // "declared and called in the same body" (returned out of its
+    // defining function, passed in as a call argument, read back off
+    // an instance field). Tried BEFORE the same-module-def dispatch
+    // below: a retained callable's own table entry is a stronger,
+    // execution-traced fact than a bare same-module `def` of the same
+    // spelling would be, and — for `add_one = make_adder(1)` — there
+    // is no module-level `def add_one` for that dispatch to find
+    // anyway, so trying this first changes nothing for the shapes that
+    // DO have a same-module def of the lambda-bound name
+    // (`same_module_def_gate_open`'s own doc already treats that name
+    // as open, meaning a real module-level `def` of the same spelling
+    // is the intended callee there — this arm never reaches that case
+    // since `retained_callable_key` answers `None` for an ordinary,
+    // non-retained lambda value).
+    if let Expr::Name(name) = call.func.as_ref() {
+        if let Some(value) = environment.read(name.id.as_str()) {
+            if let Some(result) = retained_callable_call_result(value, call, environment, kernel) {
+                return result;
+            }
+        }
+    }
     if let Expr::Name(name) = call.func.as_ref() {
         if same_module_def_gate_open(environment, name.id.as_str()) {
             if let Some(table) = environment.functions() {
@@ -1670,6 +1834,24 @@ fn evaluate_call(call: &ruff_python_ast::ExprCall, environment: &Environment, ke
         // `Kind::Object`-with-`source` check below, falling through to
         // `evaluate_attribute_call`'s own module-name arms unaffected.
         let receiver = evaluate_expression(&attribute.value, environment, kernel);
+        // A RETAINED-CALLABLE FIELD CALL: `receiver.attr(...)` where
+        // `attr` is a STORED field (never a class method — a `def` in
+        // the class body resolves through `method_def_of` below
+        // instead) holding a retained lambda/def value
+        // (b-body-expressions.py's `function_nested_on_object`:
+        // `Person(lambda: 40)` stores the lambda as `self.years`, and
+        // `person.years()` calls it back). Tried before the
+        // class-method dispatch: a field and a method never share a
+        // name on the same class (`instances::field_read`/`method_def_
+        // of` both key off the class's own single namespace), so this
+        // never shadows an actual method call.
+        if receiver.kind == Kind::Object {
+            if let Some(field) = instances::field_read(&receiver, attribute.attr.as_str()) {
+                if let Some(result) = retained_callable_call_result(&field, call, environment, kernel) {
+                    return result;
+                }
+            }
+        }
         if receiver.kind == Kind::Object && !receiver.source.is_empty() {
             if let Some(classes) = environment.classes() {
                 if let Some(model) = classes.get(receiver.source.as_str()) {
@@ -1724,6 +1906,7 @@ fn evaluate_call(call: &ruff_python_ast::ExprCall, environment: &Environment, ke
                             method,
                             &positional,
                             environment.functions(),
+                            Some(classes),
                             kernel,
                             environment.call_depth(),
                         ) {
@@ -2030,6 +2213,11 @@ fn positional_arguments_with_kwargs_dict(
 /// never a call argument, so `method.method_call_result`'s own
 /// non-`self` parameter list is the keyword-mapping target, one name
 /// per non-receiver argument the call actually supplies.
+///
+/// `@staticmethod` declares no `self`/receiver slot at all
+/// (`instances::method_call_result`'s own doc) — EVERY declared
+/// parameter is the keyword-mapping target then, none excluded. Every
+/// other member `def` keeps the `self`-splitting shape.
 fn positional_arguments_for_method(
     call: &ruff_python_ast::ExprCall,
     method: &ruff_python_ast::StmtFunctionDef,
@@ -2037,7 +2225,16 @@ fn positional_arguments_for_method(
     kernel: &Arc<RefinedTSKernel>,
 ) -> Option<Vec<AbstractValue>> {
     let parameters: Vec<_> = method.parameters.posonlyargs.iter().chain(method.parameters.args.iter()).collect();
-    let (_self_parameter, rest) = parameters.split_first()?;
+    let is_static = method
+        .decorator_list
+        .iter()
+        .any(|decorator| matches!(&decorator.expression, Expr::Name(name) if name.id.as_str() == "staticmethod"));
+    let rest: Vec<_> = if is_static {
+        parameters
+    } else {
+        let (_self_parameter, rest) = parameters.split_first()?;
+        rest.to_vec()
+    };
     let parameter_names: Vec<&str> = rest.iter().map(|parameter| parameter.parameter.name.id.as_str()).collect();
     positional_arguments_by_names(call, &parameter_names, environment, kernel)
 }
@@ -2809,6 +3006,19 @@ fn evaluate_attribute_read(
         if let Some(classes) = environment.classes() {
             if let Some(model) = classes.get(receiver.source.as_str()) {
                 if let Some(value) = instances::field_read_through_model(model, &receiver, attribute.attr.as_str()) {
+                    return value;
+                }
+                // A CLASS ATTRIBUTE (`ceiling = 40` at class-body top
+                // level, read through `cls.ceiling`/`ClassName.ceiling`)
+                // lives in the receiver's own `keys` (`instances::
+                // class_object_value` builds it there) but never in
+                // `model.fields`/`model.properties` — `field_read_
+                // through_model` only reads instance-declared fields, so
+                // it misses a class attribute by design, not by gap. The
+                // plain linear scan still finds it directly off the
+                // receiver's own stored value before falling to "this is
+                // a bound method" or "unknown."
+                if let Some(value) = instances::field_read(&receiver, attribute.attr.as_str()) {
                     return value;
                 }
                 if instances::method_def_of(model, attribute.attr.as_str()).is_some() {
@@ -3809,6 +4019,47 @@ fn call_provable_raise(
     environment: &Environment,
     kernel: &Arc<RefinedTSKernel>,
 ) -> Option<(TextRange, String)> {
+    // `f(*x)` where `x` is a genuinely unbounded list VALUE (`values:
+    // list[int]`, b-body-expressions.py's own `wrapper_spread_call_
+    // unbounded`) — CPython's own call path fails past a large
+    // positional-argument count (`splice_call_arguments`'s own doc: an
+    // unbounded iterable has no proven element count to splice into a
+    // fixed argument vector, so the VALUE path declines rather than
+    // guess). That silence is honest for the VALUE question, but the
+    // SHAPE itself is a fact this checker already knows: an unpack
+    // whose own length is unproven can throw at runtime regardless of
+    // what the call computes. A KNOWN-length iterable (`Kind::List`,
+    // whatever its own elements are known) never fires here —
+    // `wrapper_spread_call`'s own `max(*[200, 201])` stays silent,
+    // exactly as `splice_call_arguments` already treats it.
+    //
+    // EXCLUDED: `x` is this body's OWN `*args`/`**kwargs` parameter,
+    // forwarded bare (`environment::is_variadic_parameter` — r-ast-
+    // census.py's `wrapper(*args: P.args, **kwargs: P.kwargs): return
+    // f(*args, **kwargs)`). A ParamSpec-captured vararg forward hands
+    // CPython exactly the arguments THIS body itself received; it is
+    // never an independently-grown collection whose length could
+    // exceed what a real call already survived to reach this body, so
+    // it never raises on this shape alone.
+    for arg in &call.arguments.args {
+        if let Expr::Starred(starred) = arg {
+            if let Expr::Name(spread_name) = starred.value.as_ref() {
+                if environment.is_variadic_parameter(spread_name.id.as_str()) {
+                    continue;
+                }
+            }
+            let spread = evaluate_expression(&starred.value, environment, kernel);
+            if spread.kind != Kind::List {
+                let callee_name = callee_display_name(call.func.as_ref());
+                return Some((
+                    call.range(),
+                    format!(
+                        "this expression provably raises TypeError: the list can hold any number of items, and the unpack hands each to {callee_name} as its own argument"
+                    ),
+                ));
+            }
+        }
+    }
     if let Expr::Name(name) = call.func.as_ref() {
         // a `base=` keyword changes the parsing rules entirely (a
         // non-decimal radix admits letters as digits) — this row only
@@ -3906,6 +4157,20 @@ fn call_provable_raise(
     // `Raises` answer is not reached from a bare call expression here —
     // noted rather than silently unhandled.
     None
+}
+
+/// A callee expression's own plain name for a raise message — a bare
+/// `Name` reads directly (`max`, `sorted`, …); an `Attribute` reads its
+/// own trailing name (`obj.method` names `method`, the part CPython's
+/// own `TypeError` messages name); anything else (a call result used
+/// directly as a callee, for instance) falls back to a generic "the
+/// call" rather than guess at a name that is not there.
+fn callee_display_name(callee: &Expr) -> String {
+    match callee {
+        Expr::Name(name) => name.id.as_str().to_owned(),
+        Expr::Attribute(attribute) => attribute.attr.as_str().to_owned(),
+        _ => "the call".to_owned(),
+    }
 }
 
 /// Whether `text` parses as a base-10 `int(str)` argument

@@ -24,63 +24,11 @@ use std::sync::Arc;
 use pyrefly::refinedpy::check::findings_for_module_with_resolver;
 use pyrefly::refinedpy::cross_module::disk_resolver;
 use pyrefly::refinedpy::kernel_path::resolve_kernel_dylib;
+use pyrefly::refinedpy::markers::line_col;
+use pyrefly::refinedpy::markers::line_starts_of;
+use pyrefly::refinedpy::markers::markers_of;
 use refined_kernel::kernel_bridge::load_kernel;
 use refined_kernel::kernel_interface::RefinedTSKernel;
-
-/// A `# refinedpy: expect-error` marker: the line it sits on, the line
-/// it expects a fire on (the next non-comment line), and its reason.
-struct Marker {
-    marker_line: usize,
-    expected_line: usize,
-    reason: String,
-}
-
-fn markers_of(source: &str) -> Vec<Marker> {
-    let lines: Vec<&str> = source.lines().collect();
-    let mut out = Vec::new();
-    for (index, line) in lines.iter().enumerate() {
-        let trimmed = line.trim_start();
-        let Some(rest) = trimmed.strip_prefix("# refinedpy: expect-error") else {
-            continue;
-        };
-        let reason = rest
-            .trim_start_matches([' ', '\u{2014}', '-'])
-            .trim()
-            .to_owned();
-        // The expected fire sits on the next line that is not itself a
-        // comment (host-marker lines may sit between).
-        let expected = lines
-            .iter()
-            .enumerate()
-            .skip(index + 1)
-            .find(|(_, l)| !l.trim_start().starts_with('#'))
-            .map(|(i, _)| i + 1)
-            .unwrap_or(index + 2);
-        out.push(Marker {
-            marker_line: index + 1,
-            expected_line: expected,
-            reason,
-        });
-    }
-    out
-}
-
-/// 1-based line and column of a byte offset.
-fn line_col(line_starts: &[usize], offset: usize) -> (usize, usize) {
-    let line = line_starts.partition_point(|start| *start <= offset);
-    let col = offset - line_starts[line - 1] + 1;
-    (line, col)
-}
-
-fn line_starts_of(source: &str) -> Vec<usize> {
-    let mut starts = vec![0];
-    for (i, b) in source.bytes().enumerate() {
-        if b == b'\n' {
-            starts.push(i + 1);
-        }
-    }
-    starts
-}
 
 fn check_file(path: &str, kernel: &Arc<RefinedTSKernel>) -> (usize, Vec<String>) {
     let Ok(source) = std::fs::read_to_string(path) else {
