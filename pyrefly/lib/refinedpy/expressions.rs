@@ -27,6 +27,7 @@ use refined_domain::abstract_value::SetKindTag;
 use refined_domain::known_constructors::known_object;
 use refined_domain::lattice_operations::join_known;
 use refined_domain::lattice_operations::truthiness;
+use refined_domain::trust_grades::TrustLevel;
 use refined_domain::trust_grades::TrustProved;
 use refined_domain::trust_grades::TrustSpec;
 use refined_kernel::kernel_interface::RefinedTSKernel;
@@ -36,7 +37,10 @@ use refined_sets::refinement_forms::integer;
 use refined_sets::refinement_forms::make_refined_set;
 use refined_sets::refinement_forms::one_of;
 use refined_sets::refinement_forms::repeat_of;
+use refined_sets::refinement_forms::requires_integer;
 use refined_sets::refinement_forms::RefinedSet;
+use refined_sets::repetition_window_forms::as_repetition;
+use refined_sets::repetition_window_forms::repetition;
 use ruff_python_ast::BoolOp;
 use ruff_python_ast::CmpOp;
 use ruff_python_ast::ConversionFlag;
@@ -67,6 +71,16 @@ pub fn evaluate_expression(
     environment: &Environment,
     kernel: &Arc<RefinedTSKernel>,
 ) -> AbstractValue {
+    // A node whose value the walk already proved answers it directly
+    // (`Environment::evaluated_node`). The relational sum is the one
+    // publisher: a division whose operands the kernel tied together
+    // answers more tightly than evaluating the two sides here could,
+    // because the tie is a fact of the kernel program rather than of
+    // either side. Checked at this one dispatch head, so a published
+    // node is found wherever it sits in the tree.
+    if let Some(published) = environment.evaluated_node(expression.range()) {
+        return published.clone();
+    }
     match expression {
         // parenthesization carries no AST node of its own — ruff folds
         // `(x)` into `x` at parse time, so there is no case to write here
@@ -2258,7 +2272,7 @@ fn evaluate_call(call: &ruff_python_ast::ExprCall, environment: &Environment, ke
                     None => unknown(),
                 };
             }
-            match builtin_models::builtin_call_result(name.id.as_str(), &arguments) {
+            match builtin_models::builtin_call_result_with_kernel(name.id.as_str(), &arguments, kernel) {
                 Some(value) => value,
                 None => unknown(),
             }
@@ -3339,35 +3353,43 @@ fn is_bare_super_call(expr: &Expr) -> bool {
 /// display and a generator expression — expressions.rst, "Displays for
 /// lists, sets and dictionaries": "the comprehension consists of a
 /// single expression, followed by at least one `for` clause." Modeled
-/// ONLY the single-clause, known-List-iterable shape: exactly one
-/// `Comprehension` (a second `for` clause, or an `async for` —
-/// `is_async` — declines outright), the target a bare `Expr::Name` or a
-/// two-name tuple target (`comprehension_target_names`'s own doc), and
-/// the iterable a known `Kind::List` of already-known elements. Each
-/// surviving element forks
-/// the environment, binds the target, evaluates every `if` condition in
-/// order (a `known&&false` truthiness drops the element; `known&&true`
-/// keeps checking the rest; anything not fully known makes the WHOLE
-/// comprehension unknown — a single undecidable filter means this file
-/// cannot say which elements the real list would contain), then
-/// evaluates `elt` on that fork. The collected elements build through
-/// `collection_models::list_literal_value` for every one of
-/// list/set/generator — a set's own element-uniqueness and a
+/// as ONE single-clause shape (exactly one `Comprehension`; a second
+/// `for` clause or an `async for` — `is_async` — declines outright; the
+/// target a bare `Expr::Name` or a two-name tuple target,
+/// `comprehension_target_names`'s own doc) over EITHER of two iterable
+/// shapes: a known `Kind::List` of already-known elements (the CONCRETE
+/// path, tried first, unchanged from before this function grew a second
+/// arm), or an unknown-length sequence known by its element SET
+/// (`comprehension_target_and_star_element`'s own doc — a declared/
+/// refined parameter with no concrete items, tried only once the
+/// concrete path declines). The concrete path forks the environment
+/// once per surviving element, binding the target, evaluating every
+/// `if` condition in order (a `known&&false` truthiness drops the
+/// element; `known&&true` keeps checking the rest; anything not fully
+/// known makes the WHOLE comprehension unknown — a single undecidable
+/// filter means this file cannot say which elements the real list would
+/// contain), then evaluating `elt` on that fork; the collected elements
+/// build through `collection_models::list_literal_value`. The star path
+/// forks ONCE (`comprehension_star_elements`'s own doc) and answers a
+/// star-shaped `Kind::Set`, never a `Kind::List` — a length-unstated
+/// result has no exact positional slots to state. Either shape is
+/// honest for the same reason: a set's own element-uniqueness and a
 /// generator's own lazy-iteration behavior are both invisible to a
 /// caller that only ever consumes the sequence via `len()`/`sum()`/a
-/// `for`-loop read, so this file states the shared List shape honestly
-/// rather than inventing a `Kind::Set`/generator variant with no reader
-/// that would ever tell the difference.
+/// `for`-loop read.
 fn evaluate_list_or_set_comp(
     element_expr: &Expr,
     generators: &[ruff_python_ast::Comprehension],
     environment: &Environment,
     kernel: &Arc<RefinedTSKernel>,
 ) -> AbstractValue {
-    let Some(elements) = comprehension_elements(element_expr, generators, environment, kernel) else {
-        return unknown();
-    };
-    collection_models::list_literal_value(&elements)
+    if let Some(elements) = comprehension_elements(element_expr, generators, environment, kernel) {
+        return collection_models::list_literal_value(&elements);
+    }
+    if let Some(star) = comprehension_star_elements(element_expr, generators, environment, kernel) {
+        return star;
+    }
+    unknown()
 }
 
 /// `{key: value for target in iterable if cond ...}` — the same
@@ -3453,6 +3475,90 @@ fn comprehension_target_and_elements<'a>(
         return None;
     }
     Some((target_names, &clause.ifs, iterable.items))
+}
+
+/// The single-clause comprehension shape over an UNKNOWN-LENGTH,
+/// known-element-set iterable: `Kind::Set` whose only form is the
+/// repetition window `as_repetition` reads back
+/// (`check.rs::seed_parameters`'s own `list[X]`/`set[X]`/`Sequence[X]`
+/// PARAMETER seed builds the bare star, `lo` 0 and `hi` unbounded;
+/// `collection_models::star_element_read`'s own doc — the same window
+/// shape, read the same way, never a second reader). Every position of
+/// a repetition draws from the SAME element set (the grammar's own
+/// definition), so there is exactly ONE abstraction to bind the target
+/// against and exactly ONE evaluation of `elt` to perform — unlike the
+/// concrete path above, which evaluates `elt` once per known item.
+/// `None` for the same shape restrictions the concrete path takes (a
+/// second `for` clause, `async for`, a target of any other arity), OR
+/// when the iterable does not read back as a repetition at all (a
+/// union, an unknown value) — the concrete arm and this one are
+/// mutually exclusive on `iterable.kind`, so a caller tries the
+/// concrete path first and only reaches here on ITS decline. The
+/// window's own `{lo, hi}` rides back alongside the element so the
+/// caller can restate it on the mapped result.
+fn comprehension_target_and_star_element<'a>(
+    generators: &'a [ruff_python_ast::Comprehension],
+    environment: &Environment,
+    kernel: &Arc<RefinedTSKernel>,
+) -> Option<(Vec<&'a str>, &'a [Expr], AbstractValue, i64, Option<i64>)> {
+    let [clause] = generators else {
+        return None;
+    };
+    if clause.is_async {
+        return None;
+    }
+    let target_names = comprehension_target_names(&clause.target)?;
+    let iterable = evaluate_expression(&clause.iter, environment, kernel);
+    if iterable.kind != Kind::Set || iterable.set_kind_tag != SetKindTag::None {
+        return None;
+    }
+    let repeated = as_repetition(&iterable.set)?;
+    let element = known_set(repeated.element, None, TrustSpec, SetKindTag::None);
+    Some((target_names, &clause.ifs, element, repeated.lo, repeated.hi))
+}
+
+/// The star-shaped result of a list/set/generator comprehension over an
+/// unknown-length, known-element-set iterable
+/// (`comprehension_target_and_star_element`'s own doc): binds the
+/// target to the ONE element abstraction, evaluates every `if`
+/// condition against that single binding, and evaluates `elt` once —
+/// there is no per-element enumeration to run since the source length
+/// is unstated. `None` when a filter's truthiness cannot be decided FOR
+/// THE WHOLE ELEMENT SET (unlike the concrete path, which drops
+/// individual elements, a filter here either keeps every position or
+/// the comprehension is undecidable, since one shared element stands
+/// for all of them). A comprehension preserves the source's own length
+/// (mapping every position through `elt` changes no position's
+/// presence) — the result carries the SAME `{lo, hi}` window the source
+/// read back — UNLESS an `if` clause is present, in which case a filter
+/// can drop positions down to zero, so `lo` widens to 0 whenever
+/// `conditions` is non-empty; `hi` is unaffected either way (a filter
+/// only ever removes positions, never adds them).
+fn comprehension_star_elements(
+    element_expr: &Expr,
+    generators: &[ruff_python_ast::Comprehension],
+    environment: &Environment,
+    kernel: &Arc<RefinedTSKernel>,
+) -> Option<AbstractValue> {
+    let (target_names, conditions, element, source_lo, source_hi) =
+        comprehension_target_and_star_element(generators, environment, kernel)?;
+    let mut fork = environment.fork();
+    if !bind_comprehension_target(&mut fork, &target_names, &element) {
+        return None;
+    }
+    if !conditions.is_empty() && comprehension_conditions_hold(conditions, &fork, kernel).is_none() {
+        return None;
+    }
+    let mapped = evaluate_expression(element_expr, &fork, kernel);
+    if mapped.kind != Kind::Set {
+        return None; // the mapped element must itself name a scalar set to re-window over
+    }
+    let lo = if conditions.is_empty() { source_lo } else { 0 };
+    let window = repetition(mapped.set.clone(), lo, source_hi);
+    Some(AbstractValue {
+        kind_tag: mapped.kind_tag,
+        ..known_set(window, None, TrustSpec, SetKindTag::None)
+    })
 }
 
 /// The bare names a comprehension `for` target binds: one name for a
@@ -3629,7 +3735,7 @@ fn evaluate_unary(
         return known_values(vec![if value { 0.0 } else { 1.0 }], PrimitiveKind::Boolean, TrustProved);
     }
     let Some((value, sort)) = single_numeric_value(&operand) else {
-        return unknown();
+        return negate_over_set(unary.op, &operand, kernel).unwrap_or_else(unknown);
     };
     match unary.op {
         UnaryOp::USub => known_values(vec![-value], sort, TrustProved),
@@ -3643,6 +3749,45 @@ fn evaluate_unary(
         }
         UnaryOp::Not => unreachable!("handled above"),
     }
+}
+
+/// `-x` over an INT-SORTED SET operand (a seeded parameter range, or a
+/// set another transfer already produced) — the row `evaluate_unary`'s
+/// known-single-value path cannot reach. python-pins.md arith.11: "unary
+/// `-` yields the numeric negation (`__neg__`)... on ints rides `int.*`
+/// exactly," electing `int.neg`, whose kernel arm is
+/// `boundary/python.lean`'s `pythonTransferOfOp1`. The answer is
+/// Integer-sorted: negation of an integer is an integer, and arith.1's
+/// unlimited precision means it never wraps.
+///
+/// Only `USub` has a row here. `UAdd` over a set is the operand itself
+/// and needs no kernel question, but answering it would restate a value
+/// this function was handed rather than transfer one, so it is left to
+/// the caller's own decline; `Invert` (`~x`) is `-(x+1)`, a composition
+/// no pins row states as an `int.*` member; `Not` is decided before the
+/// numeric guard entirely.
+///
+/// A Float-sorted set declines: `binary64.neg` is that row's election
+/// (arith.11's own float branch), a different question this function
+/// does not pose. A kernel refusal reads as `None` through the same
+/// `catch_unwind` discipline `transfer_over_sets` keeps.
+fn negate_over_set(op: UnaryOp, operand: &AbstractValue, kernel: &Arc<RefinedTSKernel>) -> Option<AbstractValue> {
+    use refined_kernel::transfer_questions::TransferQuestionOp;
+    if op != UnaryOp::USub || operand.kind != Kind::Set {
+        return None;
+    }
+    let (operand_set, sort) = transferable_numeric_operand(operand)?;
+    if sort != PrimitiveKind::Integer {
+        return None;
+    }
+    let grade = refined_domain::trust_grades::derived_trust_level(TrustProved, std::slice::from_ref(operand));
+    int_transfer_answer(
+        TransferQuestionOp::IntNeg,
+        operand_set,
+        make_refined_set(vec![]),
+        grade,
+        kernel,
+    )
 }
 
 /// The single numeric value a known abstract value carries, if it
@@ -3855,31 +4000,275 @@ fn transferable_numeric_operand(value: &AbstractValue) -> Option<(RefinedSet, Pr
 ///   integer result outside the f64-exact 2^53 range rather than claim
 ///   an inexact one) — so these three rows are semantics-identical
 ///   between the two languages and safe to lower.
-/// - `Div` (`/`), `FloorDiv` (`//`), `Mod` (`%`), and `Pow` (`**`) do
-///   NOT lower. Python's `/` is always true division with no ECMA
-///   twin-row to ask (the kernel's `Div`/`Rem` rows are ECMA `/`/`%`,
-///   dividend-sign remainder); `%` takes the DIVISOR's sign in Python,
-///   the opposite of ECMA's dividend-sign remainder
-///   (AGENT-BRIEF.md, expressions.rst §6.7) — asking the kernel's `Rem`
-///   row for a Python `%` would silently answer the wrong sign on a
-///   mixed-sign pair; `//` floors toward negative infinity, which is
-///   not one of the kernel's arithmetic transfer rows at all; `**`
-///   has no kernel binary-arithmetic-transfer row in this family
-///   (`Pow` in `TransferQuestionOp` is the pinned NaN/unknown/set
-///   PowOperandWire shape math_transfer.go builds, a different
-///   question shape from the plain two-`RefinedSet` rows this
-///   function poses). This is the exact set `lower_counter_step_body`
-///   already trusts (Add/Sub, "no Python/JS divergence") plus `Mult`,
-///   which shares the same no-divergence property arithmetic addition
-///   and subtraction do.
+/// - `Div` (`/`) ALSO lowers. Python's `/` is always true division —
+///   arith.9 (python-pins.md): "Division of int by int (`/`) yields a
+///   float — the type is widened even when the arguments are exact
+///   integers" — and elects `binary64.div` for exactly this reason, the
+///   SAME election the kernel's `Div` row already carries; the two
+///   `/`s are not merely similarly-shaped, they name the same theorem.
+///   `transfer_over_sets`'s own `result_sort` computation carries the
+///   always-Float override for this one op — the `both_int` rule the
+///   other three admitted ops share does not apply here.
+/// - `FloorDiv` (`//`), `Mod` (`%`), and `Pow` (`**`) do NOT lower to
+///   the FLOAT family. `%` takes the DIVISOR's sign in Python, the
+///   opposite of ECMA's dividend-sign remainder (AGENT-BRIEF.md,
+///   expressions.rst §6.7) — asking the kernel's `Rem` row for a Python
+///   `%` would silently answer the wrong sign on a mixed-sign pair; `//`
+///   floors toward negative infinity, which is not one of the kernel's
+///   float arithmetic transfer rows at all; `**` has no float
+///   binary-arithmetic-transfer row in this family (`Pow` in
+///   `TransferQuestionOp` is the pinned NaN/unknown/set `PowOperandWire`
+///   shape, a different question shape from the plain two-`RefinedSet`
+///   rows this function poses).
+///
+/// `admitted_int_transfer_op` below states the row those three DO have,
+/// on the other side of the sort split: the exact `int` theory.
 fn admitted_transfer_op(op: Operator) -> Option<refined_kernel::transfer_questions::TransferQuestionOp> {
     use refined_kernel::transfer_questions::TransferQuestionOp;
     match op {
         Operator::Add => Some(TransferQuestionOp::Add),
         Operator::Sub => Some(TransferQuestionOp::Sub),
         Operator::Mult => Some(TransferQuestionOp::Mul),
+        Operator::Div => Some(TransferQuestionOp::Div),
         _ => None,
     }
+}
+
+/// The kernel `TransferQuestionOp` a Python operator lowers to when BOTH
+/// operands are INT-SORTED — the exact `int` theory
+/// (`boundary/python.lean`'s `pythonTransferOfOp2`), never the
+/// `binary64.*` float image `admitted_transfer_op` returns. Python's
+/// integers have unlimited precision and never wrap (python-pins.md
+/// arith.1), so every row here is exact arithmetic on the mathematical
+/// integers, which is what the `int.*` theory proves:
+///
+/// - `Add`/`Sub`/`Mult` elect `int.add`/`int.sub`/`int.mul` — the exact
+///   whole-number operations arith.1 names ("the float transfer is
+///   REFUSED for ints and the exact whole-number theory (`int.*`) serves
+///   them"). The float image would agree on any operand pair small
+///   enough to be f64-exact, but the exact theory is the one the pins
+///   elect, and it is the theory that stays right at the edges.
+/// - `FloorDiv` elects `int.floorDiv` — arith.7/arith.8: floor division
+///   "is always rounded towards minus infinity," paired with `%` by
+///   `x == (x//y)*y + (x%y)`. A zero divisor is `ZeroDivisionError`
+///   (arith.10), which the kernel arm refuses on rather than answering.
+/// - `Mod` elects `rem.divisorSign` — arith.4: "the modulo operator
+///   yields a result with the same sign as its SECOND operand (the
+///   divisor)." This is the Python-owned remainder, a DIFFERENT theorem
+///   from the `rem.truncDividendSign` row JavaScript's `%` elects, so
+///   electing it by name is what makes the sign right on a mixed-sign
+///   pair.
+/// - `Pow` elects `int.pow` — pow.1: "`int ** nonnegative int` yields an
+///   exact int (same type as the operands)... a negative int exponent
+///   converts both arguments to float and yields a float." The kernel's
+///   `int.pow` arm reads its exponent as a nonnegative `Nat`, so
+///   `int_transfer_over_sets` below gates this row on
+///   `exact_nonnegative_integer` before ever asking — a
+///   possibly-negative exponent declines to the float path, which is
+///   where pow.1 sends it anyway.
+/// - `BitAnd`/`BitOr`/`BitXor` elect `int.bitAnd`/`int.bitOr`/
+///   `int.bitXor` — bits.4/bits.5/bits.6: the bitwise operations on
+///   UNBOUNDED ints, "never JS's 32-bit wrap view." The `int32.*` family
+///   the JavaScript rows elect is the wrong theorem here for exactly
+///   that reason.
+///
+/// `Div` is absent by design: arith.9 widens int/int to float, so `/`
+/// never has an int-sorted row at all — it stays on
+/// `admitted_transfer_op`'s `binary64.div`. `LShift`/`RShift` are also
+/// absent: bits.1/bits.2 define them as `int.floorDiv`/`int.mul` by
+/// `2**n` rather than as their own members, so they lower as that
+/// COMPOSITION (`shift_as_int_composition` below), not as a direct op.
+fn admitted_int_transfer_op(op: Operator) -> Option<refined_kernel::transfer_questions::TransferQuestionOp> {
+    use refined_kernel::transfer_questions::TransferQuestionOp;
+    match op {
+        Operator::Add => Some(TransferQuestionOp::IntAdd),
+        Operator::Sub => Some(TransferQuestionOp::IntSub),
+        Operator::Mult => Some(TransferQuestionOp::IntMul),
+        Operator::FloorDiv => Some(TransferQuestionOp::IntFloorDiv),
+        Operator::Mod => Some(TransferQuestionOp::RemDivisorSign),
+        Operator::Pow => Some(TransferQuestionOp::IntPow),
+        Operator::BitAnd => Some(TransferQuestionOp::IntBitAnd),
+        Operator::BitOr => Some(TransferQuestionOp::IntBitOr),
+        Operator::BitXor => Some(TransferQuestionOp::IntBitXor),
+        _ => None,
+    }
+}
+
+/// A known EXACT NONNEGATIVE INTEGER operand, as its own `f64` — the
+/// shape two rows below need before they may ask an `int.*` question:
+/// `Pow`'s exponent (pow.1's nonnegative-int branch is the only one the
+/// exact `int.pow` theory covers; a negative exponent "converts both
+/// arguments to float and yields a float," a different row) and a
+/// shift's count (bits.3: "a negative shift count is illegal and raises
+/// `ValueError`"). A SET operand answers `None` even when its whole
+/// range is nonnegative — the kernel's own `int.*` arms read an operand
+/// through `exactIntOf` (a closed singleton, `numeric/enclosure_read.lean`),
+/// so a range exponent has nothing to offer them, and proving
+/// nonnegativity of a range here would state a gate the row behind it
+/// cannot use. The value must also sit inside the f64-exact 2^53 window
+/// `arithmetic_result` already trusts, for the same reason it does.
+fn exact_nonnegative_integer(value: &AbstractValue) -> Option<f64> {
+    let (number, sort) = single_numeric_value(value)?;
+    if sort != PrimitiveKind::Integer {
+        return None;
+    }
+    if number < 0.0 || number.fract() != 0.0 || number.abs() >= 2f64.powi(53) {
+        return None;
+    }
+    Some(number)
+}
+
+/// Poses one `int.*` question and reads the answer back as an
+/// INTEGER-SORTED value. Every `int.*` member answers exact whole
+/// numbers (python-pins.md arith.1 — "integer `+ − ×` never overflows
+/// and never wraps"), so the answer's sort is Integer unconditionally,
+/// with no `both_int` computation of its own: reaching this function AT
+/// ALL already required both operands to be int-sorted.
+///
+/// Two guards the float family does not need:
+///
+/// - A non-integral value in the answer declines. `int.*` cannot produce
+///   one, so this can only mean the wire carried something this row
+///   does not understand.
+/// - A value outside the f64-exact 2^53 window declines. Python's
+///   integers are unbounded (arith.1) and the kernel computes them
+///   exactly as `Int`s, but `boundary/encode_sets.lean`'s `encodeNumber`
+///   puts every result through `roundNE` before it crosses the wire — so
+///   a result past 2^53 arrives ROUNDED, and claiming it as exact would
+///   be claiming a value CPython never computes. This is the same window
+///   and the same reason `arithmetic_result` already declines on.
+///
+/// A SET answer must additionally CARRY its own integrality
+/// (`requires_integer`) before it is tagged Integer-sorted. Most `int.*`
+/// arms answer `.vals`, so this is about the one arm that answers an
+/// enclosure — `rem.divisorSign`, whose general-interval branch produces
+/// a bound-shaped enclosure. Tagging a set Integer-sorted without that
+/// mark would claim an integrality the kernel did not state.
+fn int_transfer_answer(
+    transfer_op: refined_kernel::transfer_questions::TransferQuestionOp,
+    left_set: RefinedSet,
+    right_set: RefinedSet,
+    grade: TrustLevel,
+    kernel: &Arc<RefinedTSKernel>,
+) -> Option<AbstractValue> {
+    let nan_operand = refined_kernel::transfer_questions::PowOperandWire {
+        kind: refined_kernel::transfer_questions::PowOperandKind::NaN,
+        set: make_refined_set(vec![]),
+    };
+    let asked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        (kernel.transfer)(&refined_kernel::transfer_questions::TransferQuestion {
+            op: transfer_op,
+            a: left_set,
+            b: right_set,
+            c: 0.0,
+            base: nan_operand.clone(),
+            exp: nan_operand,
+        })
+    }));
+    let answer = asked.ok()?;
+    use refined_kernel::transfer_questions::TransferAnswerKind;
+    match answer.kind {
+        TransferAnswerKind::Values => {
+            if answer
+                .values
+                .iter()
+                .any(|v| v.fract() != 0.0 || v.abs() >= 2f64.powi(53))
+            {
+                return None;
+            }
+            Some(known_values(answer.values, PrimitiveKind::Integer, grade))
+        }
+        TransferAnswerKind::Set => {
+            if !requires_integer(&answer.set) {
+                return None;
+            }
+            Some(AbstractValue {
+                kind_tag: Some(PrimitiveKind::Integer),
+                ..known_set(answer.set, None, grade, SetKindTag::None)
+            })
+        }
+        TransferAnswerKind::NaN | TransferAnswerKind::Unknown => None,
+    }
+}
+
+/// The INT-SORTED half of `transfer_over_sets`: when both operands are
+/// Integer-sorted, the exact `int` theory serves the operation, not the
+/// `binary64.*` float image (python-pins.md arith.1 states this
+/// directly — "the float transfer is REFUSED for ints and the exact
+/// whole-number theory (`int.*`) serves them").
+///
+/// Ops and their rows are `admitted_int_transfer_op`'s own doc.
+/// The two conditional rows this function gates before asking:
+///
+/// - `Pow`: the kernel's `int.pow` arm reads its exponent as a
+///   nonnegative `Nat`, matching pow.1's own exact branch. An exponent
+///   this file cannot prove is an exact nonnegative integer
+///   (`exact_nonnegative_integer`) DECLINES here and falls through to
+///   the float path, which is where pow.1 puts a negative exponent
+///   anyway ("a negative int exponent converts both arguments to float
+///   and yields a float").
+/// - `LShift`/`RShift`: bits.1/bits.2 define these as compositions
+///   rather than as their own kernel members, so they lower as that
+///   composition — see `shift_as_int_composition`.
+///
+/// `Div` never reaches here: arith.9 widens int/int to float, so the
+/// caller keeps `/` on the float path unconditionally.
+fn int_transfer_over_sets(
+    op: Operator,
+    right: &AbstractValue,
+    left_set: &RefinedSet,
+    right_set: &RefinedSet,
+    grade: TrustLevel,
+    kernel: &Arc<RefinedTSKernel>,
+) -> Option<AbstractValue> {
+    if matches!(op, Operator::LShift | Operator::RShift) {
+        return shift_as_int_composition(op, left_set, right, grade, kernel);
+    }
+    if op == Operator::Pow {
+        // pow.1's exact branch only — a possibly-negative exponent is
+        // the float row, not this one
+        exact_nonnegative_integer(right)?;
+    }
+    let transfer_op = admitted_int_transfer_op(op)?;
+    int_transfer_answer(transfer_op, left_set.clone(), right_set.clone(), grade, kernel)
+}
+
+/// `x << n` / `x >> n` over int-sorted operands, lowered as the
+/// COMPOSITION the pins define them to be rather than as kernel members
+/// of their own:
+///
+/// - bits.2: "`x << n` equals multiplication of `x` by `2**n`" —
+///   `int.mul` against the singleton `{2**n}`.
+/// - bits.1: "`x >> n` equals floor division of `x` by `2**n`" —
+///   `int.floorDiv` against the same singleton.
+///
+/// The shift count must be a KNOWN exact nonnegative integer
+/// (`exact_nonnegative_integer`): bits.3 makes a negative count a
+/// `ValueError` rather than a value, and a count this file cannot read
+/// exactly gives no `2**n` to compose against. `2**n` itself must also
+/// land inside the f64-exact 2^53 window, or the singleton this builds
+/// would not be the number it names — the same window every other
+/// exactness gate in this file keeps.
+fn shift_as_int_composition(
+    op: Operator,
+    left_set: &RefinedSet,
+    right: &AbstractValue,
+    grade: TrustLevel,
+    kernel: &Arc<RefinedTSKernel>,
+) -> Option<AbstractValue> {
+    use refined_kernel::transfer_questions::TransferQuestionOp;
+    let count = exact_nonnegative_integer(right)?;
+    let factor = 2f64.powf(count);
+    if factor.fract() != 0.0 || factor >= 2f64.powi(53) {
+        return None;
+    }
+    let factor_set = make_refined_set(vec![one_of(&[factor])]);
+    let transfer_op = if op == Operator::LShift {
+        TransferQuestionOp::IntMul
+    } else {
+        TransferQuestionOp::IntFloorDiv
+    };
+    int_transfer_answer(transfer_op, left_set.clone(), factor_set, grade, kernel)
 }
 
 /// The SET path over `binary_arithmetic_value`'s own two-known-values
@@ -3916,19 +4305,35 @@ fn transfer_over_sets(
     if left.kind != Kind::Set && right.kind != Kind::Set {
         return None;
     }
-    let transfer_op = admitted_transfer_op(op)?;
     let (left_set, left_sort) = transferable_numeric_operand(left)?;
     let (right_set, right_sort) = transferable_numeric_operand(right)?;
-    // `/`'s always-float override has no bearing here (Div is not
-    // admitted), so the same both_int rule binary_arithmetic_value's
-    // known-values path uses applies unchanged: Integer only when
-    // BOTH sides are Integer-sorted.
-    let both_int = left_sort == PrimitiveKind::Integer && right_sort == PrimitiveKind::Integer;
-    let result_sort = if both_int { PrimitiveKind::Integer } else { PrimitiveKind::Float };
     let grade = refined_domain::trust_grades::derived_trust_level(
         refined_domain::trust_grades::TrustProved,
         &[left.clone(), right.clone()],
     );
+    // BOTH operands int-sorted: the exact `int` theory serves the
+    // operation, never the float image (arith.1). `/` is the one
+    // exception and stays on the float path below — arith.9 widens
+    // int/int to float, so it has no int-sorted row at all. An int row
+    // the kernel declines (an operand that is not a closed singleton,
+    // a zero divisor, an exponent past the boundary's own fuel ceiling)
+    // falls through to the float path unchanged rather than losing the
+    // determination outright.
+    if op != Operator::Div && left_sort == PrimitiveKind::Integer && right_sort == PrimitiveKind::Integer {
+        if let Some(answer) = int_transfer_over_sets(op, right, &left_set, &right_set, grade, kernel) {
+            return Some(answer);
+        }
+    }
+    let transfer_op = admitted_transfer_op(op)?;
+    // `Div`'s always-float override (arith.9: "the type is widened even
+    // when the arguments are exact integers") beats the both_int rule
+    // outright — Python `/` never stays Integer-sorted regardless of
+    // its operands' own sorts. Every other admitted op (Add/Sub/Mult)
+    // keeps the same both_int rule binary_arithmetic_value's
+    // known-values path uses: Integer only when BOTH sides are
+    // Integer-sorted.
+    let both_int = op != Operator::Div && left_sort == PrimitiveKind::Integer && right_sort == PrimitiveKind::Integer;
+    let result_sort = if both_int { PrimitiveKind::Integer } else { PrimitiveKind::Float };
     let asked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         (kernel.transfer)(&refined_kernel::transfer_questions::TransferQuestion {
             op: transfer_op,
@@ -4151,7 +4556,10 @@ fn f64_to_exact_i64(value: f64) -> Option<i64> {
 /// subscript on a known List/Object, a bytes-like read/write whose
 /// `bytes_models` answer is `BytesAnswer::Raises`, `int(<unparseable
 /// known string>)`, `<receiver>.index(<absent known needle>)` on a
-/// known string or list receiver, and `math.sqrt(<known negative>)`.
+/// known string or list receiver, `math.sqrt(<known negative>)`, and
+/// `math.floor`/`ceil`/`trunc` of a known non-finite argument
+/// (`OverflowError` for an infinity, `ValueError` for NaN — each
+/// returns an `Integral`, and no Python `int` holds either).
 pub fn provable_raise(
     expression: &Expr,
     environment: &Environment,
@@ -4452,6 +4860,26 @@ fn call_provable_raise(
                             call.range(),
                             "this expression provably raises ValueError: math domain error".to_owned(),
                         ));
+                    }
+                }
+            }
+        }
+        // `math.floor`/`ceil`/`trunc` of a KNOWN NON-FINITE argument
+        // provably raises: each returns an `Integral`, and no Python
+        // `int` is infinite or NaN. `rounding_argument_raises` names
+        // which exception and CPython's own message; it reads the same
+        // operand through the same domain gate the value rows use
+        // (`integral_domain_admits`), so the value dispatch and this
+        // raise dispatch agree on exactly which rounding calls raise.
+        if matches!(attribute.attr.as_str(), "floor" | "ceil" | "trunc") {
+            if let Expr::Name(module_name) = attribute.value.as_ref() {
+                if module_name.id.as_str() == "math" && environment.read("math").is_none() {
+                    let arguments: Vec<AbstractValue> =
+                        call.arguments.args.iter().map(|arg| evaluate_expression(arg, environment, kernel)).collect();
+                    if let Some((exception, detail)) =
+                        math_models::rounding_argument_raises(attribute.attr.as_str(), &arguments)
+                    {
+                        return Some((call.range(), format!("this expression provably raises {exception}: {detail}")));
                     }
                 }
             }

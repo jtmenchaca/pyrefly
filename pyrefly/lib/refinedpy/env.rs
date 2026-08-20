@@ -27,6 +27,7 @@ use ruff_python_ast::Stmt;
 use ruff_python_ast::StmtFunctionDef;
 use ruff_python_ast::StmtReturn;
 use ruff_text_size::Ranged;
+use ruff_text_size::TextRange;
 
 use crate::refinedpy::function_table::FunctionTable;
 use crate::refinedpy::instances::ClassModel;
@@ -266,6 +267,25 @@ pub struct Environment {
     /// back. Shares the same `Arc<Mutex<...>>` reach as `retained_
     /// callables` itself, for the identical cross-call-boundary reason.
     lambda_keys_by_range: Arc<Mutex<HashMap<u32, u32>>>,
+    /// One expression node's already-computed value, keyed by that
+    /// node's own AST range: `evaluate_expression` answers it directly
+    /// instead of evaluating the node. Set for the walk of exactly one
+    /// statement and cleared after.
+    ///
+    /// The relational sum is the one writer (`check.rs`'s
+    /// `walk_relational_sum`). A division `total / len(xs)` whose two
+    /// operands the kernel tied together answers far more tightly than
+    /// evaluating the node here could — the tie is a fact of the kernel
+    /// program, not of either operand — so the already-proved answer is
+    /// published for that node rather than recomputed and lost. The
+    /// range identifies the node the way `lambda_keys_by_range` already
+    /// identifies a lambda, and for the same reason: the evaluation
+    /// site reads only `&Environment` and knows a node by its range.
+    ///
+    /// A plain owned field rather than the shared `Arc<Mutex<...>>` the
+    /// retained-callable tables need: this value never has to outlive
+    /// the statement whose walk set it.
+    evaluated_node: Option<(TextRange, AbstractValue)>,
 }
 
 impl Environment {
@@ -284,6 +304,7 @@ impl Environment {
             retained_callables: Arc::new(Mutex::new(HashMap::new())),
             retained_callable_counter: Arc::new(AtomicU32::new(0)),
             lambda_keys_by_range: Arc::new(Mutex::new(HashMap::new())),
+            evaluated_node: None,
         }
     }
 
@@ -440,6 +461,22 @@ impl Environment {
             .copied()
     }
 
+    /// Publishes one expression node's already-computed value for the
+    /// walk of a single statement (see the field's own doc). `None`
+    /// clears it, which every caller does once that statement is walked.
+    pub fn set_evaluated_node(&mut self, evaluated: Option<(TextRange, AbstractValue)>) {
+        self.evaluated_node = evaluated;
+    }
+
+    /// The published value for the node at `range`, if one was set for
+    /// this walk. Every other node reads `None` and evaluates normally.
+    pub fn evaluated_node(&self, range: TextRange) -> Option<&AbstractValue> {
+        match &self.evaluated_node {
+            Some((published, value)) if *published == range => Some(value),
+            _ => None,
+        }
+    }
+
     /// Record what a name holds after a statement the walk understood.
     pub fn bind(&mut self, name: &str, value: AbstractValue) {
         self.bindings.insert(name.to_owned(), value);
@@ -479,6 +516,10 @@ impl Environment {
             retained_callables: self.retained_callables.clone(),
             retained_callable_counter: self.retained_callable_counter.clone(),
             lambda_keys_by_range: self.lambda_keys_by_range.clone(),
+            // a fork walks part of the SAME statement (a comprehension's
+            // own element pass, a branch arm), so the published node
+            // travels with it
+            evaluated_node: self.evaluated_node.clone(),
         }
     }
 
@@ -521,6 +562,9 @@ impl Environment {
             retained_callables,
             retained_callable_counter,
             lambda_keys_by_range,
+            // a join lands past the statement whose walk published a
+            // node, so nothing carries forward
+            evaluated_node: None,
         }
     }
 }

@@ -30,11 +30,11 @@ use refined_domain::abstract_value::{known_set, known_values, unknown, AbstractV
 use refined_domain::known_constructors::known_list;
 use refined_domain::trust_grades::{TrustProved, TrustSpec};
 use refined_kernel::kernel_interface::RefinedTSKernel;
-use refined_sets::refinement_forms::{make_refined_set, requires_integer, star, RefinedSet};
+use refined_sets::refinement_forms::{make_refined_set, repeat_of, requires_integer, RefinedSet};
 use ruff_python_ast::{
     Alias, AtomicNodeIndex, CmpOp, ExceptHandler, ExceptHandlerExceptHandler, Expr, ExprAttribute, ExprSubscript,
-    ModModule, Parameters, Stmt, StmtAnnAssign, StmtAssign, StmtAugAssign, StmtClassDef, StmtFunctionDef, StmtIf,
-    StmtMatch, StmtRaise, StmtReturn, StmtTry, StmtWith, WithItem,
+    ModModule, Parameters, Stmt, StmtAnnAssign, StmtAssign, StmtAugAssign, StmtClassDef, StmtFunctionDef,
+    StmtIf, StmtMatch, StmtRaise, StmtReturn, StmtTry, StmtWith, WithItem,
 };
 use ruff_text_size::{Ranged, TextRange};
 
@@ -51,6 +51,7 @@ use crate::refinedpy::loops::{loop_final_environment, LoopAnswer};
 use crate::refinedpy::match_arms;
 use crate::refinedpy::match_arms::match_taken_environment;
 use crate::refinedpy::narrowing::assume;
+use crate::refinedpy::relational_sum;
 use crate::refinedpy::summaries;
 use crate::refinedpy::surface::{compile_aliases, strict_int_alias_names, surface_imports};
 use crate::refinedpy::typereading::{base_sort_return_refinement, callable_return_refinement, declared_refinement, typed_dict_return_refinement, DeclaredRefinement};
@@ -403,11 +404,56 @@ fn walk_body_with_self_binding(
     // loop seeing it directly, so the set only ever names a name that is
     // PROVABLY still unbound along the one path CPython actually ran.
     let mut provably_unbound: HashSet<String> = HashSet::new();
-    for stmt in body {
+    // The position of a division statement a relational sum already
+    // folded into its kernel program — `usize::MAX` while there is
+    // none, since no statement ever sits there.
+    let mut folded_division_at = usize::MAX;
+    for (position, stmt) in body.iter().enumerate() {
         if let (Some(class), Stmt::FunctionDef(def)) = (self_model, stmt) {
             if is_self_method(def) {
                 walk_method_def(def, class, context, out);
                 continue;
+            }
+        }
+        // RELATIONAL SUM: an accumulation over a sequence known only by
+        // its element set — either spelling, `total = 0; for x in xs:
+        // total += f(x)` or `total = sum(f(x) for x in xs)` — followed by
+        // a division of that total by the same sequence's length.
+        // Interval division answers this far too weakly (`[0, n] / [1,
+        // n]` is `[0, n]`), so the accumulation and the division lower
+        // into ONE kernel program where the linear decider ties the
+        // total to the count. Recognized here rather than inside
+        // `walk_loop` because the division sits in the FOLLOWING
+        // statement, which only this statement driver can see. Declining
+        // leaves the statement to `walk_statement` exactly as before.
+        // A folded division was already walked as part of the kernel
+        // program, so the statement itself is skipped rather than
+        // re-walked into a second, weaker binding of the same name.
+        if position == folded_division_at {
+            continue;
+        }
+        let recognized = match stmt {
+            Stmt::For(for_stmt) if for_stmt.orelse.is_empty() => {
+                relational_sum::recognize_accumulation(for_stmt, &environment)
+                    .map(|recognized| (recognized, Some(for_stmt.target.as_ref())))
+            }
+            Stmt::Assign(assign) => relational_sum::recognize_generator_sum(assign, &environment)
+                .map(|recognized| (recognized, None)),
+            _ => None,
+        };
+        if let Some((recognized, loop_target)) = recognized {
+            match walk_relational_sum(
+                recognized,
+                loop_target,
+                &body[position + 1..],
+                &mut environment,
+            ) {
+                RelationalSum::Declined => {}
+                RelationalSum::Consumed => continue,
+                RelationalSum::ConsumedWithDivision => {
+                    folded_division_at = position + 1;
+                    continue;
+                }
             }
         }
         let terminates = walk_statement(
@@ -421,6 +467,10 @@ fn walk_body_with_self_binding(
             &mut blocked,
             out,
         );
+        // A relational sum publishes its quotient for the NEXT
+        // statement's one division node; that statement has now walked,
+        // so the publication ends here and no later node can match it.
+        environment.set_evaluated_node(None);
         // A `try` whose every arm provably raises or returns leaves
         // nothing that reaches whatever follows it in THIS body — the
         // same "unreachable code past a terminal statement" rule
@@ -637,28 +687,38 @@ fn seed_parameters(parameters: &Parameters, context: &WalkContext, environment: 
         };
         // A `list[X]`/`set[X]`/`Sequence[X]` PARAMETER (`declared.element`
         // Some, `declared.set` unused/empty — typereading's own "one
-        // active field" convention) seeds a SEQUENCE of unknown length
-        // whose every position draws from X's own set: `Kind::Set` over
-        // one `Form::Star(X)` refinement. This is the "unknown length,
-        // known element set" shape — `subscript_read`'s own `Kind::Set`
-        // arm reads any index as "some member of X", the star grammar's
-        // own definition (a repetition's positions never hold anything
-        // outside its element alphabet), so no length is ever claimed
-        // and no kernel round trip is needed to answer an element read.
-        // Scoped to a SCALAR/string-sorted element (`element.set` non-
-        // empty) — an element that is itself container-shaped
-        // (`dict[str, X]`'s own element, another `list[X]`) has no
-        // scalar set here to star over, and is left for the plain
-        // element-carrying seed below, matching today's behavior for
-        // that shape.
+        // active field" convention) seeds a SEQUENCE whose every position
+        // draws from X's own set: `Kind::Set` over one `Form::Repeat(X,
+        // lo, hi)` refinement — the bare unbounded window (`lo` 0, `hi`
+        // `None`, the same shape `star` alone used to build) when the
+        // declaration states no length bound, or a TIGHTER window when
+        // `declared.element_length` carries one (`Annotated[list[X],
+        // Field(min_length=…, max_length=…)]`, `typereading.rs`'s own
+        // doc — `repeat_of`/`repetition` already accept an arbitrary
+        // `lo`, so this is the SAME constructor family, not a new one).
+        // Either way, `subscript_read`'s own `Kind::Set` arm reads any
+        // index as "some member of X", the repetition grammar's own
+        // definition (a repetition's positions never hold anything
+        // outside its element alphabet), so no kernel round trip is ever
+        // needed to answer an element read; `relational_sum.rs`'s own
+        // `element_and_count_sets` reads the SAME window's `lo`/`hi` into
+        // the count set a relational division ties to, so a `min_length`
+        // bound here is what gives that division its `count >= 1` fact
+        // with no cast. Scoped to a SCALAR/string-sorted element
+        // (`element.set` non-empty) — an element that is itself
+        // container-shaped (`dict[str, X]`'s own element, another
+        // `list[X]`) has no scalar set here to repeat over, and is left
+        // for the plain element-carrying seed below, matching today's
+        // behavior for that shape.
         let is_sequence_container = declared.spelling.starts_with("list[")
             || declared.spelling.starts_with("set[")
             || declared.spelling.starts_with("Sequence[");
         if is_sequence_container {
             if let Some(element) = &declared.element {
                 if !element.set.forms.is_empty() {
+                    let (lo, hi) = declared.element_length.unwrap_or((0, None));
                     let sequence = known_set(
-                        make_refined_set(vec![star(element.set.clone())]),
+                        make_refined_set(vec![repeat_of(element.set.clone(), lo, hi)]),
                         None,
                         TrustSpec,
                         SetKindTag::None,
@@ -1603,6 +1663,159 @@ fn arm_terminates_or_provably_raises(body: &[Stmt], out: &[Finding], findings_be
     out[findings_before..]
         .iter()
         .any(|finding| finding.code == "RTS7001" && last_range.contains_range(finding.range))
+}
+
+/// RELATIONAL SUM: `total = 0; for x in xs: total += f(x)` over a
+/// sequence known only by its ELEMENT SET, optionally followed by a
+/// division of that total by the same sequence's own length.
+///
+/// The division is what forces the lowering. Interval arithmetic knows
+/// `total` is in `[0, n]` and the length is in `[1, n]`, and dividing
+/// those two enclosures separately gives `[0, n]` — useless. The tight
+/// answer needs the RELATION between numerator and denominator, so the
+/// accumulation and the division go to the kernel as ONE program
+/// (`relational_sum`'s own doc) and the kernel's linear decider narrows
+/// the quotient. Nothing is computed here; this function recognizes the
+/// shape, asks, and binds what the kernel answered.
+///
+/// `Consumed` means the accumulation was walked here and the
+/// accumulator holds the kernel's total; the following statement, if
+/// any, still walks. `ConsumedWithDivision` means the FOLLOWING
+/// statement was an assignment whose division was folded into the same
+/// program, so the caller skips that statement rather than walking it a
+/// second time. `Declined` leaves everything to `walk_statement`,
+/// exactly as before. Recognition — both spellings, and the
+/// `for`/`else` gate — happens at the caller; this function receives an
+/// already-recognized accumulation.
+///
+/// A `return` carrying the division is `Consumed`, not
+/// `ConsumedWithDivision`: the return still walks and still judges
+/// against the enclosing annotation, with the quotient published for
+/// its one division node so the surrounding expression (the fixture's
+/// `math.sqrt(...)`) evaluates around an already-narrowed value.
+///
+/// Conservative declines, each one because the fact it would state is
+/// not the fact the kernel proved: any statement other than a division-
+/// carrying assignment or return sitting immediately after the
+/// accumulation (a statement in between could rebind either name, so
+/// nothing further is folded and the division walks ordinarily); a
+/// walrus rebinding either name anywhere in that expression; a return
+/// whose expression holds the division zero times or more than once
+/// (with two, one published answer cannot say which node it belongs
+/// to); and a kernel refusal.
+fn walk_relational_sum(
+    mut recognized: relational_sum::RecognizedAccumulation,
+    loop_target: Option<&Expr>,
+    following: &[Stmt],
+    environment: &mut Environment,
+) -> RelationalSum {
+    // The division, when the very next statement holds one. Only the
+    // IMMEDIATELY following statement is read: anything between the
+    // accumulation and the division could rebind either name, and this
+    // pass never reasons about what it did not look at.
+    //
+    // Two shapes carry it. An ASSIGNMENT divides at its top level and
+    // names the quotient, so the answer binds to that name and the
+    // statement is consumed whole. A RETURN may nest the division
+    // anywhere inside the returned expression — the fixture's own
+    // `return math.sqrt(total / len(samples))` — so the return is still
+    // walked ordinarily, with the quotient published for exactly that
+    // one division node (`Environment::set_evaluated_node`) and the
+    // surrounding call evaluated around it as usual.
+    //
+    // A walrus rebinding either name anywhere in the expression
+    // declines both shapes: the rebinding happens mid-expression, so
+    // the division would be over a value the kernel never tied.
+    let mut divided_into = None;
+    let mut published_division = None;
+    match following.first() {
+        Some(Stmt::Assign(assign)) => {
+            if let [Expr::Name(target)] = assign.targets.as_slice() {
+                if !rebinds_relational_name(assign.value.as_ref(), &recognized)
+                    && relational_sum::fold_division(&mut recognized, assign.value.as_ref())
+                {
+                    divided_into = Some(target.id.as_str().to_owned());
+                }
+            }
+        }
+        Some(Stmt::Return(ret)) => {
+            if let Some(value) = ret.value.as_deref() {
+                if !rebinds_relational_name(value, &recognized) {
+                    if let Some(range) = relational_sum::division_range_in(value, &recognized) {
+                        relational_sum::fold_located_division(&mut recognized);
+                        published_division = Some(range);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    let Some(answer) = relational_sum::walk_accumulation(&recognized) else {
+        return RelationalSum::Declined;
+    };
+    // The total always binds: it is what the accumulation proved, and it
+    // is what a return statement's own walk reads for the numerator.
+    environment.bind(&recognized.total_name, answer.total);
+    // The quotient rides its own slot, so the divided name carries
+    // exactly what the kernel proved — or, where the kernel answered the
+    // total but not the quotient, nothing at all rather than a guess.
+    let outcome = match (divided_into, published_division) {
+        (Some(target), _) => {
+            match answer.quotient {
+                Some(quotient) => environment.bind(&target, quotient),
+                None => environment.forget(&target),
+            }
+            RelationalSum::ConsumedWithDivision
+        }
+        // The return is NOT consumed — it still walks, judging against
+        // the enclosing `-> Annotation` as always. What changes is that
+        // its one division node reads the kernel's narrowed quotient
+        // instead of being evaluated from two untied enclosures. A
+        // quotient the kernel declined publishes nothing, so that node
+        // evaluates ordinarily: never a weaker path than before.
+        (None, Some(range)) => {
+            if let Some(quotient) = answer.quotient {
+                environment.set_evaluated_node(Some((range, quotient)));
+            }
+            RelationalSum::Consumed
+        }
+        (None, None) => RelationalSum::Consumed,
+    };
+    // The loop variable outlives the loop in CPython (compound_stmts,
+    // "the for statement"), but this pass never ran a concrete
+    // iteration, so which element it ended on is not a fact here — it
+    // is forgotten rather than claimed. The generator spelling has no
+    // loop target: the generator's own variable never escapes it.
+    if let Some(Expr::Name(loop_variable)) = loop_target {
+        environment.forget(loop_variable.id.as_str());
+    }
+    outcome
+}
+
+/// What `walk_relational_sum` did with a recognized accumulation.
+enum RelationalSum {
+    /// Not this pass's shape — the ordinary walk runs.
+    Declined,
+    /// The accumulation was walked here and the accumulator holds the
+    /// total. Whatever follows still walks — including a `return` whose
+    /// division was folded, which reads its published quotient.
+    Consumed,
+    /// The accumulation AND a following ASSIGNMENT's division were
+    /// walked as one kernel program, so the caller skips that statement.
+    ConsumedWithDivision,
+}
+
+/// Whether an expression rebinds — through a walrus — either name a
+/// recognized accumulation states its relation over. Such a rebinding
+/// happens mid-expression, so the division would be taken over a value
+/// the kernel's relation was never tied to.
+fn rebinds_relational_name(
+    expression: &Expr,
+    recognized: &relational_sum::RecognizedAccumulation,
+) -> bool {
+    let mut names = HashSet::new();
+    collect_walrus_names(expression, &mut names);
+    names.contains(&recognized.total_name) || names.contains(&recognized.sequence_name)
 }
 
 /// `for`/`while`: `loops::loop_final_environment` concretely executes the
@@ -2926,6 +3139,7 @@ fn direct_alias_annotation(
         spelling: name.id.as_str().to_owned(),
         admits_none: false,
         element: None,
+        element_length: None,
         generator: None,
         members: None,
         positions: None,
@@ -3993,6 +4207,7 @@ fn adapter_alias_verdict(
         spelling: class_name.id.as_str().to_owned(),
         admits_none: false,
         element: None,
+        element_length: None,
         generator: None,
         members: None,
         positions: None,

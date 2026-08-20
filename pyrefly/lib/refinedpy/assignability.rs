@@ -22,6 +22,13 @@ use refined_sets::format_string_shapes::format_py_number;
 use refined_sets::refinement_forms::on_one_tuple_layer;
 use refined_sets::refinement_forms::requires_integer;
 
+use crate::refinedpy::diagnostic_sentences::at_index;
+use crate::refinedpy::diagnostic_sentences::at_key;
+use crate::refinedpy::diagnostic_sentences::containment_refutation;
+use crate::refinedpy::diagnostic_sentences::cross_sort_of_value;
+use crate::refinedpy::diagnostic_sentences::refutation;
+use crate::refinedpy::diagnostic_sentences::required_words;
+use crate::refinedpy::diagnostic_sentences::SENTENCE;
 use crate::refinedpy::typereading::DeclaredRefinement;
 
 /// What judging one value against one declared set concluded.
@@ -239,10 +246,7 @@ pub fn judge(
             if declared.admits_none {
                 return Verdict::Silent;
             }
-            return Verdict::Fire(format!(
-                "a value of type 'None' is not assignable to type '{}'",
-                declared.spelling,
-            ));
+            return Verdict::Fire(refutation("None", &declared.spelling, &declared.set));
         }
         // WHICH container the declaration names is read off its own
         // spelling (both element-carrying constructors build it —
@@ -257,15 +261,12 @@ pub fn judge(
             declared.spelling.starts_with("list[") || declared.spelling.starts_with("set[");
         if value.kind == Kind::Object && value.kind_word.is_none() {
             if declares_sequence {
-                return Verdict::Fire(format!(
-                    "a value of type 'a dict' is not assignable to type '{}'",
-                    declared.spelling,
-                ));
+                return Verdict::Fire(refutation("a dict", &declared.spelling, &declared.set));
             }
             for key in &value.keys {
                 match judge(&key.value, element, kernel) {
                     Verdict::Fire(message) => {
-                        return Verdict::Fire(format!("{message} (at key '{}')", key.name));
+                        return Verdict::Fire(at_key(&message, &key.name));
                     }
                     Verdict::Undetermined(sentence) => return Verdict::Undetermined(sentence),
                     Verdict::Silent => {}
@@ -275,15 +276,12 @@ pub fn judge(
         }
         if value.kind == Kind::List {
             if !declares_sequence {
-                return Verdict::Fire(format!(
-                    "a value of type 'a list' is not assignable to type '{}'",
-                    declared.spelling,
-                ));
+                return Verdict::Fire(refutation("a list", &declared.spelling, &declared.set));
             }
             for (index, item) in value.items.iter().enumerate() {
                 match judge(item, element, kernel) {
                     Verdict::Fire(message) => {
-                        return Verdict::Fire(format!("{message} (at index {index})"));
+                        return Verdict::Fire(at_index(&message, index));
                     }
                     Verdict::Undetermined(sentence) => return Verdict::Undetermined(sentence),
                     Verdict::Silent => {}
@@ -313,24 +311,24 @@ pub fn judge(
             return if declared.admits_none {
                 Verdict::Silent
             } else {
-                Verdict::Fire(format!(
-                    "a value of type 'None' is not assignable to type '{}'",
-                    declared.spelling,
-                ))
+                Verdict::Fire(refutation("None", &declared.spelling, &declared.set))
             };
         }
         if value.kind == Kind::List {
             if value.items.len() != positions.len() {
+                let count = value.items.len();
+                let plural = if count == 1 { "" } else { "s" };
                 return Verdict::Fire(format!(
-                    "a value of {} elements is not assignable to type '{}'",
-                    value.items.len(),
-                    declared.spelling,
+                    "a value of {count} element{plural} is not assignable to type {} — the position states {} element{}",
+                    required_words(&declared.spelling, &declared.set),
+                    positions.len(),
+                    if positions.len() == 1 { "" } else { "s" },
                 ));
             }
             for (index, (item, position_declared)) in value.items.iter().zip(positions.iter()).enumerate() {
                 match judge(item, position_declared, kernel) {
                     Verdict::Fire(message) => {
-                        return Verdict::Fire(format!("{message} (at index {index})"));
+                        return Verdict::Fire(at_index(&message, index));
                     }
                     Verdict::Undetermined(sentence) => return Verdict::Undetermined(sentence),
                     Verdict::Silent => {}
@@ -338,9 +336,7 @@ pub fn judge(
             }
             return Verdict::Silent;
         }
-        return Verdict::Undetermined(
-            "a fixed-arity-tuple-declared position holds a value this table does not yet read".to_owned(),
-        );
+        return Verdict::Undetermined(SENTENCE.tuple_position.to_owned());
     }
     // The MEMBERS LAW: a TypedDict declaration (`declared.members` Some,
     // `declared.set` unused/empty, the same "one active field"
@@ -371,17 +367,11 @@ pub fn judge(
             return if declared.admits_none {
                 Verdict::Silent
             } else {
-                Verdict::Fire(format!(
-                    "a value of type 'None' is not assignable to type '{}'",
-                    declared.spelling,
-                ))
+                Verdict::Fire(refutation("None", &declared.spelling, &declared.set))
             };
         }
         if value.kind == Kind::List {
-            return Verdict::Fire(format!(
-                "a value of type 'a list' is not assignable to type '{}'",
-                declared.spelling,
-            ));
+            return Verdict::Fire(refutation("a list", &declared.spelling, &declared.set));
         }
         if value.kind == Kind::Object && value.kind_word.is_none() {
             for (member_name, member_declared) in members {
@@ -391,7 +381,7 @@ pub fn judge(
                 };
                 match judge(&member_value.value, member_declared, kernel) {
                     Verdict::Fire(message) => {
-                        return Verdict::Fire(format!("{message} (at key '{member_name}')"));
+                        return Verdict::Fire(at_key(&message, member_name));
                     }
                     Verdict::Undetermined(sentence) => return Verdict::Undetermined(sentence),
                     Verdict::Silent => {}
@@ -399,17 +389,15 @@ pub fn judge(
             }
             return Verdict::Silent;
         }
-        return Verdict::Undetermined(
-            "a TypedDict-declared position holds a value this table does not yet read".to_owned(),
-        );
+        return Verdict::Undetermined(SENTENCE.typed_dict_position.to_owned());
     }
     if value.kind == Kind::Object && value.kind_word.is_some() {
         let scalar_ground = scalar_or_string_shaped(&declared.set);
         if scalar_ground {
             let word = value.kind_word.expect("checked Some above");
             return Verdict::Fire(format!(
-                "a value of kind '{}' is not assignable to type '{}'",
-                word, declared.spelling,
+                "a value of kind '{word}' is not assignable to type {} — {word} is neither a number nor a string, and this position states one",
+                required_words(&declared.spelling, &declared.set),
             ));
         }
     }
@@ -450,37 +438,54 @@ pub fn judge(
                 || states_sequence(&declared.set)
                 || !within_codepoint_door(&declared.set, false))
         {
-            return Verdict::Fire(format!(
-                "a value of type '{}' is not assignable to type '{}'",
-                spelled_string_word(&value.values),
-                declared.spelling,
+            // The position's own sort is named as precisely as the set
+            // states it: an explicit `Integer` form says "an integer",
+            // a bare numeric layer says "a number".
+            let position_said = if requires_integer(&declared.set) {
+                "an integer"
+            } else {
+                "a number"
+            };
+            return Verdict::Fire(cross_sort_of_value(
+                &spelled_string_word(&value.values),
+                "a string",
+                position_said,
+                &declared.spelling,
+                &declared.set,
             ));
         }
         if !is_string && states_sequence(&declared.set) {
             for v in &value.values {
-                return Verdict::Fire(format!(
-                    "a value of type '{}' is not assignable to type '{}'",
-                    format_py_number(*v, is_float_sorted),
-                    declared.spelling,
+                return Verdict::Fire(cross_sort_of_value(
+                    &format_py_number(*v, is_float_sorted),
+                    "a number",
+                    "a string",
+                    &declared.spelling,
+                    &declared.set,
                 ));
             }
             return Verdict::Silent; // an empty tuple word has no value to fire on
         }
         if is_float_sorted && requires_integer(&declared.set) {
             for v in &value.values {
-                return Verdict::Fire(format!(
-                    "a value of type '{}' is not assignable to type '{}'",
-                    format_py_number(*v, true),
-                    declared.spelling,
+                return Verdict::Fire(cross_sort_of_value(
+                    &format_py_number(*v, true),
+                    "a float",
+                    "an integer",
+                    &declared.spelling,
+                    &declared.set,
                 ));
             }
             return Verdict::Silent; // an empty tuple word has no value to fire on
         }
         if is_boolean && requires_integer(&declared.set) {
             return Verdict::Fire(format!(
-                "a value of type '{}' is not assignable to type '{}' — bool is excluded from the int sort by product law",
-                spelled_boolean_word(&value.values),
-                declared.spelling,
+                "{} — the value is a boolean, the position states an integer, and bool is excluded from the int sort by product law",
+                refutation(
+                    &spelled_boolean_word(&value.values),
+                    &declared.spelling,
+                    &declared.set,
+                ),
             ));
         }
         // Every member ask is wrapped like the containment ask below: a
@@ -495,14 +500,12 @@ pub fn judge(
             }));
             return match asked {
                 Ok(true) => Verdict::Silent,
-                Ok(false) => Verdict::Fire(format!(
-                    "a value of type '{}' is not assignable to type '{}'",
-                    spelled_string_word(&value.values),
-                    declared.spelling,
+                Ok(false) => Verdict::Fire(refutation(
+                    &spelled_string_word(&value.values),
+                    &declared.spelling,
+                    &declared.set,
                 )),
-                Err(_) => Verdict::Undetermined(
-                    "the kernel does not yet decide membership for this set shape".to_owned(),
-                ),
+                Err(_) => Verdict::Undetermined(SENTENCE.kernel_declined_member.to_owned()),
             };
         }
         for v in &value.values {
@@ -512,16 +515,14 @@ pub fn judge(
             match asked {
                 Ok(true) => {}
                 Ok(false) => {
-                    return Verdict::Fire(format!(
-                        "a value of type '{}' is not assignable to type '{}'",
-                        format_py_number(*v, false),
-                        declared.spelling,
+                    return Verdict::Fire(refutation(
+                        &format_py_number(*v, false),
+                        &declared.spelling,
+                        &declared.set,
                     ));
                 }
                 Err(_) => {
-                    return Verdict::Undetermined(
-                        "the kernel does not yet decide membership for this set shape".to_owned(),
-                    );
+                    return Verdict::Undetermined(SENTENCE.kernel_declined_member.to_owned());
                 }
             }
         }
@@ -547,25 +548,38 @@ pub fn judge(
                 || states_sequence(&declared.set)
                 || !within_codepoint_door(&declared.set, false))
         {
-            return Verdict::Fire(format!(
-                "a value of type '{}' is not assignable to type '{}' — a string-sorted value is never in an int-sorted set",
-                refined_sets::format_for_diagnostics::format_for_diagnostics(&value.set),
-                declared.spelling,
+            // The position's own sort, named as precisely as the set
+            // states it — the same reading the Values-side law takes.
+            let position_said = if requires_integer(&declared.set) {
+                "an integer"
+            } else {
+                "a number"
+            };
+            return Verdict::Fire(cross_sort_of_value(
+                &refined_sets::format_for_diagnostics::format_for_diagnostics(&value.set),
+                "a string",
+                position_said,
+                &declared.spelling,
+                &declared.set,
             ));
         }
         if is_numeric_sorted_set && states_sequence(&declared.set) {
-            return Verdict::Fire(format!(
-                "a value of type '{}' is not assignable to type '{}' — a numeric-sorted value is never in a string-sorted set",
-                refined_sets::format_for_diagnostics::format_for_diagnostics(&value.set),
-                declared.spelling,
+            return Verdict::Fire(cross_sort_of_value(
+                &refined_sets::format_for_diagnostics::format_for_diagnostics(&value.set),
+                "a number",
+                "a string",
+                &declared.spelling,
+                &declared.set,
             ));
         }
         let is_float_sorted = value.kind_tag == Some(PrimitiveKind::Float);
         if is_float_sorted && requires_integer(&declared.set) {
-            return Verdict::Fire(format!(
-                "a value of type '{}' is not assignable to type '{}' — a float-sorted value is never in an int-sorted set",
-                refined_sets::format_for_diagnostics::format_for_diagnostics(&value.set),
-                declared.spelling,
+            return Verdict::Fire(cross_sort_of_value(
+                &refined_sets::format_for_diagnostics::format_for_diagnostics(&value.set),
+                "a float",
+                "an integer",
+                &declared.spelling,
+                &declared.set,
             ));
         }
         // CONTAINMENT-REFUTATION LAW: the checked position IS the claim
@@ -605,11 +619,10 @@ pub fn judge(
             match seq_asked {
                 Ok(true) => return Verdict::Silent,
                 Ok(false) => {
-                    return Verdict::Fire(format!(
-                        "a value of type '{}' is not assignable to type '{}' ({}) — the flowing set admits values outside the declared set",
-                        refined_sets::format_for_diagnostics::format_for_diagnostics(&value.set),
-                        declared.spelling,
-                        refined_sets::format_for_diagnostics::format_for_diagnostics(&declared.set),
+                    return Verdict::Fire(containment_refutation(
+                        &value.set,
+                        &declared.spelling,
+                        &declared.set,
                     ));
                 }
                 Err(_) => {}
@@ -620,15 +633,12 @@ pub fn judge(
         }));
         return match asked {
             Ok(true) => Verdict::Silent,
-            Ok(false) => Verdict::Fire(format!(
-                "a value of type '{}' is not assignable to type '{}' ({}) — the flowing set admits values outside the declared set",
-                refined_sets::format_for_diagnostics::format_for_diagnostics(&value.set),
-                declared.spelling,
-                refined_sets::format_for_diagnostics::format_for_diagnostics(&declared.set),
+            Ok(false) => Verdict::Fire(containment_refutation(
+                &value.set,
+                &declared.spelling,
+                &declared.set,
             )),
-            Err(_) => Verdict::Undetermined(
-                "the kernel does not yet decide containment for this set shape".to_owned(),
-            ),
+            Err(_) => Verdict::Undetermined(SENTENCE.kernel_declined_containment.to_owned()),
         };
     }
     if value.kind == Kind::Null && declared.admits_none {
@@ -643,12 +653,22 @@ pub fn judge(
             Kind::Null => "None",
             _ => unreachable!("matches! above admits only Object, List, Null"),
         };
+        // The structural mismatch names the sort crossing outright: a
+        // dict/list/None is neither a number nor a string, so no run
+        // reconciles it with a scalar-ground position — the Go twin's
+        // "is not allowed here" reason clause rather than a bare
+        // "not assignable".
+        let position_said = if on_one_tuple_layer(&declared.set) && !states_sequence(&declared.set) {
+            "a number"
+        } else {
+            "a string"
+        };
         return Verdict::Fire(format!(
-            "a value of type '{}' is not assignable to type '{}'",
-            value_word, declared.spelling,
+            "a value of type '{value_word}' is not assignable to type {} — the position states {position_said}, and {value_word} is not allowed here",
+            required_words(&declared.spelling, &declared.set),
         ));
     }
-    Verdict::Undetermined("the flowing value is not yet readable".to_owned())
+    Verdict::Undetermined(SENTENCE.value_not_readable.to_owned())
 }
 
 /// Whether the declared set names scalars or strings — the shapes a
@@ -873,6 +893,7 @@ mod tests {
             spelling: "Age".to_owned(),
             admits_none: false,
             element: None,
+            element_length: None,
             generator: None,
             members: None,
             positions: None,
@@ -887,6 +908,7 @@ mod tests {
             spelling: "Age | None".to_owned(),
             admits_none: true,
             element: None,
+            element_length: None,
             generator: None,
             members: None,
             positions: None,
@@ -954,6 +976,7 @@ mod tests {
             spelling: "Weight".to_owned(),
             admits_none: false,
             element: None,
+            element_length: None,
             generator: None,
             members: None,
             positions: None,
@@ -975,6 +998,7 @@ mod tests {
             spelling: "Label".to_owned(),
             admits_none: false,
             element: None,
+            element_length: None,
             generator: None,
             members: None,
             positions: None,
@@ -992,6 +1016,7 @@ mod tests {
             spelling: "AnyString".to_owned(),
             admits_none: false,
             element: None,
+            element_length: None,
             generator: None,
             members: None,
             positions: None,
@@ -1048,6 +1073,7 @@ mod tests {
             spelling: "ChartLayout".to_owned(),
             admits_none: false,
             element: None,
+            element_length: None,
             generator: None,
             members: None,
             positions: None,
@@ -1101,6 +1127,7 @@ mod tests {
             spelling: "Literal['horizontal', 'vertical']".to_owned(),
             admits_none: false,
             element: None,
+            element_length: None,
             generator: None,
             members: None,
             positions: None,
@@ -1181,6 +1208,7 @@ mod tests {
             spelling: "Grade".to_owned(),
             admits_none: false,
             element: None,
+            element_length: None,
             generator: None,
             members: None,
             positions: None,
@@ -1302,6 +1330,7 @@ mod tests {
             spelling: "Anything".to_owned(),
             admits_none: false,
             element: None,
+            element_length: None,
             generator: None,
             members: None,
             positions: None,
@@ -1464,6 +1493,7 @@ mod tests {
             spelling: "Weight".to_owned(),
             admits_none: false,
             element: None,
+            element_length: None,
             generator: None,
             members: None,
             positions: None,
@@ -1587,6 +1617,7 @@ mod tests {
             spelling: "PositionLabel".to_owned(),
             admits_none: false,
             element: None,
+            element_length: None,
             generator: None,
             members: None,
             positions: None,
@@ -1614,6 +1645,7 @@ mod tests {
             spelling: "Tag".to_owned(),
             admits_none: false,
             element: None,
+            element_length: None,
             generator: None,
             members: None,
             positions: None,
@@ -1659,6 +1691,7 @@ mod tests {
             spelling: "Weight".to_owned(),
             admits_none: false,
             element: None,
+            element_length: None,
             generator: None,
             members: None,
             positions: None,
@@ -1692,6 +1725,7 @@ mod tests {
             spelling: "Digits".to_owned(),
             admits_none: false,
             element: None,
+            element_length: None,
             generator: None,
             members: None,
             positions: None,
@@ -1744,6 +1778,7 @@ mod tests {
             spelling: "dict[str, Age]".to_owned(),
             admits_none: false,
             element: Some(Box::new(age_refinement())),
+            element_length: None,
             generator: None,
             members: None,
             positions: None,
@@ -1845,6 +1880,7 @@ mod tests {
             spelling: "PersonDict".to_owned(),
             admits_none: false,
             element: None,
+            element_length: None,
             generator: None,
             members: Some(vec![("age".to_owned(), age_refinement())]),
             positions: None,
@@ -1945,6 +1981,7 @@ mod tests {
             spelling: "tuple[Age, Label]".to_owned(),
             admits_none: false,
             element: None,
+            element_length: None,
             generator: None,
             members: None,
             positions: Some(vec![age_refinement(), label_refinement()]),
@@ -2025,5 +2062,98 @@ mod tests {
         declared.admits_none = true;
         let value = refined_domain::abstract_value::null_value();
         assert!(matches!(judge(&value, &declared, &kernel), Verdict::Silent));
+    }
+
+    // --- the REASONED SENTENCE: what the value is, what the sink
+    // requires. Every fire below is already pinned above for its
+    // VERDICT; these pin the WORDING the reader gets.
+
+    /// A refutation states the sink's own REQUIREMENT, not just its
+    /// name: `Age`'s bounds ride beside it, so a reader never opens the
+    /// alias to learn what it admits.
+    #[test]
+    fn a_refutation_spells_what_the_sink_requires_beside_its_name() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let declared = age_refinement();
+        let value = known_values(vec![200.0], PrimitiveKind::Integer, TrustProved);
+        let message = fire_message(judge(&value, &declared, &kernel));
+        assert!(message.contains("'200'"), "{message}");
+        assert!(message.contains("'Age'"), "{message}");
+        assert!(message.contains("120"), "names Age's own ceiling: {message}");
+    }
+
+    /// A SORT crossing states the reason in plain words — the value's
+    /// sort, the position's sort, and that no run reconciles them. The
+    /// Go twin's "— <said> is not allowed here" clause.
+    #[test]
+    fn a_float_into_an_int_sorted_alias_states_both_sorts_and_the_reason() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let declared = age_refinement();
+        let value = known_values(vec![30.0], PrimitiveKind::Float, TrustProved);
+        let message = fire_message(judge(&value, &declared, &kernel));
+        assert!(message.contains("not assignable"), "{message}");
+        assert!(message.contains("the value is a float"), "{message}");
+        assert!(message.contains("states an integer"), "{message}");
+        assert!(message.contains("not allowed here"), "{message}");
+    }
+
+    /// The mirror direction: a number arriving where a string is stated
+    /// says so as a sort crossing, never as a bare "not assignable".
+    #[test]
+    fn a_number_into_a_string_ground_alias_states_the_sort_crossing() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let declared = any_string_refinement();
+        let value = known_values(vec![30.0], PrimitiveKind::Integer, TrustProved);
+        let message = fire_message(judge(&value, &declared, &kernel));
+        assert!(message.contains("not assignable"), "{message}");
+        assert!(message.contains("the value is a number"), "{message}");
+        assert!(message.contains("states a string"), "{message}");
+        assert!(message.contains("not allowed here"), "{message}");
+    }
+
+    /// A structural mismatch (a dict where a scalar is stated) names
+    /// what the position states and why the value cannot sit there.
+    #[test]
+    fn a_dict_into_a_numeric_ground_alias_states_what_the_position_requires() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let declared = age_refinement();
+        let value = refined_domain::known_constructors::known_object(
+            Vec::new(),
+            Default::default(),
+            false,
+            TrustProved,
+            false,
+        );
+        let message = fire_message(judge(&value, &declared, &kernel));
+        assert!(message.contains("the position states"), "{message}");
+        assert!(message.contains("not allowed here"), "{message}");
+    }
+
+    /// A container declaration carries an EMPTY outer set, so the
+    /// requirement clause must not append a vacuous "(any value)" — the
+    /// name stands alone.
+    #[test]
+    fn a_container_declaration_names_itself_without_a_vacuous_contents_clause() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let declared = dict_of_age_refinement();
+        let value = refined_domain::abstract_value::null_value();
+        let message = fire_message(judge(&value, &declared, &kernel));
+        assert!(message.contains("'dict[str, Age]'"), "{message}");
+        assert!(!message.contains("any value"), "{message}");
+    }
+
+    /// An arity mismatch says how many elements arrived AND how many the
+    /// position states — the reader sees both counts.
+    #[test]
+    fn an_arity_mismatch_states_both_counts() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let declared = age_label_tuple_refinement();
+        let value = refined_domain::known_constructors::known_list(
+            vec![known_values(vec![40.0], PrimitiveKind::Integer, TrustProved)],
+            TrustProved,
+        );
+        let message = fire_message(judge(&value, &declared, &kernel));
+        assert!(message.contains("1 element"), "{message}");
+        assert!(message.contains("states 2 element"), "{message}");
     }
 }

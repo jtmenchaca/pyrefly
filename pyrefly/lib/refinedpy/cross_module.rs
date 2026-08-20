@@ -19,15 +19,23 @@
 //! only the SHAPE the resolver fills in, matching `check.rs`'s own
 //! "the walk reads whatever the caller assembled" seam.
 //!
-//! `FunctionTable` (`function_table.rs`) is opaque — its only public
-//! constructor is `function_table(&ModModule)`, and it has no
-//! mutator. An imported function is folded into `functions` by
-//! cloning its `StmtFunctionDef` under the LOCAL name (a fresh
-//! `Identifier` replaces the def's own name) into a synthetic
-//! `ModModule` alongside this module's own top-level defs, then
-//! calling `function_table` on that assembled module exactly once —
-//! the same public constructor every other caller uses, never a
+//! `FunctionTable` (`function_table.rs`) is opaque and has no mutator.
+//! An imported function is folded into `functions` by cloning its
+//! `StmtFunctionDef` under the LOCAL name (a fresh `Identifier`
+//! replaces the def's own name), then assembling every collected def
+//! into one table through that file's own constructors — never a
 //! parallel table type.
+//!
+//! Each def is assembled BESIDE THE NAME OF THE MODULE that declared
+//! it. A def's own identity is its name and its `TextRange`, and a
+//! range is a byte offset into one module's source, so two sibling
+//! modules that both open with the same `def` are indistinguishable by
+//! the def alone — the summary registry (`summaries.rs`) would serve
+//! one module's compiled answer at the other's call sites. The module
+//! stamp is what makes the identity program-wide, and a re-exported def
+//! keeps the stamp of the module that DECLARED it rather than the one
+//! it was re-exported through, so a def reached under several local
+//! names still keys to exactly one summary.
 //!
 //! Read `SYNTAX-COVERAGE §D` (`fixtures/language/syntax-coverage-py/
 //! d-module-surface.py`) for the exact edges this file serves: named
@@ -47,14 +55,15 @@ use refined_domain::known_constructors::known_object;
 use refined_domain::trust_grades::TrustLibrary;
 use refined_kernel::kernel_interface::RefinedTSKernel;
 use ruff_python_ast::{
-    AtomicNodeIndex, Expr, Identifier, ModModule, Stmt, StmtAnnAssign, StmtAssign, StmtFunctionDef,
-    StmtImport, StmtImportFrom,
+    Expr, Identifier, ModModule, Stmt, StmtAnnAssign, StmtAssign, StmtFunctionDef, StmtImport,
+    StmtImportFrom,
 };
-use ruff_text_size::TextRange;
 
 use crate::refinedpy::env::Environment;
 use crate::refinedpy::expressions::evaluate_expression;
-use crate::refinedpy::function_table::{function_table, FunctionTable};
+use crate::refinedpy::function_table::{
+    function_table_from_module, merged, FunctionTable, ENTRY_MODULE,
+};
 use crate::refinedpy::instances::{class_table, ClassModel};
 use crate::refinedpy::surface::{compile_aliases, surface_imports};
 
@@ -89,11 +98,18 @@ pub struct ModuleSurface {
 
 /// The pre-`FunctionTable` accumulator this file builds while folding
 /// imports: every def this module's surface will answer, keyed by its
-/// LOCAL name, collected as raw `StmtFunctionDef`s so one final
-/// `function_table` call (over a synthetic `ModModule` wrapping them)
-/// produces the real `FunctionTable` the public `ModuleSurface`
-/// carries.
-type DefsByLocalName = HashMap<String, StmtFunctionDef>;
+/// LOCAL name, each collected beside the NAME OF THE MODULE it was
+/// parsed from.
+///
+/// The module name rides along because a def's own identity — its name
+/// and its `TextRange` — is only unique WITHIN one module's source
+/// (`function_table.rs`'s own doc): two sibling modules opening with the
+/// same `def` produce the same name and the same span, and the summary
+/// registry would serve one module's compiled answer at the other's call
+/// sites. Folding an import therefore records where the def came from,
+/// and `assembled_function_table` rebuilds the real `FunctionTable` with
+/// every stamp intact.
+type DefsByLocalName = HashMap<String, (StmtFunctionDef, String)>;
 
 /// Builds `module`'s surface: first its own top-level plain bindings,
 /// functions, and classes; then folds in every `import`/`from…import`
@@ -111,12 +127,27 @@ pub fn module_surface(
     kernel: &Arc<RefinedTSKernel>,
     depth: u32,
 ) -> ModuleSurface {
+    module_surface_of(module, ENTRY_MODULE, resolver, kernel, depth)
+}
+
+/// `module_surface`'s own construction for a module whose NAME is known
+/// — the name a resolver was asked for. Every def this module declares
+/// itself is stamped with that name, so its summary key names the module
+/// it really came from; an imported def keeps the stamp of ITS own
+/// source module, one hop further out.
+pub fn module_surface_of(
+    module: &ModModule,
+    module_name: &str,
+    resolver: ModuleResolver,
+    kernel: &Arc<RefinedTSKernel>,
+    depth: u32,
+) -> ModuleSurface {
     let aliases = compile_aliases(module);
     let imports = surface_imports(module);
     let mut classes = class_table(module, &aliases, &imports, kernel);
 
     let mut function_environment = Environment::new(Default::default());
-    function_environment.set_functions(Arc::new(function_table(module)));
+    function_environment.set_functions(Arc::new(function_table_from_module(module, module_name)));
 
     let mut bindings = HashMap::new();
     for stmt in module.body.iter() {
@@ -131,7 +162,7 @@ pub fn module_surface(
         }
     }
 
-    let mut defs: DefsByLocalName = own_top_level_defs(module);
+    let mut defs: DefsByLocalName = own_top_level_defs(module, module_name);
 
     if depth > 0 {
         for stmt in module.body.iter() {
@@ -147,7 +178,7 @@ pub fn module_surface(
         }
     }
 
-    let functions = Arc::new(function_table(&synthetic_module(defs)));
+    let functions = Arc::new(assembled_function_table(defs));
 
     ModuleSurface {
         bindings,
@@ -157,37 +188,49 @@ pub fn module_surface(
 }
 
 /// This module's own top-level `def`s, cloned out under their OWN
-/// names — the seed `defs` starts from before any import is folded in.
-/// Reuses `function_table`'s own module scan indirectly by walking
-/// `module.body` the same way (`function_table.rs`'s own doc: "Scans
-/// `module`'s own top-level statements... for `def` statements"),
-/// since there is no accessor to enumerate an already-built
-/// `FunctionTable`'s entries by name.
-fn own_top_level_defs(module: &ModModule) -> DefsByLocalName {
+/// names and stamped with `module_name` — the seed `defs` starts from
+/// before any import is folded in. Reuses `function_table`'s own module
+/// scan indirectly by walking `module.body` the same way
+/// (`function_table.rs`'s own doc: "Scans `module`'s own top-level
+/// statements... for `def` statements"), since there is no accessor to
+/// enumerate an already-built `FunctionTable`'s entries by name.
+fn own_top_level_defs(module: &ModModule, module_name: &str) -> DefsByLocalName {
     let mut defs = HashMap::new();
     for stmt in module.body.iter() {
         if let Stmt::FunctionDef(def) = stmt {
-            defs.insert(def.name.id.as_str().to_owned(), def.clone());
+            defs.insert(
+                def.name.id.as_str().to_owned(),
+                (def.clone(), module_name.to_owned()),
+            );
         }
     }
     defs
 }
 
-/// A synthetic `ModModule` wrapping `defs`' values as top-level
-/// `Stmt::FunctionDef` statements — the one legitimate way to turn an
-/// assembled `HashMap<String, StmtFunctionDef>` into a `FunctionTable`,
-/// since `function_table`'s only public constructor takes a
-/// `&ModModule` and keys strictly by `def.name.id`. Each entry's own
-/// `name` identifier is already the LOCAL name by construction
-/// (`rename_def`/`own_top_level_defs`), so `function_table`'s own
-/// by-name indexing reproduces exactly this map's keys.
-fn synthetic_module(defs: DefsByLocalName) -> ModModule {
-    let body = defs.into_values().map(Stmt::FunctionDef).collect();
-    ModModule {
-        node_index: AtomicNodeIndex::NONE,
-        range: TextRange::default(),
-        body,
+/// The assembled accumulator as the real `FunctionTable`: one entry per
+/// LOCAL name, each still carrying the module its def was parsed from.
+///
+/// Built by merging one single-entry table per def (`FunctionTable::
+/// holding`) rather than by wrapping every def in a synthetic
+/// `ModModule` and rescanning it: a rescan reads each def's module from
+/// the module it is rescanned in, which for a synthetic wrapper is no
+/// module at all, and would relabel every imported def as the importing
+/// module's own — the exact conflation the stamp exists to prevent.
+/// `merged`'s base-wins rule is irrelevant here (the map's keys are
+/// already unique), so the fold order does not matter.
+///
+/// Each def is renamed to its LOCAL name on the way in, so the table's
+/// by-name lookup answers the spelling the importing module actually
+/// calls. Every def already arrives under that name
+/// (`own_top_level_defs` keys by the def's own name, `pull_member`
+/// renames an aliased import), so the rename only ever restates it.
+fn assembled_function_table(defs: DefsByLocalName) -> FunctionTable {
+    let mut table = FunctionTable::empty();
+    for (local_name, (def, module_name)) in defs {
+        let renamed = rename_def(&def, &local_name);
+        table = merged(&FunctionTable::holding(renamed, &module_name), &table);
     }
+    table
 }
 
 /// A clone of `def` with its `name` identifier replaced by `local_name`
@@ -271,7 +314,8 @@ fn fold_import_from(
     let Some(source_module) = resolver(source_name.id.as_str()) else {
         return;
     };
-    let source_surface = module_surface(&source_module, resolver, kernel, depth - 1);
+    let source_surface =
+        module_surface_of(&source_module, source_name.id.as_str(), resolver, kernel, depth - 1);
 
     for alias in &import.names {
         let imported_name = alias.name.id.as_str();
@@ -306,7 +350,15 @@ fn pull_member(
         bindings.insert(local_name.to_owned(), value.clone());
     }
     if let Some(def) = source.functions.def(imported_name) {
-        defs.insert(local_name.to_owned(), rename_def(def, local_name));
+        // the def keeps the module stamp `source`'s own table holds for
+        // it, which for a RE-EXPORTED name is the module one hop further
+        // upstream that really declared it — never `source` itself
+        let origin = source
+            .functions
+            .module_of(imported_name)
+            .expect("a def the table answered has a module stamp")
+            .to_owned();
+        defs.insert(local_name.to_owned(), (rename_def(def, local_name), origin));
     }
     if let Some(class_model) = source.classes.get(imported_name) {
         classes.insert(
@@ -441,7 +493,8 @@ fn fold_import(
         let Some(source_module) = resolver(module_name) else {
             continue;
         };
-        let source_surface = module_surface(&source_module, resolver, kernel, depth - 1);
+        let source_surface =
+            module_surface_of(&source_module, module_name, resolver, kernel, depth - 1);
         let local_name = alias.asname.as_ref().unwrap_or(&alias.name).id.as_str();
         let entries: Vec<ObjectKey> = source_surface
             .bindings
@@ -658,6 +711,107 @@ mod tests {
         let resolver = map_resolver(sources);
         let surface = module_surface(&entry, &resolver, &kernel, 2);
         assert_eq!(surface.bindings.get("re_forty"), Some(&integer(40.0)));
+    }
+
+    // --- module stamps (the cross-module summary identity) ---
+
+    /// A module's OWN def is stamped with that module's own name — the
+    /// entry file's, when the check started there.
+    #[test]
+    fn a_modules_own_def_is_stamped_with_its_own_module_name() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed("def scale(x):\n    return x * 2\n");
+        let resolver = map_resolver(HashMap::new());
+        let surface = module_surface(&module, &resolver, &kernel, IMPORT_DEPTH_CAP);
+        assert_eq!(surface.functions.module_of("scale"), Some(ENTRY_MODULE));
+    }
+
+    /// An IMPORTED def is stamped with the module that declared it, not
+    /// with the importing module — the stamp a cross-module call's
+    /// summary key reads.
+    #[test]
+    fn an_imported_def_is_stamped_with_the_module_that_declared_it() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let mut sources = HashMap::new();
+        sources.insert("audio_level", "def scale(x):\n    return x * 2\n");
+        let entry = parsed("from audio_level import scale\n");
+        let resolver = map_resolver(sources);
+        let surface = module_surface(&entry, &resolver, &kernel, IMPORT_DEPTH_CAP);
+        assert!(surface.functions.def("scale").is_some(), "the imported def is reachable");
+        assert_eq!(surface.functions.module_of("scale"), Some("audio_level"));
+    }
+
+    /// Two sibling modules whose defs are BYTE-IDENTICAL — same name,
+    /// same span — are told apart by their stamps. Without the stamp the
+    /// two defs share a summary key entirely, and one module's compiled
+    /// answer would serve the other's calls.
+    #[test]
+    fn two_modules_with_an_identical_def_are_told_apart_by_their_stamps() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let identical = "def scale(x):\n    return x * 2\n";
+        let mut sources = HashMap::new();
+        sources.insert("audio_level", identical);
+        sources.insert("video_level", identical);
+        let entry = parsed("from audio_level import scale\nfrom video_level import scale as other\n");
+        let resolver = map_resolver(sources);
+        let surface = module_surface(&entry, &resolver, &kernel, IMPORT_DEPTH_CAP);
+        let first = surface.functions.def("scale").expect("scale imports");
+        let second = surface.functions.def("other").expect("other imports");
+        assert_eq!(
+            first.range, second.range,
+            "the two defs really are byte-identical — the stamp is the only thing telling them apart"
+        );
+        assert_eq!(surface.functions.module_of("scale"), Some("audio_level"));
+        assert_eq!(surface.functions.module_of("other"), Some("video_level"));
+    }
+
+    /// A RENAMED import keeps the declaring module's stamp: the local
+    /// name changes, the identity does not.
+    #[test]
+    fn a_renamed_import_keeps_the_declaring_modules_stamp() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let mut sources = HashMap::new();
+        sources.insert("audio_level", "def scale(x):\n    return x * 2\n");
+        let entry = parsed("from audio_level import scale as boost\n");
+        let resolver = map_resolver(sources);
+        let surface = module_surface(&entry, &resolver, &kernel, IMPORT_DEPTH_CAP);
+        assert_eq!(surface.functions.module_of("boost"), Some("audio_level"));
+    }
+
+    /// A def reached through a RE-EXPORT chain is stamped with the module
+    /// that DECLARED it, never the module it was re-exported through —
+    /// so the same def reached by two routes keys to one summary.
+    #[test]
+    fn a_re_exported_def_keeps_the_declaring_modules_stamp() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let mut sources = HashMap::new();
+        sources.insert("b_helper", "def scale(x):\n    return x * 2\n");
+        sources.insert("a_reexport", "from b_helper import scale\n");
+        let entry = parsed("from a_reexport import scale\n");
+        let resolver = map_resolver(sources);
+        let surface = module_surface(&entry, &resolver, &kernel, IMPORT_DEPTH_CAP);
+        assert_eq!(surface.functions.module_of("scale"), Some("b_helper"));
+    }
+
+    /// A module's own def and an imported one of the SAME spelling: the
+    /// walk resolves this by re-merging the module's own table over this
+    /// surface (`check.rs`'s `merged(&own_functions, …)`, base wins), and
+    /// the merge carries each entry's stamp with it — so whichever def
+    /// wins, its stamp is the stamp of the module that declared it, never
+    /// the other's.
+    #[test]
+    fn merging_a_local_table_over_the_surface_carries_both_stamps() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let mut sources = HashMap::new();
+        sources.insert("audio_level", "def scale(x):\n    return x * 2\n");
+        sources.insert("video_level", "def other(x):\n    return x * 3\n");
+        let entry = parsed("from audio_level import scale\nfrom video_level import other\ndef scale(x):\n    return x * 4\n");
+        let resolver = map_resolver(sources);
+        let surface = module_surface(&entry, &resolver, &kernel, IMPORT_DEPTH_CAP);
+        let own = function_table_from_module(&entry, ENTRY_MODULE);
+        let table = merged(&own, surface.functions.as_ref());
+        assert_eq!(table.module_of("scale"), Some(ENTRY_MODULE), "the local def wins, with its own stamp");
+        assert_eq!(table.module_of("other"), Some("video_level"), "the imported def keeps its declaring stamp");
     }
 
     // --- disk_resolver ---

@@ -7,7 +7,9 @@
 
 //! `math.*` call transfers: the exactly-decidable slice of the `math`
 //! module (`floor`, `ceil`, `trunc`, `isqrt`, `fabs`, `copysign`, and
-//! `sqrt` on a known perfect square), PLUS the sort-only approximated
+//! `sqrt` on a known perfect square), the exact `int`-theory slice the
+//! kernel serves (`factorial`, `gcd`, `lcm`, `comb`, `perm`, and
+//! `isqrt` over a set — `int_theory_call`), PLUS the sort-only approximated
 //! family (`sqrt` on any other operand, every trig/hyperbolic function,
 //! `cbrt`, `exp`, `expm1`, `log`, `log1p`, `log2`, `log10`, `hypot`),
 //! which answers `float_sorted_unknown()` — a Float-tagged all-numbers
@@ -17,7 +19,12 @@
 //! implementation detail note: "the current implementation... will
 //! raise ValueError for invalid operations... and OverflowError for
 //! results that overflow" — an IMPLEMENTATION-graded accuracy promise,
-//! never a pinned exact bit pattern). `math_constant_value` answers the
+//! never a pinned exact bit pattern). That same note is a DOMAIN fact,
+//! not only an accuracy one: a row whose real call raises answers no
+//! value here. `isqrt` gates its negative operand for that reason, and
+//! `floor`/`ceil`/`trunc` gate their non-finite ones
+//! (`integral_domain_admits`) — each returns an `Integral`, and no
+//! Python `int` is infinite or NaN. `math_constant_value` answers the
 //! module's own ATTRIBUTE constants (`pi`, `e`, `tau`, `inf`) —
 //! separate from `math_call_result` since a constant read is never a
 //! call.
@@ -32,6 +39,7 @@ use refined_domain::abstract_value::Kind;
 use refined_domain::abstract_value::PrimitiveKind;
 use refined_domain::abstract_value::SetKindTag;
 use refined_domain::trust_grades::derived_trust_level;
+use refined_domain::trust_grades::TrustLevel;
 use refined_domain::trust_grades::TrustProved;
 use refined_domain::trust_grades::TrustSpec;
 use refined_kernel::kernel_interface::RefinedTSKernel;
@@ -42,7 +50,11 @@ use refined_kernel::transfer_questions::TransferQuestion;
 use refined_kernel::transfer_questions::TransferQuestionOp;
 use refined_sets::refinement_forms::at_least;
 use refined_sets::refinement_forms::below;
+use refined_sets::refinement_forms::Form;
 use refined_sets::refinement_forms::make_refined_set;
+use refined_sets::refinement_forms::one_of;
+use refined_sets::refinement_forms::requires_integer;
+use refined_sets::refinement_forms::RefinedSet;
 
 /// The single numeric value and its sort (int vs float), read off a
 /// known single-valued AbstractValue — the same reading
@@ -80,13 +92,116 @@ fn float_result(value: f64) -> AbstractValue {
     known_values(vec![value], PrimitiveKind::Float, TrustProved)
 }
 
+/// The DOMAIN GATE the whole `floor`/`ceil`/`trunc` family shares:
+/// their result is an `Integral` (library/math.html — "delegates to
+/// `x.__floor__`, which should return an Integral value"), and NO Python
+/// `int` is infinite or NaN. `math.floor(float('inf'))` raises
+/// `OverflowError` and `math.floor(float('nan'))` raises `ValueError`;
+/// neither call ever returns a value.
+///
+/// The IEEE answer is not wrong — `f64::floor(inf)` IS `inf`, the same
+/// clause the kernel's own `binary64.floor` proves. What is wrong is
+/// reading that float answer back as a Python `int` without the check
+/// `math.floor` itself performs. So a non-finite operand declines here
+/// rather than claim an Integer-sorted infinity or NaN, the same
+/// discipline `isqrt_call` keeps for its negative operand ("rather than
+/// answering a value the real call would never produce") and
+/// `binary_arithmetic_value`'s zero-divisor rows keep for theirs.
+///
+/// The raise itself is `provable_raise`'s row, not this one's — see
+/// `rounding_argument_raises` below, which `expressions.rs` reads the
+/// same way it reads `sqrt_argument_is_known_negative`.
+fn integral_domain_admits(value: f64) -> bool {
+    value.is_finite()
+}
+
+/// Whether a set the kernel answered describes only FINITE values — the
+/// set-shaped twin of `integral_domain_admits`, for the arm that reads a
+/// kernel enclosure back as a Python `int` result.
+///
+/// `±inf` ARE elements of the grammar (`refinement_forms`'s own module
+/// note: "+-infinity are elements of R-bar and are admitted"), so a
+/// bound or an admitted value can be infinite and the set is still
+/// well-formed — it just describes a result no Python `int` can hold.
+/// NaN cannot appear at all (`element` panics on it at construction), so
+/// there is nothing to check for it here.
+///
+/// This reads the set's OWN top-level forms, the same shallow reading
+/// `requires_integer` performs, looking through `Union`/`Difference` the
+/// same way. A form this recognizer does not understand answers `false`
+/// — an unread shape declines rather than being assumed finite, which is
+/// the direction that keeps the gate honest.
+fn enclosure_is_provably_finite(set: &RefinedSet) -> bool {
+    if set.forms.is_empty() {
+        // the unconstrained set — every real AND both infinities
+        return false;
+    }
+    let mut bounded_below = false;
+    let mut bounded_above = false;
+    for form in &set.forms {
+        match form.form {
+            Form::AtLeast | Form::Above => {
+                if !form.a.is_finite() {
+                    // `atLeast(-inf)` constrains nothing; `atLeast(+inf)`
+                    // admits only +inf
+                    return false;
+                }
+                bounded_below = true;
+            }
+            Form::AtMost | Form::Below => {
+                if !form.a.is_finite() {
+                    return false;
+                }
+                bounded_above = true;
+            }
+            // an explicit value list is finite exactly when every value is
+            Form::OneOf => {
+                if form.w.iter().all(|v| v.is_finite()) {
+                    return true;
+                }
+                return false;
+            }
+            Form::Union => {
+                let (Some(left), Some(right)) = (form.a_.as_ref(), form.b.as_ref()) else {
+                    return false;
+                };
+                // a union is finite only if BOTH arms are
+                if !enclosure_is_provably_finite(left) || !enclosure_is_provably_finite(right) {
+                    return false;
+                }
+                return true;
+            }
+            // a difference is finite when its left arm is — removing
+            // values never adds an infinity
+            Form::Difference => {
+                let Some(left) = form.a_.as_ref() else {
+                    return false;
+                };
+                if !enclosure_is_provably_finite(left) {
+                    return false;
+                }
+                return true;
+            }
+            // `Integer`/`MultipleOf` narrow but do not bound; the
+            // sequence shapes are not scalar sets at all
+            Form::Integer | Form::MultipleOf => {}
+            _ => return false,
+        }
+    }
+    bounded_below && bounded_above
+}
+
 /// `math.floor(x)` on a known single numeric value: the exact
 /// mathematical floor, Integer sort
 /// (https://docs.python.org/3.12/library/math.html#math.floor —
 /// "Return the floor of x, the largest integer less than or equal to
 /// x... delegates to x.__floor__, which should return an Integral
-/// value").
+/// value"). A non-finite operand declines — `integral_domain_admits`'s
+/// own doc.
 fn floor_call(value: f64) -> Option<AbstractValue> {
+    if !integral_domain_admits(value) {
+        return None;
+    }
     Some(integer_result(value.floor()))
 }
 
@@ -101,6 +216,15 @@ fn floor_call(value: f64) -> Option<AbstractValue> {
 /// argument still floors to Integer sort). A non-numeric-sorted set, or
 /// a kernel refusal on this set shape, declines to `None` — the same
 /// honesty every other row in this file keeps.
+///
+/// The ANSWER must additionally be provably finite
+/// (`enclosure_is_provably_finite`): the same `Integral` domain
+/// `floor_call`'s single-value row gates on applies to a set-shaped
+/// answer, and a kernel enclosure whose bound is `±inf` describes a
+/// result `math.floor` would raise `OverflowError` on rather than
+/// return. The kernel is answering its own question correctly there —
+/// `binary64.floor(inf)` IS `inf` — so this is the adapter declining to
+/// read that float answer as a Python `int`, not a kernel disagreement.
 fn floor_call_over_set(value: &AbstractValue, kernel: &Arc<RefinedTSKernel>) -> Option<AbstractValue> {
     if value.kind != Kind::Set {
         return None;
@@ -127,13 +251,202 @@ fn floor_call_over_set(value: &AbstractValue, kernel: &Arc<RefinedTSKernel>) -> 
     }))
     .ok()?;
     let grade = derived_trust_level(TrustSpec, std::slice::from_ref(value));
+    // the same `Integral` domain the single-value row gates on: an
+    // infinite result is one `math.floor` raises OverflowError for
     match asked.kind {
-        TransferAnswerKind::Values => Some(known_values(asked.values, PrimitiveKind::Integer, grade)),
-        TransferAnswerKind::Set => Some(AbstractValue {
-            kind_tag: Some(PrimitiveKind::Integer),
-            ..known_set(asked.set, None, grade, SetKindTag::None)
-        }),
+        TransferAnswerKind::Values => {
+            if !asked.values.iter().all(|v| integral_domain_admits(*v)) {
+                return None;
+            }
+            Some(known_values(asked.values, PrimitiveKind::Integer, grade))
+        }
+        TransferAnswerKind::Set => {
+            if !enclosure_is_provably_finite(&asked.set) {
+                return None;
+            }
+            Some(AbstractValue {
+                kind_tag: Some(PrimitiveKind::Integer),
+                ..known_set(asked.set, None, grade, SetKindTag::None)
+            })
+        }
         TransferAnswerKind::NaN | TransferAnswerKind::Unknown => None,
+    }
+}
+
+/// Poses one `int.*` question — the exact unbounded-integer theory
+/// (`boundary/python.lean`'s `pythonTransferOfOp1`/`pythonTransferOfOp2`)
+/// — and reads the answer back as an INTEGER-SORTED value. The exact
+/// mirror of `floor_call_over_set` above: same `TransferQuestion`
+/// construction, same `catch_unwind` refusal discipline, same
+/// `TransferAnswerKind` match. `b` is the empty set for the one-operand
+/// members.
+///
+/// Two guards `floor_call_over_set` does not need, both about the
+/// unboundedness python-pins.md arith.1 states ("integers have unlimited
+/// precision"): a non-integral answer declines (no `int.*` member can
+/// produce one), and an answer past the f64-exact 2^53 window declines
+/// because `boundary/encode_sets.lean`'s `encodeNumber` puts every
+/// result through `roundNE` before it crosses the wire — a bigger result
+/// arrives ROUNDED, and this file's carrier is f64, so claiming it as
+/// exact would claim a value CPython never computes.
+fn int_transfer_call(
+    op: TransferQuestionOp,
+    a: RefinedSet,
+    b: RefinedSet,
+    grade: TrustLevel,
+    kernel: &Arc<RefinedTSKernel>,
+) -> Option<AbstractValue> {
+    let nan_operand = PowOperandWire { kind: PowOperandKind::NaN, set: make_refined_set(vec![]) };
+    let asked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        (kernel.transfer)(&TransferQuestion {
+            op,
+            a,
+            b,
+            c: 0.0,
+            base: nan_operand.clone(),
+            exp: nan_operand,
+        })
+    }))
+    .ok()?;
+    match asked.kind {
+        TransferAnswerKind::Values => {
+            if asked.values.iter().any(|v| v.fract() != 0.0 || v.abs() >= 2f64.powi(53)) {
+                return None;
+            }
+            Some(known_values(asked.values, PrimitiveKind::Integer, grade))
+        }
+        // a SET answer must carry its own integrality before it is
+        // tagged Integer-sorted — tagging one without that mark would
+        // claim an integrality the kernel did not state
+        TransferAnswerKind::Set => {
+            if !requires_integer(&asked.set) {
+                return None;
+            }
+            Some(AbstractValue {
+                kind_tag: Some(PrimitiveKind::Integer),
+                ..known_set(asked.set, None, grade, SetKindTag::None)
+            })
+        }
+        TransferAnswerKind::NaN | TransferAnswerKind::Unknown => None,
+    }
+}
+
+/// An operand an `int.*` question can be posed over: an int-sorted
+/// `Kind::Set` reads as its own set, and a known single int-sorted value
+/// reads as the one-element set `{v}`, so a set-vs-known-value pair
+/// poses the same question a set-vs-set pair does — the same reading
+/// `expressions.rs::transferable_numeric_operand` performs, narrowed to
+/// the INT sort because every `int.*` member's domain is the integers
+/// (python-pins.md arith.1). A Float-sorted operand declines: `math.gcd`
+/// and friends raise `TypeError` on one, so there is no value to answer.
+fn int_transferable_operand(value: &AbstractValue) -> Option<RefinedSet> {
+    if let Some((number, is_int)) = single_numeric_operand(value) {
+        if !is_int || number.fract() != 0.0 {
+            return None;
+        }
+        return Some(make_refined_set(vec![one_of(&[number])]));
+    }
+    if value.kind == Kind::Set
+        && matches!(value.kind_tag, Some(PrimitiveKind::Integer) | Some(PrimitiveKind::Boolean))
+    {
+        return Some(value.set.clone());
+    }
+    None
+}
+
+/// The `int.*` rows this file serves where its own concrete paths
+/// decline — a SET operand, or a known-value pair no pure-Rust row above
+/// computes. Each names the pins row that elects it:
+///
+/// - `isqrt` → `int.isqrt` (pow.4: "the integer square root of the
+///   nonnegative int n... the floor of the exact square root"). Tried
+///   only after `isqrt_call`'s concrete path declines, so a known
+///   nonnegative int still answers without a kernel round trip.
+/// - `factorial` → `int.factorial` (arith.21: "exact int factorial,
+///   raises `ValueError` if n is not integral or negative").
+/// - `gcd`/`lcm` → `int.gcd`/`int.lcm` (arith.20: "exact
+///   greatest-common-divisor / least-common-multiple... on the unbounded
+///   `int` theory"). CPython's own signature is variadic
+///   (`math.gcd(*integers)`); the kernel members are binary, so this
+///   folds the arguments left-to-right through repeated asks —
+///   associativity of gcd/lcm is what makes the fold equal the variadic
+///   call, and a fold step the kernel declines declines the whole call
+///   rather than answering a partial product.
+/// - `comb`/`perm` → `int.comb`/`int.perm` (arith.21: "exact
+///   combinatorial counts, same int theory"). `math.perm(n)` with the
+///   count omitted defaults to `k = n`, per the same clause's
+///   `perm(n, k=None)` signature.
+///
+/// A negative operand is NOT filtered here: the kernel arms read their
+/// `Nat`-domain operands through `exactNatOf` (`boundary/python.lean`),
+/// which answers `none` on a negative exact integer rather than
+/// extending the theory function silently — so the refusal that
+/// corresponds to CPython's `ValueError` is the kernel's own, not a
+/// condition this file restates.
+fn int_theory_call(
+    function: &str,
+    arguments: &[AbstractValue],
+    kernel: &Arc<RefinedTSKernel>,
+) -> Option<AbstractValue> {
+    let grade = derived_trust_level(TrustProved, arguments);
+    let empty = make_refined_set(vec![]);
+    match function {
+        "isqrt" => {
+            let [only] = arguments else { return None };
+            int_transfer_call(TransferQuestionOp::IntIsqrt, int_transferable_operand(only)?, empty, grade, kernel)
+        }
+        "factorial" => {
+            let [only] = arguments else { return None };
+            int_transfer_call(
+                TransferQuestionOp::IntFactorial,
+                int_transferable_operand(only)?,
+                empty,
+                grade,
+                kernel,
+            )
+        }
+        // the variadic fold — gcd/lcm are associative, so folding the
+        // binary member left-to-right computes the same value the
+        // variadic call does
+        "gcd" | "lcm" => {
+            let op = if function == "gcd" { TransferQuestionOp::IntGcd } else { TransferQuestionOp::IntLcm };
+            let (first, rest) = arguments.split_first()?;
+            if rest.is_empty() {
+                return None;
+            }
+            let mut accumulated = int_transferable_operand(first)?;
+            let mut answer = None;
+            for argument in rest {
+                let next = int_transferable_operand(argument)?;
+                let step = int_transfer_call(op, accumulated, next, grade, kernel)?;
+                accumulated = int_transferable_operand(&step)?;
+                answer = Some(step);
+            }
+            answer
+        }
+        "comb" => {
+            let [n, k] = arguments else { return None };
+            int_transfer_call(
+                TransferQuestionOp::IntComb,
+                int_transferable_operand(n)?,
+                int_transferable_operand(k)?,
+                grade,
+                kernel,
+            )
+        }
+        // `math.perm(n)` defaults k to n (functions' own `perm(n,
+        // k=None)` signature, arith.21's clause)
+        "perm" => {
+            let n = arguments.first()?;
+            let n_set = int_transferable_operand(n)?;
+            let k_set = match arguments.get(1) {
+                Some(k) => int_transferable_operand(k)?,
+                None if arguments.len() == 1 => n_set.clone(),
+                None => return None,
+            };
+            int_transfer_call(TransferQuestionOp::IntPerm, n_set, k_set, grade, kernel)
+        }
+        _ => None,
     }
 }
 
@@ -142,8 +455,12 @@ fn floor_call_over_set(value: &AbstractValue, kernel: &Arc<RefinedTSKernel>) -> 
 /// (https://docs.python.org/3.12/library/math.html#math.ceil —
 /// "Return the ceiling of x, the smallest integer greater than or
 /// equal to x... delegates to x.__ceil__, which should return an
-/// Integral value").
+/// Integral value"). A non-finite operand declines —
+/// `integral_domain_admits`'s own doc.
 fn ceil_call(value: f64) -> Option<AbstractValue> {
+    if !integral_domain_admits(value) {
+        return None;
+    }
     Some(integer_result(value.ceil()))
 }
 
@@ -153,8 +470,12 @@ fn ceil_call(value: f64) -> Option<AbstractValue> {
 /// "Return x with the fractional part removed, leaving the integer
 /// part. This rounds toward 0... delegates to x.__trunc__, which
 /// should return an Integral value"). `f64::trunc` is exactly this
-/// toward-zero truncation.
+/// toward-zero truncation. A non-finite operand declines —
+/// `integral_domain_admits`'s own doc.
 fn trunc_call(value: f64) -> Option<AbstractValue> {
+    if !integral_domain_admits(value) {
+        return None;
+    }
     Some(integer_result(value.trunc()))
 }
 
@@ -185,6 +506,13 @@ fn isqrt_call(value: f64, is_int: bool) -> Option<AbstractValue> {
 /// builtin `abs()`, which preserves an int operand's sort, `fabs`
 /// always widens to float — the same distinction AGENT-BRIEF.md and
 /// PYREFLY-NUMERIC-B3-B4.md's `Math.abs` row call out.
+///
+/// This row needs NO finiteness gate, unlike the `floor`/`ceil`/`trunc`
+/// family above (`integral_domain_admits`): those return an `Integral`,
+/// and no Python `int` is infinite or NaN, but `fabs` returns a FLOAT,
+/// and `inf`/`nan` are ordinary Python floats. `math.fabs(float('inf'))`
+/// is `inf` and `math.fabs(float('nan'))` is `nan` — both return
+/// normally, so answering them is right rather than a missing check.
 fn fabs_call(value: f64) -> Option<AbstractValue> {
     Some(float_result(value.abs()))
 }
@@ -202,6 +530,42 @@ fn fabs_call(value: f64) -> Option<AbstractValue> {
 /// case the doc calls out by name.
 fn copysign_call(magnitude: f64, sign_source: f64) -> Option<AbstractValue> {
     Some(float_result(magnitude.copysign(sign_source)))
+}
+
+/// Which exception `math.floor`/`ceil`/`trunc` provably raises for a
+/// KNOWN NON-FINITE argument, or `None` when the call returns a value
+/// normally. The value dispatch and the raise dispatch read the SAME
+/// operand through the same `integral_domain_admits` gate, so they agree
+/// on exactly which rounding calls raise — the same pairing
+/// `sqrt_argument_is_known_negative` keeps with `sqrt`'s own value row.
+///
+/// The two outcomes are CPython's own, confirmed against the running
+/// interpreter and stated by library/math.html's implementation note
+/// ("will raise ValueError for invalid operations... and OverflowError
+/// for results that overflow"):
+///
+/// - an infinite argument raises `OverflowError: cannot convert float
+///   infinity to integer`
+/// - a NaN argument raises `ValueError: cannot convert float NaN to
+///   integer`
+///
+/// Both messages are returned verbatim so `provable_raise`'s one voice
+/// speaks CPython's own wording. A non-`math` rounding call, an unknown
+/// operand, or a finite one answers `None` — this predicate never
+/// guesses at a raise, the same way the file never guesses at a value.
+pub fn rounding_argument_raises(function: &str, arguments: &[AbstractValue]) -> Option<(&'static str, &'static str)> {
+    if !matches!(function, "floor" | "ceil" | "trunc") {
+        return None;
+    }
+    let [only] = arguments else { return None };
+    let (value, _) = single_numeric_operand(only)?;
+    if value.is_nan() {
+        return Some(("ValueError", "cannot convert float NaN to integer"));
+    }
+    if value.is_infinite() {
+        return Some(("OverflowError", "cannot convert float infinity to integer"));
+    }
+    None
 }
 
 /// `math.sqrt(x)` on a KNOWN NEGATIVE operand provably raises
@@ -251,6 +615,61 @@ fn sqrt_exact_perfect_square(value: f64) -> Option<AbstractValue> {
         return None;
     }
     Some(float_result(root))
+}
+
+/// `math.sqrt(x)` on a KNOWN NUMERIC SET (a seeded range, or a bounded
+/// set another transfer already produced): the kernel's own `Sqrt`
+/// transfer answers the square-rooted enclosure directly, the exact
+/// mirror of `floor_call_over_set` above — same `TransferQuestion`
+/// construction, same `catch_unwind` refusal discipline, same
+/// `TransferAnswerKind` match. Unlike `Floor` (always Integer sort),
+/// `sqrt` is Float sort ALWAYS (library/math.html's own module intro:
+/// "Except when explicitly noted otherwise, all return values are
+/// floats" — the same blanket rule `fabs_call`/`copysign_call` cite),
+/// regardless of the operand set's own sort. A negative-admitting
+/// operand set is NOT excluded here — `math.sqrt` on a known negative
+/// SINGLE value is `sqrt_argument_is_known_negative`'s own provable-raise
+/// row, but a SET that merely ADMITS a negative member alongside
+/// nonnegative ones has no single known value to raise on, so the
+/// kernel's own enclosure answer (or refusal) is this row's only
+/// determination — the same "known operands only" discipline the rest
+/// of this file keeps, deferring to the kernel rather than guessing. A
+/// non-numeric-sorted set, or a kernel refusal on this set shape,
+/// declines to `None`.
+fn sqrt_call_over_set(value: &AbstractValue, kernel: &Arc<RefinedTSKernel>) -> Option<AbstractValue> {
+    if value.kind != Kind::Set {
+        return None;
+    }
+    if !matches!(
+        value.kind_tag,
+        Some(PrimitiveKind::Integer)
+            | Some(PrimitiveKind::Float)
+            | Some(PrimitiveKind::Boolean)
+            | Some(PrimitiveKind::Number)
+    ) {
+        return None;
+    }
+    let nan_operand = PowOperandWire { kind: PowOperandKind::NaN, set: make_refined_set(vec![]) };
+    let asked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        (kernel.transfer)(&TransferQuestion {
+            op: TransferQuestionOp::Sqrt,
+            a: value.set.clone(),
+            b: make_refined_set(vec![]),
+            c: 0.0,
+            base: nan_operand.clone(),
+            exp: nan_operand,
+        })
+    }))
+    .ok()?;
+    let grade = derived_trust_level(TrustSpec, std::slice::from_ref(value));
+    match asked.kind {
+        TransferAnswerKind::Values => Some(known_values(asked.values, PrimitiveKind::Float, grade)),
+        TransferAnswerKind::Set => Some(AbstractValue {
+            kind_tag: Some(PrimitiveKind::Float),
+            ..known_set(asked.set, None, grade, SetKindTag::None)
+        }),
+        TransferAnswerKind::NaN | TransferAnswerKind::Unknown => None,
+    }
 }
 
 /// The approximated float family this wave promotes from `None` (plain
@@ -336,17 +755,28 @@ pub fn random_call_result(function: &str, arguments: &[AbstractValue]) -> Option
 /// `math_call_result` is the FROZEN entry point: `function` is the
 /// attribute name after `math.` ("floor", "sqrt", …); `arguments` are
 /// the already-evaluated operands in call order; `kernel` answers
-/// `floor`'s own set-valued row (`floor_call_over_set`'s own doc) when
-/// the operand is a bounded numeric set rather than one known value.
+/// `floor`'s own set-valued row (`floor_call_over_set`'s own doc) and
+/// `sqrt`'s own set-valued row (`sqrt_call_over_set`'s own doc) when the
+/// operand is a bounded numeric set rather than one known value.
 /// `None` means "not modeled" — the caller declines, same honesty as
 /// every other B4 row in PYREFLY-NUMERIC-B3-B4.md.
 ///
 /// Modeled EXACTLY (each an exactly-decidable row cited above):
-/// `floor`, `ceil`, `trunc`, `isqrt`, `fabs`, `copysign`, and `sqrt` on
+/// `floor`, `ceil`, `trunc` — each on a FINITE argument only
+/// (`integral_domain_admits`: they return an `Integral`, and CPython
+/// raises `OverflowError`/`ValueError` for ±inf/NaN, which is
+/// `rounding_argument_raises`' row) — `isqrt`, `fabs`, `copysign`, and `sqrt` on
 /// a known non-negative PERFECT-SQUARE operand (`sqrt_exact_perfect_square`'s
 /// own doc — IEEE 754 correct rounding, not an approximation). `floor`
-/// additionally answers a bounded numeric SET operand through the
-/// kernel's own `Floor` transfer (`floor_call_over_set`).
+/// and `sqrt` additionally answer a bounded numeric SET operand through
+/// the kernel's own `Floor`/`Sqrt` transfers (`floor_call_over_set`,
+/// `sqrt_call_over_set`).
+///
+/// Modeled EXACTLY through the `int` theory (`int_theory_call`'s own
+/// doc, each row's pins clause named there): `factorial`, `gcd`, `lcm`,
+/// `comb`, `perm`, and `isqrt` on a SET operand its concrete row above
+/// cannot read. These ask `boundary/python.lean`'s own `int.*` arms and
+/// answer Integer-sorted exact values, never the float image.
 ///
 /// Modeled at SORT-ONLY precision (`approximated_family_result`'s own
 /// doc): `sqrt` on a non-perfect-square operand, `sin`, `cos`, `tan`,
@@ -359,10 +789,9 @@ pub fn random_call_result(function: &str, arguments: &[AbstractValue]) -> Option
 /// `sqrt_argument_is_known_negative`, read by `provable_raise`).
 ///
 /// Still declined (no cited row this wave, and not sort-only-graded
-/// either): `pow`, `fsum`, `remainder`, `fmod`, `gcd`, `lcm`,
-/// `factorial`, `comb`, `perm`, `degrees`, `radians`, `isnan`, `isinf`,
-/// `isfinite`, `nextafter`, `ulp`, `frexp`, `ldexp`, `modf`, `dist`,
-/// `prod` — every one of them falls through the wildcard arm below to
+/// either): `pow`, `fsum`, `remainder`, `fmod`, `degrees`, `radians`,
+/// `isnan`, `isinf`, `isfinite`, `nextafter`, `ulp`, `frexp`, `ldexp`,
+/// `modf`, `dist`, `prod` — every one of them falls through to
 /// `None`. Constants (`math.pi`, `math.e`, `math.tau`, `math.inf`,
 /// `math.nan`) are attribute reads, not calls — out of scope for this
 /// function entirely; see `math_constant_value` for those (`math.nan`
@@ -391,10 +820,18 @@ pub fn math_call_result(
             let (value, _) = single_numeric_operand(arguments.first()?)?;
             trunc_call(value)
         }
-        "isqrt" => {
-            let (value, is_int) = single_numeric_operand(arguments.first()?)?;
-            isqrt_call(value, is_int)
-        }
+        // the concrete row first (no kernel round trip for a known
+        // nonnegative int), then the kernel's own `int.isqrt` for a SET
+        // operand — pow.4's row
+        "isqrt" => match single_numeric_operand(arguments.first()?) {
+            Some((value, is_int)) => isqrt_call(value, is_int),
+            None => int_theory_call(function, arguments, kernel),
+        },
+        // the exact `int` theory serves these outright — no pure-Rust
+        // row above computes them, so every operand shape they answer
+        // comes from the kernel (`int_theory_call`'s own doc names each
+        // row's pins clause)
+        "factorial" | "gcd" | "lcm" | "comb" | "perm" => int_theory_call(function, arguments, kernel),
         "fabs" => {
             let (value, _) = single_numeric_operand(arguments.first()?)?;
             fabs_call(value)
@@ -406,13 +843,19 @@ pub fn math_call_result(
         }
         // `sqrt` on an exact perfect square answers the exact Float
         // result (IEEE 754 correct rounding — see
-        // sqrt_exact_perfect_square's own doc); any other sqrt argument,
-        // and every other approximated-family function, falls through
-        // to the sort-only row below
+        // sqrt_exact_perfect_square's own doc); a KNOWN SET operand
+        // (no single known value to read) asks the kernel's own `Sqrt`
+        // transfer next (sqrt_call_over_set's own doc); any other sqrt
+        // argument, and every other approximated-family function, falls
+        // through to the sort-only row below
         "sqrt" => {
             let [only] = arguments else { return None };
-            let (value, _) = single_numeric_operand(only)?;
-            sqrt_exact_perfect_square(value).or_else(|| approximated_family_result(function, arguments))
+            match single_numeric_operand(only) {
+                Some((value, _)) => {
+                    sqrt_exact_perfect_square(value).or_else(|| approximated_family_result(function, arguments))
+                }
+                None => sqrt_call_over_set(only, kernel).or_else(|| approximated_family_result(function, arguments)),
+            }
         }
         // the sort-only approximated family (trig, log, exp, hypot,
         // and sqrt on a non-perfect-square): float_sorted_unknown()
@@ -510,6 +953,58 @@ mod tests {
         }
         let result = math_call("isqrt", &[int_operand(-1.0)]);
         assert_eq!(result, None);
+    }
+
+    /// `floor`/`ceil`/`trunc` return an `Integral`, and no Python `int`
+    /// is infinite or NaN — CPython raises there, so no value is
+    /// answered. The same shape as `test_isqrt_negative_declines`.
+    #[test]
+    fn test_rounding_of_non_finite_arguments_declines() {
+        if loaded_kernel().is_none() {
+            return;
+        }
+        for name in ["floor", "ceil", "trunc"] {
+            for input in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+                assert_eq!(
+                    math_call(name, &[float_operand(input)]),
+                    None,
+                    "math.{name}({input:?}) must answer no value — CPython raises there"
+                );
+            }
+        }
+    }
+
+    /// The raise predicate names CPython's own exception and message for
+    /// each non-finite argument, and stays silent on a finite one — the
+    /// pairing `provable_raise` reads.
+    #[test]
+    fn test_rounding_argument_raises_names_the_exception() {
+        assert_eq!(
+            rounding_argument_raises("floor", &[float_operand(f64::INFINITY)]),
+            Some(("OverflowError", "cannot convert float infinity to integer"))
+        );
+        assert_eq!(
+            rounding_argument_raises("ceil", &[float_operand(f64::NEG_INFINITY)]),
+            Some(("OverflowError", "cannot convert float infinity to integer"))
+        );
+        assert_eq!(
+            rounding_argument_raises("trunc", &[float_operand(f64::NAN)]),
+            Some(("ValueError", "cannot convert float NaN to integer"))
+        );
+        assert_eq!(rounding_argument_raises("floor", &[float_operand(40.9)]), None);
+        // `fabs` returns a float, so `inf` is an ordinary answer there —
+        // not a rounding row, and not a raise
+        assert_eq!(rounding_argument_raises("fabs", &[float_operand(f64::INFINITY)]), None);
+    }
+
+    /// `math.fabs` needs no finiteness gate: it returns a FLOAT, and
+    /// `inf`/`nan` are ordinary Python floats, so the call returns
+    /// normally where the rounding family raises.
+    #[test]
+    fn test_fabs_of_an_infinity_still_answers() {
+        let Some(result) = math_call("fabs", &[float_operand(f64::NEG_INFINITY)]) else { return };
+        assert_eq!(result.values, vec![f64::INFINITY]);
+        assert_eq!(result.kind_tag, Some(PrimitiveKind::Float));
     }
 
     #[test]

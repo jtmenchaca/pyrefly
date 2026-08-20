@@ -259,9 +259,10 @@ fn narrow(condition: &Expr, environment: &mut Environment, kernel: &Arc<RefinedT
             }
             narrow_isinstance_call(call, environment, truth);
         }
-        // Calls other than isinstance, attributes, walrus, `in`, string
+        // Calls other than isinstance, attributes, walrus, string
         // comparisons, and everything else this wave does not read: no
-        // narrowing, the honest default.
+        // narrowing, the honest default. (`in`/`not in` narrow on the
+        // SET channel, never here.)
         _ => {}
     }
 }
@@ -342,8 +343,8 @@ fn narrow_one_comparison(left: &Expr, op: CmpOp, right: &Expr, environment: &mut
 }
 
 /// The subset of `CmpOp` this wave's numeric side-bounds filter reads:
-/// `< <= > >= == !=`. `is`/`is not`/`in`/`not in` are handled
-/// elsewhere or not at all.
+/// `< <= > >= == !=`. `is`/`is not` are handled by `narrow_is_none`;
+/// `in`/`not in` by the SET channel's own `membership_leaf_tree_of`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum NumericCmpOp {
     Lt,
@@ -920,11 +921,24 @@ fn compare_tree_of(compare: &ruff_python_ast::ExprCompare, place: &str) -> Narro
 
 /// One comparison pair (`left op right`) → a `NarrowTree` leaf, scoped
 /// to `place`: a numeric literal on the other side lowers to `Cmp`
-/// (`<`/`<=`/`>`/`>=`) or `Eq`/`not Eq` (`==`/`!=`); anything else
-/// (`is`/`is not` — read separately by the VALUES channel only, since
-/// `None` is never a `Kind::Set` member; two changing names; a string
-/// literal) is `other_tree()`.
+/// (`<`/`<=`/`>`/`>=`) or `Eq`/`not Eq` (`==`/`!=`); a literal
+/// collection on the right of `in`/`not in` lowers to the membership
+/// fold (`membership_leaf_tree_of`); anything else (`is`/`is not` —
+/// read separately by the VALUES channel only, since `None` is never a
+/// `Kind::Set` member; two changing names) is `other_tree()`.
 fn comparison_leaf_tree_of(left: &Expr, op: CmpOp, right: &Expr, place: &str) -> NarrowTree {
+    // `place in <collection>` / `place not in <collection>` — membership
+    // against a literal collection of scalars, folded to the DISJUNCTION
+    // of its members' own equality leaves (see `membership_leaf_tree_of`).
+    if matches!(op, CmpOp::In | CmpOp::NotIn) {
+        if name_of(left) != Some(place) {
+            return other_tree();
+        }
+        let Some(leaf) = membership_leaf_tree_of(right) else {
+            return other_tree();
+        };
+        return if op == CmpOp::In { leaf } else { not_tree(leaf) };
+    }
     // A STRING-literal equality (`layout == "horizontal"`) lowers to the
     // kernel's own EqSeq leaf — the word's code points ride `points`
     // (set_functions/narrow.lean's `.eqSeq`), so a string-tuple-union
@@ -978,6 +992,79 @@ fn string_literal_points(expr: &Expr) -> Option<Vec<f64>> {
         return None;
     };
     Some(literal.value.to_str().chars().map(|c| c as u32 as f64).collect())
+}
+
+/// `place in <collection>` as a `NarrowTree`: a literal list/tuple/set
+/// of scalars folds to the DISJUNCTION of its members' own equality
+/// leaves — `x in [1, 2, 3]` becomes `Or(Eq 1, Or(Eq 2, Eq 3))`.
+///
+/// That fold IS membership under the kernel's own `narrowQ`
+/// (`set_functions/narrow.lean`), on both sides at once, with no new
+/// leaf needed. Truth: `orClaim` unions the members' singletons into
+/// exactly the one-of set, STRONG (every disjunct's own truth claim is
+/// strong, and `orClaim` keeps strength only when all are — each `Eq`
+/// leaf's holding proves the value real, so the union does too).
+/// Falsity: `andClaim` intersects the members' own real-difference
+/// claims, WEAK — ℝ̄ minus every listed value, which is precisely what
+/// `not in` proves for a value already known real. Both claims are the
+/// ones `narrowQ_sound` already proves; the fold buys the whole `in`
+/// vocabulary at the existing soundness theorem's price.
+///
+/// The kernel's `inSet` leaf is NOT the route here: it is a SEQUENCE-
+/// world leaf (`leafEval`'s own `.inSet _, _, _ => False` gives it no
+/// scalar runs, and its falsity claim is `diffSet stringsSet S` — C*
+/// minus the set, a claim about strings). A numeric place tested for
+/// membership belongs in the scalar world, and the `Eq`/`Or` fold puts
+/// it there.
+///
+/// Members must share ONE sort — all numeric, or all string — matching
+/// the boundary's own refusal to mix the worlds in one tree
+/// (`exports_narrow.lean`'s `treeScalarClaim && treeSeqClaim` check,
+/// which FAILS the whole question for a mixed tree). A mixed or empty
+/// collection, a non-literal collection (a name, a comprehension, a
+/// call), or any member this file cannot read as a literal, answers
+/// `None` — the caller lowers `other_tree()`, narrowing nothing.
+///
+/// A DICT is never read: `x in {...}` tests the dict's KEYS, and a
+/// `dict` display's keys are a different collection from the members a
+/// list display names. Declining is conservative, never wrong.
+fn membership_leaf_tree_of(collection: &Expr) -> Option<NarrowTree> {
+    let elements: &[Expr] = match collection {
+        Expr::List(list) => &list.elts,
+        Expr::Tuple(tuple) => &tuple.elts,
+        Expr::Set(set) => &set.elts,
+        _ => return None,
+    };
+    if elements.is_empty() {
+        return None;
+    }
+    // one sort per collection: read every member as a number, or every
+    // member as a string, and decline the moment the two mix
+    let leaves: Option<Vec<NarrowTree>> = elements
+        .iter()
+        .map(|element| {
+            literal_number(element)
+                .map(|k| NarrowTree { kind: NarrowTreeKind::Eq, k, ..other_tree() })
+                .or_else(|| {
+                    string_literal_points(element)
+                        .map(|points| NarrowTree { kind: NarrowTreeKind::EqSeq, points, ..other_tree() })
+                })
+        })
+        .collect();
+    let leaves = leaves?;
+    let all_numeric = leaves.iter().all(|leaf| leaf.kind == NarrowTreeKind::Eq);
+    let all_words = leaves.iter().all(|leaf| leaf.kind == NarrowTreeKind::EqSeq);
+    if !all_numeric && !all_words {
+        return None;
+    }
+    let mut folded = None;
+    for leaf in leaves {
+        folded = Some(match folded {
+            Some(existing) => and_or_tree(NarrowTreeKind::Or, existing, leaf),
+            None => leaf,
+        });
+    }
+    folded
 }
 
 /// `isinstance(place, ...)` as a `NarrowTree` leaf: the kernel's own
@@ -1403,11 +1490,151 @@ mod tests {
         );
     }
 
-    /// A leaf this file cannot read at all (`x in "abc"` — membership
-    /// against a receiver that is not this file's `isinstance`/
-    /// comparison vocabulary) lowers to `other_tree()`; the whole tree
-    /// says nothing (`says_anything` false), so the binding is left
-    /// exactly as it was — never narrowed, never refused.
+    // ── `in` / `not in` membership ───────────────────────────────────
+
+    /// `x in [1, 2, 3]` on a Set-kind binding narrows to exactly those
+    /// three values: the `Or`-fold of the members' own `Eq` leaves has
+    /// the kernel union their singletons into the one-of set.
+    #[test]
+    fn test_in_a_literal_list_narrows_to_the_member_set() {
+        let environment = environment_with_set("x", unbounded_integers(), PrimitiveKind::Integer);
+        let Some(narrowed) = assumed("x in [1, 2, 3]", environment, true) else {
+            return;
+        };
+        let x = narrowed.read("x").expect("x still bound");
+        assert_eq!(x.kind, Kind::Set);
+        let Some(kernel) = loaded_kernel() else { return };
+        let members = make_refined_set(vec![refined_sets::refinement_forms::one_of(&[1.0, 2.0, 3.0])]);
+        assert!(
+            (kernel.scalar_subset)(&x.set, &members) && (kernel.scalar_subset)(&members, &x.set),
+            "x.set = {:?}, want the same set as {:?}",
+            x.set,
+            members
+        );
+    }
+
+    /// A tuple and a set display are the same membership question as a
+    /// list — `x in (1, 2, 3)` narrows identically.
+    #[test]
+    fn test_in_a_literal_tuple_narrows_the_same_way() {
+        let environment = environment_with_set("x", unbounded_integers(), PrimitiveKind::Integer);
+        let Some(narrowed) = assumed("x in (1, 2, 3)", environment, true) else {
+            return;
+        };
+        let x = narrowed.read("x").expect("x still bound");
+        let Some(kernel) = loaded_kernel() else { return };
+        let members = make_refined_set(vec![refined_sets::refinement_forms::one_of(&[1.0, 2.0, 3.0])]);
+        assert!(
+            (kernel.scalar_subset)(&x.set, &members) && (kernel.scalar_subset)(&members, &x.set),
+            "x.set = {:?}, want the same set as {:?}",
+            x.set,
+            members
+        );
+    }
+
+    /// The COMPLEMENT: `x in [1, 2, 3]` proving FALSE (and its `not in`
+    /// spelling proving true) leaves a set that still admits values
+    /// outside the list — and no longer admits the listed ones. Pinned
+    /// as "200 survives, 2 does not," the two facts the claim states.
+    #[test]
+    fn test_not_in_a_literal_list_drops_the_members_and_keeps_the_rest() {
+        let environment = environment_with_set("x", unbounded_integers(), PrimitiveKind::Integer);
+        let Some(narrowed) = assumed("x not in [1, 2, 3]", environment, true) else {
+            return;
+        };
+        let x = narrowed.read("x").expect("x still bound");
+        let Some(kernel) = loaded_kernel() else { return };
+        let members = make_refined_set(vec![refined_sets::refinement_forms::one_of(&[1.0, 2.0, 3.0])]);
+        assert!(
+            !(kernel.scalar_subset)(&x.set, &members),
+            "x.set = {:?} must not be inside the very set it excludes",
+            x.set
+        );
+        let two = make_refined_set(vec![refined_sets::refinement_forms::one_of(&[2.0])]);
+        assert!(
+            !(kernel.scalar_subset)(&two, &x.set),
+            "x.set = {:?} must no longer admit 2",
+            x.set
+        );
+    }
+
+    /// `not in` proving FALSE is membership again — the kernel's own
+    /// `Not` swaps the sides, so this lands the same one-of set the
+    /// plain `in` truth arm does.
+    #[test]
+    fn test_not_in_proving_false_is_membership() {
+        let environment = environment_with_set("x", unbounded_integers(), PrimitiveKind::Integer);
+        let Some(narrowed) = assumed("x not in [1, 2, 3]", environment, false) else {
+            return;
+        };
+        let x = narrowed.read("x").expect("x still bound");
+        let Some(kernel) = loaded_kernel() else { return };
+        let members = make_refined_set(vec![refined_sets::refinement_forms::one_of(&[1.0, 2.0, 3.0])]);
+        assert!(
+            (kernel.scalar_subset)(&x.set, &members) && (kernel.scalar_subset)(&members, &x.set),
+            "x.set = {:?}, want the same set as {:?}",
+            x.set,
+            members
+        );
+    }
+
+    /// A MIXED collection (a number beside a word) states nothing this
+    /// file lowers: the boundary refuses a tree mixing the numeric and
+    /// string worlds outright, so the leaf declines before asking and
+    /// the binding is left exactly as it was.
+    #[test]
+    fn test_in_a_mixed_sort_collection_narrows_nothing() {
+        let environment = environment_with_set("x", unbounded_integers(), PrimitiveKind::Integer);
+        let Some(narrowed) = assumed("x in [1, \"two\"]", environment, true) else {
+            return;
+        };
+        let x = narrowed.read("x").expect("x still bound");
+        assert_eq!(x.set, unbounded_integers());
+    }
+
+    /// A collection with a member this file cannot read as a literal (a
+    /// name) declines the whole leaf — never a partial reading of the
+    /// members it happened to recognize.
+    #[test]
+    fn test_in_a_collection_holding_a_name_narrows_nothing() {
+        let environment = environment_with_set("x", unbounded_integers(), PrimitiveKind::Integer);
+        let Some(narrowed) = assumed("x in [1, some_name]", environment, true) else {
+            return;
+        };
+        let x = narrowed.read("x").expect("x still bound");
+        assert_eq!(x.set, unbounded_integers());
+    }
+
+    /// A DICT display tests the dict's KEYS, a different collection from
+    /// the members a list display names — declined, narrowing nothing.
+    #[test]
+    fn test_in_a_dict_display_narrows_nothing() {
+        let environment = environment_with_set("x", unbounded_integers(), PrimitiveKind::Integer);
+        let Some(narrowed) = assumed("x in {1: 'a', 2: 'b'}", environment, true) else {
+            return;
+        };
+        let x = narrowed.read("x").expect("x still bound");
+        assert_eq!(x.set, unbounded_integers());
+    }
+
+    /// Membership with the PLACE on the collection side (`1 in x`) is a
+    /// different question entirely — it tests the place's own contents,
+    /// not its value — and narrows nothing.
+    #[test]
+    fn test_place_on_the_collection_side_narrows_nothing() {
+        let environment = environment_with_set("x", unbounded_integers(), PrimitiveKind::Integer);
+        let Some(narrowed) = assumed("1 in x", environment, true) else {
+            return;
+        };
+        let x = narrowed.read("x").expect("x still bound");
+        assert_eq!(x.set, unbounded_integers());
+    }
+
+    /// A leaf this file cannot read at all (`x in y` — membership
+    /// against a collection that is not a literal display this file
+    /// reads) lowers to `other_tree()`; the whole tree says nothing
+    /// (`says_anything` false), so the binding is left exactly as it
+    /// was — never narrowed, never refused.
     #[test]
     fn test_an_unreadable_leaf_shape_leaves_the_set_binding_untouched() {
         let environment = environment_with_set("x", unbounded_integers(), PrimitiveKind::Integer);

@@ -96,6 +96,9 @@ use refined_domain::abstract_value::{
 };
 use refined_domain::known_constructors::{known_list, known_object};
 use refined_domain::trust_grades::{trust_level_of, TrustProved};
+use refined_sets::refinement_forms::at_least;
+use refined_sets::refinement_forms::at_most;
+use refined_sets::refinement_forms::make_refined_set;
 use refined_sets::repetition_window_forms::as_repetition;
 
 /// A Python `list` display (`[a, b, c]`): `Kind::List` with one exact
@@ -430,28 +433,31 @@ fn dict_key_set_read(keys: &[ObjectKey], index: &AbstractValue) -> Option<Abstra
 /// `container[index]` on a KNOWN-LENGTH-UNKNOWN, known-element-set
 /// receiver: `Kind::Set` whose only form is `Form::Star(element)` — the
 /// shape `check.rs::seed_parameters` builds for a `list[X]`/`set[X]`/
-/// `Sequence[X]` parameter, `X`'s own set starred rather than nested
+/// `Sequence[X]` parameter, `X`'s own set repeated rather than nested
 /// into exact positional slots (unlike `Kind::List`, which states an
 /// exact count `list_index_read` bounds-checks against). A repetition
-/// `A*`'s own positions never hold anything outside `A` — the grammar's
-/// definition, not a fact this function proves — so ANY known Integer
-/// index reads the same answer: "some member of `element`", no bounds
-/// check possible or needed since the length is unstated. `as_repetition`
-/// reads the bare star back to its element without a kernel round trip
+/// window's own positions never hold anything outside its element set —
+/// the grammar's definition, not a fact this function proves — so ANY
+/// known Integer index reads the same answer: "some member of
+/// `element`", regardless of the window's own `{lo, hi}`
+/// (`check.rs::seed_parameters` seeds the bare unbounded window when the
+/// declaration states no length bound, or a TIGHTER `{lo, hi}` window
+/// when it does — `typereading.rs`'s own `DeclaredRefinement::
+/// element_length` doc — but a symbolic index read can never bounds-
+/// check against either shape host-side: the concrete integer VALUE at
+/// the index is unknown either way, only its membership in the element
+/// alphabet is known). `as_repetition` reads any repetition window back
+/// to its element without a kernel round trip
 /// (`refined_sets::repetition_window_forms`, the same reader
 /// `format_for_hover.rs`/`format_string_shapes.rs` already use for the
-/// string-domain's own `C*`). Any OTHER set shape (a bound scalar range,
-/// a bounded repetition window, a union) answers `None` — this reads
-/// only the one unbounded-star shape the parameter seed builds.
+/// string-domain's own `C*`). Any OTHER set shape (a union, a bare
+/// scalar range with no repetition wrapper) answers `None`.
 fn star_element_read(container: &AbstractValue, index: &AbstractValue) -> Option<AbstractValue> {
     if container.kind != Kind::Set || container.set_kind_tag != SetKindTag::None {
         return None;
     }
     known_integer_index(index)?;
     let repeated = as_repetition(&container.set)?;
-    if repeated.lo != 0 || repeated.hi.is_some() {
-        return None; // a bounded window, not the bare star this reads
-    }
     Some(known_set(repeated.element, None, trust_level_of(container), SetKindTag::None))
 }
 
@@ -498,10 +504,29 @@ pub fn subscript_read(container: &AbstractValue, index: &AbstractValue) -> Optio
 /// - an exact string (`Kind::Values` tagged `PrimitiveKind::String`):
 ///   `values.len()`, one code point per `f64` — the same count
 ///   `string_models.rs` already establishes `len()` reads as.
+/// - an UNKNOWN-LENGTH star-shaped sequence (`Kind::Set`, the bare star
+///   `as_repetition` reads back — `star_element_read`'s own doc, a
+///   declared `list[X]`/`set[X]`/`Sequence[X]` parameter with no
+///   concrete items): an Integer-tagged SET, `[window.lo, window.hi]`
+///   (unbounded `hi` answers `[window.lo, +inf)`), never one exact
+///   count — the real length is unstated, only its own declared bounds
+///   are known.
 ///
-/// Every other shape (an unknown value, a non-string `Kind::Values`)
-/// answers `None`.
+/// Every other shape (an unknown value, a non-string `Kind::Values`, a
+/// bounded-but-not-bare-star `Kind::Set`) answers `None`.
 pub fn len_result(container: &AbstractValue) -> Option<AbstractValue> {
+    if container.kind == Kind::Set && container.set_kind_tag == SetKindTag::None {
+        let window = as_repetition(&container.set)?;
+        let mut forms = vec![at_least(window.lo as f64)];
+        if let Some(hi) = window.hi {
+            forms.push(at_most(hi as f64));
+        }
+        let grade = trust_level_of(container);
+        return Some(AbstractValue {
+            kind_tag: Some(PrimitiveKind::Integer),
+            ..known_set(make_refined_set(forms), None, grade, SetKindTag::None)
+        });
+    }
     let count = match container.kind {
         Kind::List => container.items.len(),
         Kind::Object => container.keys.len(),

@@ -46,6 +46,18 @@ pub struct DeclaredRefinement {
     /// `dict[str, X]`'s VALUE slot; the outer `set` field is unused
     /// (empty) when `element` is Some.
     pub element: Option<Box<DeclaredRefinement>>,
+    /// A `list[X]`/`set[X]`/`Sequence[X]` declaration's own SEQUENCE
+    /// length bounds — `{lo, hi}`, `hi` `None` for unbounded — read from
+    /// `Annotated[list[X], Field(min_length=…, max_length=…)]` (or the
+    /// `annotated_types.MinLen`/`MaxLen` constructor spelling,
+    /// `annotated_expression_set`'s own doc). `None` when the
+    /// declaration states no length bound, OR the declaration is not a
+    /// sequence container at all — always `None` unless `element` is
+    /// also `Some` (the same "belongs to the container arm only"
+    /// convention `element` itself keeps against `set`).
+    /// `check.rs::seed_parameters` reads this to seed a bounded
+    /// `repeat_of` in place of the unbounded `star` when present.
+    pub element_length: Option<(i64, Option<i64>)>,
     /// A GENERATOR declaration's two checked positions —
     /// `Generator[YieldType, SendType, ReturnType]` /
     /// `AsyncGenerator[YieldType, SendType]` / `Iterator[YieldType]` /
@@ -119,6 +131,7 @@ pub fn declared_refinement(
                 spelling: spelling.to_owned(),
                 admits_none: false,
                 element: None,
+                element_length: None,
                 generator: None,
                 members: None,
                 positions: None,
@@ -182,6 +195,7 @@ pub fn declared_refinement(
                         spelling,
                         admits_none: false,
                         element: None,
+                        element_length: None,
                         generator: None,
                         members: None,
                         positions: None,
@@ -195,6 +209,7 @@ pub fn declared_refinement(
                         spelling,
                         admits_none: false,
                         element: None,
+                        element_length: None,
                         generator: None,
                         members: None,
                         positions: None,
@@ -233,6 +248,7 @@ pub fn declared_refinement(
                                     spelling,
                                     admits_none: false,
                                     element: Some(Box::new(value_declared)),
+                                    element_length: None,
                                     generator: None,
                                     members: None,
                                     positions: None,
@@ -286,6 +302,7 @@ pub fn declared_refinement(
                         spelling,
                         admits_none: false,
                         element: Some(Box::new(element_declared)),
+                        element_length: None,
                         generator: None,
                         members: None,
                         positions: None,
@@ -348,6 +365,7 @@ pub fn declared_refinement(
                         spelling,
                         admits_none: false,
                         element: None,
+                        element_length: None,
                         generator: None,
                         members: None,
                         positions: Some(positions),
@@ -386,19 +404,52 @@ pub fn declared_refinement(
                         spelling,
                         admits_none: false,
                         element: None,
+                        element_length: None,
                         generator: Some(Box::new(generator)),
                         members: None,
                         positions: None,
                     });
                 }
             }
-            let set = annotated_expression_set(annotation, imports)?;
+            // `Annotated[list[X]|set[X]|Sequence[X], Field(min_length=…,
+            // max_length=…)]` — the OUTER wrapper is `Annotated`, unlike
+            // the bare `list[X]` the `is_element_container` arm above
+            // reads, so this shape only ever reaches this wildcard
+            // fallthrough. `annotated_expression_set`'s own container
+            // recognition answers the length window (its second tuple
+            // slot); the element itself is read HERE, through the
+            // ordinary `declared_refinement` recursion (full alias
+            // resolution, the same the `is_element_container` arm above
+            // already gives a bare `list[X]`'s element), so `Sample` in
+            // `list[Sample]` resolves the same way whether or not an
+            // outer `Annotated[...]`/`Field(min_length=…)` wraps it.
+            if let Some((head, element_expr)) = annotated_sequence_container(annotation, imports) {
+                let (_container_set, length_window) = annotated_expression_set(annotation, imports, aliases)?;
+                if let Some(element_declared) = declared_refinement(element_expr, aliases, imports, environment)
+                    .or_else(|| base_sort_return_refinement(element_expr))
+                {
+                    let spelling = format!("{}[{}]", head, element_declared.spelling);
+                    return Some(DeclaredRefinement {
+                        set: make_refined_set(Vec::new()),
+                        spelling,
+                        admits_none: false,
+                        element: Some(Box::new(element_declared)),
+                        element_length: length_window,
+                        generator: None,
+                        members: None,
+                        positions: None,
+                    });
+                }
+                return None;
+            }
+            let (set, _length_window) = annotated_expression_set(annotation, imports, aliases)?;
             let spelling = format_for_diagnostics(&set);
             Some(DeclaredRefinement {
                 set,
                 spelling,
                 admits_none: false,
                 element: None,
+                element_length: None,
                 generator: None,
                 members: None,
                 positions: None,
@@ -439,6 +490,48 @@ pub fn declared_refinement(
         // refinement applies".
         _ => None,
     }
+}
+
+/// Whether `annotation` is `Annotated[list[X]|set[X]|Sequence[X],
+/// Field(…)|MinLen(…)|MaxLen(…)…]` — the OUTER `Annotated` wrapping a
+/// container base, the shape a `list[X]` PARAMETER states its own
+/// SEQUENCE length bound through (`declared_refinement`'s own wildcard
+/// fallthrough doc). Recognized by the same `Annotated` import-identity
+/// check `annotated_expression_set` itself takes, and the same bare-Name
+/// `list`/`set`/`Sequence` head check `declared_refinement`'s own
+/// `is_element_container` arm takes for the UNWRAPPED shape — this
+/// function answers the head spelling and the unread element EXPRESSION
+/// only; the length window itself is `annotated_expression_set`'s own
+/// answer (its second tuple slot), and the element's own
+/// `DeclaredRefinement` is read by the caller through the ordinary
+/// `declared_refinement` recursion, never duplicated here.
+fn annotated_sequence_container<'a>(annotation: &'a Expr, imports: &SurfaceImports) -> Option<(&'static str, &'a Expr)> {
+    let Expr::Subscript(subscript) = annotation else {
+        return None;
+    };
+    let Expr::Name(head) = subscript.value.as_ref() else {
+        return None;
+    };
+    if !imports.annotated_names.contains(head.id.as_str()) {
+        return None;
+    }
+    let Expr::Tuple(arguments) = subscript.slice.as_ref() else {
+        return None;
+    };
+    let base = arguments.elts.first()?;
+    let Expr::Subscript(base_subscript) = base else {
+        return None;
+    };
+    let Expr::Name(base_head) = base_subscript.value.as_ref() else {
+        return None;
+    };
+    let head_spelling = match base_head.id.as_str() {
+        "list" => "list",
+        "set" => "set",
+        "Sequence" => "Sequence",
+        _ => return None,
+    };
+    Some((head_spelling, base_subscript.slice.as_ref()))
 }
 
 /// A CALLABLE-VARIABLE's own RETURN refinement: `Callable[[...], R]`
@@ -539,6 +632,7 @@ pub fn base_sort_return_refinement(returns: &Expr) -> Option<DeclaredRefinement>
         spelling,
         admits_none: false,
         element: None,
+        element_length: None,
         generator: None,
         members: None,
         positions: None,
@@ -567,6 +661,7 @@ pub fn typed_dict_return_refinement(
         spelling: name.id.as_str().to_owned(),
         admits_none: false,
         element: None,
+        element_length: None,
         generator: None,
         members: Some(members.clone()),
         positions: None,
@@ -926,6 +1021,7 @@ mod tests {
             spelling: "Age".to_owned(),
             admits_none: false,
             element: None,
+            element_length: None,
             generator: None,
             members: None,
             positions: None,

@@ -41,6 +41,7 @@
 //! statement dispatch.
 
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use refined_domain::abstract_value::float_sorted_unknown;
 use refined_domain::abstract_value::known_set;
@@ -51,13 +52,20 @@ use refined_domain::abstract_value::Kind;
 use refined_domain::abstract_value::PrimitiveKind;
 use refined_domain::abstract_value::SetKindTag;
 use refined_domain::lattice_operations::join_known;
+use refined_domain::lattice_operations::set_of_known;
 use refined_domain::lattice_operations::truthiness;
 use refined_domain::trust_grades::TrustSpec;
 use refined_kernel::kernel_interface::RefinedTSKernel;
+use refined_kernel::narrow_questions::KnownStateWire;
+use refined_kernel::summary_questions::ask_apply_summary;
+use refined_kernel::summary_questions::ask_summarize;
+use refined_kernel::summary_questions::SummaryBlob;
 use refined_sets::codepoint_sets::strings;
 use refined_sets::refinement_forms::at_least;
 use refined_sets::refinement_forms::integer;
 use refined_sets::refinement_forms::make_refined_set;
+use refined_sets::refinement_forms::one_of;
+use refined_sets::refinement_forms::Form;
 use refined_sets::refinement_forms::RefinedSet;
 use ruff_python_ast::AtomicNodeIndex;
 use ruff_python_ast::Expr;
@@ -77,6 +85,7 @@ use crate::refinedpy::env::Environment;
 use crate::refinedpy::expressions::binary_arithmetic_value;
 use crate::refinedpy::expressions::evaluate_expression;
 use crate::refinedpy::function_table::FunctionTable;
+use crate::refinedpy::function_table::ENTRY_MODULE;
 use crate::refinedpy::instances::class_table;
 use crate::refinedpy::instances::field_read;
 use crate::refinedpy::instances::field_write;
@@ -84,6 +93,8 @@ use crate::refinedpy::instances::self_attribute_name;
 use crate::refinedpy::instances::ClassModel;
 use crate::refinedpy::match_arms;
 use crate::refinedpy::narrowing;
+use crate::refinedpy::summary_lowering::lower_function_body;
+use crate::refinedpy::summary_lowering::LoweredBody;
 use crate::refinedpy::surface::surface_imports;
 
 /// The deepest a call chain interprets before declining outright. A
@@ -141,6 +152,39 @@ pub fn call_result_with_enclosing(
 ) -> Option<AbstractValue> {
     if depth >= CALL_DEPTH_CAP {
         return return_sort_fallback(def);
+    }
+    // THE KERNEL SUMMARY ROUTE, tried ahead of the concrete
+    // interpretation below. The body is lowered and compiled ONCE per
+    // `def` (`summary_registry`), and this call sends only its own
+    // argument states; the answer is the kernel's, carrying the same
+    // soundness the walk carries (`summarize_eq`). Everything it cannot
+    // serve — a body outside the lowering's grammar, an argument the
+    // state wire cannot spell, a kernel that declines — falls through to
+    // the interpreter unchanged, so this route only ever ADDS answers.
+    //
+    // GATED ON A PROPERTY OF THE DEF, never on whether this CALLER
+    // happened to supply an environment. Every ordinary def call passes
+    // one (`expressions.rs`'s own call arm), so a gate reading
+    // `enclosing.is_some()` would exclude every ordinary call and leave
+    // the route reachable only from the callback arms. What the
+    // exclusion is really about is the enclosing MACHINERY below — free-
+    // variable seeding, retained-callable inheritance, class-table
+    // inheritance — and whether that machinery has anything to do is
+    // decided by the def's own body (`needs_enclosing_scope`).
+    //
+    // The def's MODULE comes from the table that answered it: a def
+    // reached through an import carries the stamp of the module that
+    // DECLARED it (`function_table.rs`), so a cross-module call keys to
+    // the declaring module's own summary and never to a same-named,
+    // same-spanned def in another file. A def reached with no table at
+    // all is the calling module's own, so it keys under `ENTRY_MODULE`.
+    if !needs_enclosing_scope(def) {
+        let module = table
+            .and_then(|table| table.module_of(def.name.id.as_str()))
+            .unwrap_or(ENTRY_MODULE);
+        if let Some(answer) = kernel_summary_result(def, module, arguments) {
+            return Some(answer);
+        }
     }
     // A `*args` tail binds to a KNOWN-LENGTH tuple of the caller's own
     // trailing positional arguments (`bind_parameters`'s own vararg row,
@@ -262,6 +306,383 @@ pub fn call_result_with_enclosing(
     };
     let joined = answers.fold(first, |acc, next| join_known(acc, next));
     Some(joined)
+}
+
+// --- THE KERNEL SUMMARY ROUTE ---------------------------------------
+//
+// A `def`'s body is lowered to the kernel's flow IR and COMPILED once
+// (`refined_kernel::summary_questions::ask_summarize`); every call after
+// that sends only its own entry states (`ask_apply_summary`) and reads
+// the exit at the result slot. The interpreter above re-walks the body
+// per call; this route walks it never.
+//
+// The store is keyed by the `def` ALONE: a summary quantifies over every
+// entry, so it is context-free and one `def` has exactly one compiled
+// answer whatever any call passes. The key is the def's MODULE, its
+// NAME, and its own source RANGE — `FunctionTable` hands out CLONES of a
+// parsed def, so a pointer would be a different identity at every call
+// site while the module/name/range triple is the same for every clone of
+// one source def and different for any two source defs.
+//
+// The MODULE is what makes the key unique across a whole program rather
+// than within one file. A `TextRange` is a byte offset into ONE module's
+// source, so two sibling modules that both open with `def scale(x):
+// return x * 2` give their defs the same name and the same span; without
+// the module, one module's compiled summary would answer the other's
+// calls. `FunctionTable` carries each def's own module for exactly this
+// (`function_table.rs`'s own doc), and an imported def keeps the stamp of
+// the module that DECLARED it, so a def reached through a re-export chain
+// keys to one summary however many local names it is reached under.
+
+/// Whether interpreting `def` needs the CALLER's environment at all —
+/// the def-level property the kernel-summary gate reads.
+///
+/// Four pieces of machinery read the caller's environment, and each has
+/// a precondition that is a property of the DEF rather than of the call:
+///
+/// 1. FREE-VARIABLE SEEDING copies every name the body reads that the
+///    body itself does not bind. It has something to do exactly when
+///    `free_names_read` finds such a name — so this asks that same
+///    question, over the same locally-bound set `free_variable_snapshot`
+///    builds, and answers true when any free read exists.
+/// 2. RETAINED-CALLABLE INHERITANCE matters only for a body that creates
+///    or returns a callable.
+/// 3. CLASS-TABLE INHERITANCE matters only for a body that constructs a
+///    class instance, which it can only do by CALLING one.
+/// 4. A PARAMETER DEFAULT is evaluated against a copy of the caller's
+///    bindings (`bind_parameters`), so a default naming an outer name
+///    reads the enclosing scope as surely as a body read does.
+///
+/// Only (1) is tested here. The other three are already impossible for
+/// any def that compiles to a summary at all: the lowering is
+/// total-or-decline and spells no nested `def`, no `lambda`, no call of
+/// any kind, and no defaulted parameter — so a body reaching one of them
+/// never reaches the apply path whatever this answers. Testing them
+/// again would be a second statement of the same invariant, and the two
+/// could drift.
+///
+/// This function's remaining job is therefore (1), plus skipping the
+/// kernel attempt cheaply for the bodies that will need the interpreter
+/// anyway.
+///
+/// A def this answers TRUE for keeps the concrete interpreter outright,
+/// exactly as before. A def it answers FALSE for reads only its own
+/// parameters and locals, so the summary's entry vector carries
+/// everything the body can see and the caller's environment adds nothing.
+fn needs_enclosing_scope(def: &StmtFunctionDef) -> bool {
+    // reads the SAME free-name question the seeding itself asks —
+    // `locally_bound_names` is the set `free_variable_snapshot` builds
+    // before its own copy, so the gate and the machinery it guards can
+    // never disagree about which names are free
+    !free_names_read(&def.body, &locally_bound_names(def)).is_empty()
+}
+
+/// The identity a compiled summary is stored under: the module the def
+/// was parsed from, the def's name, and its own span in that source.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SummaryKey {
+    module: String,
+    name: String,
+    start: u32,
+    end: u32,
+}
+
+fn summary_key(def: &StmtFunctionDef, module: &str) -> SummaryKey {
+    SummaryKey {
+        module: module.to_owned(),
+        name: def.name.id.as_str().to_owned(),
+        start: def.range.start().to_u32(),
+        end: def.range.end().to_u32(),
+    }
+}
+
+/// One `def`'s compiled answer: the blob the kernel wrote, beside the
+/// slot bookkeeping a call site reads its entry states and its result
+/// out of. A `None` entry is a REMEMBERED decline — a body that failed
+/// to lower, or a compile the kernel refused, answers `None` forever
+/// rather than paying the lowering again at every call.
+struct CompiledSummary {
+    blob: SummaryBlob,
+    lowered: LoweredBody,
+}
+
+/// One entry per `def` asked about: the compiled answer, or `None` for a
+/// remembered decline.
+type SummaryStore = std::collections::HashMap<SummaryKey, Option<Arc<CompiledSummary>>>;
+
+/// SUMMARY_REGISTRY holds the finished answers; SUMMARY_BUILDING holds
+/// the keys whose build is in flight — the cycle guard. A body whose own
+/// lowering re-enters itself is a recursive `def`; it answers `None`
+/// WITHOUT storing a decline, so the outer build's real answer is what
+/// lands in the store.
+///
+/// (The lowering reaches no callee today — a call declines the body —
+/// so the guard fires only on a re-entry through the apply path. It is
+/// here because the registry, not its current caller, is where the
+/// invariant lives.)
+static SUMMARY_REGISTRY: Mutex<Option<SummaryStore>> = Mutex::new(None);
+static SUMMARY_BUILDING: Mutex<Option<std::collections::HashSet<SummaryKey>>> = Mutex::new(None);
+
+/// `def`'s compiled summary, building it on the first ask and storing
+/// the answer — hit or decline — under the key.
+fn compiled_summary_for(def: &StmtFunctionDef, module: &str) -> Option<Arc<CompiledSummary>> {
+    let key = summary_key(def, module);
+    {
+        let registry = SUMMARY_REGISTRY.lock().expect("summary registry lock poisoned");
+        if let Some(held) = registry.as_ref().and_then(|map| map.get(&key)) {
+            return held.clone();
+        }
+    }
+    {
+        let mut building = SUMMARY_BUILDING.lock().expect("summary build lock poisoned");
+        let in_flight = building.get_or_insert_with(Default::default);
+        if !in_flight.insert(key.clone()) {
+            // a re-entry while this def's own build is running: answer
+            // nothing, and store nothing, so the outer build's real
+            // answer is the one that lands
+            return None;
+        }
+    }
+    // the build runs OUTSIDE the registry lock — a lowering that reached
+    // a callee would take the same lock for it
+    let built = build_summary(def);
+    {
+        let mut building = SUMMARY_BUILDING.lock().expect("summary build lock poisoned");
+        if let Some(in_flight) = building.as_mut() {
+            in_flight.remove(&key);
+        }
+    }
+    let mut registry = SUMMARY_REGISTRY.lock().expect("summary registry lock poisoned");
+    registry
+        .get_or_insert_with(Default::default)
+        .insert(key, built.clone());
+    built
+}
+
+/// Lowers `def`'s body and hands it to the kernel's compiler exactly
+/// once. `None` where the body leaves the lowering's grammar, or where
+/// the kernel refuses the compile.
+fn build_summary(def: &StmtFunctionDef) -> Option<Arc<CompiledSummary>> {
+    let lowered = lower_function_body(def)?;
+    // ARITY is the WHOLE slot count, not the parameter count: the
+    // compiler numbers one entry state per binding, and the apply side
+    // sends one state per slot — the two numberings must agree or every
+    // local's read collapses onto entry 0.
+    let blob = ask_summarize(lowered.slot_count as i64, &lowered.statements, &[])?;
+    Some(Arc::new(CompiledSummary { blob, lowered }))
+}
+
+/// The compiled summary applied to one call's own arguments, or `None`
+/// wherever this route cannot serve — which is always a fall-through to
+/// the interpreter, never a claim.
+///
+/// The declines, each of them a fall-through:
+///
+/// - the body does not lower, or the kernel refused the compile;
+/// - the call passes a different number of arguments than the def
+///   declares parameters (the entry vector has no place to put the
+///   difference, and this route reads no defaults);
+/// - an argument's value has no state the wire spells
+///   (`entry_state_of`);
+/// - the kernel refuses the application, or answers a short exit row;
+/// - the exit says nothing (a TOP result), which is not an answer;
+/// - a path may fall off the end without returning, so the value is
+///   sometimes the result and sometimes `None` — a shape this route
+///   does not spell, and the interpreter reads exactly.
+fn kernel_summary_result(
+    def: &StmtFunctionDef,
+    module: &str,
+    arguments: &[AbstractValue],
+) -> Option<AbstractValue> {
+    let compiled = compiled_summary_for(def, module)?;
+    let lowered = &compiled.lowered;
+    if arguments.len() != lowered.parameter_count {
+        return None;
+    }
+    let mut entries: Vec<KnownStateWire> = Vec::with_capacity(lowered.slot_count);
+    for argument in arguments {
+        entries.push(entry_state_of(argument)?);
+    }
+    // every slot past the parameters is a local, which enters ABSENT —
+    // it holds no value until the body writes one
+    while entries.len() < lowered.slot_count {
+        entries.push(absent_entry_state());
+    }
+    // the done flag enters exactly "not yet returned"
+    entries[lowered.done_index] = flag_down_entry_state();
+    let exits = ask_apply_summary(&compiled.blob, &entries)?;
+    if lowered.ret_index >= exits.len() || lowered.done_index >= exits.len() {
+        return None;
+    }
+    let done_exit = &exits[lowered.done_index];
+    // EVERY PATH RETURNED, or the value is sometimes the result and
+    // sometimes `None` — the interpreter's own fall-through join reads
+    // that case, and this route declines it rather than answering the
+    // returned half alone.
+    if done_exit.top || done_exit.undef || done_exit.null || !flag_is_definitely_up(done_exit) {
+        return None;
+    }
+    // the RETURNED half of the result slot: what the runs that COMPLETED
+    // left there, which the kernel proves admits every non-thrown outcome
+    // (`returned_denotes`)
+    let returned = exits[lowered.ret_index].returned();
+    let value = value_of_exit_state(&returned)?;
+    Some(AbstractValue {
+        kind_tag: declared_return_sort(def),
+        ..value
+    })
+}
+
+/// The SORT the `def` declares its return to be, read from its own
+/// annotation — `int` and `float` and nothing else, the same two numeric
+/// names `return_sort_fallback` reads.
+///
+/// The compiled summary answers a SET of real numbers and carries no
+/// sort of its own: the kernel decides membership on the real line and
+/// never holds this checker's int/float tags. A `def` that states its
+/// sort supplies it here; one that does not leaves the answer untagged,
+/// which the assignability laws read as numeric-sorted and never as
+/// float-sorted, so an unstated sort costs a fire that the tag would
+/// have caught and never claims one it should not.
+fn declared_return_sort(def: &StmtFunctionDef) -> Option<PrimitiveKind> {
+    let Expr::Name(sort) = def.returns.as_deref()? else {
+        return None;
+    };
+    match sort.id.as_str() {
+        "int" => Some(PrimitiveKind::Integer),
+        "float" => Some(PrimitiveKind::Float),
+        _ => None,
+    }
+}
+
+/// One argument's value as the entry state the wire carries, or `None`
+/// when this domain's value has no faithful state — the call then falls
+/// through to the interpreter rather than entering on a fabricated one.
+///
+/// What crosses: a scalar value list (`Kind::Values` over a numeric
+/// sort), an untagged numeric `Kind::Set` (`set_of_known`'s own reading —
+/// the one set reader this file shares with every other kernel question),
+/// and the two absent admissions. A STRING-sorted value does not cross:
+/// the lowering's arithmetic reads its slots numerically, so a word
+/// entering one of them would be reread across sorts.
+///
+/// Everything else — an object, a list, a collection, a promise, an
+/// unknown — has no state this wire spells, and answers `None`.
+fn entry_state_of(argument: &AbstractValue) -> Option<KnownStateWire> {
+    match argument.kind {
+        Kind::Values => {
+            if !matches!(
+                argument.kind_tag,
+                Some(PrimitiveKind::Number)
+                    | Some(PrimitiveKind::Integer)
+                    | Some(PrimitiveKind::Float)
+                    | Some(PrimitiveKind::Boolean)
+            ) {
+                return None;
+            }
+            // a value LIST is the scalar set of those values —
+            // `one_of([a, b])`, never `set_of_known`'s tuple
+            // concatenation, which spells a SEQUENCE of them
+            Some(KnownStateWire {
+                top: false,
+                set: make_refined_set(vec![one_of(&argument.values)]),
+                undef: false,
+                null: false,
+                nan: false,
+                thrown: false,
+            })
+        }
+        Kind::Set => {
+            // a WORN set's members are not doubles, and `set_of_known`
+            // already refuses one; a string-tagged set would cross the
+            // sort line, so it is refused here
+            if argument.set_kind_tag != SetKindTag::None
+                || argument.kind_tag == Some(PrimitiveKind::String)
+            {
+                return None;
+            }
+            let set = set_of_known(argument)?;
+            Some(KnownStateWire {
+                top: false,
+                set,
+                undef: false,
+                null: false,
+                nan: false,
+                thrown: false,
+            })
+        }
+        Kind::Null => Some(KnownStateWire {
+            top: false,
+            set: make_refined_set(vec![one_of(&[])]),
+            undef: false,
+            null: true,
+            nan: false,
+            thrown: false,
+        }),
+        Kind::Undef => Some(absent_entry_state()),
+        _ => None,
+    }
+}
+
+/// The definitely-absent entry state: no value at all. Every slot past
+/// the parameters enters holding this, since a local holds nothing until
+/// the body writes it.
+fn absent_entry_state() -> KnownStateWire {
+    KnownStateWire {
+        top: false,
+        set: make_refined_set(vec![one_of(&[])]),
+        undef: true,
+        null: true,
+        nan: false,
+        thrown: false,
+    }
+}
+
+/// The done flag's own entry state: exactly `{0}`, "not yet returned."
+fn flag_down_entry_state() -> KnownStateWire {
+    KnownStateWire {
+        top: false,
+        set: make_refined_set(vec![one_of(&[0.0])]),
+        undef: false,
+        null: false,
+        nan: false,
+        thrown: false,
+    }
+}
+
+/// Whether the done flag's EXIT admits only the raised value — every
+/// path through the body returned. The set is read as an intersection of
+/// forms, so a shape this reader cannot judge answers false, which costs
+/// this route a serving and never claims one.
+fn flag_is_definitely_up(exit: &KnownStateWire) -> bool {
+    exit.set
+        .forms
+        .iter()
+        .any(|form| form.form == Form::OneOf && form.w.len() == 1 && form.w[0] == 1.0)
+}
+
+/// The result slot's exit state as this domain's value, or `None` where
+/// the exit says nothing worth answering. A TOP exit is exactly "the
+/// return value is unconstrained," which is what the interpreter would
+/// have to derive for itself — so this route declines and lets it, rather
+/// than serving a silence that would displace a real reading.
+///
+/// The value crosses at SPEC grade: the claim is the kernel's own
+/// derivation over the entry states this call supplied, and the entries
+/// carried the arguments' own sets rather than their grades.
+fn value_of_exit_state(exit: &KnownStateWire) -> Option<AbstractValue> {
+    if exit.top || exit.nan {
+        return None;
+    }
+    if exit.undef || exit.null {
+        // the value is sometimes absent: an admission this route's own
+        // answer has no arm for, and the interpreter's join reads it
+        return None;
+    }
+    if exit.set.forms.is_empty() {
+        return None;
+    }
+    Some(known_set(exit.set.clone(), None, TrustSpec, SetKindTag::None))
 }
 
 /// `call_result_with_enclosing`'s own answer, PLUS every ENCLOSING-SCOPE
@@ -724,7 +1145,23 @@ pub(crate) fn free_variable_snapshot(
     def: &StmtFunctionDef,
     enclosing: &Environment,
 ) -> std::collections::HashMap<String, AbstractValue> {
-    let mut locally_bound = std::collections::HashSet::new();
+    let mut snapshot = std::collections::HashMap::new();
+    for free_name in free_names_read(&def.body, &locally_bound_names(def)) {
+        if let Some(value) = enclosing.read(&free_name) {
+            snapshot.insert(free_name, value.clone());
+        }
+    }
+    snapshot
+}
+
+/// Every name `def` binds itself: its parameters of all four flavors,
+/// then every name its body binds. This is the set that decides which of
+/// the body's reads are FREE — the complement of it, over the body's own
+/// reads, is what `seed_free_variables` copies from the caller and what
+/// `needs_enclosing_scope` tests for existence. Both read it here so the
+/// gate and the machinery it guards share one definition.
+fn locally_bound_names(def: &StmtFunctionDef) -> std::collections::HashSet<String> {
+    let mut bound = std::collections::HashSet::new();
     for parameter in def
         .parameters
         .posonlyargs
@@ -732,22 +1169,16 @@ pub(crate) fn free_variable_snapshot(
         .chain(def.parameters.args.iter())
         .chain(def.parameters.kwonlyargs.iter())
     {
-        locally_bound.insert(parameter.parameter.name.id.as_str().to_owned());
+        bound.insert(parameter.parameter.name.id.as_str().to_owned());
     }
     if let Some(vararg) = def.parameters.vararg.as_ref() {
-        locally_bound.insert(vararg.name.id.as_str().to_owned());
+        bound.insert(vararg.name.id.as_str().to_owned());
     }
     if let Some(kwarg) = def.parameters.kwarg.as_ref() {
-        locally_bound.insert(kwarg.name.id.as_str().to_owned());
+        bound.insert(kwarg.name.id.as_str().to_owned());
     }
-    collect_bound_names(&def.body, &mut locally_bound);
-    let mut snapshot = std::collections::HashMap::new();
-    for free_name in free_names_read(&def.body, &locally_bound) {
-        if let Some(value) = enclosing.read(&free_name) {
-            snapshot.insert(free_name, value.clone());
-        }
-    }
-    snapshot
+    collect_bound_names(&def.body, &mut bound);
+    bound
 }
 
 /// Every bare `Expr::Name` a parameter's own default expression reads —
@@ -2733,5 +3164,197 @@ mod tests {
             .expect("a second construction of the same body-local class still resolves");
         assert_eq!(result.kind, Kind::Object);
         assert_eq!(result.source, "_Device");
+    }
+
+    // --- THE KERNEL SUMMARY ROUTE ---
+    //
+    // These read the route's own bookkeeping — the gate, the store key,
+    // and the memo — without asking a kernel: every case below either
+    // declines in the LOWERING (which runs before any question), reads
+    // the gate, or compares two keys, so none of them loads a dylib.
+
+    /// THE GATE IS A PROPERTY OF THE DEF. A body reading only its own
+    /// parameters and locals needs no caller environment, so the kernel
+    /// route is open to it — and that must hold for the ordinary call
+    /// arm, which always supplies one (`expressions.rs`'s own call site).
+    /// Gating on the caller's `enclosing` instead would shut the route
+    /// off for every ordinary call and leave it reachable only from the
+    /// callback arms.
+    #[test]
+    fn a_body_reading_only_its_own_parameters_and_locals_needs_no_enclosing_scope() {
+        assert!(!needs_enclosing_scope(&parsed_def("def double(x):\n    return x + x\n")));
+        assert!(!needs_enclosing_scope(&parsed_def(
+            "def scaled(x):\n    doubled = x + x\n    return doubled\n"
+        )));
+        assert!(!needs_enclosing_scope(&parsed_def(
+            "def band(n):\n    if n < 10:\n        return 1\n    return 2\n"
+        )));
+    }
+
+    /// A body reading a name it does not bind — a module-level global, a
+    /// captured local — keeps the concrete interpreter, which seeds that
+    /// name from the caller's environment.
+    #[test]
+    fn a_body_reading_a_free_name_needs_the_enclosing_scope() {
+        assert!(needs_enclosing_scope(&parsed_def("def capped(x):\n    return x + LIMIT\n")));
+        assert!(needs_enclosing_scope(&parsed_def(
+            "def guarded(x):\n    if x < CEILING:\n        return x\n    return 0\n"
+        )));
+    }
+
+    /// The free-name test reads a name bound LATER in the body as local,
+    /// the same way the seeding's own snapshot does — a write-then-read
+    /// body captures nothing.
+    #[test]
+    fn a_name_the_body_binds_before_reading_is_local_not_free() {
+        assert!(!needs_enclosing_scope(&parsed_def(
+            "def held(x):\n    total = 0\n    total = total + x\n    return total\n"
+        )));
+    }
+
+    /// A def that captures is excluded by the gate even where the CALLER
+    /// supplied no environment, and a def that does not capture is
+    /// admitted even where the caller supplied one — the two halves of
+    /// reading the def rather than the call. Neither direction was true
+    /// of a gate on `enclosing`, which admitted exactly the first case
+    /// and excluded exactly the second.
+    #[test]
+    fn the_gate_and_the_callers_environment_are_independent() {
+        let captures = parsed_def("def capped(x):\n    return x + LIMIT\n");
+        let closed = parsed_def("def double(x):\n    return x + x\n");
+        assert!(needs_enclosing_scope(&captures), "a capturing def is excluded however it is called");
+        assert!(!needs_enclosing_scope(&closed), "a closed def is admitted however it is called");
+    }
+
+    /// The ordinary call arm's own spelling — a caller environment
+    /// supplied — still reaches the registry for a closed body. This is
+    /// the reachability the correction restores: before it, this call
+    /// never consulted the store at all.
+    #[test]
+    fn an_ordinary_call_with_a_caller_environment_reaches_the_registry() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let def = parsed_def("def scaled(x):\n    return x * 2\n");
+        let enclosing = Environment::new(std::collections::HashSet::new());
+        let _ = call_result_with_enclosing(&def, &[known_int(3.0)], None, &kernel, 0, Some(&enclosing));
+        let registry = SUMMARY_REGISTRY.lock().expect("summary registry lock poisoned");
+        assert!(
+            registry
+                .as_ref()
+                .is_some_and(|map| map.contains_key(&summary_key(&def, ENTRY_MODULE))),
+            "a call carrying a caller environment must still consult the store",
+        );
+    }
+
+    /// A `def` and a CLONE of it (which is what `FunctionTable` hands a
+    /// call site) key to the same compiled summary — the whole reason the
+    /// key is the name/range pair rather than a pointer.
+    #[test]
+    fn a_clone_of_a_def_keys_to_the_same_stored_summary() {
+        let def = parsed_def("def double(x):\n    return x + x\n");
+        let clone = def.clone();
+        assert_eq!(summary_key(&def, ENTRY_MODULE), summary_key(&clone, ENTRY_MODULE));
+    }
+
+    /// The SAME def text at the SAME span in two different modules keys
+    /// APART — the cross-module half of the identity. Two sibling modules
+    /// that both open with the same `def` give their defs the same name
+    /// and the same `TextRange`, so without the module in the key one
+    /// module's compiled summary would answer the other module's calls.
+    #[test]
+    fn the_same_def_in_two_modules_keys_apart() {
+        let def = parsed_def("def scale(x):\n    return x * 2\n");
+        assert_ne!(summary_key(&def, "audio_level"), summary_key(&def, "video_level"));
+    }
+
+    /// One def reached under two different LOCAL names (an alias import)
+    /// keys to ONE summary: the key reads the def's own name and its
+    /// declaring module, and `rename_def` rewrites the local spelling
+    /// only for the table's own by-name lookup.
+    #[test]
+    fn one_def_reached_through_one_module_keys_the_same_however_it_is_reached() {
+        let def = parsed_def("def scale(x):\n    return x * 2\n");
+        let again = def.clone();
+        assert_eq!(summary_key(&def, "audio_level"), summary_key(&again, "audio_level"));
+    }
+
+    /// Two defs in one module are different keys, even where their
+    /// bodies are identical: the range tells them apart.
+    #[test]
+    fn two_defs_in_one_module_key_apart() {
+        let module = parse_module("def a(x):\n    return x\ndef b(x):\n    return x\n")
+            .expect("fixture source parses")
+            .into_syntax();
+        let defs: Vec<StmtFunctionDef> = module
+            .body
+            .into_iter()
+            .filter_map(|stmt| stmt.function_def_stmt())
+            .collect();
+        assert_eq!(defs.len(), 2);
+        assert_ne!(summary_key(&defs[0], ENTRY_MODULE), summary_key(&defs[1], ENTRY_MODULE));
+    }
+
+    /// A body outside the lowering's grammar answers a decline, and the
+    /// decline is REMEMBERED: the second ask reads the store rather than
+    /// lowering again. Asked twice, both answers are the decline, and the
+    /// store holds exactly one entry for the key by the end.
+    #[test]
+    fn a_body_that_does_not_lower_is_remembered_as_a_decline() {
+        // a call in the body: outside the grammar, and the decline
+        // happens in the lowering, before any kernel question exists
+        let def = parsed_def("def calls(x):\n    return helper(x)\n");
+        assert!(compiled_summary_for(&def, ENTRY_MODULE).is_none());
+        assert!(
+            compiled_summary_for(&def, ENTRY_MODULE).is_none(),
+            "the second ask reads the remembered decline"
+        );
+        let registry = SUMMARY_REGISTRY.lock().expect("summary registry lock poisoned");
+        let held = registry
+            .as_ref()
+            .expect("the registry holds the answer")
+            .get(&summary_key(&def, ENTRY_MODULE));
+        let spelling = match held {
+            None => "no entry at all",
+            Some(None) => "a remembered decline",
+            Some(Some(_)) => "a compiled summary",
+        };
+        assert!(matches!(held, Some(None)), "the store holds {spelling}, want a remembered decline");
+    }
+
+    /// The route declines a call whose argument count does not match the
+    /// def's own parameters — the entry vector has no place for the
+    /// difference, and the interpreter (which reads defaults) answers
+    /// instead.
+    #[test]
+    fn the_summary_route_declines_an_argument_count_the_entry_vector_cannot_place() {
+        let def = parsed_def("def add(x, y):\n    return x + y\n");
+        assert!(kernel_summary_result(&def, ENTRY_MODULE, &[known_int(1.0)]).is_none());
+    }
+
+    /// An argument this domain carries but the state wire does not spell
+    /// declines the call, not the summary.
+    #[test]
+    fn an_argument_the_state_wire_cannot_spell_declines_the_call() {
+        assert!(entry_state_of(&unknown()).is_none());
+        assert!(entry_state_of(&known_string_value("hi")).is_none());
+        assert!(entry_state_of(&known_int(3.0)).is_some(), "a numeric value list crosses");
+        assert!(entry_state_of(&null_value()).is_some(), "the null admission crosses");
+    }
+
+    /// A `Kind::Values` holding several numbers crosses as the SCALAR set
+    /// of those numbers — `one_of([3, 5])` — never as the tuple
+    /// `set_of_known` builds for a multi-value list.
+    #[test]
+    fn a_multi_value_argument_crosses_as_the_scalar_set_of_its_values() {
+        let two_valued = known_values(vec![3.0, 5.0], PrimitiveKind::Integer, TrustProved);
+        let state = entry_state_of(&two_valued).expect("a numeric value list crosses");
+        assert_eq!(state.set, make_refined_set(vec![one_of(&[3.0, 5.0])]));
+    }
+
+    /// A Python `str` as this domain spells it — one code point per f64,
+    /// the representation `string_models.rs` documents. Built here rather
+    /// than reached for, matching `loops.rs`'s own same-crate precedent.
+    fn known_string_value(text: &str) -> AbstractValue {
+        let code_points: Vec<f64> = text.chars().map(|c| c as u32 as f64).collect();
+        known_values(code_points, PrimitiveKind::String, TrustProved)
     }
 }

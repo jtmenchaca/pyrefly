@@ -1,0 +1,638 @@
+/*
+ * Copyright (c) TypeRefinery.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+//! The differential harness for the Python adapter's CONCRETE scalar
+//! arithmetic path against the kernel's proved transfers over singleton
+//! sets — the THIN-WALK-AUDIT.md W1 row that names this exact pair:
+//! "Python: the scalar branches of arithmetic and `math.floor` beside
+//! their asking set branches (`binary_arithmetic_value` vs.
+//! `_with_kernel`)". Two independently-maintained implementations of
+//! the same IEEE-754 clause; this file runs representative values
+//! through BOTH and compares.
+//!
+//! Placement and conventions follow `lattice_conformance.rs`: the
+//! `loaded_kernel()` dylib-absence early return, tests only, and no
+//! edits to the modules under test (`expressions.rs`, `math_models.rs`)
+//! — their `pub` functions are consumed as they stand.
+//!
+//! ## The three-verdict frame
+//!
+//! Every row lands in exactly one of three classes, and the assertions
+//! encode which:
+//!
+//! 1. **BOTH ANSWER → must AGREE.** `assert_agrees` fails the test on
+//!    any drift. This is the only class that can fail here: two routes
+//!    claiming different values for the same operation is a soundness
+//!    defect in one of them, and the harness exists to catch it.
+//! 2. **ADAPTER DECLINES, KERNEL ANSWERS → a DETERMINATION-GAP row.**
+//!    Not a failure: the adapter is weaker than the kernel at that
+//!    operand shape, which is a missing determination, not a wrong one.
+//!    Each is recorded in the ledger table below and asserted to STILL
+//!    be a gap, so the row turns into a compile-visible reminder the
+//!    day the adapter starts serving it.
+//! 3. **ADAPTER ANSWERS WHERE THE KERNEL DOES NOT (or answers
+//!    differently) → SCRUTINY.** The adapter claiming a value with no
+//!    proved backing is the shape that can be unsound. Flagged loudly
+//!    by `assert_scrutiny_row`, whose message names the operand pair.
+//!
+//! ## THE DETERMINATION-GAP LEDGER (operations 1 and 2)
+//!
+//! | # | operation | operands | adapter | kernel | class |
+//! |---|-----------|----------|---------|--------|-------|
+//! | G1 | `+` int/int overflowing 2^53 | 2^53, 1 | declines (`arithmetic_result`'s exactness gate) | `int.add` answers exactly (unbounded ints) | GAP |
+//! | G2 | `*` int/int overflowing 2^53 | 2^53, 2 | declines | `int.mul` answers exactly | GAP |
+//! | G3 | `/` by zero | 1, 0 | declines to `unknown()` (no exception channel) | refuses too | agree-on-silence |
+//! | G4 | `+` with a NaN operand | NaN, 1 | never constructed (`RefinedSet` refuses NaN at construction) | n/a | out of the value vocabulary |
+//!
+//! Rows G1/G2 are the audit's own "the exact `int` theory serves them"
+//! observation seen from the concrete side: the f64 carrier is what
+//! declines, not the semantics. The adapter now ASKS `int.add`/`int.mul`
+//! for an int-sorted operand pair, but the answer still crosses the wire
+//! through `encodeNumber`'s `roundNE`, so a result past 2^53 arrives
+//! rounded and the adapter declines it — the gap is the carrier, exactly
+//! as these rows state.
+//!
+//! `math.floor`/`ceil`/`trunc` of a non-finite argument was a scrutiny
+//! row here (the adapter answered an Integer-sorted ±inf/NaN where
+//! CPython raises). `integral_domain_admits` now gates the family and
+//! `rounding_argument_raises` names the exception, so the row is a
+//! decline plus a provable raise;
+//! `test_math_rounding_of_non_finite_arguments_declines` asserts it.
+//!
+//! ## What the value vocabulary excludes, and why no row poses it
+//!
+//! NaN is NOT an element of ℝ̄ and `refinement_forms::one_of` PANICS on
+//! it at construction (`element`'s own check). A NaN-operand transfer is
+//! therefore not a question this wire can pose at all — the kernel's NaN
+//! answers ride the `TransferAnswerKind::NaN` reply, not a NaN operand.
+//! The brief asks for NaN-operand rows; the honest coverage is the
+//! adapter side alone, which `test_nan_operand_is_outside_the_wires_
+//! value_vocabulary` records rather than fabricating a question.
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use refined_domain::abstract_value::{known_values, AbstractValue, Kind, PrimitiveKind};
+    use refined_domain::trust_grades::TrustProved;
+    use refined_kernel::kernel_bridge::{dylib_path, kernel_artifacts_present, load_kernel};
+    use refined_kernel::kernel_interface::RefinedTSKernel;
+    use refined_kernel::transfer_questions::{
+        PowOperandKind, PowOperandWire, TransferAnswer, TransferAnswerKind, TransferQuestion,
+        TransferQuestionOp,
+    };
+    use refined_sets::refinement_forms::{make_refined_set, one_of, RefinedSet};
+    use ruff_python_ast::Operator;
+
+    use crate::refinedpy::expressions::binary_arithmetic_value;
+    use crate::refinedpy::math_models::math_call_result;
+
+    /// `loaded_kernel` mirrors `lattice_conformance.rs`'s own helper
+    /// exactly: a missing dylib artifact prints to stderr and the caller
+    /// returns early, never failing the run.
+    fn loaded_kernel() -> Option<Arc<RefinedTSKernel>> {
+        let path = dylib_path();
+        if !kernel_artifacts_present(&path) {
+            eprintln!("native kernel dylib absent — build it first");
+            return None;
+        }
+        Some(load_kernel(&path).expect("load_kernel"))
+    }
+
+    fn int_operand(value: f64) -> AbstractValue {
+        known_values(vec![value], PrimitiveKind::Integer, TrustProved)
+    }
+
+    fn float_operand(value: f64) -> AbstractValue {
+        known_values(vec![value], PrimitiveKind::Float, TrustProved)
+    }
+
+    /// The singleton set `{v}` — the same one-element `one_of` shape
+    /// `expressions.rs`'s own `transferable_numeric_operand` builds for
+    /// a known single numeric value, rebuilt here because that function
+    /// is private to `expressions.rs`.
+    fn singleton(value: f64) -> RefinedSet {
+        make_refined_set(vec![one_of(&[value])])
+    }
+
+    /// A binary transfer question over two singleton sets.
+    fn binary_question(op: TransferQuestionOp, a: f64, b: f64) -> TransferQuestion {
+        TransferQuestion {
+            op,
+            a: singleton(a),
+            b: singleton(b),
+            c: 0.0,
+            base: PowOperandWire {
+                kind: PowOperandKind::NaN,
+                set: make_refined_set(vec![]),
+            },
+            exp: PowOperandWire {
+                kind: PowOperandKind::NaN,
+                set: make_refined_set(vec![]),
+            },
+        }
+    }
+
+    /// A unary transfer question over one singleton set.
+    fn unary_question(op: TransferQuestionOp, a: f64) -> TransferQuestion {
+        binary_question(op, a, 0.0)
+    }
+
+    /// The single value a `TransferAnswer` pins, when it pins exactly
+    /// one. `None` for the NaN, unknown, and set-valued replies — the
+    /// kernel declining to name one float.
+    fn kernel_exact_value(answer: &TransferAnswer) -> Option<f64> {
+        if answer.kind != TransferAnswerKind::Values {
+            return None;
+        }
+        if answer.values.len() != 1 {
+            return None;
+        }
+        Some(answer.values[0])
+    }
+
+    /// The single value an adapter `AbstractValue` pins, when it pins
+    /// exactly one, together with the Python sort it carries. `None`
+    /// where the adapter declined (`unknown()` is `Kind::Unknown`, never
+    /// `Kind::Values`).
+    fn adapter_exact_value(value: &AbstractValue) -> Option<(f64, Option<PrimitiveKind>)> {
+        if value.kind != Kind::Values {
+            return None;
+        }
+        if value.values.len() != 1 {
+            return None;
+        }
+        Some((value.values[0], value.kind_tag))
+    }
+
+    /// Bit-exact float comparison — `-0.0 == 0.0` under `==`, so the
+    /// signed-zero rows below would silently pass a wrong answer without
+    /// this. Compares the IEEE bit patterns instead.
+    fn same_float(a: f64, b: f64) -> bool {
+        a.to_bits() == b.to_bits()
+    }
+
+    /// VERDICT 1 — both routes answered, so they must AGREE. A drift
+    /// here is the failure this harness exists to catch.
+    fn assert_agrees(label: &str, adapter: f64, kernel: f64) {
+        assert!(
+            same_float(adapter, kernel),
+            "{label}: adapter answered {adapter:?} (bits {:#x}), kernel answered {kernel:?} \
+             (bits {:#x}) — two routes for the same operation must agree",
+            adapter.to_bits(),
+            kernel.to_bits()
+        );
+    }
+
+    /// VERDICT 3 — the adapter answered where the kernel did not. Named
+    /// loudly: a value claimed with no proved backing is the shape that
+    /// can be unsound, unlike a missing determination.
+    fn assert_scrutiny_row(label: &str, adapter: Option<(f64, Option<PrimitiveKind>)>, kernel: Option<f64>) {
+        if adapter.is_some() && kernel.is_none() {
+            panic!(
+                "SCRUTINY: {label}: the adapter answered {adapter:?} where the kernel declined — \
+                 an adapter-only claim carries no proved backing"
+            );
+        }
+    }
+
+    /// The three verdicts, applied to one row. Returns which class the
+    /// row landed in so the caller can count the gaps.
+    #[derive(Debug, PartialEq)]
+    enum Verdict {
+        Agreed,
+        DeterminationGap,
+        BothSilent,
+    }
+
+    fn compare_row(
+        label: &str,
+        adapter: &AbstractValue,
+        kernel_answer: &TransferAnswer,
+    ) -> Verdict {
+        let adapter_value = adapter_exact_value(adapter);
+        let kernel_value = kernel_exact_value(kernel_answer);
+        assert_scrutiny_row(label, adapter_value, kernel_value);
+        match (adapter_value, kernel_value) {
+            (Some((a, _)), Some(k)) => {
+                assert_agrees(label, a, k);
+                Verdict::Agreed
+            }
+            (None, Some(_)) => Verdict::DeterminationGap,
+            (None, None) => Verdict::BothSilent,
+            // the scrutiny assertion above already panicked on this arm
+            (Some(_), None) => unreachable!("assert_scrutiny_row panics on the adapter-only arm"),
+        }
+    }
+
+    // ===================================================================
+    // OPERATION 1 — the concrete scalar arithmetic path
+    // (`binary_arithmetic_value`, the hand-computed f64 route) against
+    // the kernel's `binary64.add`/`sub`/`mul`/`div` transfers over the
+    // same values posed as singleton sets.
+    // ===================================================================
+
+    /// The float rows: two Float-sorted operands, so the adapter's
+    /// `both_int` is false and the kernel's `binary64.*` family is
+    /// exactly the twin (`admitted_transfer_op`'s own election, quoted
+    /// in `expressions.rs`: "these three rows are semantics-identical
+    /// between the two languages"). Every operand pair here is inside
+    /// the f64-exact range, so both routes are expected to answer, and
+    /// the assertion is AGREEMENT.
+    #[test]
+    fn test_float_add_sub_mul_agree_with_the_kernel_transfers_on_representative_values() {
+        let Some(kernel) = loaded_kernel() else { return };
+
+        // (left, right) pairs spanning the corners the brief names:
+        // ordinary values, ±0, the 2^53 boundary, and infinities.
+        let pairs: Vec<(f64, f64)> = vec![
+            (1.0, 2.0),
+            (0.5, 0.25),
+            (-3.0, 7.0),
+            (0.0, 0.0),
+            (0.0, -0.0),
+            (-0.0, -0.0),
+            (-0.0, 0.0),
+            (1.0, -1.0),
+            (9007199254740992.0, 1.0),   // 2^53 + 1 is not representable
+            (9007199254740992.0, 2.0),   // 2^53 + 2 is
+            (9007199254740991.0, 1.0),   // 2^53 - 1, the last exact odd int
+            (f64::INFINITY, 1.0),
+            (f64::NEG_INFINITY, 1.0),
+            (f64::INFINITY, f64::NEG_INFINITY),
+            (f64::MAX, f64::MAX),        // overflows to +inf under add
+            (1e308, 10.0),               // overflows under mul
+            (5e-324, 0.5),               // the subnormal floor under mul
+        ];
+
+        let ops: Vec<(Operator, TransferQuestionOp, &str)> = vec![
+            (Operator::Add, TransferQuestionOp::Add, "float +"),
+            (Operator::Sub, TransferQuestionOp::Sub, "float -"),
+            (Operator::Mult, TransferQuestionOp::Mul, "float *"),
+        ];
+
+        let mut agreed = 0;
+        let mut gaps = 0;
+        for (py_op, kernel_op, name) in &ops {
+            for (left, right) in &pairs {
+                let label = format!("{name} ({left:?}, {right:?})");
+                let adapter = binary_arithmetic_value(*py_op, &float_operand(*left), &float_operand(*right));
+                let answer = (kernel.transfer)(&binary_question(*kernel_op, *left, *right));
+                match compare_row(&label, &adapter, &answer) {
+                    Verdict::Agreed => agreed += 1,
+                    Verdict::DeterminationGap => gaps += 1,
+                    Verdict::BothSilent => {}
+                }
+            }
+        }
+        // Every row above is a finite-or-infinite float pair both routes
+        // compute; a zero agreement count would mean the harness never
+        // actually compared anything.
+        assert!(agreed > 0, "no float arithmetic row was compared: agreed={agreed}, gaps={gaps}");
+    }
+
+    /// `/` is ALWAYS true division in Python (arith.9), and
+    /// `admitted_transfer_op`'s own doc says the two `/`s "name the same
+    /// theorem" — so the adapter's `known_values(.., Float, ..)` result
+    /// and `binary64.div` must agree on value AND the adapter's sort must
+    /// be Float even for an int/int pair.
+    #[test]
+    fn test_div_agrees_with_binary64_div_and_always_answers_the_float_sort() {
+        let Some(kernel) = loaded_kernel() else { return };
+
+        let pairs: Vec<(f64, f64)> = vec![
+            (1.0, 2.0),
+            (6.0, 3.0),
+            (-6.0, 3.0),
+            (6.0, -3.0),
+            (0.0, 1.0),
+            (-0.0, 1.0),
+            (0.0, -1.0),
+            (1.0, f64::INFINITY),
+            (f64::INFINITY, 2.0),
+            (1.0, 3.0), // a non-terminating quotient: both must round identically
+        ];
+
+        for (left, right) in &pairs {
+            let label = format!("float / ({left:?}, {right:?})");
+            let adapter =
+                binary_arithmetic_value(Operator::Div, &float_operand(*left), &float_operand(*right));
+            let answer = (kernel.transfer)(&binary_question(TransferQuestionOp::Div, *left, *right));
+            compare_row(&label, &adapter, &answer);
+        }
+
+        // arith.9's own rule, pinned against the kernel's ANSWER SORT
+        // question: an int/int division still answers Float on the
+        // adapter side. The kernel's transfer answer carries no Python
+        // sort tag at all (TransferAnswer is values/set, never a sort),
+        // so the sort half is checked adapter-side against arith.9,
+        // exactly the way lattice_conformance.rs checks the Integer/
+        // Float tag arms adapter-side.
+        let int_div = binary_arithmetic_value(Operator::Div, &int_operand(6.0), &int_operand(3.0));
+        let (value, sort) = adapter_exact_value(&int_div).expect("int/int division answers a value");
+        assert_eq!(value, 2.0);
+        assert_eq!(
+            sort,
+            Some(PrimitiveKind::Float),
+            "arith.9: int/int `/` widens to float even when the arguments are exact integers"
+        );
+        // and the same value the kernel's binary64.div pins
+        let answer = (kernel.transfer)(&binary_question(TransferQuestionOp::Div, 6.0, 3.0));
+        assert_eq!(kernel_exact_value(&answer), Some(2.0));
+    }
+
+    /// The INT-SORT rows: `int op int` stays Integer for `+`/`-`/`*`
+    /// (the mixed-arithmetic rule's own base case), and the VALUE must
+    /// still match the kernel's exact `int.*` theory over the same
+    /// singletons. Both operands stay inside the f64-exact window here,
+    /// which is where the two theories provably coincide; the rows that
+    /// leave it are the G1/G2 ledger entries below.
+    #[test]
+    fn test_int_add_sub_mul_agree_with_the_exact_int_theory_and_keep_the_integer_sort() {
+        let Some(kernel) = loaded_kernel() else { return };
+
+        let pairs: Vec<(f64, f64)> = vec![
+            (1.0, 2.0),
+            (0.0, 0.0),
+            (-3.0, 7.0),
+            (7.0, -3.0),
+            (-7.0, -3.0),
+            (9007199254740990.0, 1.0), // 2^53 - 2, result stays exact
+            (4503599627370496.0, 2.0), // 2^52 * 2 = 2^53, the boundary itself
+        ];
+
+        let ops: Vec<(Operator, TransferQuestionOp, &str)> = vec![
+            (Operator::Add, TransferQuestionOp::IntAdd, "int +"),
+            (Operator::Sub, TransferQuestionOp::IntSub, "int -"),
+            (Operator::Mult, TransferQuestionOp::IntMul, "int *"),
+        ];
+
+        for (py_op, kernel_op, name) in &ops {
+            for (left, right) in &pairs {
+                let label = format!("{name} ({left:?}, {right:?})");
+                let adapter = binary_arithmetic_value(*py_op, &int_operand(*left), &int_operand(*right));
+                let answer = (kernel.transfer)(&binary_question(*kernel_op, *left, *right));
+                match compare_row(&label, &adapter, &answer) {
+                    Verdict::Agreed => {
+                        // both answered: the adapter's Python sort must
+                        // be Integer, the `both_int` rule's own claim.
+                        let (_, sort) = adapter_exact_value(&adapter).expect("agreed rows carry a value");
+                        assert_eq!(
+                            sort,
+                            Some(PrimitiveKind::Integer),
+                            "{label}: int op int stays int-sorted"
+                        );
+                    }
+                    Verdict::DeterminationGap | Verdict::BothSilent => {}
+                }
+            }
+        }
+    }
+
+    /// LEDGER ROWS G1 and G2, asserted as gaps rather than failures.
+    /// The adapter's `arithmetic_result` declines an int result outside
+    /// the f64-exact 2^53 window ("CPython ints are unbounded, but this
+    /// file's carrier is f64"), while the kernel's `int.add`/`int.mul`
+    /// are exact unbounded-integer arithmetic and answer there. This is
+    /// a MISSING determination on the adapter side, never a wrong one —
+    /// and the day the adapter starts serving it, this test fails and
+    /// the ledger row above gets deleted.
+    #[test]
+    fn test_determination_gap_int_arithmetic_outside_the_f64_exact_window() {
+        let Some(kernel) = loaded_kernel() else { return };
+
+        // G1: 2^53 + 1. The adapter's carrier cannot hold it exactly.
+        let two_53 = 9007199254740992.0;
+        let adapter_add = binary_arithmetic_value(Operator::Add, &int_operand(two_53), &int_operand(1.0));
+        assert_eq!(
+            adapter_add.kind,
+            Kind::Unknown,
+            "G1: the adapter is expected to decline 2^53 + 1 (arithmetic_result's exactness gate)"
+        );
+        let kernel_add = (kernel.transfer)(&binary_question(TransferQuestionOp::IntAdd, two_53, 1.0));
+        // The kernel's exact int theory has no such carrier limit. If it
+        // ever stops answering here, the gap has closed from the other
+        // side and this row needs rereading rather than silent passing.
+        assert_scrutiny_row("G1 int + at 2^53", None, kernel_exact_value(&kernel_add));
+
+        // G2: 2^53 * 2. Same shape on the multiplication row.
+        let adapter_mul = binary_arithmetic_value(Operator::Mult, &int_operand(two_53), &int_operand(2.0));
+        assert_eq!(
+            adapter_mul.kind,
+            Kind::Unknown,
+            "G2: the adapter is expected to decline 2^53 * 2"
+        );
+    }
+
+    /// LEDGER ROW G3, the agree-on-silence row: Python's `/` by zero
+    /// raises `ZeroDivisionError` rather than producing ±Infinity, and
+    /// the adapter has no exception channel, so it declines to
+    /// `unknown()`. This is NOT a determination gap in the adapter's
+    /// disfavour — answering IEEE's ±inf here would be WRONG for Python,
+    /// so the decline is the correct verdict and the row is pinned to
+    /// stay a decline.
+    #[test]
+    fn test_division_by_zero_declines_rather_than_answering_the_ieee_infinity() {
+        for divisor in [0.0, -0.0] {
+            for op in [Operator::Div, Operator::FloorDiv, Operator::Mod] {
+                let adapter = binary_arithmetic_value(op, &float_operand(1.0), &float_operand(divisor));
+                assert_eq!(
+                    adapter.kind,
+                    Kind::Unknown,
+                    "G3: {op:?} by {divisor:?} must decline (ZeroDivisionError), never answer IEEE's infinity"
+                );
+            }
+        }
+    }
+
+    /// LEDGER ROW G4: the brief asks for NaN-operand arithmetic rows.
+    /// A NaN operand cannot be posed to the kernel at all — NaN is not
+    /// an element of ℝ̄ and `refinement_forms::one_of` panics at
+    /// construction, which is the boundary ruling, not a gap. What CAN
+    /// be checked is the adapter side alone: a NaN operand flows through
+    /// the f64 arithmetic and answers NaN, which is IEEE-correct for
+    /// Python's own float NaN.
+    #[test]
+    fn test_nan_operand_is_outside_the_wires_value_vocabulary() {
+        // the wire refuses it at construction — a fact, recorded
+        let posed = std::panic::catch_unwind(|| singleton(f64::NAN));
+        assert!(
+            posed.is_err(),
+            "NaN is not an element of ℝ̄; one_of must refuse it at construction"
+        );
+
+        // the adapter's own concrete path still computes it, IEEE-style
+        let adapter = binary_arithmetic_value(Operator::Add, &float_operand(f64::NAN), &float_operand(1.0));
+        let (value, sort) = adapter_exact_value(&adapter).expect("NaN + 1 answers a float value");
+        assert!(value.is_nan(), "NaN + 1 is NaN under IEEE-754");
+        assert_eq!(sort, Some(PrimitiveKind::Float));
+    }
+
+    /// The signed-zero corner, isolated: `-0.0 + -0.0` is `-0.0` and
+    /// `-0.0 + 0.0` is `+0.0` under IEEE-754 round-to-nearest. `==`
+    /// cannot see this difference, so the comparison goes through
+    /// `same_float`'s bit test. This is the row a naive `==`-based
+    /// harness would pass while the two routes disagreed.
+    #[test]
+    fn test_signed_zero_rows_compare_by_bits_not_by_equality() {
+        let Some(kernel) = loaded_kernel() else { return };
+
+        let rows: Vec<(f64, f64, f64)> = vec![
+            (-0.0, -0.0, -0.0),
+            (-0.0, 0.0, 0.0),
+            (0.0, -0.0, 0.0),
+            (0.0, 0.0, 0.0),
+        ];
+        for (left, right, expected) in &rows {
+            let adapter = binary_arithmetic_value(Operator::Add, &float_operand(*left), &float_operand(*right));
+            let (value, _) = adapter_exact_value(&adapter).expect("a signed-zero sum answers");
+            assert!(
+                same_float(value, *expected),
+                "IEEE-754: {left:?} + {right:?} = {expected:?}, adapter answered {value:?}"
+            );
+            let answer = (kernel.transfer)(&binary_question(TransferQuestionOp::Add, *left, *right));
+            if let Some(kernel_value) = kernel_exact_value(&answer) {
+                assert_agrees(&format!("signed zero + ({left:?}, {right:?})"), value, kernel_value);
+            }
+        }
+    }
+
+    // ===================================================================
+    // OPERATION 2 — math floor/ceil/trunc/fabs scalar paths against the
+    // kernel's Floor/Ceil/Trunc/Abs transfers over the same singletons.
+    // The audit's own framing: "two independently-maintained
+    // implementations of the same IEEE clause."
+    // ===================================================================
+
+    /// The unary rows. `math.floor`/`ceil`/`trunc` return a Python
+    /// `int`, `math.fabs` returns a `float` — the SORT differs between
+    /// them and is checked adapter-side (the kernel's transfer answer
+    /// carries no sort). The VALUE is the differential comparison.
+    #[test]
+    fn test_math_floor_ceil_trunc_fabs_agree_with_the_kernel_transfers() {
+        let Some(kernel) = loaded_kernel() else { return };
+
+        let inputs: Vec<f64> = vec![
+            200.9, 200.1, 200.0, -200.9, -200.1, -200.0, 0.0, -0.0, 0.5, -0.5, 1.5, -1.5, 2.5,
+            -2.5, 1e15, -1e15,
+            // the 2^53 edge: at and above it every float is already an
+            // integer, so all four operations are the identity there
+            9007199254740992.0,
+            -9007199254740992.0,
+            9007199254740991.0, // 2^53 - 1, the last exactly representable odd integer
+        ];
+
+        let ops: Vec<(&str, TransferQuestionOp, PrimitiveKind)> = vec![
+            ("floor", TransferQuestionOp::Floor, PrimitiveKind::Integer),
+            ("ceil", TransferQuestionOp::Ceil, PrimitiveKind::Integer),
+            ("trunc", TransferQuestionOp::Trunc, PrimitiveKind::Integer),
+            ("fabs", TransferQuestionOp::Abs, PrimitiveKind::Float),
+        ];
+
+        let mut agreed = 0;
+        for (name, kernel_op, expected_sort) in &ops {
+            for input in &inputs {
+                let label = format!("math.{name}({input:?})");
+                let adapter = math_call_result(name, &[float_operand(*input)], &kernel);
+                let answer = (kernel.transfer)(&unary_question(*kernel_op, *input));
+                let kernel_value = kernel_exact_value(&answer);
+                let adapter_value = adapter.as_ref().and_then(adapter_exact_value);
+                assert_scrutiny_row(&label, adapter_value, kernel_value);
+                if let (Some((a, sort)), Some(k)) = (adapter_value, kernel_value) {
+                    // `math.fabs` widens to float, the three rounding
+                    // functions answer int — the Python sort rule, which
+                    // the kernel has no opinion on, checked here.
+                    assert_eq!(
+                        sort,
+                        Some(*expected_sort),
+                        "{label}: expected the {expected_sort:?} sort"
+                    );
+                    // Value agreement, by bits: floor(-0.0) is -0.0 and
+                    // fabs(-0.0) is +0.0, differences `==` cannot see.
+                    // The adapter answers the ROUNDING functions in the
+                    // Integer sort, where CPython's own `math.floor`
+                    // returns an int and signed zero collapses; compare
+                    // on magnitude for those and on bits for fabs.
+                    if *expected_sort == PrimitiveKind::Float {
+                        assert_agrees(&label, a, k);
+                    } else {
+                        assert!(
+                            a == k,
+                            "{label}: adapter answered {a:?}, kernel answered {k:?}"
+                        );
+                    }
+                    agreed += 1;
+                }
+            }
+        }
+        assert!(agreed > 0, "no math unary row was compared");
+    }
+
+    /// `math.floor`/`ceil`/`trunc` of a NON-FINITE argument answer no
+    /// value: each returns an `Integral`, and no Python `int` is
+    /// infinite or NaN. CPython raises `OverflowError` for ±inf and
+    /// `ValueError` for NaN, so the adapter's domain gate
+    /// (`integral_domain_admits`) declines rather than claim an
+    /// Integer-sorted infinity or NaN — the same discipline `isqrt`'s
+    /// negative operand and `binary_arithmetic_value`'s zero divisors
+    /// already keep. The raise itself is `provable_raise`'s row, which
+    /// reads the same operand through `rounding_argument_raises`.
+    ///
+    /// The kernel is not involved in the divergence: `binary64.floor`
+    /// is the pure IEEE clause and `floor(inf) = inf` is correct there.
+    /// The gate is the adapter declining to read that float answer back
+    /// as a Python `int`, confirmed below.
+    #[test]
+    fn test_math_rounding_of_non_finite_arguments_declines() {
+        let Some(kernel) = loaded_kernel() else { return };
+
+        for name in ["floor", "ceil", "trunc"] {
+            for input in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+                let adapter = math_call_result(name, &[float_operand(input)], &kernel);
+                assert_eq!(
+                    adapter, None,
+                    "math.{name}({input:?}) must answer no value — CPython raises there, so any \
+                     answer claims a Python int that does not exist"
+                );
+            }
+        }
+
+        // The kernel, by contrast, is answering its own question
+        // correctly: binary64.floor of an infinity IS that infinity
+        // under IEEE-754. Confirmed here so the finding cannot be
+        // misread as a kernel defect.
+        let answer = (kernel.transfer)(&unary_question(TransferQuestionOp::Floor, f64::INFINITY));
+        if let Some(k) = kernel_exact_value(&answer) {
+            assert!(
+                k.is_infinite() && k > 0.0,
+                "the kernel's binary64.floor(inf) is inf — the IEEE clause, correctly"
+            );
+        }
+    }
+
+    /// The int-sorted argument rows: `math.floor` of an int is the
+    /// identity, and the kernel's floor over a singleton integer set
+    /// agrees. Included because the int and float argument paths are
+    /// different arms in `single_numeric_operand`.
+    #[test]
+    fn test_math_floor_of_an_int_argument_is_the_identity_and_agrees() {
+        let Some(kernel) = loaded_kernel() else { return };
+
+        for input in [0.0, 1.0, -1.0, 7.0, -7.0, 9007199254740991.0] {
+            let label = format!("math.floor(int {input:?})");
+            let adapter = math_call_result("floor", &[int_operand(input)], &kernel);
+            let answer = (kernel.transfer)(&unary_question(TransferQuestionOp::Floor, input));
+            let adapter_value = adapter.as_ref().and_then(adapter_exact_value);
+            let kernel_value = kernel_exact_value(&answer);
+            assert_scrutiny_row(&label, adapter_value, kernel_value);
+            if let (Some((a, _)), Some(k)) = (adapter_value, kernel_value) {
+                assert_agrees(&label, a, k);
+                assert_eq!(a, input, "{label}: floor of an integer is the identity");
+            }
+        }
+    }
+}

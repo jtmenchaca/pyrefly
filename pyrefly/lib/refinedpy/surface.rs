@@ -57,7 +57,14 @@ pub fn compile_aliases(module: &ModModule) -> HashMap<String, RefinedSet> {
         let Expr::Name(name) = alias.name.as_ref() else {
             continue;
         };
-        let set = annotated_expression_set(alias.value.as_ref(), &imports)
+        // A module-level `type X = ...` alias names ONE set, never a
+        // sequence's own length bounds — `annotated_expression_set`'s
+        // second tuple element (the container length window) has no
+        // slot in this table's `HashMap<String, RefinedSet>` output, so
+        // it is dropped here; only a PARAMETER annotation
+        // (`declared_refinement`'s own call site) reads it.
+        let set = annotated_expression_set(alias.value.as_ref(), &imports, &out)
+            .map(|(set, _length_window)| set)
             .or_else(|| literal_alias_set(alias.value.as_ref()))
             .or_else(|| literal_union_alias_set(alias.value.as_ref()))
             .or_else(|| {
@@ -211,29 +218,48 @@ fn string_literal_set(members: &[String]) -> RefinedSet {
     set
 }
 
-/// `Annotated[int|float|str, Field(…), …]` → the stated set, resolved
-/// against the module's import identities. The `Annotated` head name
-/// must itself resolve to an import of `typing.Annotated` (or
-/// `typing_extensions.Annotated`) — a bare `Annotated` that was never
-/// imported is not recognized. The `int` sort carries the integer form
-/// (int ≠ float is a product law); the `str` sort carries the string
-/// ground (`C*`, codepoint_sets::strings) so a bare `Annotated[str,
-/// Field(…)]` with no length/pattern kwarg still names a set (every
-/// string). Every metadata element must be a recognized `Field(…)`
-/// call (by import identity, not spelling) or the alias refuses.
+/// `Annotated[int|float|str|list[X]|set[X]|Sequence[X], Field(…), …]` →
+/// the stated set, resolved against the module's import identities. The
+/// `Annotated` head name must itself resolve to an import of
+/// `typing.Annotated` (or `typing_extensions.Annotated`) — a bare
+/// `Annotated` that was never imported is not recognized. The `int`
+/// sort carries the integer form (int ≠ float is a product law); the
+/// `str` sort carries the string ground (`C*`, codepoint_sets::strings)
+/// so a bare `Annotated[str, Field(…)]` with no length/pattern kwarg
+/// still names a set (every string). A `list[X]`/`set[X]`/`Sequence[X]`
+/// base carries no scalar set of its own (the empty set, the same
+/// "container states nothing itself" convention
+/// `declared_refinement`'s own bare `list[X]` arm keeps) — this
+/// function only recognizes WHETHER `base` has that shape
+/// (`element_container_element`'s own doc); the element `X` itself is
+/// resolved by the CALLER (`declared_refinement`'s own wildcard
+/// fallthrough), through the ordinary `declared_refinement` recursion
+/// against `aliases`, never duplicated here. Every metadata element
+/// must be a recognized `Field(…)` call (by import identity, not
+/// spelling) or the alias refuses.
 ///
-/// `min_length`/`max_length` fold into ONE repetition window over the
-/// codepoint ground rather than stacking a form per kwarg — pydantic
-/// itself reads them as one window's two edges
-/// (`StringConstraints`/`Len`, PYREFLY-PYDANTIC-SURFACE.md §2.3), and
+/// `min_length`/`max_length` mean two DIFFERENT things depending on the
+/// base's own sort: on a string base they fold into ONE repetition
+/// window over the codepoint ground rather than stacking a form per
+/// kwarg (pydantic itself reads them as one window's two edges —
+/// `StringConstraints`/`Len`, PYREFLY-PYDANTIC-SURFACE.md §2.3, and
 /// `tighten_repetition`'s own reading of chained `.min`/`.max` folds
-/// the same way. `pattern` intersects the compiled grammar set
-/// (`format_grammar`, unanchored search semantics per
-/// AGENT-BRIEF.md's pydantic surface facts) as its own conjoined form
-/// — a length window and a pattern on the same alias both hold at
-/// once, exactly like pydantic validates both constraints on the same
-/// field.
-pub fn annotated_expression_set(value: &Expr, imports: &SurfaceImports) -> Option<RefinedSet> {
+/// the same way); on a `list[X]`/`set[X]`/`Sequence[X]` base they state
+/// the SEQUENCE's own length bounds instead, returned as the second
+/// tuple element (`None` when the base is not a container, or a
+/// container base states no length kwarg) rather than folded into any
+/// `RefinedSet` — `check.rs::seed_parameters` reads this to seed a
+/// bounded repetition (`repeat_of`) in place of the unbounded star.
+/// `pattern` intersects the compiled grammar set (`format_grammar`,
+/// unanchored search semantics per AGENT-BRIEF.md's pydantic surface
+/// facts) as its own conjoined form, string base only — a length window
+/// and a pattern on the same alias both hold at once, exactly like
+/// pydantic validates both constraints on the same field.
+pub fn annotated_expression_set(
+    value: &Expr,
+    imports: &SurfaceImports,
+    aliases: &HashMap<String, RefinedSet>,
+) -> Option<(RefinedSet, Option<(i64, Option<i64>)>)> {
     let Expr::Subscript(subscript) = value else {
         return None;
     };
@@ -248,6 +274,7 @@ pub fn annotated_expression_set(value: &Expr, imports: &SurfaceImports) -> Optio
     };
     let (base, metadata) = arguments.elts.split_first()?;
     let is_string_sort = matches!(base, Expr::Name(sort) if sort.id.as_str() == "str");
+    let is_sequence_base = element_container_element(base, imports, aliases).is_some();
     let mut forms: Vec<Refinement> = match base {
         Expr::Name(sort) if sort.id.as_str() == "int" => vec![integer()],
         // `StrictInt` (pydantic's own strict-mode int type, imported by
@@ -261,6 +288,15 @@ pub fn annotated_expression_set(value: &Expr, imports: &SurfaceImports) -> Optio
         // RefinedSet carries an iterative Drop, so `.forms` cannot move
         // out of a set — std::mem::take is the house pattern (AGENT-BRIEF)
         Expr::Name(sort) if sort.id.as_str() == "str" => std::mem::take(&mut strings().forms),
+        // `list[X]`/`set[X]`/`Sequence[X]` — the container itself states
+        // nothing (the empty set), the same convention
+        // `declared_refinement`'s own bare `list[X]` arm keeps; its
+        // element belongs to `element_container_element`, read once
+        // more below rather than carried through this match arm's own
+        // value (the element set is not returned here — it is not this
+        // function's own `RefinedSet`, and `declared_refinement`'s own
+        // container arm already knows how to read it independently).
+        _ if is_sequence_base => Vec::new(),
         _ => return None,
     };
     let mut min_length: Option<i64> = None;
@@ -278,10 +314,10 @@ pub fn annotated_expression_set(value: &Expr, imports: &SurfaceImports) -> Optio
                     "le" => forms.push(at_most(literal_number(&keyword.value)?)),
                     "lt" => forms.push(below(literal_number(&keyword.value)?)),
                     "multiple_of" => forms.push(multiple_of(literal_number(&keyword.value)?)),
-                    "min_length" if is_string_sort => {
+                    "min_length" if is_string_sort || is_sequence_base => {
                         min_length = Some(literal_length(&keyword.value)?);
                     }
-                    "max_length" if is_string_sort => {
+                    "max_length" if is_string_sort || is_sequence_base => {
                         max_length = Some(literal_length(&keyword.value)?);
                     }
                     "pattern" if is_string_sort => {
@@ -324,14 +360,25 @@ pub fn annotated_expression_set(value: &Expr, imports: &SurfaceImports) -> Optio
             AnnotatedTypesCtor::Le => forms.push(at_most(literal_number(argument)?)),
             AnnotatedTypesCtor::Lt => forms.push(below(literal_number(argument)?)),
             AnnotatedTypesCtor::MultipleOf => forms.push(multiple_of(literal_number(argument)?)),
-            AnnotatedTypesCtor::MinLen if is_string_sort => {
+            AnnotatedTypesCtor::MinLen if is_string_sort || is_sequence_base => {
                 min_length = Some(literal_length(argument)?);
             }
-            AnnotatedTypesCtor::MaxLen if is_string_sort => {
+            AnnotatedTypesCtor::MaxLen if is_string_sort || is_sequence_base => {
                 max_length = Some(literal_length(argument)?);
             }
             AnnotatedTypesCtor::MinLen | AnnotatedTypesCtor::MaxLen => return None,
         }
+    }
+    if is_sequence_base {
+        // the container's own length bounds ride the SECOND tuple slot
+        // — a length window here is a SEQUENCE fact, never a `RefinedSet`
+        // conjunct on the (always empty) container set itself.
+        let length_window = if min_length.is_some() || max_length.is_some() {
+            Some((min_length.unwrap_or(0), max_length))
+        } else {
+            None
+        };
+        return Some((make_refined_set(forms), length_window));
     }
     if min_length.is_some() || max_length.is_some() {
         // the window REPLACES the plain C* ground rather than joining
@@ -348,7 +395,39 @@ pub fn annotated_expression_set(value: &Expr, imports: &SurfaceImports) -> Optio
         forms.retain(|f| f != plain_ground);
         forms.extend(std::mem::take(&mut window.forms));
     }
-    Some(make_refined_set(forms))
+    Some((make_refined_set(forms), None))
+}
+
+/// Whether `base` (the first slot of an `Annotated[...]` subscript) is
+/// itself a `list[X]`/`set[X]`/`Sequence[X]` container shape — recognized
+/// by bare-Name head only, the same no-import-identity convention
+/// `declared_refinement`'s own container arm takes. Returns the element
+/// EXPRESSION (unread — `declared_refinement`'s own container arm, not
+/// this function, is what actually resolves it against `aliases` and
+/// builds the `DeclaredRefinement`); this function only answers WHETHER
+/// `base` has this shape, so `annotated_expression_set` can gate its
+/// `min_length`/`max_length` reading onto "a container base" without
+/// duplicating the element-resolution work `declared_refinement`
+/// already owns. `_imports`/`_aliases` are unused today (the element
+/// itself is never read here) but kept in the signature so a future
+/// caller that DOES need the resolved element does not have to thread
+/// them in fresh.
+fn element_container_element<'a>(
+    base: &'a Expr,
+    _imports: &SurfaceImports,
+    _aliases: &HashMap<String, RefinedSet>,
+) -> Option<&'a Expr> {
+    let Expr::Subscript(subscript) = base else {
+        return None;
+    };
+    let is_container_head = matches!(
+        subscript.value.as_ref(),
+        Expr::Name(head) if head.id.as_str() == "list" || head.id.as_str() == "set" || head.id.as_str() == "Sequence"
+    );
+    if !is_container_head {
+        return None;
+    }
+    Some(subscript.slice.as_ref())
 }
 
 /// The codepoint ground (`C`, one scalar) `min_length`/`max_length`
@@ -437,7 +516,7 @@ fn annotated_types_argument<'a>(call: &'a ruff_python_ast::ExprCall, imports: &S
 pub struct SurfaceImports {
     field_names: HashSet<String>,
     pydantic_modules: HashSet<String>,
-    annotated_names: HashSet<String>,
+    pub(crate) annotated_names: HashSet<String>,
     strict_int_names: HashSet<String>,
     annotated_types_ge: HashSet<String>,
     annotated_types_gt: HashSet<String>,

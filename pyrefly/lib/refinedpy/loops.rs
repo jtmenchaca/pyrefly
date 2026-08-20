@@ -1729,6 +1729,7 @@ mod tests {
             spelling: "Age".to_owned(),
             admits_none: false,
             element: None,
+            element_length: None,
             generator: None,
             members: None,
             positions: None,
