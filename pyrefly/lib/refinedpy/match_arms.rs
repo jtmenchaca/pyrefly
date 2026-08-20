@@ -203,33 +203,63 @@ fn pattern_outcome(
 }
 
 /// `MatchValue` — "`LITERAL` will succeed only if `<subject> ==
-/// LITERAL`." Decided only when `subject` is a known single numeric or
-/// boolean value AND the pattern's own expression evaluates (via
-/// `evaluate_expression`, which forces the walk's OWN literal rules) to
-/// a known single numeric or boolean value; `==` is CPython's
-/// value-equality, which for two host-numeric-sorted values is plain
-/// float equality — `1 == True` and `1 == 1.0` both hold, so a
-/// Number-tagged subject of 1 DOES take `case 1:` and `case True:`'s
-/// VALUE reading would too if it appeared as a MatchValue (it never
-/// does — `True` always parses as MatchSingleton, never MatchValue).
+/// LITERAL`." Decided when `subject` and the pattern's own evaluated
+/// expression (via `evaluate_expression`, which forces the walk's OWN
+/// literal rules) are BOTH known single numeric/boolean values, or BOTH
+/// known exact strings — the two `==` rows CPython's own equality
+/// actually reaches for a `MatchValue` pattern (expressions.rst,
+/// "Comparisons": numeric types compare by mathematical value, strings
+/// compare by their code-point sequence). Numeric: `1 == True` and
+/// `1 == 1.0` both hold, so a Number-tagged subject of 1 DOES take
+/// `case 1:` and `case True:`'s VALUE reading would too if it appeared
+/// as a MatchValue (it never does — `True` always parses as
+/// MatchSingleton, never MatchValue). String: `case "left":` against a
+/// String-tagged subject compares the code-point vectors directly, the
+/// same reading `expressions.rs::exact_string_values` gives an ordinary
+/// `==` comparison — this is what lets `anchor_of`'s own `match o: case
+/// "left": ...` decide its arm for a concrete `Literal["left", ...]`
+/// argument instead of falling through to the undecided join over every
+/// arm. A subject/pattern pair that is neither both-numeric nor
+/// both-string (or one side unknown) is Undecidable.
 fn match_value_outcome(
     value_pattern: &ruff_python_ast::PatternMatchValue,
     subject: &AbstractValue,
     environment: &Environment,
     kernel: &Arc<RefinedTSKernel>,
 ) -> ArmOutcome {
-    let Some(subject_value) = single_numeric_value(subject) else {
-        return ArmOutcome::Undecidable;
-    };
     let literal_value = evaluate_expression(&value_pattern.value, environment, kernel);
-    let Some(pattern_value) = single_numeric_value(&literal_value) else {
-        return ArmOutcome::Undecidable;
-    };
-    if subject_value == pattern_value {
-        ArmOutcome::Taken(environment.fork())
-    } else {
-        ArmOutcome::NotTaken
+    if let (Some(subject_value), Some(pattern_value)) =
+        (single_numeric_value(subject), single_numeric_value(&literal_value))
+    {
+        return if subject_value == pattern_value {
+            ArmOutcome::Taken(environment.fork())
+        } else {
+            ArmOutcome::NotTaken
+        };
     }
+    if let (Some(subject_text), Some(pattern_text)) =
+        (exact_string_values(subject), exact_string_values(&literal_value))
+    {
+        return if subject_text == pattern_text {
+            ArmOutcome::Taken(environment.fork())
+        } else {
+            ArmOutcome::NotTaken
+        };
+    }
+    ArmOutcome::Undecidable
+}
+
+/// The code-point vector an AbstractValue carries, if it is a known
+/// exact string (`Kind::Values` tagged `PrimitiveKind::String`) —
+/// `expressions.rs::exact_string_values`'s own twin, reimplemented
+/// locally rather than imported (this file's own "no importing
+/// loops.rs" precedent, `generator_yields`'s own doc, applied to
+/// expressions.rs's private helper the same way).
+fn exact_string_values(value: &AbstractValue) -> Option<&[f64]> {
+    if value.kind != Kind::Values || value.kind_tag != Some(PrimitiveKind::String) {
+        return None;
+    }
+    Some(&value.values)
 }
 
 /// `MatchSingleton` — "For the singletons `None`, `True` and `False`,
@@ -824,6 +854,32 @@ mod tests {
         let environment = empty_environment();
         let outcome = arm_outcome(&cases[0].pattern, cases[0].guard.as_deref(), &subject, &environment, &kernel);
         assert!(matches!(outcome, ArmOutcome::NotTaken), "2 must not match `case 1:`");
+    }
+
+    /// `anchor_of`'s own row: a String-tagged subject against a
+    /// string-literal `MatchValue` pattern (`case "left":`) is DECIDED,
+    /// not Undecidable — the fix this file's own doc now names.
+    #[test]
+    fn string_value_pattern_hit() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let cases = match_cases("match x:\n    case \"left\":\n        pass\n");
+        let subject = crate::refinedpy::string_models::string_literal_value("left");
+        let environment = empty_environment();
+        let outcome = arm_outcome(&cases[0].pattern, cases[0].guard.as_deref(), &subject, &environment, &kernel);
+        assert!(matches!(outcome, ArmOutcome::Taken(_)), "\"left\" must match `case \"left\":`");
+    }
+
+    /// The miss half of the same shape: a different known string subject
+    /// against the same literal pattern decides NotTaken, not
+    /// Undecidable.
+    #[test]
+    fn string_value_pattern_miss() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let cases = match_cases("match x:\n    case \"left\":\n        pass\n");
+        let subject = crate::refinedpy::string_models::string_literal_value("right");
+        let environment = empty_environment();
+        let outcome = arm_outcome(&cases[0].pattern, cases[0].guard.as_deref(), &subject, &environment, &kernel);
+        assert!(matches!(outcome, ArmOutcome::NotTaken), "\"right\" must not match `case \"left\":`");
     }
 
     /// The brief's pinned fact: a Number-tagged subject of 1 falls

@@ -6,18 +6,22 @@
  */
 
 //! Kernel artifact resolution, shared by the LSP seam and the check
-//! CLI: `REFINEDPY_KERNEL_DYLIB` wins; otherwise the current
-//! directory's ancestors are searched for the in-repo artifact, then
-//! the executable's own ancestors — an editor spawns the server with
-//! the workspace as its working directory, and the binary itself
-//! lives inside the repository.
+//! CLI: the current directory's ancestors are searched for the in-repo
+//! artifact, then the executable's own ancestors — an editor spawns
+//! the server with the workspace as its working directory, and the
+//! binary itself lives inside the repository.
+//!
+//! There is no environment-variable override. A path read from the
+//! environment lets a stale or foreign artifact answer questions the
+//! repository's own kernel would answer differently, and it hides a
+//! missing build behind a working run — the artifact either sits where
+//! the layout says, or every check honestly declines.
 
 use std::path::Path;
 use std::path::PathBuf;
 
 /// The kernel artifact's path inside the TypeRefinery repository.
-const KERNEL_DYLIB_RELATIVE: &str =
-    "packages/refinedts/refined-ts-lean/native/build/librefinedts_kernel.dylib";
+const KERNEL_DYLIB_RELATIVE: &str = "packages/refined-lean/native/build/librefined_kernel.dylib";
 
 /// Resolve the kernel dylib path, or `None` when no artifact exists —
 /// in which case every check declines.

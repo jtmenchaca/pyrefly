@@ -1731,6 +1731,7 @@ mod tests {
             element: None,
             generator: None,
             members: None,
+            positions: None,
         }
     }
 

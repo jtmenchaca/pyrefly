@@ -1779,6 +1779,18 @@ fn interpret_if(
 /// — but `assume`'s narrowing channel reads the SAME call shape and
 /// tightens the binding directly), mirroring `check.rs::walk_if`'s own
 /// per-arm `assume` call for the ordinary walk.
+///
+/// An arm the narrowing just proved IMPOSSIBLE for this call's concrete
+/// arguments (`narrowing::arm_is_infeasible`) is skipped WITHOUT
+/// interpreting its body — the same `pick_years(200)` call's own
+/// `isinstance(value, int)` FALSE arm narrows `value` to the empty set
+/// (200 genuinely is an int), and CPython never runs `return
+/// len(value)` for this call at all; interpreting it anyway and letting
+/// its own unmodeled `len()` call decline would sink the WHOLE call
+/// (the `?` on `interpret_body`'s result) even though the arm actually
+/// taken (`return value`) is fully readable. A dead arm contributes no
+/// surviving fork and no return value — the same as any other
+/// terminating arm, just reached for a different reason.
 fn interpret_undecided_arms(
     arms: &[(Option<&Expr>, &[Stmt])],
     kernel: &Arc<RefinedTSKernel>,
@@ -1792,13 +1804,19 @@ fn interpret_undecided_arms(
     for (arm_index, (test, body)) in arms.iter().enumerate() {
         has_catch_all = has_catch_all || test.is_none();
         let mut arm_environment = environment.fork();
+        let mut infeasible = false;
         for (earlier_test, _) in arms.iter().take(arm_index) {
             if let Some(earlier_test) = earlier_test {
                 arm_environment = narrowing::assume(earlier_test, arm_environment, kernel, false);
+                infeasible = infeasible || narrowing::arm_is_infeasible(earlier_test, &arm_environment);
             }
         }
         if let Some(test_expr) = test {
             arm_environment = narrowing::assume(test_expr, arm_environment, kernel, true);
+            infeasible = infeasible || narrowing::arm_is_infeasible(test_expr, &arm_environment);
+        }
+        if infeasible {
+            continue;
         }
         let falls_through = interpret_body(body, kernel, depth, &mut arm_environment, returns, super_resolver)?;
         if falls_through {
@@ -1814,12 +1832,26 @@ fn interpret_undecided_arms(
         // when EVERY test in `arms` was false, so it is narrowed by all
         // of them the same way an explicit later arm would be.
         let mut fallthrough_environment = environment.fork();
+        let mut fallthrough_infeasible = false;
         for (test, _) in arms {
             if let Some(test_expr) = test {
                 fallthrough_environment = narrowing::assume(test_expr, fallthrough_environment, kernel, false);
+                fallthrough_infeasible =
+                    fallthrough_infeasible || narrowing::arm_is_infeasible(test_expr, &fallthrough_environment);
             }
         }
-        surviving.push(fallthrough_environment);
+        // A fallthrough narrowing already proven impossible for this
+        // call's concrete arguments (`pick_years(200)`'s own `value`
+        // narrowed to the empty Integer set once `isinstance(value,
+        // int)` proved true) is never reached by CPython — the
+        // statement after the `if` (`return len(value)`) is dead code
+        // for THIS call, so it must not contribute a surviving fork
+        // (or be walked at all): a surviving-but-impossible fork is
+        // exactly what let an unrelated, unmodeled construct in dead
+        // code decline the whole call.
+        if !fallthrough_infeasible {
+            surviving.push(fallthrough_environment);
+        }
     }
 
     *environment = match surviving.len() {
@@ -2226,6 +2258,51 @@ mod tests {
         let result = call_result(&def, &[], None, &kernel, 0)
             .expect("the `global` declaration is a no-op; the following write/read resolve normally");
         assert_eq!(result, known_int(15.0));
+    }
+
+    /// e-class-and-function.py's own `pick_years` shape: `if
+    /// isinstance(value, int): return value` with no `else`, followed by
+    /// `return len(value)` as the NEXT top-level statement. Calling with
+    /// a concrete int argument (200) takes the isinstance-true arm; the
+    /// FALSE arm's own fallthrough narrows `value` to the empty set (200
+    /// really is an int), so `return len(value)` — unmodeled on a
+    /// non-string `Kind::Values` — is dead code for this call and must
+    /// never run. Before `interpret_undecided_arms`/the fallthrough
+    /// branch recognized that dead arm as unreachable, walking it anyway
+    /// let `len`'s own decline sink the WHOLE call to `None`, even
+    /// though the arm actually taken answers cleanly.
+    #[test]
+    fn call_result_skips_a_fallthrough_arm_narrowing_proves_unreachable() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let def = parsed_def(concat!(
+            "def pick_years(value):\n",
+            "    if isinstance(value, int):\n",
+            "        return value\n",
+            "    return len(value)\n",
+        ));
+        let result = call_result(&def, &[known_int(200.0)], None, &kernel, 0)
+            .expect("the isinstance-true arm answers the call; the dead len(value) arm must not decline it");
+        assert_eq!(result, known_int(200.0));
+    }
+
+    /// The same shape's OTHER branch: an explicit `elif`/second arm
+    /// (rather than an implicit fallthrough) that is itself narrowed
+    /// infeasible must also be skipped rather than interpreted — pins
+    /// `interpret_undecided_arms`'s own per-arm infeasibility check
+    /// (`narrowing::arm_is_infeasible`), not just the fallthrough one.
+    #[test]
+    fn call_result_skips_an_explicit_elif_arm_narrowing_proves_unreachable() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let def = parsed_def(concat!(
+            "def pick_years(value):\n",
+            "    if isinstance(value, int):\n",
+            "        return value\n",
+            "    else:\n",
+            "        return len(value)\n",
+        ));
+        let result = call_result(&def, &[known_int(200.0)], None, &kernel, 0)
+            .expect("the isinstance-true arm answers the call; the dead else arm must not decline it");
+        assert_eq!(result, known_int(200.0));
     }
 
     // --- return_sort_fallback: declined-call sort fallback ---

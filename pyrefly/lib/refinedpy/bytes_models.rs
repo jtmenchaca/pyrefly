@@ -102,6 +102,29 @@ pub enum BytesAnswer {
     Raises(String),
 }
 
+/// The species word a bytes-like `Kind::List` value carries on its own
+/// `kind_word` — the same "extra species tag riding a shared shape"
+/// pattern `env.rs`'s `FUNCTION_VALUE_WORD` already uses on `Kind::Object`
+/// (a retained lambda/def is still `Kind::Object`, distinguished only by
+/// its word). No existing reader in this file's own package inspects
+/// `kind_word` on a `Kind::List` value (every `kind_word` match elsewhere
+/// gates on `Kind::Object` first — `assignability.rs`, `collection_
+/// models.rs`, `env.rs`), so tagging a list this way is invisible to
+/// every read/join/judge path that does not explicitly ask for it, and
+/// `known_list`'s own zero value never sets it — an ordinary `list`/
+/// `tuple` literal carries `kind_word: None` exactly as before.
+///
+/// Three words, not one: `bytes` (immutable — ANY element write raises
+/// `TypeError`, `bytearray_write_answer`'s sibling below has no row for
+/// it), `bytearray` (mutable, `ValueError` outside `0..=255`), and
+/// `memoryview` (mutable over a shared buffer, the SAME `0..=255` range
+/// but a DIFFERENT `ValueError` wording — `bytes_models.rs`'s own module
+/// doc). `bytes_write_answer` below reads whichever of the three a
+/// receiver carries to pick the right rule.
+pub const BYTES_WORD: &str = "a bytes value";
+pub const BYTEARRAY_WORD: &str = "a bytearray value";
+pub const MEMORYVIEW_WORD: &str = "a memoryview value";
+
 /// A `bytes`/`bytearray` display built from KNOWN element values
 /// (`bytes([10, 20, 30])`, `bytearray(b"\x0a\x14")`'s literal form) —
 /// `Kind::List` with one Integer-tagged `known_values` slot per byte,
@@ -274,6 +297,49 @@ pub fn memoryview_write_answer(value: &AbstractValue) -> Option<BytesAnswer> {
         "this write provably raises ValueError: memoryview: invalid value for format 'B'"
             .to_owned(),
     ))
+}
+
+/// Stamps `word` (one of the three constants above) onto a `Kind::List`
+/// value's own `kind_word` — a bytes-like construction call's own last
+/// step, so the receiver a later write reads carries which of the three
+/// write rules applies. A non-`Kind::List` value passes through
+/// unchanged (never stamped): this tag means nothing outside the one
+/// `Kind` it is read against.
+pub fn tagged(value: AbstractValue, word: &'static str) -> AbstractValue {
+    if value.kind != Kind::List {
+        return value;
+    }
+    AbstractValue {
+        kind_word: Some(word),
+        ..value
+    }
+}
+
+/// `receiver[index] = value` on a receiver carrying one of this file's
+/// own three species words (`BYTES_WORD`/`BYTEARRAY_WORD`/`MEMORYVIEW_
+/// WORD`, `tagged`'s own doc) — the one write-time dispatch every
+/// bytes-like receiver's write goes through, so `check.rs`'s write sink
+/// does not itself need to know which of the three rules applies.
+///
+/// `bytes` is IMMUTABLE: `stdtypes.rst`'s own "Bytes objects are
+/// immutable sequences" states there is no `__setitem__` at all, so
+/// EVERY write RAISES, regardless of the value (execution-verified:
+/// `bytes([1,2])[0] = 1` raises `TypeError: 'bytes' object does not
+/// support item assignment` even though 1 is a perfectly in-range
+/// byte). `bytearray`/`memoryview` route to their own existing
+/// range-checked answer. A receiver with no recognized word (a plain
+/// `list`/`tuple`, `kind_word: None`) answers `None`: this function has
+/// no rule for it, and the caller's own existing `list_with_item` path
+/// is the honest one to keep using.
+pub fn bytes_write_answer(receiver: &AbstractValue, value: &AbstractValue) -> Option<BytesAnswer> {
+    match receiver.kind_word {
+        Some(BYTES_WORD) => Some(BytesAnswer::Raises(
+            "this write provably raises TypeError: 'bytes' object does not support item assignment".to_owned(),
+        )),
+        Some(BYTEARRAY_WORD) => bytearray_write_answer(value),
+        Some(MEMORYVIEW_WORD) => memoryview_write_answer(value),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -499,5 +565,66 @@ mod tests {
     #[test]
     fn memoryview_write_unknown_value_declines() {
         assert!(memoryview_write_answer(&refined_domain::abstract_value::unknown()).is_none());
+    }
+
+    // --- tagged ---
+
+    #[test]
+    fn tagged_stamps_kind_word_on_a_list_value() {
+        let list = bytes_literal_value(&[0]);
+        let stamped = tagged(list, BYTEARRAY_WORD);
+        assert_eq!(stamped.kind, Kind::List);
+        assert_eq!(stamped.kind_word, Some(BYTEARRAY_WORD));
+    }
+
+    #[test]
+    fn tagged_leaves_a_non_list_value_unstamped() {
+        // a receiver this function never claims to know how to tag (an
+        // unrecognized memoryview argument, for instance) passes through
+        // exactly as `bytes_like_construction_value`'s own decline already
+        // states — no accidental tag on a shape this file does not own.
+        let scalar = integer(40.0);
+        let stamped = tagged(scalar.clone(), BYTEARRAY_WORD);
+        assert_eq!(stamped, scalar);
+        assert_eq!(stamped.kind_word, None);
+    }
+
+    // --- bytes_write_answer: species dispatch ---
+
+    #[test]
+    fn bytes_write_answer_on_a_bytearray_receiver_uses_the_bytearray_rule() {
+        let receiver = tagged(bytes_literal_value(&[0]), BYTEARRAY_WORD);
+        let message = unwrap_raises(bytes_write_answer(&receiver, &integer(256.0)).expect("must decide"));
+        assert!(message.contains("byte must be in range(0, 256)"), "{message}");
+    }
+
+    #[test]
+    fn bytes_write_answer_on_a_memoryview_receiver_uses_the_memoryview_rule() {
+        let receiver = tagged(bytes_literal_value(&[0]), MEMORYVIEW_WORD);
+        let message = unwrap_raises(bytes_write_answer(&receiver, &integer(256.0)).expect("must decide"));
+        assert!(message.contains("memoryview: invalid value for format 'B'"), "{message}");
+    }
+
+    #[test]
+    fn bytes_write_answer_on_a_bytes_receiver_always_raises_type_error() {
+        // p-typed-array.py `bytes_is_immutable`: `frozen[0] = 99` raises
+        // even though 99 is a perfectly in-range byte — bytes has no
+        // __setitem__ at all, so the VALUE never matters.
+        let receiver = tagged(bytes_literal_value(&[10, 20]), BYTES_WORD);
+        let message = unwrap_raises(bytes_write_answer(&receiver, &integer(99.0)).expect("must decide"));
+        assert!(message.contains("TypeError"), "{message}");
+        assert!(message.contains("'bytes' object does not support item assignment"), "{message}");
+    }
+
+    #[test]
+    fn bytes_write_answer_on_an_untagged_list_declines() {
+        // a plain list/tuple (kind_word: None) has no rule this function
+        // owns — the caller's own list_with_item path is the honest one.
+        let receiver = list_literal_value_for_test();
+        assert!(bytes_write_answer(&receiver, &integer(200.0)).is_none());
+    }
+
+    fn list_literal_value_for_test() -> AbstractValue {
+        known_list(vec![integer(1.0), integer(2.0)], TrustProved)
     }
 }

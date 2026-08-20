@@ -292,6 +292,117 @@ pub fn judge(
             return Verdict::Silent;
         }
     }
+    // The POSITIONS LAW: a fixed-arity tuple declaration (`declared.
+    // positions` Some, `declared.set` unused/empty, the same "one active
+    // field" convention `element` keeps) judges EACH SLOT against ITS OWN
+    // refinement, keyed by index rather than by name — unlike the ELEMENT
+    // LAW above, which shares one refinement across every position of a
+    // `list[X]`/`set[X]`, a fixed-arity tuple's positions are checked
+    // separately. Only a known List with the SAME LENGTH as `positions`
+    // is judged this way; a length mismatch is the same structural
+    // mismatch CPython itself would reject the annotation over, so it
+    // fires rather than sitting undetermined. `None` is its own explicit
+    // arm (`admits_none` wins exactly like the element/members laws); any
+    // other value shape (an opaque object, an unresolved value) falls
+    // through undetermined rather than guessing a structural mismatch
+    // that may not hold. The first Fire among the positions wins, naming
+    // the offending index; any Undetermined position makes the whole
+    // judgment Undetermined; every position Silent is Silent.
+    if let Some(positions) = &declared.positions {
+        if value.kind == Kind::Null {
+            return if declared.admits_none {
+                Verdict::Silent
+            } else {
+                Verdict::Fire(format!(
+                    "a value of type 'None' is not assignable to type '{}'",
+                    declared.spelling,
+                ))
+            };
+        }
+        if value.kind == Kind::List {
+            if value.items.len() != positions.len() {
+                return Verdict::Fire(format!(
+                    "a value of {} elements is not assignable to type '{}'",
+                    value.items.len(),
+                    declared.spelling,
+                ));
+            }
+            for (index, (item, position_declared)) in value.items.iter().zip(positions.iter()).enumerate() {
+                match judge(item, position_declared, kernel) {
+                    Verdict::Fire(message) => {
+                        return Verdict::Fire(format!("{message} (at index {index})"));
+                    }
+                    Verdict::Undetermined(sentence) => return Verdict::Undetermined(sentence),
+                    Verdict::Silent => {}
+                }
+            }
+            return Verdict::Silent;
+        }
+        return Verdict::Undetermined(
+            "a fixed-arity-tuple-declared position holds a value this table does not yet read".to_owned(),
+        );
+    }
+    // The MEMBERS LAW: a TypedDict declaration (`declared.members` Some,
+    // `declared.set` unused/empty, the same "one active field"
+    // convention `element` keeps) judges EACH NAMED MEMBER against ITS
+    // OWN refinement — unlike the ELEMENT LAW above, which shares one
+    // refinement across every key, a TypedDict's members are
+    // heterogeneous, so each declared name carries its own set. Only a
+    // known Object with no `kind_word` (a dict literal) is judged this
+    // way; `None` is its own explicit arm (`admits_none` wins exactly
+    // like the element law); a `Kind::List` is the same structural
+    // mismatch the element law already fires for a container
+    // declaration. Anything else this table has not yet read (an opaque
+    // object, an unresolved value) falls through undetermined rather
+    // than guessing a structural mismatch that may not hold. A declared
+    // member ABSENT from the value's own keys is not judged at all (an
+    // absent key states nothing this table can read into a member's own
+    // set, matching `judge_construction`'s honest-absence convention
+    // elsewhere in this checker); an extra key the declaration does not
+    // name is likewise not judged — TypedDict's own `total=True` default
+    // requires every declared key to be present at runtime, but a
+    // structural extra-key refusal is a different check this row does
+    // not ask for. The first Fire among the declared members wins,
+    // naming the offending member; any Undetermined member makes the
+    // whole judgment Undetermined; all declared members present and
+    // Silent is Silent.
+    if let Some(members) = &declared.members {
+        if value.kind == Kind::Null {
+            return if declared.admits_none {
+                Verdict::Silent
+            } else {
+                Verdict::Fire(format!(
+                    "a value of type 'None' is not assignable to type '{}'",
+                    declared.spelling,
+                ))
+            };
+        }
+        if value.kind == Kind::List {
+            return Verdict::Fire(format!(
+                "a value of type 'a list' is not assignable to type '{}'",
+                declared.spelling,
+            ));
+        }
+        if value.kind == Kind::Object && value.kind_word.is_none() {
+            for (member_name, member_declared) in members {
+                let Some(member_value) = value.keys.iter().find(|key| key.name == *member_name && !key.numeric)
+                else {
+                    continue;
+                };
+                match judge(&member_value.value, member_declared, kernel) {
+                    Verdict::Fire(message) => {
+                        return Verdict::Fire(format!("{message} (at key '{member_name}')"));
+                    }
+                    Verdict::Undetermined(sentence) => return Verdict::Undetermined(sentence),
+                    Verdict::Silent => {}
+                }
+            }
+            return Verdict::Silent;
+        }
+        return Verdict::Undetermined(
+            "a TypedDict-declared position holds a value this table does not yet read".to_owned(),
+        );
+    }
     if value.kind == Kind::Object && value.kind_word.is_some() {
         let scalar_ground = scalar_or_string_shaped(&declared.set);
         if scalar_ground {
@@ -458,15 +569,52 @@ pub fn judge(
             ));
         }
         // CONTAINMENT-REFUTATION LAW: the checked position IS the claim
-        // `flowing ⊆ declared`. `scalar_subset` proves it (silent);
-        // a decided `false` refutes it — whether by a proved disjoint or
-        // a proved overlap, both fire. A REFUSAL (a set shape the
-        // kernel's subset decider does not decide — e.g. a concatenation
-        // pattern against a length window today) PANICS inside the
-        // kernel closure rather than returning a boolean; that panic is
-        // caught here and answered as Undetermined naming the refusal —
-        // never read as a refutation (refined-ts-go's containedInAsked
-        // recover()s the same way).
+        // `flowing ⊆ declared`. `scalar_subset` proves it on the 1-tuple
+        // layer (silent on `true`); a decided `false` refutes it —
+        // whether by a proved disjoint or a proved overlap, both fire. A
+        // REFUSAL (a set shape the kernel's subset decider does not
+        // decide — e.g. a concatenation pattern against a length window
+        // today) PANICS inside the kernel closure rather than returning a
+        // boolean; that panic is caught here and answered as Undetermined
+        // naming the refusal — never read as a refutation (refined-ts-go's
+        // containedInAsked recover()s the same way).
+        //
+        // SEQUENCE-SHAPED SETS (a string-literal union, e.g. `anchor_of`'s
+        // own `Literal["end", "start", "middle"]` narrowed by a `match` to
+        // one member) are never scalar (1-tuple) shaped, so
+        // `scalar_subset` always refuses them — `kernelScalarSubset`'s own
+        // export fails outright unless BOTH sides are `scalarB`
+        // (exports_sets.lean). Either side being sequence-shaped
+        // (`sequence_shaped`, this file's own recursive Star/Concatenation/
+        // Repeat/RepeatWord/EmptyTuple/Union/Difference test) tries
+        // `seq_subset` FIRST — the kernel's own sequence-shape decider
+        // (`kernelSeqSubset`'s doc: "a theorem in both directions" for
+        // every branch that answers at all; the pattern-placement route's
+        // `false` is likewise a proved separating witness, never a bare
+        // "no proof found" — only a witness-less search still refuses).
+        // `scalar_subset` is tried only as the FALLBACK when `seq_subset`
+        // itself refuses (both panics caught the same way), since a set
+        // that is sequence-shaped by this file's own test may still sit
+        // on the 1-tuple layer too (the tuple pun) and the scalar decider
+        // can occasionally settle what the sequence route could not.
+        let sequence_question = sequence_shaped(&value.set) || sequence_shaped(&declared.set);
+        if sequence_question {
+            let seq_asked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                (kernel.seq_subset)(&value.set, &declared.set)
+            }));
+            match seq_asked {
+                Ok(true) => return Verdict::Silent,
+                Ok(false) => {
+                    return Verdict::Fire(format!(
+                        "a value of type '{}' is not assignable to type '{}' ({}) — the flowing set admits values outside the declared set",
+                        refined_sets::format_for_diagnostics::format_for_diagnostics(&value.set),
+                        declared.spelling,
+                        refined_sets::format_for_diagnostics::format_for_diagnostics(&declared.set),
+                    ));
+                }
+                Err(_) => {}
+            }
+        }
         let asked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             (kernel.scalar_subset)(&value.set, &declared.set)
         }));
@@ -516,11 +664,33 @@ fn scalar_or_string_shaped(set: &refined_sets::refinement_forms::RefinedSet) -> 
     on_one_tuple_layer(set) || is_string_ground(set) || sequence_shaped(set)
 }
 
+/// A `Star`/`Repeat`/`RepeatWord` form's own element sits inside the
+/// codepoint alphabet — the same gate `is_character` (`refined_sets::
+/// format_string_shapes`) checks for the identical reason there: this
+/// crate's grammar reuses `Star` for a NUMERIC element too
+/// (`check.rs::seed_parameters`'s `list[int]`/`set[int]`/`Sequence[int]`
+/// parameter seed, `Form::Star(int's own set)`), so a bare repetition
+/// form is string-shaped only when its element demonstrably IS
+/// codepoints, never merely because it wears one of these forms.
+fn repetition_element_is_codepoints(form: &refined_sets::refinement_forms::Refinement) -> bool {
+    let one = refined_sets::refinement_forms::make_refined_set(vec![form.clone()]);
+    match refined_sets::repetition_window_forms::as_repetition(&one) {
+        Some(repeated) => refined_sets::format_string_shapes::is_character(&repeated.element),
+        None => false,
+    }
+}
+
 fn sequence_shaped(set: &refined_sets::refinement_forms::RefinedSet) -> bool {
     use refined_sets::refinement_forms::Form;
     !set.forms.is_empty()
         && set.forms.iter().all(|form| match form.form {
-            Form::EmptyTuple | Form::Concatenation | Form::Star | Form::Repeat | Form::RepeatWord => true,
+            // EmptyTuple/Concatenation carry no separate "element sort" of
+            // their own (an EmptyTuple names no element at all; a
+            // Concatenation's operands are themselves nested sets this
+            // crate only ever builds over codepoints — `string_tuple`'s
+            // own encoding) — string-shaped exactly as before.
+            Form::EmptyTuple | Form::Concatenation => true,
+            Form::Star | Form::Repeat | Form::RepeatWord => repetition_element_is_codepoints(form),
             Form::Union | Form::Difference => {
                 form.a_.as_deref().map(sequence_shaped).unwrap_or(false)
                     && form.b.as_deref().map(sequence_shaped).unwrap_or(false)
@@ -705,6 +875,7 @@ mod tests {
             element: None,
             generator: None,
             members: None,
+            positions: None,
         }
     }
 
@@ -718,6 +889,7 @@ mod tests {
             element: None,
             generator: None,
             members: None,
+            positions: None,
         }
     }
 
@@ -784,6 +956,7 @@ mod tests {
             element: None,
             generator: None,
             members: None,
+            positions: None,
         };
         let thirty_float = known_values(vec![30.0], PrimitiveKind::Float, TrustProved);
         assert!(matches!(judge(&thirty_float, &declared, &kernel), Verdict::Silent));
@@ -804,6 +977,7 @@ mod tests {
             element: None,
             generator: None,
             members: None,
+            positions: None,
         }
     }
 
@@ -820,6 +994,7 @@ mod tests {
             element: None,
             generator: None,
             members: None,
+            positions: None,
         }
     }
 
@@ -875,6 +1050,7 @@ mod tests {
             element: None,
             generator: None,
             members: None,
+            positions: None,
         }
     }
 
@@ -927,6 +1103,7 @@ mod tests {
             element: None,
             generator: None,
             members: None,
+            positions: None,
         };
         let value = refined_domain::abstract_value::null_value();
         let Verdict::Fire(message) = judge(&value, &two_member_declared, &kernel) else {
@@ -1006,6 +1183,7 @@ mod tests {
             element: None,
             generator: None,
             members: None,
+            positions: None,
         }
     }
 
@@ -1126,6 +1304,7 @@ mod tests {
             element: None,
             generator: None,
             members: None,
+            positions: None,
         };
         let value = refined_domain::abstract_value::opaque_value("a function value");
         assert!(matches!(judge(&value, &declared, &kernel), Verdict::Undetermined(_)));
@@ -1226,6 +1405,32 @@ mod tests {
         assert!(matches!(judge(&value, &declared, &kernel), Verdict::Undetermined(_)));
     }
 
+    /// A NUMERIC star (`list[int]`'s own element-read shape,
+    /// `Form::Star(int's set)` — `refinedpy::collection_models::
+    /// subscript_read`'s new `Kind::Set` arm hands this exact shape back
+    /// for `ages[0]`) against `Age` must NOT take the string-sort law:
+    /// before `sequence_shaped` learned to check the star's own alphabet,
+    /// ANY `Form::Star` read as string-shaped regardless of its element,
+    /// which would have wrongly fired "a string-sorted value is never in
+    /// an int-sorted set" here even though the element is a whole number.
+    /// The correct path is the CONTAINMENT law: the unbounded int ray is
+    /// not a subset of Age's `[0, 120]` window, so this fires the
+    /// CONTAINMENT message instead.
+    #[test]
+    fn a_numeric_star_shaped_set_into_age_fires_containment_not_the_sort_law() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let declared = age_refinement();
+        let whole_ints = make_refined_set(vec![integer(), refined_sets::refinement_forms::at_least(f64::NEG_INFINITY)]);
+        let numeric_star = make_refined_set(vec![refined_sets::refinement_forms::star(whole_ints)]);
+        let value = known_set(numeric_star, None, TrustProved, SetKindTag::None);
+        let message = fire_message(judge(&value, &declared, &kernel));
+        assert!(message.contains("'Age'"), "{message}");
+        assert!(
+            message.contains("admits values outside"),
+            "must fire the CONTAINMENT message, not the string-sort law: {message}"
+        );
+    }
+
     /// The FLOAT-SORT SET law: a Float-sorted Set (`float_sorted_unknown`
     /// — the shape `math.sqrt`'s result carries) against Age (int-sorted)
     /// fires — a float-sorted value is never a member of an int-sorted
@@ -1261,6 +1466,7 @@ mod tests {
             element: None,
             generator: None,
             members: None,
+            positions: None,
         };
         let value = refined_domain::abstract_value::float_sorted_unknown();
         let message = fire_message(judge(&value, &declared, &kernel));
@@ -1348,6 +1554,81 @@ mod tests {
         assert!(sentence.contains("containment"), "{sentence}");
     }
 
+    /// The SEQ_SUBSET ROUTING law's own pin: `e-class-and-function.py:610`'s
+    /// shape — a narrowed union of specific string members
+    /// (`or_narrowed_branch_call`'s own `Literal["insideStart",
+    /// "insideEnd", "end"]`, `sequence_shaped` true — each member's own
+    /// multi-character `string_tuple` is a `Concatenation`, not the
+    /// tuple-pun bare `OneOf` `Grade`'s single-character members build)
+    /// flowing into a declared set that admits every one of those members
+    /// PLUS more (`position_label`'s own four-member
+    /// `Literal["insideStart", "insideEnd", "end", "outside"]`) is a
+    /// genuine subset. Before this law, `scalar_subset` refused the pair
+    /// outright (neither side is 1-tuple/scalar shaped) and the row sat
+    /// Undetermined; `seq_subset` decides it Silent.
+    #[test]
+    fn a_narrowed_string_literal_union_subset_of_a_wider_one_is_silent() {
+        let Some(kernel) = loaded_kernel() else { return };
+        use refined_sets::codepoint_sets::string_tuple;
+        use refined_sets::refinement_forms::union;
+        let narrowed = make_refined_set(vec![union(
+            make_refined_set(vec![union(string_tuple("insideStart"), string_tuple("insideEnd"))]),
+            string_tuple("end"),
+        )]);
+        let wider = make_refined_set(vec![union(
+            make_refined_set(vec![union(
+                make_refined_set(vec![union(string_tuple("insideStart"), string_tuple("insideEnd"))]),
+                string_tuple("end"),
+            )]),
+            string_tuple("outside"),
+        )]);
+        let declared = DeclaredRefinement {
+            set: wider,
+            spelling: "PositionLabel".to_owned(),
+            admits_none: false,
+            element: None,
+            generator: None,
+            members: None,
+            positions: None,
+        };
+        let value = known_set(narrowed, None, TrustProved, SetKindTag::None);
+        assert!(
+            matches!(judge(&value, &declared, &kernel), Verdict::Silent),
+            "a narrowed string-literal union wholly inside a wider one must be Silent, not Undetermined"
+        );
+    }
+
+    /// The mirror: a member OUTSIDE the declared union
+    /// (`string_to_literal_union_parameter`'s own shape, widened to a Set
+    /// rather than that row's single-value read) fires — `seq_subset`
+    /// proving false over recognized sequence shapes is a decided
+    /// refutation, the same "false is a verdict, never a refusal in
+    /// disguise" reading `scalar_subset`'s own law doc states.
+    #[test]
+    fn a_string_literal_union_with_a_member_outside_the_declared_set_fires() {
+        let Some(kernel) = loaded_kernel() else { return };
+        use refined_sets::codepoint_sets::string_tuple;
+        use refined_sets::refinement_forms::union;
+        let declared = DeclaredRefinement {
+            set: make_refined_set(vec![union(string_tuple("node"), string_tuple("link"))]),
+            spelling: "Tag".to_owned(),
+            admits_none: false,
+            element: None,
+            generator: None,
+            members: None,
+            positions: None,
+        };
+        let value = known_set(
+            make_refined_set(vec![union(string_tuple("node"), string_tuple("other"))]),
+            None,
+            TrustProved,
+            SetKindTag::None,
+        );
+        let message = fire_message(judge(&value, &declared, &kernel));
+        assert!(message.contains("'Tag'"), "{message}");
+        assert!(message.contains("admits values outside"), "{message}");
+    }
+
     /// The BOOLEAN PRODUCT LAW: `True` (Boolean-tagged) against Age
     /// (int-sorted) fires — bool is excluded from the int sort by
     /// product law, the fixture rows' own reason
@@ -1380,6 +1661,7 @@ mod tests {
             element: None,
             generator: None,
             members: None,
+            positions: None,
         };
         let value = known_values(vec![1.0], PrimitiveKind::Boolean, TrustProved);
         assert!(matches!(judge(&value, &declared, &kernel), Verdict::Silent));
@@ -1412,6 +1694,7 @@ mod tests {
             element: None,
             generator: None,
             members: None,
+            positions: None,
         }
     }
 
@@ -1463,6 +1746,7 @@ mod tests {
             element: Some(Box::new(age_refinement())),
             generator: None,
             members: None,
+            positions: None,
         }
     }
 
@@ -1547,5 +1831,199 @@ mod tests {
         let message = fire_message(judge(&value, &declared, &kernel));
         assert!(message.contains("'dict[str, Age]'"), "{message}");
         assert!(message.to_lowercase().contains("list"), "{message}");
+    }
+
+    // --- the MEMBERS LAW: a TypedDict's per-member judgment ---
+
+    /// `PersonDict`'s own `age: Age` member table — the `members`-carrying
+    /// declaration h-object-literal-members.py's `dict_return_member`
+    /// needs, `age` set to the same `age_refinement` every other test in
+    /// this file shares.
+    fn person_dict_refinement() -> DeclaredRefinement {
+        DeclaredRefinement {
+            set: make_refined_set(Vec::new()),
+            spelling: "PersonDict".to_owned(),
+            admits_none: false,
+            element: None,
+            generator: None,
+            members: Some(vec![("age".to_owned(), age_refinement())]),
+            positions: None,
+        }
+    }
+
+    /// `return {"age": 200}` under `-> PersonDict` — the declared member's
+    /// own out-of-set value fires, naming the key exactly like the
+    /// element law's own key-naming convention.
+    #[test]
+    fn a_typed_dict_with_an_out_of_set_member_fires_naming_the_key() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let declared = person_dict_refinement();
+        let value = refined_domain::known_constructors::known_object(
+            vec![refined_domain::abstract_value::ObjectKey {
+                name: "age".to_owned(),
+                numeric: false,
+                value: known_values(vec![200.0], PrimitiveKind::Integer, TrustProved),
+            }],
+            None,
+            true,
+            TrustProved,
+            false,
+        );
+        let message = fire_message(judge(&value, &declared, &kernel));
+        assert!(message.contains("'Age'"), "{message}");
+        assert!(message.contains("(at key 'age')"), "{message}");
+    }
+
+    /// `return {"age": 40}` under `-> PersonDict` — the member sits inside
+    /// its own declared set, so the whole dict is Silent.
+    #[test]
+    fn a_typed_dict_with_its_member_in_set_is_silent() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let declared = person_dict_refinement();
+        let value = refined_domain::known_constructors::known_object(
+            vec![refined_domain::abstract_value::ObjectKey {
+                name: "age".to_owned(),
+                numeric: false,
+                value: known_values(vec![40.0], PrimitiveKind::Integer, TrustProved),
+            }],
+            None,
+            true,
+            TrustProved,
+            false,
+        );
+        assert!(matches!(judge(&value, &declared, &kernel), Verdict::Silent));
+    }
+
+    /// A declared member the dict literal never writes is not judged at
+    /// all — the honest-absence rule this law's own doc states — so a
+    /// dict missing `age` entirely is still Silent rather than
+    /// Undetermined or a false Fire.
+    #[test]
+    fn a_typed_dict_missing_a_declared_member_is_silent() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let declared = person_dict_refinement();
+        let value = refined_domain::known_constructors::known_object(Vec::new(), None, true, TrustProved, false);
+        assert!(matches!(judge(&value, &declared, &kernel), Verdict::Silent));
+    }
+
+    /// `None` against a plain (non-`Optional`) TypedDict declaration
+    /// fires — the members law's own explicit Null arm, mirroring the
+    /// element law's.
+    #[test]
+    fn none_against_a_plain_typed_dict_declaration_fires() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let declared = person_dict_refinement();
+        assert!(!declared.admits_none);
+        let value = refined_domain::abstract_value::null_value();
+        let message = fire_message(judge(&value, &declared, &kernel));
+        assert!(message.contains("'PersonDict'"), "{message}");
+        assert!(message.to_lowercase().contains("none"), "{message}");
+    }
+
+    /// A list against a TypedDict declaration fires — the members law's
+    /// own explicit List arm.
+    #[test]
+    fn a_list_against_a_typed_dict_declaration_fires() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let declared = person_dict_refinement();
+        let value = refined_domain::known_constructors::known_list(Vec::new(), TrustProved);
+        let message = fire_message(judge(&value, &declared, &kernel));
+        assert!(message.contains("'PersonDict'"), "{message}");
+        assert!(message.to_lowercase().contains("list"), "{message}");
+    }
+
+    // --- the POSITIONS LAW: a fixed-arity tuple's per-slot judgment ---
+
+    /// `tuple[Age, Label]` — the `positions`-carrying declaration
+    /// `c-reads-and-values.py`'s own fixed-arity-tuple rows need, each
+    /// slot set to a DIFFERENT one of this file's shared refinements —
+    /// unlike the element law's one shared refinement, each position
+    /// keeps its own set.
+    fn age_label_tuple_refinement() -> DeclaredRefinement {
+        DeclaredRefinement {
+            set: make_refined_set(Vec::new()),
+            spelling: "tuple[Age, Label]".to_owned(),
+            admits_none: false,
+            element: None,
+            generator: None,
+            members: None,
+            positions: Some(vec![age_refinement(), label_refinement()]),
+        }
+    }
+
+    /// A list of two values, both inside their own position's set, is
+    /// Silent.
+    #[test]
+    fn a_two_slot_list_with_every_position_in_set_is_silent() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let declared = age_label_tuple_refinement();
+        let value = refined_domain::known_constructors::known_list(
+            vec![
+                known_values(vec![40.0], PrimitiveKind::Integer, TrustProved),
+                known_values(hi_points("ok"), PrimitiveKind::String, TrustProved),
+            ],
+            TrustProved,
+        );
+        assert!(matches!(judge(&value, &declared, &kernel), Verdict::Silent));
+    }
+
+    /// Slot 0 out of its own declared set fires, naming the offending
+    /// index — the positions law's own twin of the element law's
+    /// key-naming convention.
+    #[test]
+    fn a_two_slot_list_with_slot_zero_out_of_set_fires_naming_the_index() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let declared = age_label_tuple_refinement();
+        let value = refined_domain::known_constructors::known_list(
+            vec![
+                known_values(vec![200.0], PrimitiveKind::Integer, TrustProved),
+                known_values(hi_points("ok"), PrimitiveKind::String, TrustProved),
+            ],
+            TrustProved,
+        );
+        let message = fire_message(judge(&value, &declared, &kernel));
+        assert!(message.contains("'Age'"), "{message}");
+        assert!(message.contains("(at index 0)"), "{message}");
+    }
+
+    /// A list of the WRONG LENGTH (one slot, not two) fires as a
+    /// structural mismatch rather than sitting undetermined or judging
+    /// past the end of `positions`.
+    #[test]
+    fn a_list_of_the_wrong_length_fires_as_a_structural_mismatch() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let declared = age_label_tuple_refinement();
+        let value = refined_domain::known_constructors::known_list(
+            vec![known_values(vec![40.0], PrimitiveKind::Integer, TrustProved)],
+            TrustProved,
+        );
+        let message = fire_message(judge(&value, &declared, &kernel));
+        assert!(message.contains("'tuple[Age, Label]'"), "{message}");
+    }
+
+    /// `None` against a plain (non-`Optional`) fixed-arity tuple
+    /// declaration fires — the positions law's own explicit Null arm,
+    /// mirroring the element/members laws.
+    #[test]
+    fn none_against_a_plain_positions_declaration_fires() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let declared = age_label_tuple_refinement();
+        assert!(!declared.admits_none);
+        let value = refined_domain::abstract_value::null_value();
+        let message = fire_message(judge(&value, &declared, &kernel));
+        assert!(message.contains("'tuple[Age, Label]'"), "{message}");
+        assert!(message.to_lowercase().contains("none"), "{message}");
+    }
+
+    /// `None` against `Optional[tuple[Age, Label]]` (`admits_none` true)
+    /// is Silent — the same admits_none precedence the element/members
+    /// laws already give their own Null arm.
+    #[test]
+    fn none_against_an_admits_none_positions_declaration_is_silent() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let mut declared = age_label_tuple_refinement();
+        declared.admits_none = true;
+        let value = refined_domain::abstract_value::null_value();
+        assert!(matches!(judge(&value, &declared, &kernel), Verdict::Silent));
     }
 }

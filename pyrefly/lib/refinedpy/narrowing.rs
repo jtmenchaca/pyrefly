@@ -114,6 +114,30 @@ pub fn assume(
     environment
 }
 
+/// Whether `condition` being `truth`, under `environment` (already
+/// narrowed by `assume`), is PROVEN IMPOSSIBLE for this call's own
+/// concrete arguments — every name the condition names (`collect_names`)
+/// that is bound `Kind::Values` with an EMPTY `values` list is a name
+/// `narrow_isinstance_call`'s own "the whole binding disagrees with the
+/// test" arm (or an equivalent comparison narrowing) already proved has
+/// no member left standing under this branch. CPython never executes a
+/// branch it cannot reach for the ACTUAL argument (`pick_years(200)`'s
+/// own `isinstance(value, int)` false arm: `value` narrows to the empty
+/// Integer-tagged set, since 200 genuinely is an int, so `return
+/// len(value)` — unmodeled on a non-string `Kind::Values` — never runs
+/// for this call at all); the caller uses this to skip interpreting a
+/// dead arm's body rather than letting an unrelated construct inside it
+/// decline the WHOLE call.
+pub fn arm_is_infeasible(condition: &Expr, environment: &Environment) -> bool {
+    let mut names = Vec::new();
+    collect_names(condition, &mut names);
+    names.iter().any(|name| {
+        environment
+            .read(name.as_str())
+            .is_some_and(|value| value.kind == Kind::Values && value.values.is_empty())
+    })
+}
+
 /// The SET channel's own entry point: for every name `condition`
 /// mentions (`collect_names`) that is CURRENTLY bound `Kind::Set`,
 /// lower the whole condition relative to that name and ask the kernel

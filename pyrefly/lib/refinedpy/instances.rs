@@ -25,6 +25,8 @@
 //! the vendored tree in this file's owning report).
 
 use std::collections::HashMap;
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use refined_domain::abstract_value::{
@@ -34,6 +36,7 @@ use refined_domain::known_constructors::known_object;
 use refined_domain::lattice_operations::truthiness;
 use refined_domain::trust_grades::TrustSpec;
 use refined_kernel::kernel_interface::RefinedTSKernel;
+use refined_sets::refinement_forms::make_refined_set;
 use refined_sets::refinement_forms::RefinedSet;
 use ruff_python_ast::{Expr, ExprCall, ModModule, Number, Stmt, StmtClassDef, StmtFunctionDef, UnaryOp};
 use ruff_text_size::TextRange;
@@ -168,6 +171,53 @@ pub fn class_table(
     out
 }
 
+/// Every module-level `class X(TypedDict): name: Annotation, …` read
+/// into its own per-member refinement table, keyed by the class's name.
+/// A TypedDict class body carries no `__init__`, no methods, and no
+/// inheritance chain this table follows — it is exactly the plain
+/// AnnAssign rows `class_model_of` already reads for an ordinary class,
+/// with none of that function's `__init__`/`super()` machinery, so this
+/// is its own small reader rather than a `ClassModel`-shaped one: a
+/// TypedDict's checked shape is "each member's own declared refinement,"
+/// not "a constructible instance with fields." Recognized by BARE base
+/// name `TypedDict` (`single_bare_name_base`, the same one-bare-Name-base
+/// rule `class_table` already applies), matching `is_class_var`'s own
+/// no-import-identity convention — no fixture row spells `TypedDict`
+/// through an import alias.
+pub fn typed_dict_table(
+    module: &ModModule,
+    aliases: &HashMap<String, RefinedSet>,
+    imports: &SurfaceImports,
+) -> HashMap<String, Vec<(String, DeclaredRefinement)>> {
+    let empty_environment = Environment::new(Default::default());
+    let mut out = HashMap::new();
+    for stmt in module.body.iter() {
+        let Stmt::ClassDef(def) = stmt else {
+            continue;
+        };
+        if single_bare_name_base(def) != Some("TypedDict") {
+            continue;
+        }
+        let mut members = Vec::new();
+        for member_stmt in def.body.iter() {
+            let Stmt::AnnAssign(assign) = member_stmt else {
+                continue;
+            };
+            let Expr::Name(target_name) = assign.target.as_ref() else {
+                continue;
+            };
+            let Some(declared) =
+                declared_refinement(assign.annotation.as_ref(), aliases, imports, &empty_environment)
+            else {
+                continue;
+            };
+            members.push((target_name.id.as_str().to_owned(), declared));
+        }
+        out.insert(def.name.id.as_str().to_owned(), members);
+    }
+    out
+}
+
 /// Depth-first build of one class into `out`, building its single
 /// bare-Name module-level parent first when one exists. `building`
 /// guards an inheritance cycle (`class A(B): ...` / `class B(A):
@@ -199,7 +249,15 @@ fn build_class_model(
         out.get(parent_name)
     });
 
-    let model = class_model_of(def, aliases, imports, kernel, parent);
+    // A parent-CLONE (`parent.cloned()`) so `class_model_of`'s own
+    // field loop can build/read a DIFFERENT class (a member's own
+    // annotation naming another BaseModel — `Resident.address:
+    // Address`) through `out`/`building` without holding a live borrow
+    // of `parent`'s entry across that nested `build_class_model` call —
+    // Rust's borrow checker forbids mutating `out` (to insert the
+    // nested class) while `parent` still borrows from it immutably.
+    let parent = parent.cloned();
+    let model = class_model_of(def, aliases, imports, kernel, parent.as_ref(), defs, out, building);
     building.remove(name);
     out.insert(model.name.clone(), model);
 }
@@ -272,6 +330,9 @@ fn class_model_of(
     imports: &SurfaceImports,
     kernel: &Arc<RefinedTSKernel>,
     parent: Option<&ClassModel>,
+    defs: &HashMap<String, &StmtClassDef>,
+    out: &mut HashMap<String, ClassModel>,
+    building: &mut std::collections::HashSet<String>,
 ) -> ClassModel {
     let empty_environment = Environment::new(Default::default());
     let mut ann_fields: HashMap<String, ClassField> = HashMap::new();
@@ -286,7 +347,34 @@ fn class_model_of(
         let Expr::Name(target_name) = assign.target.as_ref() else {
             continue;
         };
-        let declared = declared_refinement(assign.annotation.as_ref(), aliases, imports, &empty_environment);
+        let declared = declared_refinement(assign.annotation.as_ref(), aliases, imports, &empty_environment)
+            // A bare-Name annotation `declared_refinement` reads as
+            // nothing this table's own alias/inline-form grammar
+            // covers (`Resident.address: Address` — `Address` is a
+            // module-level BaseModel class, not a type alias) — the
+            // MEMBERS LAW twin of `typed_dict_return_refinement`, but
+            // for a class member rather than a return position. The
+            // named class is built first when `out` does not have it
+            // yet (`build_class_model`'s own lazy pattern, reused
+            // verbatim: a class already mid-build reads parent-less/
+            // member-less rather than looping on a field cycle), then
+            // its OWN just-built fields become this member's per-field
+            // table — nested BaseModel membership (`Resident.person:
+            // Person`, itself a BaseModel) recurses for free, since
+            // `Person` was built the same way and its own `declared`
+            // may itself carry `members: Some(...)`.
+            .or_else(|| {
+                let Expr::Name(class_name) = assign.annotation.as_ref() else {
+                    return None;
+                };
+                if !defs.contains_key(class_name.id.as_str()) {
+                    return None;
+                }
+                if !out.contains_key(class_name.id.as_str()) {
+                    build_class_model(class_name.id.as_str(), defs, aliases, imports, kernel, out, building);
+                }
+                out.get(class_name.id.as_str()).map(model_members_refinement)
+            });
         let default = assign
             .value
             .as_deref()
@@ -369,6 +457,34 @@ fn class_model_of(
         methods,
         parent_methods,
         class_attributes,
+    }
+}
+
+/// A module-level class's own fields, wrapped as a `DeclaredRefinement`
+/// with `members: Some(...)` — `typed_dict_return_refinement`'s exact
+/// shape, built here instead from an already-built `ClassModel` rather
+/// than a fresh scan, since a class MEMBER's own declared refinement
+/// (`declared: Option<DeclaredRefinement>` per field) is already exactly
+/// what `assignability::judge`'s MEMBERS LAW reads. A field whose own
+/// annotation states no refinement (`declared: None` — an unrefined
+/// `str`/`int`, or an annotation this table cannot read) is left out of
+/// the member list entirely, matching `typed_dict_table`'s own
+/// `let Some(declared) = ... else { continue }` convention: an absent
+/// member states nothing the MEMBERS LAW judges, never a guessed set.
+fn model_members_refinement(model: &ClassModel) -> DeclaredRefinement {
+    let members: Vec<(String, DeclaredRefinement)> = model
+        .fields
+        .iter()
+        .filter_map(|field| field.declared.clone().map(|declared| (field.name.clone(), declared)))
+        .collect();
+    DeclaredRefinement {
+        set: make_refined_set(Vec::new()),
+        spelling: model.name.clone(),
+        admits_none: false,
+        element: None,
+        generator: None,
+        members: Some(members),
+        positions: None,
     }
 }
 
@@ -962,6 +1078,26 @@ fn field_call_default(call: &ruff_python_ast::ExprCall) -> Option<AbstractValue>
 /// value, TrustSpec — same construction check.rs's seed_parameters
 /// uses"). A field with no argument takes its default if present,
 /// else its declared set if present, else `unknown()`.
+
+/// The counter `next_instance_identity` draws from — one process-wide
+/// sequence, so two constructions anywhere in one checker run (even of
+/// different classes, even on different threads if this checker ever
+/// becomes concurrent) never mint the same id.
+static NEXT_INSTANCE_IDENTITY: AtomicU32 = AtomicU32::new(0);
+
+/// Mints a fresh per-construction identity — unique for the life of the
+/// process, never reused. `judge_construction` stamps this onto every
+/// instance it builds (`AbstractValue::instance_identity`'s own doc), so
+/// two `Holder()` calls (the same class, the same AST call site, two
+/// separate executions) always mint two distinct ids, exactly the way
+/// `env.rs`'s `next_retained_callable_key` mints a fresh key per lambda/def
+/// creation rather than keying by the AST's own range (that module's own
+/// doc: a range key would let two creations of the same source text
+/// silently conflate).
+fn next_instance_identity() -> u32 {
+    NEXT_INSTANCE_IDENTITY.fetch_add(1, Ordering::Relaxed)
+}
+
 pub fn judge_construction(
     model: &ClassModel,
     positional: &[(AbstractValue, TextRange)],
@@ -1025,6 +1161,12 @@ pub fn judge_construction(
     // receiver.method(...) call can find the ClassModel in the
     // environment's class table; empty on every non-instance object.
     instance.source = model.name.clone();
+    // instance_identity carries THIS call's own fresh id — distinct from
+    // `source`, which every instance of `model` shares. Two `Holder()`
+    // calls build two different instances; a dict keyed by one must not
+    // answer a lookup by the other (`collection_models::known_dict_key`'s
+    // own identity arm reads this field to tell them apart).
+    instance.instance_identity = Some(next_instance_identity());
 
     // pydantic's own post-construction hook: `model_post_init(self,
     // __context)` runs immediately after every field is set
@@ -1794,6 +1936,7 @@ mod tests {
             element: None,
             generator: None,
             members: None,
+            positions: None,
         }
     }
 
@@ -1847,6 +1990,40 @@ mod tests {
         assert!(person.fields[1].declared.is_none(), "bare str states no refinement");
     }
 
+    // --- typed_dict_table: per-member refinements ---
+
+    #[test]
+    fn typed_dict_table_reads_each_members_own_refinement() {
+        let module = parsed(concat!(
+            "from typing import Annotated, TypedDict\n",
+            "from pydantic import Field\n",
+            "type Age = Annotated[int, Field(ge=0, le=120)]\n",
+            "class PersonDict(TypedDict):\n",
+            "    age: Age\n",
+            "    label: str\n",
+        ));
+        let aliases = crate::refinedpy::surface::compile_aliases(&module);
+        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let table = typed_dict_table(&module, &aliases, &imports);
+        let members = table.get("PersonDict").expect("PersonDict recorded");
+        assert_eq!(members.len(), 1, "only age reads a refinement; bare str states none");
+        assert_eq!(members[0].0, "age");
+        assert_eq!(members[0].1.spelling, "Age");
+    }
+
+    #[test]
+    fn typed_dict_table_ignores_a_class_with_no_typed_dict_base() {
+        let module = parsed(concat!(
+            "from pydantic import BaseModel\n",
+            "class Person(BaseModel):\n",
+            "    age: int\n",
+        ));
+        let aliases = HashMap::new();
+        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let table = typed_dict_table(&module, &aliases, &imports);
+        assert!(table.get("Person").is_none(), "a plain BaseModel class is not a TypedDict");
+    }
+
     // --- ClassVar is skipped ---
 
     #[test]
@@ -1864,6 +2041,86 @@ mod tests {
         let counted = table.get("Counted").expect("Counted class recorded");
         assert_eq!(counted.fields.len(), 1, "ClassVar row must not become a field");
         assert_eq!(counted.fields[0].name, "age");
+    }
+
+    // --- a field annotated with another module-level BaseModel class ---
+
+    /// m-pydantic-schema.py's own `Resident.address: Address` shape:
+    /// `Address` is a class, not a `type` alias, so `declared_refinement`'s
+    /// bare-Name arm reads nothing for it — `class_model_of`'s own
+    /// `.or_else` fallback must build `Address`'s member table instead.
+    /// `Resident`'s field carries `members: Some(...)` with `zip_code`'s
+    /// own declared set, so a later `judge_construction`/MEMBERS LAW
+    /// judgment of a nested dict can see past the bare class name.
+    #[test]
+    fn class_model_of_reads_a_field_annotated_with_another_module_level_class() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field, BaseModel\n",
+            "type ZipCode = Annotated[str, Field(min_length=5, max_length=5)]\n",
+            "class Address(BaseModel):\n",
+            "    zip_code: ZipCode\n",
+            "class Resident(BaseModel):\n",
+            "    address: Address\n",
+        ));
+        let aliases = crate::refinedpy::surface::compile_aliases(&module);
+        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let table = class_table(&module, &aliases, &imports, &kernel);
+        let resident = table.get("Resident").expect("Resident class recorded");
+        let address_field = resident.fields.iter().find(|field| field.name == "address").expect("address field present");
+        let declared = address_field.declared.as_ref().expect("Address reads as a member-carrying declaration");
+        let members = declared.members.as_ref().expect("a class-typed field carries a per-member table");
+        let zip_code = members.iter().find(|(name, _)| name == "zip_code").expect("zip_code member present");
+        assert_eq!(zip_code.1.spelling, "ZipCode");
+    }
+
+    /// The same shape one level deeper: `Resident.person: Person` where
+    /// `Person` is ITSELF a BaseModel with a refined field — nested
+    /// membership recurses because `Person` was built through the same
+    /// lazy `build_class_model` call, so its own `declared` already
+    /// carries `members: Some(...)` by the time `Resident`'s field reads it.
+    #[test]
+    fn class_model_of_reads_a_doubly_nested_member_class() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field, BaseModel\n",
+            "type Age = Annotated[int, Field(ge=0, le=120)]\n",
+            "class Person(BaseModel):\n",
+            "    age: Age\n",
+            "class Resident(BaseModel):\n",
+            "    person: Person\n",
+        ));
+        let aliases = crate::refinedpy::surface::compile_aliases(&module);
+        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let table = class_table(&module, &aliases, &imports, &kernel);
+        let resident = table.get("Resident").expect("Resident class recorded");
+        let person_field = resident.fields.iter().find(|field| field.name == "person").expect("person field present");
+        let declared = person_field.declared.as_ref().expect("Person reads as a member-carrying declaration");
+        let members = declared.members.as_ref().expect("a class-typed field carries a per-member table");
+        let age = members.iter().find(|(name, _)| name == "age").expect("age member present");
+        assert_eq!(age.1.spelling, "Age");
+    }
+
+    /// A field annotated with a class name the module never declares
+    /// (a typo, or a class defined in another module this table cannot
+    /// see) declines exactly as before this unit — `declared: None`,
+    /// never a guessed member table.
+    #[test]
+    fn class_model_of_field_annotated_with_an_unknown_name_stays_undeclared() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "from pydantic import BaseModel\n",
+            "class Resident(BaseModel):\n",
+            "    address: Missing\n",
+        ));
+        let aliases = HashMap::new();
+        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let table = class_table(&module, &aliases, &imports, &kernel);
+        let resident = table.get("Resident").expect("Resident class recorded");
+        let address_field = resident.fields.iter().find(|field| field.name == "address").expect("address field present");
+        assert!(address_field.declared.is_none(), "an undeclared class name states nothing this table reads");
     }
 
     // --- judge_construction: positional mapping ---
@@ -2509,6 +2766,28 @@ mod tests {
         assert_eq!(field_read(&written, "age"), Some(integer_value(41.0)));
     }
 
+    // --- judge_construction: instance_identity ---
+
+    /// Two separate construction calls of the SAME class each mint their
+    /// own `instance_identity` — a dict keyed by one instance must not
+    /// answer a lookup by the other (`collection_models::known_dict_key`'s
+    /// own identity arm reads this field to tell two `Holder()` calls
+    /// apart, the way `env.rs`'s `next_retained_callable_key` already
+    /// tells two lambda/def creations apart).
+    #[test]
+    fn judge_construction_mints_a_distinct_instance_identity_per_call() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let model = bare_model("Holder", Vec::new());
+        let first = judge_construction(&model, &[], &[], &kernel).instance;
+        let second = judge_construction(&model, &[], &[], &kernel).instance;
+        assert!(first.instance_identity.is_some(), "a constructed instance carries an identity");
+        assert!(second.instance_identity.is_some(), "a constructed instance carries an identity");
+        assert_ne!(
+            first.instance_identity, second.instance_identity,
+            "two separate Holder() calls must not mint the same identity"
+        );
+    }
+
     // --- generator_yields: the stream() for-loop shape ---
 
     /// `async def stream(): for value in (10, 20, 30): yield value` —
@@ -2525,7 +2804,7 @@ mod tests {
             "        yield value\n",
         ));
         let def = module.body.into_iter().next().expect("one top-level def").function_def_stmt().expect("is a def");
-        let yields = generator_yields(&def, &[], None, None, &kernel, 0).expect("the stream() for-loop shape must decide");
+        let yields = generator_yields(&def, &[], None, &kernel, 0).expect("the stream() for-loop shape must decide");
         assert_eq!(yields, vec![integer_value(10.0), integer_value(20.0), integer_value(30.0)]);
     }
 
@@ -2541,7 +2820,7 @@ mod tests {
             "        yield value + 100\n",
         ));
         let def = module.body.into_iter().next().expect("one top-level def").function_def_stmt().expect("is a def");
-        let yields = generator_yields(&def, &[], None, None, &kernel, 0).expect("the transformed-yield shape must decide");
+        let yields = generator_yields(&def, &[], None, &kernel, 0).expect("the transformed-yield shape must decide");
         assert_eq!(yields, vec![integer_value(110.0), integer_value(120.0)]);
     }
 
@@ -2558,7 +2837,7 @@ mod tests {
             "        yield value\n",
         ));
         let def = module.body.into_iter().next().expect("one top-level def").function_def_stmt().expect("is a def");
-        let yields = generator_yields(&def, &[], None, None, &kernel, 0).expect("the mixed shape must decide");
+        let yields = generator_yields(&def, &[], None, &kernel, 0).expect("the mixed shape must decide");
         assert_eq!(yields, vec![integer_value(1.0), integer_value(2.0), integer_value(3.0)]);
     }
 
@@ -2595,7 +2874,7 @@ mod tests {
         ));
         let def = module.body.into_iter().next().expect("one top-level def").function_def_stmt().expect("is a def");
         assert!(
-            generator_yields(&def, &[], None, None, &kernel, 0).is_none(),
+            generator_yields(&def, &[], None, &kernel, 0).is_none(),
             "a yield under a condition is a permanent decline, not a shape this function joins"
         );
     }
@@ -2614,7 +2893,7 @@ mod tests {
             "    yield 40\n",
         ));
         let def = module.body.into_iter().next().expect("one top-level def").function_def_stmt().expect("is a def");
-        let yields = generator_yields(&def, &[], None, None, &kernel, 0)
+        let yields = generator_yields(&def, &[], None, &kernel, 0)
             .expect("a leading docstring must not decline the body");
         assert_eq!(yields, vec![integer_value(40.0)]);
     }
@@ -2631,7 +2910,7 @@ mod tests {
             "        yield value\n",
         ));
         let def = module.body.into_iter().next().expect("one top-level def").function_def_stmt().expect("is a def");
-        let yields = generator_yields(&def, &[], None, None, &kernel, 0)
+        let yields = generator_yields(&def, &[], None, &kernel, 0)
             .expect("a leading docstring must not decline the for-loop shape");
         assert_eq!(yields, vec![integer_value(10.0), integer_value(20.0)]);
     }

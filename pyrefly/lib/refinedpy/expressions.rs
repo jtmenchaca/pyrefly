@@ -34,6 +34,8 @@ use refined_sets::codepoint_sets::strings;
 use refined_sets::refinement_forms::at_least;
 use refined_sets::refinement_forms::integer;
 use refined_sets::refinement_forms::make_refined_set;
+use refined_sets::refinement_forms::one_of;
+use refined_sets::refinement_forms::repeat_of;
 use refined_sets::refinement_forms::RefinedSet;
 use ruff_python_ast::BoolOp;
 use ruff_python_ast::CmpOp;
@@ -790,6 +792,61 @@ fn evaluate_fstring(fstring: &ruff_python_ast::ExprFString, environment: &Enviro
     known_set(folded, None, grade, SetKindTag::None)
 }
 
+/// One codepoint drawn from the given ASCII characters — the digit and
+/// sign alphabet `int_spelling_set`/`float_spelling_set` repeat.
+fn one_char_of(chars: &str) -> RefinedSet {
+    let points: Vec<f64> = chars.chars().map(|c| c as u32 as f64).collect();
+    make_refined_set(vec![one_of(&points)])
+}
+
+/// Every string `str()` can spell for an Integer-sorted value: one or
+/// more characters drawn from the digits and `-` — `stdtypes.rst`
+/// (`int.__repr__`) states no other characters and no length ceiling
+/// (CPython `int` is arbitrary-precision, verified: `str(10**30) ==
+/// "1000000000000000000000000000000"`, `str(-5) == "-5"`, `str(0) ==
+/// "0"`). A single `Repeat` over the two-character alphabet, rather than
+/// a union of a bare digit run and a `-`-prefixed one, admits a few
+/// strings `str()` never produces (an interior or repeated `-`, e.g.
+/// `"1-2"`) — still a SOUND superset of every real spelling, and the
+/// shape the kernel's sequence reader
+/// (`set_functions/subset_seq_shape.lean`'s `seqOf`) recognizes directly:
+/// a lone `.Repeat A lo none` is read as a positional shape outright
+/// (line `some (List.replicate lo A, some A)`), where a `Union` of two
+/// concatenation shapes is not — the pattern union routes
+/// (`set_functions/pattern_union_routes.lean`'s `leftRouteB`) only
+/// distribute a union that is the FIRST piece of an outer concatenation,
+/// and this set is always the TRAILING piece once the caller concatenates
+/// it after the f-string's own literal text. The alphabet stays bounded
+/// even though the length does not — `Repeat` over a finite `one_of`,
+/// never `Star` over the whole codepoint ground — so the kernel's
+/// counting-window decider (the same route
+/// `temporal_string_grammars.rs`'s `TSG_DIGIT`/`tsg_rep` uses for a
+/// bounded digit run) can refute containment in a length window instead
+/// of falling through to the unresolved general pattern search.
+fn int_spelling_set() -> RefinedSet {
+    make_refined_set(vec![repeat_of(one_char_of("0123456789-"), 1, None)])
+}
+
+/// Every string `str()` can spell for a Float-sorted value: CPython's
+/// `repr(float)` alphabet is digits, `-`, `.`, and a lowercase `e`
+/// exponent marker (verified: `str(3.5) == "3.5"`, `str(1e+300) ==
+/// "1e+300"`, `str(1e-300) == "1e-300"`), or one of the three
+/// non-numeric words `inf`, `-inf`, `nan` (verified: `str(float('inf'))
+/// == "inf"`, `str(float('-inf')) == "-inf"`, `str(float('nan')) ==
+/// "nan"`) — all three of which are themselves spelled only from
+/// letters already admitted below (`i`, `n`, `f`, `a`), so folding their
+/// three extra letters into the SAME repeated alphabet as the digit/sign
+/// run covers every case with one `Repeat`, the shape
+/// `int_spelling_set`'s own doc explains the kernel recognizes directly
+/// (a bare `Union` embedded as this set's own trailing position, the way
+/// a separate words-union would be, is not recognized the same way).
+/// CPython never emits an uppercase `E` or a bare `+` outside an
+/// exponent, but admitting `+`/`e`/`i`/`n`/`f`/`a` freely only widens the
+/// claim, never narrows it past what `str()` can actually produce.
+fn float_spelling_set() -> RefinedSet {
+    make_refined_set(vec![repeat_of(one_char_of("0123456789.+-einaf"), 1, None)])
+}
+
 /// The set of strings an f-string interpolation admits, once it is known
 /// to be a `Kind::Set` but not readable as one exact value — the
 /// spellings-of-a-known-set half of `evaluateTemplate`'s own concatenated
@@ -801,22 +858,28 @@ fn evaluate_fstring(fstring: &ruff_python_ast::ExprFString, environment: &Enviro
 /// interpolation can hold IS a member of that set already. A NUMERIC-
 /// sorted set (Integer or Float `kind_tag` — `summaries::
 /// return_sort_fallback`'s int-sort fallback, or `float_sorted_unknown()`)
-/// has no numeric-spelling grammar available in this crate (no
-/// `refined_sets` constructor turns "every real number" into "every
-/// number's decimal spelling," the same gap refined-ts-go's own
-/// `TextOfKnown`/`format_string_shapes` bridges for its host); the honest
-/// SOUND weaker claim is `codepoint_sets::strings()` — literally every
-/// string, since every real spelling of every admitted number IS some
-/// string, so the coarse claim never excludes a spelling the true set
-/// would include. Any other `Kind::Set` shape (a set carrying no sort tag
-/// at all, or one this function does not recognize) declines — the
+/// spells through `int_spelling_set`/`float_spelling_set` instead of the
+/// unbounded `codepoint_sets::strings()` this used to fall back to: the
+/// bare `strings()` claim is sound but its `Star` shape is one the
+/// kernel's placement search cannot always decide against a length
+/// window (verified: `refinedpy-check` on this file used to panic with
+/// "no pattern inclusion proof — the placement search found none" rather
+/// than fire), where a bounded-alphabet `Repeat` routes through the
+/// proved counting-window decider instead (refined-lean's
+/// `set_functions/subset_window.lean`, `RefinedSet.seqAskableB` on a
+/// single `.Repeat` form). A bare `Number` tag (no Python sort proved,
+/// `summaries.rs`'s int/float join) reads through the FLOAT alphabet —
+/// the wider of the two, so a value that could be either sort still gets
+/// a sound superset. Any other `Kind::Set` shape (a set carrying no sort
+/// tag at all, or one this function does not recognize) declines — the
 /// caller's own `unknown()` fallback stays honest for it.
 fn spellings_of_known_set(value: &AbstractValue) -> Option<RefinedSet> {
     if value.kind != Kind::Set {
         return None;
     }
     match value.kind_tag {
-        Some(PrimitiveKind::Integer) | Some(PrimitiveKind::Float) | Some(PrimitiveKind::Number) => Some(strings()),
+        Some(PrimitiveKind::Integer) => Some(int_spelling_set()),
+        Some(PrimitiveKind::Float) | Some(PrimitiveKind::Number) => Some(float_spelling_set()),
         Some(PrimitiveKind::String) | None => {
             if value.set_kind_tag == SetKindTag::None {
                 Some(value.set.clone())
@@ -1346,7 +1409,12 @@ fn bytes_like_construction_value(
     let argument = evaluate_expression(only, environment, kernel);
     if constructor == "memoryview" {
         if argument.kind == Kind::List {
-            return Some(argument);
+            // a view SHARES the underlying buffer (module doc) — writing
+            // through the view raises the memoryview-specific wording
+            // regardless of which species the wrapped argument itself
+            // carried, so this re-tags rather than keeping the argument's
+            // own word (`bytes_models::tagged`'s own doc).
+            return Some(bytes_models::tagged(argument, bytes_models::MEMORYVIEW_WORD));
         }
         return None;
     }
@@ -1354,13 +1422,21 @@ fn bytes_like_construction_value(
         if let Some((length, PrimitiveKind::Integer)) = single_numeric_value(&argument) {
             if (0.0..=1024.0).contains(&length) {
                 let zeroes = vec![0u8; length as usize];
-                return Some(bytes_models::bytes_literal_value(&zeroes));
+                return Some(bytes_models::tagged(
+                    bytes_models::bytes_literal_value(&zeroes),
+                    bytes_models::BYTEARRAY_WORD,
+                ));
             }
             return None;
         }
     }
     let bytes = known_byte_sequence(&argument)?;
-    Some(bytes_models::bytes_literal_value(&bytes))
+    let word = if constructor == "bytearray" {
+        bytes_models::BYTEARRAY_WORD
+    } else {
+        bytes_models::BYTES_WORD
+    };
+    Some(bytes_models::tagged(bytes_models::bytes_literal_value(&bytes), word))
 }
 
 /// `array.array('d', [...])` — the Float64Array twin,
@@ -1954,7 +2030,27 @@ fn evaluate_call(call: &ruff_python_ast::ExprCall, environment: &Environment, ke
             }
         }
         if receiver.kind == Kind::Object && !receiver.source.is_empty() {
-            if let Some(classes) = environment.classes() {
+            // TWO SIBLING NESTED DEFS DECLARING THE SAME CLASS NAME
+            // (b-body-expressions.py's `binary_chained_builder_call`:
+            // `make_ok_builder`/`make_over_builder` each declare their
+            // own `class Builder`) collide in `environment.classes()` —
+            // the caller's own flat, body-wide table can hold only ONE
+            // `"Builder"` entry, whichever `check.rs::local_class_table`
+            // happened to see first while pre-scanning the caller's body.
+            // A CHAINED call's receiver (`make_over_builder().type("x")`)
+            // needs the SPECIFIC sibling's own class, not that shared
+            // guess, so `receiver_def_local_classes` re-reads the class
+            // straight from the same-module def the receiver expression
+            // actually traces back to, fresh, with no sibling to collide
+            // against. Tried first; `environment.classes()` still answers
+            // every other receiver (an ordinary constructed instance, a
+            // parameter, a field read) exactly as before.
+            let scoped_classes = receiver_def_local_classes(&attribute.value, environment, kernel);
+            let classes_for_call = match &scoped_classes {
+                Some(scoped) if scoped.contains_key(receiver.source.as_str()) => Some(scoped),
+                _ => environment.classes(),
+            };
+            if let Some(classes) = classes_for_call {
                 if let Some(model) = classes.get(receiver.source.as_str()) {
                     if let Some(method) = instances::method_def_of(model, attribute.attr.as_str()) {
                         let Some(positional) = positional_arguments_for_method(call, method, environment, kernel) else {
@@ -2169,6 +2265,69 @@ fn evaluate_call(call: &ruff_python_ast::ExprCall, environment: &Environment, ke
         }
         Expr::Attribute(attribute) => evaluate_attribute_call(attribute, &arguments, environment, kernel),
         _ => unknown(),
+    }
+}
+
+/// The class table a chained method call's RECEIVER expression should
+/// resolve its instance's class against, read fresh from the SPECIFIC
+/// same-module def the receiver traces back to — never the caller's own
+/// shared `environment.classes()`, which can hold only one entry per
+/// bare class name and so cannot tell two sibling nested defs' own
+/// same-named classes apart (`check.rs::local_class_table`'s own doc:
+/// "a class nested inside a NESTED def... is collected too", flattened
+/// into one map, first-scanned-wins on a spelling collision).
+///
+/// `receiver` is peeled one layer at a time: an `Attribute` reads
+/// through to its own `.value` (`make_over_builder().type("x")`'s
+/// receiver, for the `.size(1)` call, is `make_over_builder().type("x")`
+/// itself — another Attribute call, not yet the root), a `Call` whose
+/// callee is a bare `Name` naming a same-module def (`environment.
+/// functions()`, which already carries every LOCAL nested def merged
+/// over the module's own top-level ones — `check.rs::local_function_
+/// table`'s own doc) is the root: that def's own body is rescanned for
+/// its OWN top-level classes, mirroring `summaries::interpret_class_def`'s
+/// exact synthetic-module construction (empty aliases/imports — a
+/// body-local class's own field annotations reading a module-level
+/// alias is a narrower, still-sound miss the same way that function's
+/// own doc already accepts). `None` for every other receiver shape (an
+/// ordinary bound name, a field read, a call to anything but a
+/// same-module def) — the caller falls back to `environment.classes()`
+/// unchanged.
+fn receiver_def_local_classes(
+    receiver: &Expr,
+    environment: &Environment,
+    kernel: &Arc<RefinedTSKernel>,
+) -> Option<std::sync::Arc<std::collections::HashMap<String, instances::ClassModel>>> {
+    match receiver {
+        Expr::Attribute(attribute) => receiver_def_local_classes(&attribute.value, environment, kernel),
+        // `make_over_builder().type("x")` (the `.size(1)` call's own
+        // receiver) is ITSELF a Call whose callee is an Attribute, not
+        // yet the root — peel through `.func`'s own receiver the same
+        // way the `Expr::Attribute` arm above peels `.value`, so a chain
+        // of any length still traces back to the one `Name` call that
+        // started it.
+        Expr::Call(call) if matches!(call.func.as_ref(), Expr::Attribute(_)) => {
+            receiver_def_local_classes(call.func.as_ref(), environment, kernel)
+        }
+        Expr::Call(call) => {
+            let Expr::Name(name) = call.func.as_ref() else {
+                return None;
+            };
+            let def = environment.functions()?.def(name.id.as_str())?;
+            let synthetic = ruff_python_ast::ModModule {
+                node_index: ruff_python_ast::AtomicNodeIndex::NONE,
+                range: TextRange::default(),
+                body: def.body.iter().filter(|stmt| matches!(stmt, ruff_python_ast::Stmt::ClassDef(_))).cloned().collect(),
+            };
+            let empty_aliases = std::collections::HashMap::new();
+            let empty_imports = crate::refinedpy::surface::surface_imports(&ruff_python_ast::ModModule {
+                node_index: ruff_python_ast::AtomicNodeIndex::NONE,
+                range: TextRange::default(),
+                body: Vec::new().into(),
+            });
+            Some(std::sync::Arc::new(instances::class_table(&synthetic, &empty_aliases, &empty_imports, kernel)))
+        }
+        _ => None,
     }
 }
 
@@ -3596,14 +3755,55 @@ pub fn binary_arithmetic_value(op: Operator, left: &AbstractValue, right: &Abstr
                 arithmetic_result(left_value.powf(right_value), false)
             }
         }
-        // `@`, shifts, and bitwise ops have no cited CPython row for
-        // exact-value arithmetic transfer in this wave
-        Operator::MatMult
-        | Operator::LShift
-        | Operator::RShift
-        | Operator::BitOr
-        | Operator::BitXor
-        | Operator::BitAnd => unknown(),
+        // `@` has no cited CPython row for exact-value arithmetic
+        // transfer in this wave.
+        Operator::MatMult => unknown(),
+        // `<<`/`>>` on ints are exact per §6.8: `x << n` is `x * 2**n`,
+        // `x >> n` is `x // 2**n` (floor division toward negative
+        // infinity, matching CPython's own arbitrary-precision shift).
+        // A negative shift count raises ValueError in CPython — this
+        // file has no exception channel for a binary operator's own
+        // decline (the same posture `Div`/`FloorDiv`/`Mod` already take
+        // for a zero divisor), so it declines to unknown() rather than
+        // claim a value CPython never produces. Both operands must be
+        // int-sorted (a float shift operand raises TypeError in
+        // CPython) and the shift count must stay small enough that
+        // `2**n` is itself f64-exact, or this declines the same way an
+        // out-of-2^53-range result already does elsewhere in this
+        // function.
+        Operator::LShift | Operator::RShift if both_int && right_value >= 0.0 && right_value < 53.0 => {
+            let factor = 2f64.powf(right_value);
+            if op == Operator::LShift {
+                arithmetic_result(left_value * factor, true)
+            } else {
+                arithmetic_result((left_value / factor).floor(), true)
+            }
+        }
+        Operator::LShift | Operator::RShift => unknown(),
+        // `&`/`|`/`^` on ints are exact per §6.8, computed over CPython's
+        // conceptually infinite two's-complement representation. Both
+        // operands must be int-sorted (a float bitwise operand raises
+        // TypeError in CPython) and stay within `i64`'s exact range —
+        // this file's carrier is f64, so an operand or result outside
+        // i64 declines rather than truncate silently.
+        Operator::BitOr | Operator::BitXor | Operator::BitAnd
+            if both_int && left_value.fract() == 0.0 && right_value.fract() == 0.0 =>
+        {
+            let Some(left_int) = f64_to_exact_i64(left_value) else {
+                return unknown();
+            };
+            let Some(right_int) = f64_to_exact_i64(right_value) else {
+                return unknown();
+            };
+            let result = match op {
+                Operator::BitOr => left_int | right_int,
+                Operator::BitXor => left_int ^ right_int,
+                Operator::BitAnd => left_int & right_int,
+                _ => unreachable!("guarded to BitOr/BitXor/BitAnd above"),
+            };
+            arithmetic_result(result as f64, true)
+        }
+        Operator::BitOr | Operator::BitXor | Operator::BitAnd => unknown(),
     }
 }
 
@@ -3919,6 +4119,19 @@ fn arithmetic_result(value: f64, both_int: bool) -> AbstractValue {
         return known_values(vec![value], PrimitiveKind::Integer, TrustProved);
     }
     known_values(vec![value], PrimitiveKind::Float, TrustProved)
+}
+
+/// An f64 carrying a whole number, as an `i64` — but only inside the
+/// same 2^53 exact-integer window `arithmetic_result` already trusts
+/// for every other operator. `&`/`|`/`^` need integer bit patterns
+/// rather than f64 arithmetic, so this is the one extra conversion
+/// step those three rows take; anything outside the window declines
+/// the same way an out-of-range `+`/`-`/`*` result already does.
+fn f64_to_exact_i64(value: f64) -> Option<i64> {
+    if value.fract() != 0.0 || value.abs() >= 2f64.powi(53) {
+        return None;
+    }
+    Some(value as i64)
 }
 
 /// Whether `expression` (or a sub-expression it evaluates FIRST, in
@@ -4730,6 +4943,74 @@ mod tests {
         assert_eq!(exact_string_values(&result).and_then(code_points_to_string).as_deref(), Some("abc"));
     }
 
+    /// `&`/`|`/`^` on two known int-sorted values are exact per §6.8 —
+    /// pins `40 | 200 == 232` (CPython-checked), the exact fold
+    /// `compound_bitwise_on_number_slot`'s `age |= 200` depends on to
+    /// carry a judgeable value past Age's 120 ceiling instead of
+    /// declining to unknown().
+    #[test]
+    fn test_binary_arithmetic_value_bitwise_or_is_exact() {
+        let forty = known_values(vec![40.0], PrimitiveKind::Integer, TrustProved);
+        let two_hundred = known_values(vec![200.0], PrimitiveKind::Integer, TrustProved);
+        let result = binary_arithmetic_value(Operator::BitOr, &forty, &two_hundred);
+        assert_eq!(result.values, vec![232.0]);
+        assert_eq!(result.kind_tag, Some(PrimitiveKind::Integer));
+    }
+
+    /// `&`/`^` follow the same exact two's-complement law as `|` —
+    /// CPython-checked: `5 & 3 == 1`, `5 ^ 3 == 6`.
+    #[test]
+    fn test_binary_arithmetic_value_bitwise_and_xor_are_exact() {
+        let five = known_values(vec![5.0], PrimitiveKind::Integer, TrustProved);
+        let three = known_values(vec![3.0], PrimitiveKind::Integer, TrustProved);
+        let and_result = binary_arithmetic_value(Operator::BitAnd, &five, &three);
+        assert_eq!(and_result.values, vec![1.0]);
+        let xor_result = binary_arithmetic_value(Operator::BitXor, &five, &three);
+        assert_eq!(xor_result.values, vec![6.0]);
+    }
+
+    /// `<<`/`>>` on two known int-sorted values are exact per §6.8:
+    /// `x << n` is `x * 2**n`, `x >> n` floors `x / 2**n` — CPython-
+    /// checked: `1 << 5 == 32`, `(-8) >> 2 == -2` (floors toward
+    /// negative infinity, not truncates toward zero).
+    #[test]
+    fn test_binary_arithmetic_value_shifts_are_exact() {
+        let one = known_values(vec![1.0], PrimitiveKind::Integer, TrustProved);
+        let five = known_values(vec![5.0], PrimitiveKind::Integer, TrustProved);
+        let left_shifted = binary_arithmetic_value(Operator::LShift, &one, &five);
+        assert_eq!(left_shifted.values, vec![32.0]);
+
+        let negative_eight = known_values(vec![-8.0], PrimitiveKind::Integer, TrustProved);
+        let two = known_values(vec![2.0], PrimitiveKind::Integer, TrustProved);
+        let right_shifted = binary_arithmetic_value(Operator::RShift, &negative_eight, &two);
+        assert_eq!(right_shifted.values, vec![-2.0]);
+    }
+
+    /// A negative shift count raises ValueError in CPython — this file
+    /// has no exception channel for a binary operator's own decline, so
+    /// it declines to unknown() rather than claim a value CPython never
+    /// produces.
+    #[test]
+    fn test_binary_arithmetic_value_negative_shift_declines() {
+        let one = known_values(vec![1.0], PrimitiveKind::Integer, TrustProved);
+        let negative_one = known_values(vec![-1.0], PrimitiveKind::Integer, TrustProved);
+        let result = binary_arithmetic_value(Operator::LShift, &one, &negative_one);
+        assert_eq!(result.kind, Kind::Unknown);
+    }
+
+    /// A float operand to a bitwise op raises TypeError in CPython
+    /// (unsupported operand type) — `single_numeric_value` reads a bare
+    /// Float-sorted operand as non-int, so `both_int` is false and this
+    /// declines rather than guess a two's-complement pattern for a
+    /// value that was never an int.
+    #[test]
+    fn test_binary_arithmetic_value_bitwise_float_operand_declines() {
+        let one_float = known_values(vec![1.0], PrimitiveKind::Float, TrustProved);
+        let one_int = known_values(vec![1.0], PrimitiveKind::Integer, TrustProved);
+        let result = binary_arithmetic_value(Operator::BitAnd, &one_float, &one_int);
+        assert_eq!(result.kind, Kind::Unknown);
+    }
+
     /// `age + 1` where `age` is a seeded int-sorted SET `[0, 120]` — the
     /// mission's own headline case: the known-values path declines (age
     /// is not one known value), so `binary_arithmetic_value_with_kernel`
@@ -5455,6 +5736,71 @@ mod tests {
             crate::refinedpy::instances::field_read(&value, "age"),
             Some(known_values(vec![40.0], PrimitiveKind::Integer, TrustProved))
         );
+    }
+
+    /// b-body-expressions.py's own `binary_chained_builder_call` shape:
+    /// TWO same-module defs each declare their own `class Builder`, with
+    /// DIFFERENT `size` method bodies. `environment.classes()` is set to
+    /// the COLLAPSED table `check.rs::local_class_table`'s own
+    /// first-scanned-wins merge would build for the enclosing body
+    /// (`make_ok_builder`'s Builder, the one whose `size` returns
+    /// `"ab"`) — the exact stale, shared guess a chained call must NOT
+    /// trust. `make_over_builder().type("x").size(1)` still answers
+    /// `"too-long-str"`, `make_over_builder`'s OWN `size`, proving
+    /// `receiver_def_local_classes` traces the chain back to the right
+    /// def instead of reading the collapsed table.
+    #[test]
+    fn test_chained_call_on_a_same_named_sibling_local_class_reads_its_own_def() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = ruff_python_parser::parse_module(concat!(
+            "def make_ok_builder():\n",
+            "    class Builder:\n",
+            "        def type(self, _t):\n",
+            "            return self\n",
+            "        def size(self, _n):\n",
+            "            return \"ab\"\n",
+            "    return Builder()\n",
+            "def make_over_builder():\n",
+            "    class Builder:\n",
+            "        def type(self, _t):\n",
+            "            return self\n",
+            "        def size(self, _n):\n",
+            "            return \"too-long-str\"\n",
+            "    return Builder()\n",
+        ))
+        .expect("test module parses")
+        .into_syntax();
+        let table = std::sync::Arc::new(crate::refinedpy::function_table::function_table(&module));
+        let aliases = std::collections::HashMap::new();
+        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let ruff_python_ast::Stmt::FunctionDef(make_ok_builder) = &module.body[0] else {
+            panic!("module's first statement is def make_ok_builder")
+        };
+        // the STALE, collapsed table: only `make_ok_builder`'s own
+        // `Builder` (whose `size` answers "ab") — the first-scanned-wins
+        // shape `local_class_table`'s recursive merge would leave behind
+        // for a body enclosing both nested defs.
+        let stale_classes = std::sync::Arc::new(crate::refinedpy::instances::class_table(
+            &ruff_python_ast::ModModule {
+                node_index: ruff_python_ast::AtomicNodeIndex::NONE,
+                range: TextRange::default(),
+                body: make_ok_builder
+                    .body
+                    .iter()
+                    .filter(|stmt| matches!(stmt, ruff_python_ast::Stmt::ClassDef(_)))
+                    .cloned()
+                    .collect(),
+            },
+            &aliases,
+            &imports,
+            &kernel,
+        ));
+        let mut environment = empty_environment();
+        environment.set_functions(table);
+        environment.set_classes(stale_classes);
+        let parsed = parse_expression("make_over_builder().type(\"x\").size(1)").expect("test source must parse");
+        let value = evaluate_expression(&parsed.into_expr(), &environment, &kernel);
+        assert_eq!(value.values, string_models::string_literal_value("too-long-str").values);
     }
 
     // --- item 3: attribute read ---
@@ -6502,6 +6848,47 @@ mod tests {
     fn test_len_of_a_bytearray_constructor_composes() {
         let Some(value) = eval("len(bytearray(10))") else { return };
         assert_eq!(value.values, vec![10.0]);
+    }
+
+    /// `bytearray(4)`/`bytearray(b"...")`/`bytes([...])`/
+    /// `memoryview(bytearray(...))` each carry their own species word
+    /// (`bytes_models::tagged`'s own doc) — `check.rs`'s write sink reads
+    /// this to decide which of the three write rules applies. A plain
+    /// list literal carries none of these words.
+    #[test]
+    fn test_bytearray_from_length_is_tagged_bytearray() {
+        let Some(value) = eval("bytearray(4)") else { return };
+        assert_eq!(value.kind_word, Some(bytes_models::BYTEARRAY_WORD));
+    }
+
+    #[test]
+    fn test_bytearray_from_a_bytes_literal_is_tagged_bytearray() {
+        let Some(value) = eval("bytearray(b\"\\x0a\\x14\")") else { return };
+        assert_eq!(value.kind_word, Some(bytes_models::BYTEARRAY_WORD));
+    }
+
+    #[test]
+    fn test_bytes_constructor_is_tagged_bytes() {
+        let Some(value) = eval("bytes([10, 20, 30])") else { return };
+        assert_eq!(value.kind_word, Some(bytes_models::BYTES_WORD));
+    }
+
+    #[test]
+    fn test_memoryview_over_bytearray_is_tagged_memoryview_not_bytearray() {
+        // the view's OWN word must win — a write through the view raises
+        // the memoryview-specific wording, not bytearray's, even though
+        // the wrapped argument was itself tagged bytearray.
+        let Some(kernel) = loaded_kernel() else { return };
+        let parsed = parse_expression("memoryview(bytearray(2))").expect("test source must parse");
+        let environment = empty_environment();
+        let value = evaluate_expression(&parsed.into_expr(), &environment, &kernel);
+        assert_eq!(value.kind_word, Some(bytes_models::MEMORYVIEW_WORD));
+    }
+
+    #[test]
+    fn test_plain_list_literal_carries_no_bytes_species_word() {
+        let Some(value) = eval("[10, 20, 30]") else { return };
+        assert_eq!(value.kind_word, None);
     }
 
     // --- h/c-file: computed dict key evaluating to a known string ---

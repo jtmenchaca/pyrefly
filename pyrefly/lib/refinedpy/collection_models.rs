@@ -92,10 +92,11 @@
 //!   this method never raises a KeyError."
 
 use refined_domain::abstract_value::{
-    known_values, null_value, unknown, AbstractValue, Kind, ObjectKey, PrimitiveKind,
+    known_set, known_values, null_value, unknown, AbstractValue, Kind, ObjectKey, PrimitiveKind, SetKindTag,
 };
 use refined_domain::known_constructors::{known_list, known_object};
-use refined_domain::trust_grades::TrustProved;
+use refined_domain::trust_grades::{trust_level_of, TrustProved};
+use refined_sets::repetition_window_forms::as_repetition;
 
 /// A Python `list` display (`[a, b, c]`): `Kind::List` with one exact
 /// slot per element, in source order. `known_list`'s own floor logic
@@ -171,12 +172,14 @@ impl DictKey {
     /// value comparison (stdtypes.rst's mapping rule only requires a
     /// key be :term:`hashable`, never a string or number — a bare
     /// `object()` sentinel, hashable by identity alone, is a legal dict
-    /// key this way). `tag` is the source-carried identity a value's
-    /// own `AbstractValue.source` field states (today, only
-    /// `object_call`'s fixed `"object()"` tag, `builtin_models.rs`) —
-    /// this constructor does not itself decide WHICH values are
-    /// identity-comparable; `known_dict_key`'s own identity arm decides
-    /// that, and this is just the spelling it wraps the tag in.
+    /// key this way). `tag` is `identity_key_tag`'s own answer: either an
+    /// opaque value's source text (today, only `object_call`'s fixed
+    /// `"object()"` tag, `builtin_models.rs`), or a `#`-prefixed spelling
+    /// of a constructed class instance's own `instance_identity`
+    /// (`instances::judge_construction`'s own doc) — this constructor
+    /// does not itself decide WHICH values are identity-comparable;
+    /// `known_dict_key`'s own identity arm decides that, and this is
+    /// just the spelling it wraps the tag in.
     fn identity(tag: &str) -> DictKey {
         DictKey {
             name: format!("{IDENTITY_KEY_PREFIX}{tag}"),
@@ -273,21 +276,30 @@ fn known_string_key(value: &AbstractValue) -> Option<String> {
 
 /// An IDENTITY-KEYED value's own tag, if `value` is a `Kind::Object`
 /// value this file recognizes as identity-comparable rather than
-/// value-comparable: an opaque object (`kind_word` is `Some`, the
-/// `opaque_value` shape — a featureless `object()`, `builtin_models.rs`)
-/// carrying a non-empty `source`. `source` doubles as a constructed
-/// CLASS instance's own class-name tag elsewhere (`instances.rs`'s
-/// `judge_construction`), so this reads ONLY an opaque value's source,
-/// never a class instance's — a `Holder()`-style class instance used as
-/// an identity-only key needs its own per-CALL-SITE tag threaded from
-/// construction (`instances.rs`/`expressions.rs`, out of this file's
-/// reach), and reading a class instance's `source` here would wrongly
-/// treat every instance of the SAME class as the same key.
-fn identity_key_tag(value: &AbstractValue) -> Option<&str> {
-    if value.kind != Kind::Object || value.kind_word.is_none() || value.source.is_empty() {
+/// value-comparable. Two shapes:
+/// - an opaque object (`kind_word` is `Some`, the `opaque_value` shape —
+///   a featureless `object()`, `builtin_models.rs`) carrying a non-empty
+///   `source`, tagged with that source text.
+/// - a constructed CLASS instance (`instances::judge_construction`'s own
+///   `instance_identity`, `Some(id)`) — a PER-CONSTRUCTION id, distinct
+///   from `source` (which carries the CLASS's name and is shared by
+///   every instance of that class): reading `source` here would wrongly
+///   treat every `Holder()` instance as the same dict key, so this reads
+///   `instance_identity` instead, tagged under a `#`-prefixed spelling no
+///   opaque value's own `source` text can produce (`object_call`'s fixed
+///   `"object()"` tag has no leading `#`, and no other opaque tag in this
+///   checker does either).
+fn identity_key_tag(value: &AbstractValue) -> Option<String> {
+    if value.kind != Kind::Object {
         return None;
     }
-    Some(value.source.as_str())
+    if let Some(id) = value.instance_identity {
+        return Some(format!("#{id}"));
+    }
+    if value.kind_word.is_some() && !value.source.is_empty() {
+        return Some(value.source.clone());
+    }
+    None
 }
 
 /// An already-evaluated subscript/read index, read as a dict key: a
@@ -316,7 +328,7 @@ pub fn known_dict_key(value: &AbstractValue) -> Option<DictKey> {
         return Some(DictKey::integer(value.values[0] as i64));
     }
     if let Some(tag) = identity_key_tag(value) {
-        return Some(DictKey::identity(tag));
+        return Some(DictKey::identity(&tag));
     }
     None
 }
@@ -415,21 +427,50 @@ fn dict_key_set_read(keys: &[ObjectKey], index: &AbstractValue) -> Option<Abstra
     joined
 }
 
+/// `container[index]` on a KNOWN-LENGTH-UNKNOWN, known-element-set
+/// receiver: `Kind::Set` whose only form is `Form::Star(element)` — the
+/// shape `check.rs::seed_parameters` builds for a `list[X]`/`set[X]`/
+/// `Sequence[X]` parameter, `X`'s own set starred rather than nested
+/// into exact positional slots (unlike `Kind::List`, which states an
+/// exact count `list_index_read` bounds-checks against). A repetition
+/// `A*`'s own positions never hold anything outside `A` — the grammar's
+/// definition, not a fact this function proves — so ANY known Integer
+/// index reads the same answer: "some member of `element`", no bounds
+/// check possible or needed since the length is unstated. `as_repetition`
+/// reads the bare star back to its element without a kernel round trip
+/// (`refined_sets::repetition_window_forms`, the same reader
+/// `format_for_hover.rs`/`format_string_shapes.rs` already use for the
+/// string-domain's own `C*`). Any OTHER set shape (a bound scalar range,
+/// a bounded repetition window, a union) answers `None` — this reads
+/// only the one unbounded-star shape the parameter seed builds.
+fn star_element_read(container: &AbstractValue, index: &AbstractValue) -> Option<AbstractValue> {
+    if container.kind != Kind::Set || container.set_kind_tag != SetKindTag::None {
+        return None;
+    }
+    known_integer_index(index)?;
+    let repeated = as_repetition(&container.set)?;
+    if repeated.lo != 0 || repeated.hi.is_some() {
+        return None; // a bounded window, not the bare star this reads
+    }
+    Some(known_set(repeated.element, None, trust_level_of(container), SetKindTag::None))
+}
+
 /// `container[index]` — the subscription read (expressions.rst,
 /// "Subscriptions"): a known list/tuple (`Kind::List`) with a known
 /// Integer index, a known exact string (`Kind::Values` tagged
 /// `PrimitiveKind::String`) with a known Integer index
-/// (`string_index_read`'s own doc), or a known dict (`Kind::Object`)
+/// (`string_index_read`'s own doc), a known dict (`Kind::Object`)
 /// with a known String- or Integer-sorted key (`known_dict_key`'s own
 /// doc — an Object receiver keyed numerically is still a DICT read,
 /// never the list/tuple positional-index path above: the two receiver
-/// kinds never share one dispatch arm), or a dict keyed by a finite
+/// kinds never share one dispatch arm), a dict keyed by a finite
 /// UNION of known strings where every named entry is present
-/// (`dict_key_set_read`'s own doc). Every other receiver shape or
-/// index/key shape answers `None` — an unknown receiver, a non-Integer
-/// index into a list or string, an unsupported key sort into a dict, or
-/// a slice — none of those are modeled here and this function declines
-/// honestly rather than guessing.
+/// (`dict_key_set_read`'s own doc), or an unknown-length sequence whose
+/// element set is known (`star_element_read`'s own doc). Every other
+/// receiver shape or index/key shape answers `None` — an unknown
+/// receiver, a non-Integer index into a list or string, an unsupported
+/// key sort into a dict, or a slice — none of those are modeled here
+/// and this function declines honestly rather than guessing.
 pub fn subscript_read(container: &AbstractValue, index: &AbstractValue) -> Option<AbstractValue> {
     match container.kind {
         Kind::List => {
@@ -444,6 +485,7 @@ pub fn subscript_read(container: &AbstractValue, index: &AbstractValue) -> Optio
             Some(key) => dict_key_read(&container.keys, &key),
             None => dict_key_set_read(&container.keys, index),
         },
+        Kind::Set => star_element_read(container, index),
         _ => None,
     }
 }
@@ -572,6 +614,13 @@ pub fn dict_without_item(receiver: &AbstractValue, key: &AbstractValue) -> Optio
 /// negative-index rule as a read; an index past the end raises
 /// `IndexError`, which this domain has no channel for, so it declines
 /// rather than silently extending the list the way `append` would).
+///
+/// Carries `receiver`'s own `kind_word` forward onto the written-through
+/// list — a bytes-like receiver (`bytes_models::tagged`'s own species
+/// word) stays tagged after a write that mutated its contents, so a
+/// SECOND write to the same name still reads which of the three
+/// bytes-like write rules applies rather than losing the tag the moment
+/// this function rebuilds the list.
 pub fn list_with_item(receiver: &AbstractValue, index: &AbstractValue, value: &AbstractValue) -> Option<AbstractValue> {
     if receiver.kind != Kind::List {
         return None;
@@ -584,7 +633,9 @@ pub fn list_with_item(receiver: &AbstractValue, index: &AbstractValue, value: &A
     }
     let mut items = receiver.items.clone();
     items[adjusted as usize] = value.clone();
-    Some(list_literal_value(&items))
+    let mut written = list_literal_value(&items);
+    written.kind_word = receiver.kind_word;
+    Some(written)
 }
 
 /// A mutating container-method call's (new receiver, call result) pair
@@ -1103,16 +1154,59 @@ mod tests {
     }
 
     #[test]
-    fn known_dict_key_ignores_a_class_instances_source_tag() {
-        // a constructed class instance (judge_construction's own
-        // `instance.source = model.name` tag, instances.rs) is NOT an
-        // opaque value (no kind_word) — reading its source as an
-        // identity tag would wrongly treat every instance of the SAME
-        // class as one shared dict key, so known_dict_key must decline
-        // here rather than build a DictKey::identity from it.
+    fn known_dict_key_ignores_a_class_instances_source_tag_with_no_instance_identity() {
+        // a constructed class instance with `source` set but no
+        // `instance_identity` (a hand-built instance this test never ran
+        // through `judge_construction`) is NOT an opaque value (no
+        // kind_word) and carries no per-construction id — reading its
+        // shared `source` as an identity tag would wrongly treat every
+        // instance of the SAME class as one shared dict key, so
+        // known_dict_key must decline here rather than build a
+        // DictKey::identity from it.
         let mut class_instance = known_object(vec![], None, true, TrustProved, false);
         class_instance.source = "Holder".to_owned();
         assert_eq!(known_dict_key(&class_instance), None);
+    }
+
+    // --- identity-keyed dict entries (a class instance's own
+    // instance_identity, `instances::judge_construction`'s own tag) ---
+
+    /// Two class instances that share the SAME `source` (both `Holder`)
+    /// but carry DIFFERENT `instance_identity` ids — the shape
+    /// `judge_construction` builds for two separate `Holder()` calls.
+    fn class_instance(class_name: &str, identity: u32) -> AbstractValue {
+        let mut instance = known_object(vec![], None, true, TrustProved, false);
+        instance.source = class_name.to_owned();
+        instance.instance_identity = Some(identity);
+        instance
+    }
+
+    #[test]
+    fn known_dict_key_reads_a_class_instances_own_instance_identity() {
+        let a = class_instance("Holder", 1);
+        let b = class_instance("Holder", 2);
+        assert_ne!(known_dict_key(&a), known_dict_key(&b), "two distinct constructions must not share a key");
+    }
+
+    #[test]
+    fn dict_get_result_finds_the_exact_instance_a_key_was_inserted_with() {
+        // cache[key] = 40; cache.get(key) must read 40 back; a DIFFERENT
+        // instance of the same class (missing_key) must miss — the
+        // WeakKeyDictionary.get row this table exists to serve.
+        let key = class_instance("Holder", 1);
+        let missing_key = class_instance("Holder", 2);
+        let dict_key = known_dict_key(&key).expect("a constructed instance is an identity key");
+        let built = dict_literal_value(&[Some(dict_key)], &[integer(40.0)]);
+        assert_eq!(dict_get_result(&built, &key, None), Some(integer(40.0)));
+        assert_eq!(dict_get_result(&built, &missing_key, None), Some(null_value()));
+    }
+
+    #[test]
+    fn dict_with_item_class_instance_key_round_trips_through_get() {
+        let key = class_instance("Holder", 7);
+        let empty = known_object(vec![], None, true, TrustProved, false);
+        let written = dict_with_item(&empty, &key, &integer(40.0)).expect("identity-keyed write must decide");
+        assert_eq!(dict_get_result(&written, &key, None), Some(integer(40.0)));
     }
 
     // --- dict subscript keyed by a joined (Set-kind) string ---
@@ -1230,6 +1324,63 @@ mod tests {
         let dict = dict_literal_value(&[Some(DictKey::integer(15))], &[integer(115.0)]);
         assert_eq!(subscript_read(&dict, &string("15")), None);
         assert_eq!(subscript_read(&dict, &integer(15.0)), Some(integer(115.0)));
+    }
+
+    // --- unknown-length, known-element-set receivers (the `list[int]`/
+    // `set[int]`/`Sequence[int]` parameter seed's own star shape) ---
+
+    /// The star-of-a-set receiver `check.rs::seed_parameters` builds for
+    /// a `list[int]` parameter: `Kind::Set` over one bare
+    /// `Form::Star(element)`. Any known Integer index reads "some member
+    /// of element" — the star's own definition, no bounds check possible
+    /// since the length is unstated.
+    fn star_of(element: refined_sets::refinement_forms::RefinedSet) -> AbstractValue {
+        known_set(
+            refined_sets::refinement_forms::make_refined_set(vec![refined_sets::refinement_forms::star(element)]),
+            None,
+            TrustProved,
+            SetKindTag::None,
+        )
+    }
+
+    #[test]
+    fn subscript_read_of_a_star_shaped_set_answers_the_element_set_at_any_index() {
+        let whole_ints = refined_sets::refinement_forms::make_refined_set(vec![
+            refined_sets::refinement_forms::integer(),
+            refined_sets::refinement_forms::at_least(f64::NEG_INFINITY),
+        ]);
+        let ages = star_of(whole_ints.clone());
+        let element_at_zero = subscript_read(&ages, &integer(0.0)).expect("index 0 reads the star's element");
+        assert_eq!(element_at_zero.kind, Kind::Set);
+        assert_eq!(element_at_zero.set, whole_ints.clone());
+        // the length is unstated — a large index reads the SAME element
+        // set, never a bounds refusal the way an exact Kind::List would
+        let element_at_large_index =
+            subscript_read(&ages, &integer(9000.0)).expect("a star has no length to bound against");
+        assert_eq!(element_at_large_index.set, whole_ints);
+    }
+
+    #[test]
+    fn subscript_read_of_a_star_shaped_set_declines_a_non_integer_index() {
+        let whole_ints = refined_sets::refinement_forms::make_refined_set(vec![
+            refined_sets::refinement_forms::integer(),
+            refined_sets::refinement_forms::at_least(f64::NEG_INFINITY),
+        ]);
+        let ages = star_of(whole_ints);
+        assert_eq!(subscript_read(&ages, &string("0")), None);
+    }
+
+    #[test]
+    fn subscript_read_of_a_bounded_scalar_set_is_not_read_as_a_star() {
+        // an ordinary bound scalar range (not a star) must not fall into
+        // the star reader — it declines the same as before this feature
+        let bound = known_set(
+            refined_sets::refinement_forms::make_refined_set(vec![refined_sets::refinement_forms::at_least(0.0)]),
+            None,
+            TrustProved,
+            SetKindTag::None,
+        );
+        assert_eq!(subscript_read(&bound, &integer(0.0)), None);
     }
 
     // --- len() ---
@@ -1371,6 +1522,24 @@ mod tests {
     fn list_with_item_out_of_range_declines() {
         let list = list_literal_value(&[integer(1.0)]);
         assert_eq!(list_with_item(&list, &integer(5.0), &integer(9.0)), None);
+    }
+
+    #[test]
+    fn list_with_item_carries_the_receivers_kind_word_forward() {
+        // a bytes-like receiver's own species word (bytes_models::tagged)
+        // must survive a write that mutates its contents — a SECOND write
+        // to the same name still needs to read which write rule applies.
+        let mut bytes_like = list_literal_value(&[integer(1.0), integer(2.0)]);
+        bytes_like.kind_word = Some("a bytearray value");
+        let written = list_with_item(&bytes_like, &integer(0.0), &integer(9.0)).expect("write must decide");
+        assert_eq!(written.kind_word, Some("a bytearray value"));
+    }
+
+    #[test]
+    fn list_with_item_on_an_untagged_list_stays_untagged() {
+        let list = list_literal_value(&[integer(1.0), integer(2.0)]);
+        let written = list_with_item(&list, &integer(0.0), &integer(9.0)).expect("write must decide");
+        assert_eq!(written.kind_word, None);
     }
 
     // --- mutated_receiver: list ---

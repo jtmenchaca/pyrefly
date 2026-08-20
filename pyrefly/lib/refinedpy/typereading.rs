@@ -70,6 +70,21 @@ pub struct DeclaredRefinement {
     /// the same "one active field" convention the other container shapes
     /// already keep.
     pub members: Option<Vec<(String, DeclaredRefinement)>>,
+    /// A FIXED-ARITY tuple declaration's own per-position table —
+    /// `tuple[int, int]`'s slot 0 and slot 1, each read through the
+    /// ordinary `declared_refinement` recursion, in declaration order.
+    /// Unlike `element` (one refinement shared by every position of a
+    /// `list[X]`), a fixed-arity tuple's positions are each checked
+    /// separately, so this carries one refinement per slot rather than
+    /// one shared refinement — the same "heterogeneous, keyed by
+    /// position instead of by name" shape `members` already carries for a
+    /// TypedDict, keyed by index instead of by field name. `set`/
+    /// `element`/`generator`/`members` are unused (empty/None) when this
+    /// is Some, the same "one active field" convention every other
+    /// container shape already keeps. `tuple[X, ...]` (a variadic tuple,
+    /// the slice ending in a bare `...`) is a DIFFERENT shape this field
+    /// does not carry — that subscript is read elsewhere or not at all.
+    pub positions: Option<Vec<DeclaredRefinement>>,
 }
 
 /// The two checked positions a generator-shaped return annotation
@@ -106,6 +121,7 @@ pub fn declared_refinement(
                 element: None,
                 generator: None,
                 members: None,
+                positions: None,
             })
         }
         // `Optional[X]` reads X through the ordinary path and marks the
@@ -168,6 +184,7 @@ pub fn declared_refinement(
                         element: None,
                         generator: None,
                         members: None,
+                        positions: None,
                     });
                 }
                 if let Some(members) = string_literal_members(subscript.slice.as_ref()) {
@@ -180,6 +197,7 @@ pub fn declared_refinement(
                         element: None,
                         generator: None,
                         members: None,
+                        positions: None,
                     });
                 }
                 return None;
@@ -217,6 +235,7 @@ pub fn declared_refinement(
                                     element: Some(Box::new(value_declared)),
                                     generator: None,
                                     members: None,
+                                    positions: None,
                                 });
                             }
                         }
@@ -224,23 +243,42 @@ pub fn declared_refinement(
                 }
                 return None;
             }
-            // `list[X]` / `set[X]` — the same one-element-slot shape
-            // `dict[str, X]` reads for its VALUE slot: the container
-            // itself carries no scalar set, its ELEMENT does. The slice
-            // is the single element annotation directly (no Tuple wrap
-            // for a one-argument subscript, the same ruff rule the
-            // Optional arm above documents).
+            // `list[X]` / `set[X]` / `Sequence[X]` — the same
+            // one-element-slot shape `dict[str, X]` reads for its VALUE
+            // slot: the container itself carries no scalar set, its
+            // ELEMENT does. The slice is the single element annotation
+            // directly (no Tuple wrap for a one-argument subscript, the
+            // same ruff rule the Optional arm above documents).
+            // `Sequence` is `collections.abc.Sequence`/`typing.Sequence`
+            // (tmp/cpython Doc/library/typing.rst: "typing.Sequence ...
+            // Deprecated alias to collections.abc.Sequence"), a
+            // read-only container with the same one-element-slot shape
+            // `list`/`set` already read — recognized by bare name only,
+            // the same no-import-identity convention this table already
+            // takes for `Optional`/`Literal`/`Callable`.
             let is_element_container = matches!(
                 subscript.value.as_ref(),
-                Expr::Name(head) if head.id.as_str() == "list" || head.id.as_str() == "set"
+                Expr::Name(head) if head.id.as_str() == "list" || head.id.as_str() == "set" || head.id.as_str() == "Sequence"
             );
             if is_element_container {
                 let head = match subscript.value.as_ref() {
                     Expr::Name(head) => head.id.as_str(),
                     _ => unreachable!("matched Name above"),
                 };
-                if let Some(element_declared) =
-                    declared_refinement(subscript.slice.as_ref(), aliases, imports, environment)
+                // The element position ALSO falls back to the bare
+                // `int`/`float`/`str` sort reading (`base_sort_return_
+                // refinement`) when the ordinary alias table has nothing
+                // for it — `list[int]`'s element is `int`, which is not
+                // an alias name. Scoped to this one call site, the same
+                // narrow exception `seed_parameters` already takes at the
+                // top level: reading a base sort HERE only ever widens
+                // what a container's OWN element states, never turns an
+                // unrelated `-> int` return into a fresh blocker (the
+                // general-table doc's own concern), because the sort
+                // never reaches `declared_refinement`'s general recursion
+                // except through this one element slot.
+                if let Some(element_declared) = declared_refinement(subscript.slice.as_ref(), aliases, imports, environment)
+                    .or_else(|| base_sort_return_refinement(subscript.slice.as_ref()))
                 {
                     let spelling = format!("{}[{}]", head, element_declared.spelling);
                     return Some(DeclaredRefinement {
@@ -250,9 +288,71 @@ pub fn declared_refinement(
                         element: Some(Box::new(element_declared)),
                         generator: None,
                         members: None,
+                        positions: None,
                     });
                 }
                 return None;
+            }
+            // `tuple[X, Y, ...]` FIXED-ARITY (every slot a concrete type,
+            // no trailing bare `...`) — a known-length positional shape,
+            // unlike `list[X]`'s one-element-slot shape above: slot `i`
+            // carries POSITION `i`'s own declared refinement, not one
+            // refinement shared by every slot. Recognized by bare-Name
+            // head `tuple` (no `SurfaceImports` identity for it either,
+            // the same no-import-identity convention this table already
+            // takes) with a `Tuple` slice (ruff wraps a multi-element
+            // subscript, the same rule `dict[str, X]` above documents; a
+            // one-element `tuple[X]` has no `Tuple` wrap and is read as a
+            // single-position tuple below). `tuple[X, ...]` (a VARIADIC
+            // tuple, the slice ending in a bare `Expr::EllipsisLiteral`)
+            // is a different, unbounded-length shape this arm does not
+            // recognize — it declines here and falls through to
+            // `annotated_expression_set` below, which also declines,
+            // leaving that shape's own reading (if any) to a different
+            // unit. Every position must itself read through the ordinary
+            // `declared_refinement` recursion, falling back to the same
+            // bare `int`/`float`/`str` sort reading the element-slot arm
+            // above already takes (`tuple[int, int]`'s own slots are not
+            // alias names) — any position that does not read declines the
+            // WHOLE tuple, the same all-or-nothing rule `dict[str,
+            // Unreadable]` already takes for its own value slot.
+            let is_tuple = matches!(subscript.value.as_ref(), Expr::Name(head) if head.id.as_str() == "tuple");
+            if is_tuple {
+                let slots: Option<Vec<&Expr>> = match subscript.slice.as_ref() {
+                    Expr::Tuple(arguments) => {
+                        if arguments.elts.iter().any(|element| matches!(element, Expr::EllipsisLiteral(_))) {
+                            None
+                        } else {
+                            Some(arguments.elts.iter().collect())
+                        }
+                    }
+                    Expr::EllipsisLiteral(_) => None,
+                    other => Some(vec![other]),
+                };
+                if let Some(slots) = slots {
+                    let mut positions = Vec::with_capacity(slots.len());
+                    for slot in slots {
+                        let Some(slot_declared) = declared_refinement(slot, aliases, imports, environment)
+                            .or_else(|| base_sort_return_refinement(slot))
+                        else {
+                            return None;
+                        };
+                        positions.push(slot_declared);
+                    }
+                    let spelling = format!(
+                        "tuple[{}]",
+                        positions.iter().map(|position| position.spelling.as_str()).collect::<Vec<_>>().join(", ")
+                    );
+                    return Some(DeclaredRefinement {
+                        set: make_refined_set(Vec::new()),
+                        spelling,
+                        admits_none: false,
+                        element: None,
+                        generator: None,
+                        members: None,
+                        positions: Some(positions),
+                    });
+                }
             }
             // `Generator[YieldType, SendType, ReturnType]` /
             // `AsyncGenerator[YieldType, SendType]` / `Iterator[YieldType]`
@@ -288,6 +388,7 @@ pub fn declared_refinement(
                         element: None,
                         generator: Some(Box::new(generator)),
                         members: None,
+                        positions: None,
                     });
                 }
             }
@@ -300,6 +401,7 @@ pub fn declared_refinement(
                 element: None,
                 generator: None,
                 members: None,
+                positions: None,
             })
         }
         // `X | None` / `None | X` (exactly one side a bare `None`
@@ -439,6 +541,35 @@ pub fn base_sort_return_refinement(returns: &Expr) -> Option<DeclaredRefinement>
         element: None,
         generator: None,
         members: None,
+        positions: None,
+    })
+}
+
+/// A bare-Name return/AnnAssign annotation naming a module-level
+/// TypedDict class (`instances::typed_dict_table`'s own keys) —
+/// `PersonDict`'s own per-member table, wrapped as a `DeclaredRefinement`
+/// with `members: Some(...)` so `assignability::judge`'s MEMBERS law can
+/// judge a dict literal against it field-by-field. `None` for anything
+/// else (an alias name, a class that is not a recognized TypedDict, a
+/// non-bare-Name annotation) — the ordinary `declared_refinement` path
+/// already owns every other shape, and this function is a narrow
+/// addition alongside it, not a replacement.
+pub fn typed_dict_return_refinement(
+    annotation: &Expr,
+    typed_dicts: &HashMap<String, Vec<(String, DeclaredRefinement)>>,
+) -> Option<DeclaredRefinement> {
+    let Expr::Name(name) = annotation else {
+        return None;
+    };
+    let members = typed_dicts.get(name.id.as_str())?;
+    Some(DeclaredRefinement {
+        set: make_refined_set(Vec::new()),
+        spelling: name.id.as_str().to_owned(),
+        admits_none: false,
+        element: None,
+        generator: None,
+        members: Some(members.clone()),
+        positions: None,
     })
 }
 
@@ -641,6 +772,178 @@ mod tests {
             .expect("a visible alias resolves");
         assert_eq!(got.spelling, "PositiveInt");
         assert_eq!(got.set, make_refined_set(vec![at_least(1.0)]));
+    }
+
+    /// `list[int]`'s element position resolves through the bare-sort
+    /// fallback: `int` is not a module-level alias, so without the
+    /// `base_sort_return_refinement` fallback at this one call site the
+    /// whole `list[int]` subscript declines (`f-type-nodes.py`'s
+    /// `list_annotation_parameter` row, undetermined before this fix).
+    #[test]
+    fn list_of_a_bare_int_resolves_its_element_through_the_base_sort_fallback() {
+        let aliases = HashMap::new();
+        let imports = no_imports();
+        let environment = no_locals();
+        let parsed = parse_expression("list[int]").expect("test source must parse");
+        let annotation = parsed.into_expr();
+
+        let got = declared_refinement(&annotation, &aliases, &imports, &environment)
+            .expect("list[int]'s element must resolve through the base-sort fallback");
+        assert_eq!(got.spelling, "list[int]");
+        let element = got.element.expect("list[X] carries its element, not a scalar set");
+        assert_eq!(element.spelling, "int");
+        assert!(!element.set.forms.is_empty(), "int's own set must not be empty");
+    }
+
+    /// `set[str]` and `Sequence[float]` take the identical fallback path
+    /// — the same `is_element_container` arm, keyed only on the head
+    /// name.
+    #[test]
+    fn set_and_sequence_of_a_bare_base_sort_also_resolve_their_element() {
+        let aliases = HashMap::new();
+        let imports = no_imports();
+        let environment = no_locals();
+
+        let set_parsed = parse_expression("set[str]").expect("test source must parse");
+        let set_got = declared_refinement(&set_parsed.into_expr(), &aliases, &imports, &environment)
+            .expect("set[str]'s element must resolve");
+        assert_eq!(set_got.element.expect("element present").spelling, "str");
+
+        let sequence_parsed = parse_expression("Sequence[float]").expect("test source must parse");
+        let sequence_got = declared_refinement(&sequence_parsed.into_expr(), &aliases, &imports, &environment)
+            .expect("Sequence[float]'s element must resolve");
+        assert_eq!(sequence_got.element.expect("element present").spelling, "float");
+    }
+
+    /// `tuple[int, int]` — a FIXED-ARITY tuple of two bare base sorts:
+    /// each position reads through the same base-sort fallback the
+    /// element-container arm above takes, kept SEPARATE per position
+    /// (unlike `list[int]`'s one shared element) — `c-reads-and-values.py`'s
+    /// `ternary_spread_copies_optional_list` own parameter shape.
+    #[test]
+    fn fixed_arity_tuple_of_two_bare_ints_resolves_each_position_through_the_base_sort_fallback() {
+        let aliases = HashMap::new();
+        let imports = no_imports();
+        let environment = no_locals();
+        let parsed = parse_expression("tuple[int, int]").expect("test source must parse");
+
+        let got = declared_refinement(&parsed.into_expr(), &aliases, &imports, &environment)
+            .expect("tuple[int, int]'s positions must resolve through the base-sort fallback");
+        assert_eq!(got.spelling, "tuple[int, int]");
+        let positions = got.positions.expect("a fixed-arity tuple carries its positions, not a scalar set");
+        assert_eq!(positions.len(), 2);
+        assert_eq!(positions[0].spelling, "int");
+        assert_eq!(positions[1].spelling, "int");
+    }
+
+    /// `tuple[Age, Label]` — mixed alias positions each read through the
+    /// ordinary alias recursion, keeping their own distinct sets.
+    #[test]
+    fn fixed_arity_tuple_of_two_aliases_resolves_each_positions_own_set() {
+        let aliases = age_aliases();
+        let imports = no_imports();
+        let environment = no_locals();
+        let parsed = parse_expression("tuple[Age, Label]").expect("test source must parse");
+
+        let got = declared_refinement(&parsed.into_expr(), &aliases, &imports, &environment)
+            .expect("tuple[Age, Label]'s positions must resolve");
+        let positions = got.positions.expect("positions present");
+        assert_eq!(positions[0].spelling, "Age");
+        assert_eq!(positions[0].set, make_refined_set(vec![at_least(0.0)]));
+        assert_eq!(positions[1].spelling, "Label");
+        assert_eq!(positions[1].set, make_refined_set(vec![at_least(1.0)]));
+    }
+
+    /// `tuple[int, Unreadable]` — one position this table cannot read
+    /// declines the WHOLE tuple, the same all-or-nothing rule
+    /// `dict[str, Unreadable]` already takes for its own value slot.
+    #[test]
+    fn fixed_arity_tuple_with_one_unreadable_position_declines_whole() {
+        let aliases = HashMap::new();
+        let imports = no_imports();
+        let environment = no_locals();
+        let parsed = parse_expression("tuple[int, Unreadable]").expect("test source must parse");
+
+        let got = declared_refinement(&parsed.into_expr(), &aliases, &imports, &environment);
+        assert!(got.is_none());
+    }
+
+    /// `tuple[int, ...]` — a VARIADIC tuple (the slice ends in a bare
+    /// `...`) is a different, unbounded-length shape this reader does not
+    /// recognize; it declines rather than misreading the ellipsis as a
+    /// second fixed position.
+    #[test]
+    fn variadic_tuple_declines_the_fixed_arity_reader() {
+        let aliases = HashMap::new();
+        let imports = no_imports();
+        let environment = no_locals();
+        let parsed = parse_expression("tuple[int, ...]").expect("test source must parse");
+
+        let got = declared_refinement(&parsed.into_expr(), &aliases, &imports, &environment);
+        assert!(got.is_none());
+    }
+
+    /// `tuple[int]` — a SINGLE-element tuple has no `Tuple`-wrapped slice
+    /// (ruff only wraps a multi-element subscript), so this reads as a
+    /// one-position tuple, not the element-container `list[X]` shape.
+    #[test]
+    fn single_element_tuple_resolves_one_position() {
+        let aliases = HashMap::new();
+        let imports = no_imports();
+        let environment = no_locals();
+        let parsed = parse_expression("tuple[int]").expect("test source must parse");
+
+        let got = declared_refinement(&parsed.into_expr(), &aliases, &imports, &environment)
+            .expect("tuple[int]'s one position must resolve");
+        let positions = got.positions.expect("positions present");
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].spelling, "int");
+    }
+
+    /// `list[Age]` (an alias element, not a bare sort) is unaffected by
+    /// the fallback — it still resolves through the ordinary alias path,
+    /// the same as before this fix.
+    #[test]
+    fn list_of_an_alias_element_still_resolves_through_the_alias_path() {
+        let mut aliases = HashMap::new();
+        aliases.insert("Age".to_owned(), make_refined_set(vec![at_least(0.0)]));
+        let imports = no_imports();
+        let environment = no_locals();
+        let parsed = parse_expression("list[Age]").expect("test source must parse");
+
+        let got = declared_refinement(&parsed.into_expr(), &aliases, &imports, &environment)
+            .expect("list[Age]'s element must resolve through the alias table");
+        let element = got.element.expect("element present");
+        assert_eq!(element.spelling, "Age");
+        assert_eq!(element.set, make_refined_set(vec![at_least(0.0)]));
+    }
+
+    #[test]
+    fn typed_dict_return_refinement_wraps_the_classs_own_member_table() {
+        let mut typed_dicts = HashMap::new();
+        let age_declared = DeclaredRefinement {
+            set: make_refined_set(vec![at_least(0.0)]),
+            spelling: "Age".to_owned(),
+            admits_none: false,
+            element: None,
+            generator: None,
+            members: None,
+            positions: None,
+        };
+        typed_dicts.insert("PersonDict".to_owned(), vec![("age".to_owned(), age_declared)]);
+
+        let got = typed_dict_return_refinement(&name_expr("PersonDict"), &typed_dicts)
+            .expect("a recorded TypedDict name resolves");
+        assert_eq!(got.spelling, "PersonDict");
+        let members = got.members.expect("members carries the per-field table");
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].0, "age");
+    }
+
+    #[test]
+    fn typed_dict_return_refinement_declines_a_name_absent_from_the_table() {
+        let typed_dicts: HashMap<String, Vec<(String, DeclaredRefinement)>> = HashMap::new();
+        assert!(typed_dict_return_refinement(&name_expr("PersonDict"), &typed_dicts).is_none());
     }
 
     #[test]
@@ -847,6 +1150,29 @@ mod tests {
             .expect("Optional[Annotated[int, Field(ge=0)]] resolves");
         assert!(got.admits_none);
         assert_eq!(got.set, make_refined_set(vec![refined_sets::refinement_forms::integer(), at_least(0.0)]));
+    }
+
+    /// `"Sequence[Age]"` — a quoted forward reference to
+    /// `collections.abc.Sequence`/`typing.Sequence`: the string re-parses
+    /// (the `Expr::StringLiteral` arm) to an ordinary `Sequence[Age]`
+    /// subscript, which reads the same one-element-slot shape `list[X]`/
+    /// `set[X]` already read, carrying `Age` as `element` rather than a
+    /// scalar `set`.
+    #[test]
+    fn quoted_sequence_of_age_reads_age_as_the_element() {
+        let module = ruff_python_parser::parse_module("x: \"Sequence[Age]\" = None\n")
+            .expect("test module parses")
+            .into_syntax();
+        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let annotation = annotated_or_none_annotation(&module);
+        let aliases = age_aliases();
+        let environment = no_locals();
+
+        let got = declared_refinement(annotation, &aliases, &imports, &environment)
+            .expect("Sequence[Age] resolves");
+        assert_eq!(got.spelling, "Sequence[Age]");
+        let element = got.element.expect("Sequence carries an element refinement");
+        assert_eq!(element.set, make_refined_set(vec![at_least(0.0)]));
     }
 
     /// `Literal[10, 20]` — a multi-member int Literal (ruff wraps the

@@ -27,9 +27,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use refined_domain::abstract_value::{known_set, known_values, unknown, AbstractValue, Kind, ObjectKey, PrimitiveKind, SetKindTag};
+use refined_domain::known_constructors::known_list;
 use refined_domain::trust_grades::{TrustProved, TrustSpec};
 use refined_kernel::kernel_interface::RefinedTSKernel;
-use refined_sets::refinement_forms::{requires_integer, RefinedSet};
+use refined_sets::refinement_forms::{make_refined_set, requires_integer, star, RefinedSet};
 use ruff_python_ast::{
     Alias, AtomicNodeIndex, CmpOp, ExceptHandler, ExceptHandlerExceptHandler, Expr, ExprAttribute, ExprSubscript,
     ModModule, Parameters, Stmt, StmtAnnAssign, StmtAssign, StmtAugAssign, StmtClassDef, StmtFunctionDef, StmtIf,
@@ -38,6 +39,7 @@ use ruff_python_ast::{
 use ruff_text_size::{Ranged, TextRange};
 
 use crate::refinedpy::assignability::{judge, Verdict};
+use crate::refinedpy::bytes_models::{self, BytesAnswer};
 use crate::refinedpy::collection_models::{dict_get_result, dict_with_item, dict_without_item, list_literal_value, list_with_item, mutated_receiver, subscript_read};
 use crate::refinedpy::cross_module::{module_surface, ModuleResolver, IMPORT_DEPTH_CAP};
 use crate::refinedpy::env::Environment;
@@ -51,7 +53,7 @@ use crate::refinedpy::match_arms::match_taken_environment;
 use crate::refinedpy::narrowing::assume;
 use crate::refinedpy::summaries;
 use crate::refinedpy::surface::{compile_aliases, strict_int_alias_names, surface_imports};
-use crate::refinedpy::typereading::{base_sort_return_refinement, callable_return_refinement, declared_refinement, DeclaredRefinement};
+use crate::refinedpy::typereading::{base_sort_return_refinement, callable_return_refinement, declared_refinement, typed_dict_return_refinement, DeclaredRefinement};
 
 /// One refinement finding: the range it anchors to, the RTS code, and
 /// the rendered message.
@@ -96,6 +98,14 @@ struct WalkContext<'a> {
     /// (a `StrictInt` base never attempts str-to-int coercion,
     /// execution-verified against pydantic 2.13.4).
     strict_int_aliases: &'a HashSet<String>,
+    /// Every module-level `class X(TypedDict): name: Annotation, …`
+    /// read into its own per-member refinement table
+    /// (`instances::typed_dict_table`), keyed on the class's name —
+    /// consulted where a `-> X`/`x: X` annotation names a TypedDict
+    /// rather than a `type X = …` alias, so a dict literal judged
+    /// against it is judged member-by-member (`typed_dict_return_
+    /// refinement`) instead of reading as unrefined.
+    typed_dicts: Arc<HashMap<String, Vec<(String, DeclaredRefinement)>>>,
 }
 
 /// Every finding in one module, resolving no imports — the LSP seam's
@@ -175,6 +185,7 @@ pub fn findings_for_module_with_resolver(
     }
     let module_callable_returns = Arc::new(module_level_callable_returns(module, &aliases, &imports));
     let strict_int_aliases = strict_int_alias_names(module);
+    let typed_dicts = Arc::new(instances::typed_dict_table(module, &aliases, &imports));
     let context = WalkContext {
         aliases: &aliases,
         imports: &imports,
@@ -184,6 +195,7 @@ pub fn findings_for_module_with_resolver(
         module_bindings: surface.bindings,
         module_callable_returns,
         strict_int_aliases: &strict_int_aliases,
+        typed_dicts,
     };
     let mut out = Vec::new();
     walk_body(&module.body, None, None, None, &context, &mut out);
@@ -398,7 +410,7 @@ fn walk_body_with_self_binding(
                 continue;
             }
         }
-        walk_statement(
+        let terminates = walk_statement(
             stmt,
             return_refinement,
             yield_refinement,
@@ -409,6 +421,18 @@ fn walk_body_with_self_binding(
             &mut blocked,
             out,
         );
+        // A `try` whose every arm provably raises or returns leaves
+        // nothing that reaches whatever follows it in THIS body — the
+        // same "unreachable code past a terminal statement" rule
+        // `arm_terminates` already applies to a bare `return`/`raise`,
+        // extended here to a try/except construct whose own termination
+        // is proved rather than syntactic. Stopping here is what keeps a
+        // read past the try from reporting an unreadable-value blocker
+        // for a name only the (unreachable) fall-through path would have
+        // left unbound.
+        if terminates {
+            break;
+        }
     }
 }
 
@@ -516,6 +540,7 @@ fn walk_method_def(def: &StmtFunctionDef, class: &ClassModel, context: &WalkCont
     let outer_environment = Environment::new(HashSet::new());
     let return_refinement = def.returns.as_deref().and_then(|annotation| {
         declared_refinement(annotation, context.aliases, context.imports, &outer_environment)
+            .or_else(|| typed_dict_return_refinement(annotation, &context.typed_dicts))
     });
     let (return_refinement, yield_refinement) = generator_body_refinements(def, return_refinement);
     let self_instance = judge_construction(class, &[], &[], context.kernel).instance;
@@ -610,6 +635,60 @@ fn seed_parameters(parameters: &Parameters, context: &WalkContext, environment: 
         else {
             continue;
         };
+        // A `list[X]`/`set[X]`/`Sequence[X]` PARAMETER (`declared.element`
+        // Some, `declared.set` unused/empty — typereading's own "one
+        // active field" convention) seeds a SEQUENCE of unknown length
+        // whose every position draws from X's own set: `Kind::Set` over
+        // one `Form::Star(X)` refinement. This is the "unknown length,
+        // known element set" shape — `subscript_read`'s own `Kind::Set`
+        // arm reads any index as "some member of X", the star grammar's
+        // own definition (a repetition's positions never hold anything
+        // outside its element alphabet), so no length is ever claimed
+        // and no kernel round trip is needed to answer an element read.
+        // Scoped to a SCALAR/string-sorted element (`element.set` non-
+        // empty) — an element that is itself container-shaped
+        // (`dict[str, X]`'s own element, another `list[X]`) has no
+        // scalar set here to star over, and is left for the plain
+        // element-carrying seed below, matching today's behavior for
+        // that shape.
+        let is_sequence_container = declared.spelling.starts_with("list[")
+            || declared.spelling.starts_with("set[")
+            || declared.spelling.starts_with("Sequence[");
+        if is_sequence_container {
+            if let Some(element) = &declared.element {
+                if !element.set.forms.is_empty() {
+                    let sequence = known_set(
+                        make_refined_set(vec![star(element.set.clone())]),
+                        None,
+                        TrustSpec,
+                        SetKindTag::None,
+                    );
+                    environment.bind(parameter.parameter.name.id.as_str(), sequence);
+                    continue;
+                }
+            }
+        }
+        // A FIXED-ARITY `tuple[X, Y]` PARAMETER (`declared.positions`
+        // Some — typereading's own per-position table) seeds a
+        // KNOWN-LENGTH `Kind::List` whose slot `i` is `known_set` over
+        // position `i`'s own declared set — the same nested-exact-
+        // sequence shape a literal tuple/list display already builds
+        // (`collection_models.rs`'s own module doc). Unlike the sequence
+        // seed above, every position keeps its OWN set rather than
+        // sharing one starred element, so `subscript_read`'s `Kind::List`
+        // arm reads slot `i` back exactly, and a spread (`[*item]`) can
+        // splice the slots in place — a spread only recognizes a known
+        // `Kind::List` receiver (`expressions.rs::evaluate_display_elements`),
+        // never the unknown-length `Kind::Set` star shape above.
+        if let Some(positions) = &declared.positions {
+            let items = positions
+                .iter()
+                .map(|position| known_set(position.set.clone(), None, TrustSpec, SetKindTag::None))
+                .collect();
+            let tuple = known_list(items, TrustSpec);
+            environment.bind(parameter.parameter.name.id.as_str(), tuple);
+            continue;
+        }
         let seeded = known_set(declared.set, None, TrustSpec, SetKindTag::None);
         environment.bind(parameter.parameter.name.id.as_str(), seeded);
     }
@@ -644,6 +723,13 @@ fn record_blocker(blocked: &mut bool, range: TextRange, sentence: String, out: &
 /// this body's own first unwalkable construct) clears the set wholesale
 /// before dispatching — the conservative "any branch/loop/blocker
 /// between declaration and read → no fire" rule the mission states.
+///
+/// Returns whether this statement provably never falls through to
+/// whatever follows it — true only for a `try` whose own arms all
+/// terminate (`walk_try`'s return). Every other form still runs exactly
+/// as before and answers `false`: this is not a general reachability
+/// signal, only the one fact `walk_try` already computes and this
+/// dispatcher passes outward untouched.
 fn walk_statement(
     stmt: &Stmt,
     return_refinement: Option<&DeclaredRefinement>,
@@ -654,7 +740,7 @@ fn walk_statement(
     provably_unbound: &mut HashSet<String>,
     blocked: &mut bool,
     out: &mut Vec<Finding>,
-) {
+) -> bool {
     match stmt {
         Stmt::AnnAssign(assign) => {
             walk_ann_assign(
@@ -855,7 +941,7 @@ fn walk_statement(
         }
         Stmt::Try(try_stmt) => {
             provably_unbound.clear();
-            walk_try(
+            return walk_try(
                 try_stmt,
                 return_refinement,
                 yield_refinement,
@@ -876,6 +962,7 @@ fn walk_statement(
             );
         }
     }
+    false
 }
 
 /// Removes every bare name a (possibly destructuring) Assign/AugAssign
@@ -1129,6 +1216,7 @@ fn walk_function_def(def: &StmtFunctionDef, context: &WalkContext, out: &mut Vec
     let outer_environment = Environment::new(HashSet::new());
     let return_refinement = def.returns.as_deref().and_then(|annotation| {
         declared_refinement(annotation, context.aliases, context.imports, &outer_environment)
+            .or_else(|| typed_dict_return_refinement(annotation, &context.typed_dicts))
     });
     let (return_refinement, yield_refinement) = generator_body_refinements(def, return_refinement);
     walk_body_with_self_binding(
@@ -1539,7 +1627,13 @@ fn arm_terminates_or_provably_raises(body: &[Stmt], out: &[Finding], findings_be
 /// body/orelse bind, PLUS every attribute-call/subscript-store receiver
 /// the unmodeled body only ever MUTATES — `forget_mutated_receivers_in_stmt`),
 /// so a stale pre-loop fact never survives an unmodeled loop that may
-/// have rebound it.
+/// have rebound it. NO-CHECKED-POSITION LAW: that blocker is recorded
+/// only when this body has a declared return/yield position or a
+/// declared slot (`aug_assign_refinements`) the loop could write —
+/// otherwise nothing anywhere in this walk is waiting on the loop's own
+/// answer, so declining to run it concretely states nothing worth
+/// reporting; the environment forgetting above still runs regardless,
+/// since a stale fact can survive even when there is no sink to judge.
 fn walk_loop(
     stmt: &Stmt,
     return_refinement: Option<&DeclaredRefinement>,
@@ -1614,6 +1708,21 @@ fn walk_loop(
                 out,
             );
         }
+        return;
+    }
+    // NO-CHECKED-POSITION LAW: a loop this module cannot concretely run
+    // is only a BLOCKER when some later read could have been judged
+    // against it — a declared return/yield position, or a declared
+    // slot (`x: Age = ...`) the body could write. Neither exists means
+    // there is no value anywhere in this walk waiting on the loop's own
+    // answer, so declining to run it concretely is not a blocker, it is
+    // nothing to report (q-decline-names.py's own `sum_rest`: `-> int`
+    // is not a refined alias and the body declares no slot, so its
+    // `for value in rest:` has no sink an unwalked loop could have
+    // served).
+    if return_refinement.is_none() && yield_refinement.is_none() && aug_assign_refinements.is_empty() {
+        forget_names_bound_by_stmt(stmt, environment);
+        forget_mutated_receivers_in_stmt(stmt, environment);
         return;
     }
     record_blocker(
@@ -1921,6 +2030,17 @@ fn bind_with_target(target: &Expr, value: AbstractValue, environment: &mut Envir
 /// join, on the joined environment — "the finally clause is executed...
 /// if the try clause is executed, including any except and else
 /// clauses."
+///
+/// Returns whether the try statement itself provably never falls
+/// through: zero surviving arms means every path either raises past an
+/// uncaught exception or terminates inside its own handler — the exact
+/// fact `surviving.is_empty()` already computes for the join below,
+/// surfaced so the caller's own body loop can stop walking statements
+/// that follow, the same way it already stops after a bare `return`/
+/// `raise` (`arm_terminates`). A `finally` clause still always runs
+/// first regardless — CPython runs `finally` even when nothing survives
+/// the try/except — so this only governs statements AFTER the whole
+/// try/except/else/finally construct, never `finalbody` itself.
 fn walk_try(
     try_stmt: &StmtTry,
     return_refinement: Option<&DeclaredRefinement>,
@@ -1930,7 +2050,7 @@ fn walk_try(
     aug_assign_refinements: &mut HashMap<String, DeclaredRefinement>,
     blocked: &mut bool,
     out: &mut Vec<Finding>,
-) {
+) -> bool {
     let mut surviving: Vec<Environment> = Vec::new();
 
     let mut try_env = environment.fork();
@@ -2022,6 +2142,7 @@ fn walk_try(
         }
     }
 
+    let nothing_survives = surviving.is_empty();
     *environment = match surviving.len() {
         0 => environment.fork(),
         1 => surviving.into_iter().next().unwrap(),
@@ -2048,6 +2169,7 @@ fn walk_try(
             out,
         );
     }
+    nothing_survives
 }
 
 /// The value one `except <type> as <name>:` handler's own `<name>`
@@ -2309,7 +2431,7 @@ fn walk_aug_assign(
             walk_field_aug_assign(assign, attribute, context, environment, out);
         }
         Expr::Subscript(subscript) => {
-            walk_subscript_aug_assign(assign, subscript, context, environment);
+            walk_subscript_aug_assign(assign, subscript, context, environment, aug_assign_refinements, out);
         }
         _ => {
             record_blocker(
@@ -2422,23 +2544,40 @@ fn walk_field_aug_assign(
 /// `name[key] = v` write — rebinding `name` so a later read in the same
 /// straight-line body sees the mutated element.
 ///
-/// NO ELEMENT-LEVEL JUDGING happens here: a container annotation
-/// (`ages: list[Age]`) states its element's own declared refinement
-/// nowhere this checker currently reads — `typereading::
-/// DeclaredRefinement.element` is populated for `dict[str, X]`'s VALUE
-/// slot only; `list[X]`'s own element slot is not wired into that
-/// reader today (see this wave's report, Proposed rulings — a
-/// `typereading.rs` change, outside `check.rs`/`instances.rs`'s
-/// ownership, is the honest fix). This function composes the write
-/// mechanically (so a later read observes the mutation, same soundness
-/// `bind_or_forget_subscript_target` already gives a plain `=` write)
-/// but never fires here — firing without a declared element set would
-/// be a guess, not a judgment.
+/// ELEMENT-LEVEL JUDGING: when `name`'s own declared refinement
+/// (`aug_assign_refinements`, this body's `x: list[Age] = …` table) is
+/// element-carrying (`typereading::DeclaredRefinement.element`, read for
+/// `list[X]`/`set[X]`/`dict[str, X]`), the folded element value is
+/// judged against that inner refinement through the shared `judge`
+/// entry point — the same law `judge_and_bind` already applies to a
+/// bare-name aug-target, one level down at the element. A Fire pushes
+/// the finding and writes the DECLARED element set back into the slot
+/// (the refused-write law: the container keeps a fact it can still
+/// answer for later reads, never the refused value) rather than
+/// `updated`; Silent writes `updated` through unchanged; Undetermined
+/// forgets the receiver — this walk has no blocker-sentence channel
+/// for a subscript aug-target (`walk_aug_assign`'s own doc already
+/// scopes blocker candidates to non-name targets, and an element-level
+/// Undetermined is not that either), so the honest answer is silence
+/// plus forgetting, the same posture an unresolved element read already
+/// takes below. A receiver with no recorded declared refinement, or one
+/// that is not element-carrying, composes the write mechanically with
+/// no judging — unchanged from before.
+///
+/// A bytes-like receiver is the one exception: `bytes_models::
+/// bytes_write_answer`'s raise is a LANGUAGE fact (CPython itself raises
+/// on the write), so it is checked here the same way
+/// `bind_or_forget_subscript_target` checks it for a plain `=` write —
+/// see that function's own doc for the full three-way rule (a provable
+/// raise leaves the receiver untouched and records no finding, success
+/// applies through `list_with_item` as today, undecidable forgets).
 fn walk_subscript_aug_assign(
     assign: &StmtAugAssign,
     subscript: &ExprSubscript,
     context: &WalkContext,
     environment: &mut Environment,
+    aug_assign_refinements: &HashMap<String, DeclaredRefinement>,
+    out: &mut Vec<Finding>,
 ) {
     let Expr::Name(receiver_name) = subscript.value.as_ref() else {
         return;
@@ -2455,6 +2594,38 @@ fn walk_subscript_aug_assign(
     };
     let operand = evaluate_expression(assign.value.as_ref(), environment, context.kernel);
     let updated = binary_arithmetic_value(assign.op, &current, &operand);
+    if receiver_value.kind == Kind::List && receiver_value.kind_word.is_some() {
+        match bytes_models::bytes_write_answer(&receiver_value, &updated) {
+            Some(BytesAnswer::Raises(_)) => return,
+            Some(BytesAnswer::Value(_)) => {}
+            None => {
+                environment.forget(receiver_name.id.as_str());
+                return;
+            }
+        }
+    }
+    let element_declared = aug_assign_refinements
+        .get(receiver_name.id.as_str())
+        .and_then(|declared| declared.element.as_deref());
+    let updated = if let Some(element_declared) = element_declared {
+        match judge(&updated, element_declared, context.kernel) {
+            Verdict::Fire(message) => {
+                out.push(Finding {
+                    range: assign.range(),
+                    code: "RTS7001",
+                    message,
+                });
+                known_set(element_declared.set.clone(), None, TrustSpec, SetKindTag::None)
+            }
+            Verdict::Silent => updated,
+            Verdict::Undetermined(_) => {
+                environment.forget(receiver_name.id.as_str());
+                return;
+            }
+        }
+    } else {
+        updated
+    };
     let written = match receiver_value.kind {
         Kind::Object => dict_with_item(&receiver_value, &key_value, &updated),
         Kind::List => list_with_item(&receiver_value, &key_value, &updated),
@@ -2757,6 +2928,7 @@ fn direct_alias_annotation(
         element: None,
         generator: None,
         members: None,
+        positions: None,
     })
 }
 
@@ -2950,12 +3122,24 @@ fn write_named_field(
             message,
         });
     }
+    // A `@property` name is never a stored slot — `field_read_through_model`
+    // resolves a read of `field` to the property's `backing` name
+    // (`instances.rs`'s own doc), so the write must land on that SAME
+    // backing name or a later read through the property sees the instance's
+    // pre-write value instead of what was just assigned
+    // (e-class-and-function.py's `property_getter_setter`,
+    // q-decline-names.py's `setter_effect_read_through_getter`: writing
+    // `over_box.age = 200` and reading `over_box.age` back must see 200).
+    let write_target = match model.properties.get(field) {
+        Some(property) => property.backing.as_str(),
+        None => field,
+    };
     // re-read after the class-table lookup above (which only borrowed
     // `environment`) so the write below can borrow it mutably; the
     // receiver is still exactly the instance just read, since nothing in
     // between could have rebound it.
     let instance = environment.read(receiver_name).expect("checked Some above").clone();
-    if let Some(updated) = instances::field_write(&instance, field, value.clone()) {
+    if let Some(updated) = instances::field_write(&instance, write_target, value.clone()) {
         environment.bind(receiver_name, updated);
     }
     true
@@ -3185,6 +3369,29 @@ fn unpack_mismatch_detail(expected: usize, got: usize, has_star: bool) -> String
 /// no single environment slot to rebind and is left untouched, matching
 /// this file's existing "no element-level model" posture for a receiver
 /// it cannot name.
+///
+/// A `bytes`/`bytearray`/`memoryview` receiver (`bytes_models::tagged`'s
+/// own species word) routes through `bytes_models::bytes_write_answer`
+/// FIRST, before the plain `list_with_item` path below ever runs. A
+/// write CPython provably raises (an out-of-`0..=255` bytearray/
+/// memoryview element, or ANY write onto an immutable `bytes`) leaves
+/// the receiver COMPLETELY UNTOUCHED — no bind, no forget, no finding.
+/// The write never took effect, so the pre-write contents are still
+/// exactly right (rebinding OR forgetting would both be a weaker, wrong
+/// answer — a forgotten receiver reads Undetermined past this point even
+/// though its value is still fully known), and the raise itself is not
+/// this function's own finding to report: it is not a judgment against a
+/// declared refinement (`assignability::judge`'s own seam), just a
+/// LANGUAGE fact this function uses to keep its model honest
+/// (p-typed-array.py's own `bytes_is_immutable` docstring: "No
+/// expect-error marker belongs on the raise itself"). A write that
+/// provably SUCCEEDS applies through the ordinary `list_with_item` path
+/// below unchanged (200 into a bytearray is in `0..=255`, so it writes
+/// through even though 200 would refuse against a declared `Age` — a
+/// different, later question `judge_and_bind` owns, never this
+/// function). An UNDECIDABLE bytes-like write (an unknown value) falls
+/// through to the same decline-and-forget the untagged path already
+/// takes, honest about a write this function cannot prove either way.
 fn bind_or_forget_subscript_target(
     subscript: &ExprSubscript,
     value: &AbstractValue,
@@ -3196,6 +3403,20 @@ fn bind_or_forget_subscript_target(
     };
     let receiver_value = evaluate_expression(subscript.value.as_ref(), environment, context.kernel);
     let key_value = evaluate_expression(subscript.slice.as_ref(), environment, context.kernel);
+    if receiver_value.kind == Kind::List && receiver_value.kind_word.is_some() {
+        match bytes_models::bytes_write_answer(&receiver_value, value) {
+            Some(BytesAnswer::Raises(_)) => return,
+            Some(BytesAnswer::Value(_)) => {
+                // falls through to the ordinary list_with_item path below,
+                // which performs the identical index-bounds write — this
+                // function only needed to know the write does not raise.
+            }
+            None => {
+                environment.forget(receiver_name.id.as_str());
+                return;
+            }
+        }
+    }
     let written = match receiver_value.kind {
         Kind::Object => dict_with_item(&receiver_value, &key_value, value),
         Kind::List => list_with_item(&receiver_value, &key_value, value),
@@ -3774,6 +3995,7 @@ fn adapter_alias_verdict(
         element: None,
         generator: None,
         members: None,
+        positions: None,
     };
     let range = argument_expr.range();
     let mut value = evaluate_expression(argument_expr, environment, context.kernel);
@@ -4956,6 +5178,92 @@ mod tests {
         assert!(messages[2].contains("'-1'"), "{messages:?}");
     }
 
+    /// `f-type-nodes.py`'s `list_annotation_parameter` row: a `list[int]`
+    /// PARAMETER read through `ages[0]` against `Age` — `int`'s own
+    /// unbounded ray admits values outside `Age`'s [0, 120] window, so
+    /// this fires (`seed_parameters`' star-of-a-set seed, read back
+    /// through `collection_models::subscript_read`'s new `Kind::Set` arm).
+    #[test]
+    fn a_list_int_parameters_element_read_fires_against_a_narrower_declared_set() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Age = Annotated[int, Field(ge=0, le=120)]\n",
+            "def list_annotation_parameter(ages: list[int]) -> Age:\n",
+            "    return ages[0]\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        assert_eq!(findings.len(), 1, "{:?}", findings.iter().map(|f| &f.message).collect::<Vec<_>>());
+        assert_eq!(findings[0].code, "RTS7001");
+        assert!(findings[0].message.contains("'Age'"), "{}", findings[0].message);
+    }
+
+    /// The same shape, but the declared element ITSELF is `Age` (an
+    /// alias, not a bare sort): `list[Age]`'s element already resolves
+    /// through the ordinary alias path (no fallback needed), and reading
+    /// its element against `Age` is a set-equals-itself Silent — pinning
+    /// that the star seed only ever WIDENS what silently determines,
+    /// never narrows an already-working alias-element row.
+    #[test]
+    fn a_list_of_the_declared_sets_own_alias_element_is_silent() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Age = Annotated[int, Field(ge=0, le=120)]\n",
+            "def first_age(ages: list[Age]) -> Age:\n",
+            "    return ages[0]\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        assert_eq!(findings.len(), 0, "{:?}", findings.iter().map(|f| &f.message).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_list_element_compound_write_past_the_declared_ceiling_fires() {
+        let Some(kernel) = loaded_kernel() else { return };
+        // ages[0] is 2 after the `//= 2`; += 190 writes 192, past Age's
+        // 120 ceiling — the element-level judging `walk_subscript_
+        // aug_assign` now applies through `aug_assign_refinements`'
+        // `list[Age]` entry.
+        let module = parsed(concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Age = Annotated[int, Field(ge=0, le=120)]\n",
+            "def rows() -> None:\n",
+            "    ages: list[Age] = [10, 20]\n",
+            "    ages[0] //= 5\n",
+            "    ages[0] += 190\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        let fires: Vec<&Finding> = findings.iter().filter(|f| f.code == "RTS7001").collect();
+        assert_eq!(
+            fires.len(),
+            1,
+            "want exactly one fire for the 192 write: {:?}",
+            findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_list_element_compound_write_inside_the_declared_ceiling_stays_silent() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Age = Annotated[int, Field(ge=0, le=120)]\n",
+            "def rows() -> None:\n",
+            "    ages: list[Age] = [10, 20]\n",
+            "    ages[0] += 5\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        assert!(
+            findings.iter().all(|f| f.code != "RTS7001"),
+            "an in-range element write must never fire: {:?}",
+            findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn an_alias_the_table_cannot_lower_declines_whole() {
         let Some(kernel) = loaded_kernel() else { return };
@@ -5968,6 +6276,49 @@ mod tests {
         );
     }
 
+    /// A `try` whose body provably raises (an arity-mismatch unpack) and
+    /// whose sole handler itself terminates (`except ValueError: return
+    /// first`) leaves `walk_try`'s own `surviving` list empty — this
+    /// statement never falls through. Statements written AFTER the try
+    /// describe only unreachable code, so they must not be walked for
+    /// judgement: a read of a name the try body never got to bind must
+    /// not report an unreadable-value blocker, and the try body's own
+    /// provable raise is still the sole finding.
+    #[test]
+    fn a_try_whose_every_arm_terminates_stops_the_body_walk_at_the_try() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Age = Annotated[int, Field(ge=0, le=120)]\n",
+            "def f() -> Age:\n",
+            "    first = 40\n",
+            "    triple = (200, 201, 202)\n",
+            "    try:\n",
+            "        over_first, over_second = triple\n",
+            "    except ValueError:\n",
+            "        return first\n",
+            "    return over_first\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        let raises: Vec<&Finding> = findings
+            .iter()
+            .filter(|f| f.code == "RTS7001" && f.message.contains("provably raises ValueError"))
+            .collect();
+        assert_eq!(
+            raises.len(),
+            1,
+            "the try body's own arity-mismatch unpack must still fire: {:?}",
+            findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+        );
+        let blockers: Vec<&Finding> = findings.iter().filter(|f| f.code == "RTS7002").collect();
+        assert!(
+            blockers.is_empty(),
+            "the unreachable `return over_first` past the terminating try must not report a blocker: {:?}",
+            findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+        );
+    }
+
     // --- HANDLER AS-NAME (law 3) ---
 
     #[test]
@@ -6711,6 +7062,47 @@ mod tests {
             findings.iter().map(|f| &f.message).collect::<Vec<_>>()
         );
         assert!(fires[0].message.contains("'200'"), "{}", fires[0].message);
+    }
+
+    /// A DISCRIMINATING test for the write TARGET, not just the write's
+    /// own judgment: the backing field starts at an OUT-OF-SET value
+    /// (200), and the setter then writes an IN-SET value (40) through
+    /// the property. `write_named_field` writes the property name
+    /// itself (`age`) into the instance's keys, but `field_read_through_
+    /// model` reads a property through its OWN `backing` name (`_held`)
+    /// — a write that lands on `age` instead of `_held` never reaches
+    /// the getter's own read at all, so the later `over_box.age` read
+    /// would still see the STALE 200 backing value and wrongly fire.
+    /// The write must resolve to the SAME backing name the read
+    /// resolves to, so this call stays completely silent.
+    #[test]
+    fn a_property_setter_write_lands_on_the_backing_field_a_later_getter_read_sees() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Age = Annotated[int, Field(ge=0, le=120)]\n",
+            "class Aged:\n",
+            "    def __init__(self) -> None:\n",
+            "        self._held = 200\n",
+            "    @property\n",
+            "    def age(self) -> int:\n",
+            "        return self._held\n",
+            "    @age.setter\n",
+            "    def age(self, value: Age) -> None:\n",
+            "        self._held = value\n",
+            "def f() -> Age:\n",
+            "    box = Aged()\n",
+            "    box.age = 40\n",
+            "    return box.age\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        assert!(
+            findings.is_empty(),
+            "the setter's in-set write (40) must land on the SAME backing field the getter reads, \
+             leaving no stale out-of-set value behind: {:?}",
+            findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+        );
     }
 
     #[test]
