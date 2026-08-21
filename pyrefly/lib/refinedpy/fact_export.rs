@@ -1753,8 +1753,13 @@ mod tests {
     /// ledgered fix flips this test's own assertion the moment it
     /// lands, at which point `level_gain_argv` should be asserted
     /// present in `functions` instead.
+    /// The real mixed fixture's body — the two-free-name comprehension
+    /// element `s * gain` — derives its return: the transfer's
+    /// sort-only answer for an unbounded operand pair flows into the
+    /// max/min clamp, the clamp bounds it to [-1, 1], and the whole
+    /// sum/len/sqrt chain lands on [0, 1].
     #[test]
-    fn the_real_mixed_fixture_bodys_return_is_still_undetermined() {
+    fn the_real_mixed_fixture_bodys_return_derives() {
         let Some(kernel) = loaded_kernel() else {
             return;
         };
@@ -1768,15 +1773,16 @@ mod tests {
         for omission in &export.omissions {
             eprintln!("omission: '{}' — {}", omission.function, omission.reason);
         }
-        let omission = export
-            .omissions
-            .iter()
-            .find(|omission| omission.function == "level_gain_argv")
-            .unwrap_or_else(|| panic!("expected 'level_gain_argv' to be omitted (see ISSUES.md) — instead it exported"));
-        assert_eq!(
-            omission.reason,
-            "the derived return is a value this walk never determined, which has no faithful set reading"
+        let rendered = serde_json::to_value(&export.artifact).expect("the artifact renders");
+        let function = &rendered["functions"]["level_gain_argv"];
+        assert!(
+            !function.is_null(),
+            "level_gain_argv must export (its body derives through the sort-only transfer answer)"
         );
+        let return_forms = function["return"]["set"]["forms"]
+            .as_array()
+            .expect("the derived return states its forms");
+        assert_eq!(return_forms.len(), 2, "the derived return is the two-sided [0, 1] window");
     }
 
     /// The main-block reader recognizes the file shape spelled exactly

@@ -4425,7 +4425,30 @@ fn transfer_over_sets(
             kind_tag: Some(result_sort),
             ..known_set(answer.set, None, grade, SetKindTag::None)
         }),
-        TransferAnswerKind::NaN | TransferAnswerKind::Unknown => None,
+        TransferAnswerKind::Unknown => {
+            // The kernel's honest top for this operand pair: no enclosure
+            // narrows the result (e.g. a bounded set times an unbounded
+            // one), but the SORT rule still holds — the same language-level
+            // guarantee float_sorted_unknown carries for the math family —
+            // so the answer is sort-known, value-unknown, never nothing.
+            // A downstream clamp (max/min) can still bound it, which is
+            // exactly how a two-free-name comprehension element derives.
+            Some(if both_int {
+                AbstractValue {
+                    kind_tag: Some(PrimitiveKind::Integer),
+                    ..known_set(
+                        make_refined_set(vec![integer(), at_least(f64::NEG_INFINITY)]),
+                        None,
+                        TrustSpec,
+                        SetKindTag::None,
+                    )
+                }
+            } else {
+                float_sorted_unknown()
+            })
+        }
+        // A may-be-NaN answer must never masquerade as a NaN-free set.
+        TransferAnswerKind::NaN => None,
     }
 }
 
@@ -5525,17 +5548,24 @@ mod tests {
     /// The UNBOUNDED float-set row: `float_sorted_unknown() * 2` — the
     /// operand is the whole numeric line (math.sqrt's sort-only shape),
     /// and the kernel's transfer answers no tighter certified image for
-    /// an unbounded operand, so the ask decides nothing and the honest
-    /// answer stays unknown(). The BOUNDED-set row above is where the
-    /// transfer certifies; this row pins that an unbounded operand is
-    /// never guessed at.
+    /// an unbounded operand. The answer is the SORT-ONLY unbounded set
+    /// (the same language-level guarantee the math family carries), not
+    /// nothing: the product of two numerics is a numeric, and a
+    /// downstream clamp can still bound it. The BOUNDED-set row above
+    /// is where the transfer certifies a tight image; this row pins
+    /// that an unbounded operand keeps its sort and loses its bounds —
+    /// never a guessed value, never a dropped one.
     #[test]
-    fn test_float_sorted_set_times_known_int_stays_unknown_when_unbounded() {
+    fn test_float_sorted_set_times_known_int_answers_the_sort_when_unbounded() {
         let Some(kernel) = loaded_kernel() else { return };
         let sqrt_result = float_sorted_unknown();
         let two = known_values(vec![2.0], PrimitiveKind::Integer, TrustProved);
         let result = binary_arithmetic_value_with_kernel(Operator::Mult, &sqrt_result, &two, &kernel);
-        assert_eq!(result.kind, Kind::Unknown);
+        assert_eq!(result.kind, Kind::Set);
+        assert_eq!(result.kind_tag, Some(PrimitiveKind::Float));
+        let everything = refined_sets::refinement_forms::numbers();
+        assert!((kernel.scalar_subset)(&result.set, &everything), "the sort-only answer must stay inside the numeric line");
+        assert!((kernel.scalar_subset)(&everything, &result.set), "the sort-only answer must not invent bounds the transfer never certified");
     }
 
     /// The EXCLUDED-operator row: `age % 7` where `age` is a seeded set —
