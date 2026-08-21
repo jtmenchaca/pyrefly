@@ -33,9 +33,10 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use pyrefly::refinedpy::check::findings_for_module_with_resolver;
+use pyrefly::refinedpy::check::findings_for_module_at;
 use pyrefly::refinedpy::cross_module::disk_resolver;
 use pyrefly::refinedpy::fact_export::export_module;
+use pyrefly::refinedpy::foreign_edge_artifact::cache_artifact_path;
 use pyrefly::refinedpy::kernel_path::resolve_kernel_dylib;
 use pyrefly::refinedpy::markers::line_col;
 use pyrefly::refinedpy::markers::line_starts_of;
@@ -57,7 +58,12 @@ fn check_file(path: &str, kernel: &Arc<RefinedTSKernel>) -> (usize, Vec<String>)
     // directory) resolves against `.` instead of an empty path.
     let entry_directory = Path::new(path).parent().filter(|dir| !dir.as_os_str().is_empty());
     let resolver = disk_resolver(entry_directory.unwrap_or_else(|| Path::new(".")).to_path_buf());
-    let findings = findings_for_module_with_resolver(&module, &resolver, kernel);
+    let findings = findings_for_module_at(
+        &module,
+        &resolver,
+        kernel,
+        Some(entry_directory.unwrap_or_else(|| Path::new("."))),
+    );
     let markers = markers_of(&source);
     let line_starts = line_starts_of(&source);
 
@@ -152,40 +158,29 @@ fn export_file(path: &str, output: &Path, kernel: &Arc<RefinedTSKernel>) -> Exit
             return ExitCode::from(2);
         }
     }
-    if let Err(err) = std::fs::write(output, format!("{rendered}\n")) {
-        eprintln!("{}: the artifact could not be written: {err}", output.display());
-        return ExitCode::from(2);
-    }
-    ExitCode::SUCCESS
-}
-
-/// The target's project-cache entry: the nearest ancestor holding
-/// `.git` is the project root (the target's own directory when none is
-/// found), and the entry mirrors the target's path relative to that
-/// root — the SAME derivation the TypeScript consumer reads by, so the
-/// two checkers meet at one file without either being told where.
-fn cache_artifact_path(target: &str) -> PathBuf {
-    let absolute = std::path::absolute(target).unwrap_or_else(|_| PathBuf::from(target));
-    let start = absolute.parent().unwrap_or(Path::new("."));
-    let mut root = start.to_path_buf();
-    let mut walk = Some(start);
-    while let Some(dir) = walk {
-        if dir.join(".git").exists() {
-            root = dir.to_path_buf();
-            break;
-        }
-        walk = dir.parent();
-    }
-    let relative = absolute.strip_prefix(&root).unwrap_or_else(|_| {
-        Path::new(absolute.file_name().map(|name| name.as_ref()).unwrap_or(Path::new("artifact").as_os_str()))
-    });
-    let mut entry = root.join(".refined").join("cache").join(relative);
-    let file_name = entry
+    // ATOMIC write: a reader (the Go/Rust consumer on the other side of
+    // the edge) can observe this file at any moment, including while an
+    // LSP save-hook writer is mid-write. A direct fs::write can be read
+    // torn (a spurious "not readable JSON" decline); writing a temp file
+    // in the SAME directory and renaming over it is atomic on the same
+    // volume and needs no new crate (std::fs::rename only). Last-write
+    // wins is semantically safe here because every writer derives the
+    // artifact from the same target's own disk bytes.
+    let file_name = output
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "artifact".to_owned());
-    entry.set_file_name(format!("{file_name}.refined.json"));
-    entry
+    let temp_output = output.with_file_name(format!("{file_name}.tmp.{}", std::process::id()));
+    if let Err(err) = std::fs::write(&temp_output, format!("{rendered}\n")) {
+        eprintln!("{}: the artifact could not be written: {err}", temp_output.display());
+        return ExitCode::from(2);
+    }
+    if let Err(err) = std::fs::rename(&temp_output, output) {
+        eprintln!("{}: the artifact could not be published: {err}", output.display());
+        let _ = std::fs::remove_file(&temp_output);
+        return ExitCode::from(2);
+    }
+    ExitCode::SUCCESS
 }
 
 /// The command line read into one of the two modes: `--export-fact

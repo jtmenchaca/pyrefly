@@ -44,6 +44,7 @@ use crate::refinedpy::collection_models::{dict_get_result, dict_with_item, dict_
 use crate::refinedpy::cross_module::{module_surface, ModuleResolver, IMPORT_DEPTH_CAP};
 use crate::refinedpy::env::Environment;
 use crate::refinedpy::expressions::{binary_arithmetic_value, evaluate_expression, fieldless_exception_value, provable_raise, register_retained_callables};
+use crate::refinedpy::foreign_edge;
 use crate::refinedpy::function_table::{function_table, merged, FunctionTable};
 use crate::refinedpy::instances;
 use crate::refinedpy::instances::{class_table, judge_construction, ClassModel, ConstructionVerdict};
@@ -107,6 +108,13 @@ struct WalkContext<'a> {
     /// against it is judged member-by-member (`typed_dict_return_
     /// refinement`) instead of reading as unrefined.
     typed_dicts: Arc<HashMap<String, Vec<(String, DeclaredRefinement)>>>,
+    /// The checked file's own directory, when the caller knows it — a
+    /// foreign edge's relative argv entry (`"./audio_level.ts"`) is
+    /// relative to the file that wrote it, never to the eventual
+    /// process's cwd, so the recognizer joins against this. `None`
+    /// (the resolver-less test entry points) leaves relative targets
+    /// unresolved, which declines honestly downstream.
+    entry_directory: Option<std::path::PathBuf>,
 }
 
 /// Every finding in one module, resolving no imports — the LSP seam's
@@ -135,6 +143,19 @@ pub fn findings_for_module_with_resolver(
     module: &ModModule,
     resolver: ModuleResolver,
     kernel: &Arc<RefinedTSKernel>,
+) -> Vec<Finding> {
+    findings_for_module_at(module, resolver, kernel, None)
+}
+
+/// `findings_for_module_with_resolver` plus the checked file's own
+/// directory — the CLI and the LSP seam both know it, and the foreign
+/// edge needs it to resolve a relative argv target against the file
+/// that wrote it rather than the process's cwd.
+pub fn findings_for_module_at(
+    module: &ModModule,
+    resolver: ModuleResolver,
+    kernel: &Arc<RefinedTSKernel>,
+    entry_directory: Option<&std::path::Path>,
 ) -> Vec<Finding> {
     let aliases = compile_aliases(module);
     if aliases.is_empty() {
@@ -197,6 +218,7 @@ pub fn findings_for_module_with_resolver(
         module_callable_returns,
         strict_int_aliases: &strict_int_aliases,
         typed_dicts,
+        entry_directory: entry_directory.map(|dir| dir.to_path_buf()),
     };
     let mut out = Vec::new();
     walk_body(&module.body, None, None, None, &context, &mut out);
@@ -418,6 +440,16 @@ fn walk_body_with_self_binding(
     // folded into its kernel program — `usize::MAX` while there is
     // none, since no statement ever sits there.
     let mut folded_division_at = usize::MAX;
+    // A foreign-edge return fact waiting to be published: the position
+    // of the statement holding its `json.loads(...)` node, the node's
+    // own range, and the value it reads as. Unlike a relational sum's
+    // quotient (always the very next statement), the sole `json.loads`
+    // consumer a foreign edge finds may sit several statements after
+    // the call, so this rides across more than one loop iteration
+    // rather than being cleared unconditionally after one walk — set
+    // here, applied via `environment.set_evaluated_node` only at the
+    // matching `position`, and left as `None` for every other body.
+    let mut foreign_edge_override: Option<(usize, TextRange, AbstractValue)> = None;
     for (position, stmt) in body.iter().enumerate() {
         if let (Some(class), Stmt::FunctionDef(def)) = (self_model, stmt) {
             if is_self_method(def) {
@@ -441,6 +473,56 @@ fn walk_body_with_self_binding(
         // re-walked into a second, weaker binding of the same name.
         if position == folded_division_at {
             continue;
+        }
+        // FOREIGN EDGE: `<name> = subprocess.run(["node", "<script>.ts"],
+        // input=json.dumps(...), capture_output=True, text=True)` followed
+        // by `json.loads(<name>.stdout)` — a cross-language call whose
+        // argv NAMES the TypeScript code that runs next, so the checker
+        // reads that target's own exported fact and attaches it to the
+        // parse node. Tried BEFORE `recognize_generator_sum` below: both
+        // recognize a shape at an `Assign`, and the foreign edge's own
+        // shape (a `subprocess.run` call) is the more specific of the two,
+        // so it must not be shadowed by a generator-sum match that could
+        // never apply to a `subprocess.run` value anyway — the fixed
+        // order this mission calls for once two Assign-shaped two-
+        // statement recognizers coexist.
+        if matches!(stmt, Stmt::Assign(_)) {
+            if let Some(outcome) = foreign_edge::foreign_edge_at(
+                body,
+                position,
+                &environment,
+                context.kernel,
+                context.entry_directory.as_deref(),
+            ) {
+                match outcome {
+                    foreign_edge::ForeignEdgeOutcome::Override { parse_range, value } => {
+                        // The override applies at the STATEMENT HOLDING the
+                        // `json.loads(...)` node — the sole consumer may sit
+                        // any number of statements after the call, so find
+                        // it by range containment rather than assuming a
+                        // position.
+                        let consumer_position = body
+                            .iter()
+                            .enumerate()
+                            .skip(position + 1)
+                            .find(|(_, following)| following.range().contains_range(parse_range))
+                            .map(|(index, _)| index);
+                        if let Some(consumer_position) = consumer_position {
+                            foreign_edge_override = Some((consumer_position, parse_range, value));
+                        }
+                    }
+                    foreign_edge::ForeignEdgeOutcome::Fired { message, range } => {
+                        out.push(Finding { range, code: "RTS7001", message });
+                    }
+                    foreign_edge::ForeignEdgeOutcome::Decline { message, range } => {
+                        record_blocker(&mut blocked, range, message, out);
+                    }
+                }
+                // recognized whole (an override, a fire, or a named
+                // decline) — the statement itself still walks ordinarily
+                // below so `<name>` binds through the usual Assign path;
+                // only the LATER `json.loads` node's value is overridden.
+            }
         }
         let recognized = match stmt {
             Stmt::For(for_stmt) if for_stmt.orelse.is_empty() => {
@@ -466,6 +548,17 @@ fn walk_body_with_self_binding(
                 }
             }
         }
+        // A foreign edge's return fact is published for the STATEMENT
+        // HOLDING its `json.loads(...)` node, wherever that sits later in
+        // this body — set here, immediately before that one statement's
+        // walk, and cleared unconditionally right after (the same
+        // scoping obligation a relational sum's quotient keeps for the
+        // very next statement, widened to whichever position matches).
+        if let Some((override_position, parse_range, value)) = &foreign_edge_override {
+            if *override_position == position {
+                environment.set_evaluated_node(Some((*parse_range, value.clone())));
+            }
+        }
         let terminates = walk_statement(
             stmt,
             return_refinement,
@@ -478,9 +571,14 @@ fn walk_body_with_self_binding(
             out,
         );
         // A relational sum publishes its quotient for the NEXT
-        // statement's one division node; that statement has now walked,
-        // so the publication ends here and no later node can match it.
+        // statement's one division node; a foreign edge's own publish
+        // (above) is likewise scoped to exactly the one statement whose
+        // walk just ran — either way, the publication ends here and no
+        // later node can match it.
         environment.set_evaluated_node(None);
+        if foreign_edge_override.as_ref().is_some_and(|(override_position, ..)| *override_position == position) {
+            foreign_edge_override = None;
+        }
         // A `try` whose every arm provably raises or returns leaves
         // nothing that reaches whatever follows it in THIS body — the
         // same "unreachable code past a terminal statement" rule
@@ -1415,6 +1513,9 @@ pub fn derived_return_values(
         module_callable_returns,
         strict_int_aliases: &strict_int_aliases,
         typed_dicts,
+        // the export derivation runs no foreign edge today — a .py body
+        // that itself crosses to TypeScript is a later composition
+        entry_directory: None,
     };
     let mut derived = HashMap::new();
     for def in module.body.iter().filter_map(|stmt| match stmt {

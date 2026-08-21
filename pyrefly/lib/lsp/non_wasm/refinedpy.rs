@@ -28,7 +28,7 @@ use refined_kernel::kernel_bridge::load_kernel;
 use refined_kernel::kernel_interface::RefinedTSKernel;
 
 use crate::refinedpy::check::findings_for_module;
-use crate::refinedpy::check::findings_for_module_with_resolver;
+use crate::refinedpy::check::findings_for_module_at;
 use crate::refinedpy::cross_module::disk_resolver;
 use crate::refinedpy::markers::line_col;
 use crate::refinedpy::markers::line_starts_of;
@@ -94,7 +94,7 @@ pub fn append_refinedpy_diagnostics(
     let findings = match handle.path().as_path().parent() {
         Some(directory) => {
             let resolver = disk_resolver(directory.to_path_buf());
-            findings_for_module_with_resolver(&ast, &resolver, &kernel)
+            findings_for_module_at(&ast, &resolver, &kernel, Some(directory))
         }
         None => findings_for_module(&ast, &kernel),
     };

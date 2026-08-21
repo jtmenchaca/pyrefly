@@ -119,6 +119,33 @@ pub const SENTENCE: Sentences = Sentences {
     tuple_position: "a fixed-arity-tuple-declared position holds a value this table does not yet read",
 };
 
+/// A cross-language crossing's refutation: the reason the value cannot
+/// cross, with the target's own provenance appended — the second step
+/// of the two-language explanation, in the message-text form
+/// `foreign_edge.go`'s own `foreignMessage` renders. `provenance_line`
+/// of 0 means the target stated no line (the provenance is present but
+/// unlocated); an empty `provenance_said` alongside a nonzero line
+/// still names WHERE without a quoted claim.
+pub fn foreign_crossing_refusal(
+    said: &str,
+    provenance_file: &str,
+    provenance_line: usize,
+    provenance_said: &str,
+) -> String {
+    if provenance_file.is_empty() {
+        return said.to_owned();
+    }
+    let mut where_said = provenance_file.to_owned();
+    if provenance_line > 0 {
+        where_said.push(':');
+        where_said.push_str(&provenance_line.to_string());
+    }
+    if provenance_said.is_empty() {
+        return format!("{said}. the target states this at {where_said}");
+    }
+    format!("{said}. {where_said} said: {provenance_said}")
+}
+
 /// A member's own refutation, keyed by the name it escaped under — the
 /// dict/TypedDict element law's own suffix.
 pub fn at_key(message: &str, key: &str) -> String {
@@ -210,5 +237,30 @@ mod tests {
     fn member_suffixes_name_the_offending_position() {
         assert!(at_key("a value", "age").contains("at key 'age'"));
         assert!(at_index("a value", 2).contains("at index 2"));
+    }
+
+    /// A crossing refusal appends the target's own located provenance.
+    #[test]
+    fn a_crossing_refusal_appends_the_located_provenance() {
+        let message = foreign_crossing_refusal("the value can escape", "./audio_level.ts", 30, "0.0 … 1.0");
+        assert!(message.contains("the value can escape"), "{message}");
+        assert!(message.contains("./audio_level.ts:30"), "{message}");
+        assert!(message.contains("0.0 … 1.0"), "{message}");
+    }
+
+    /// A provenance with no line still names the file, un-located.
+    #[test]
+    fn a_crossing_refusal_with_no_line_still_names_the_file() {
+        let message = foreign_crossing_refusal("the value can escape", "./audio_level.ts", 0, "");
+        assert!(message.contains("./audio_level.ts"), "{message}");
+        assert!(!message.contains(":0"), "{message}");
+        assert!(message.contains("states this at"), "{message}");
+    }
+
+    /// No provenance at all leaves the said sentence unchanged.
+    #[test]
+    fn a_crossing_refusal_with_no_provenance_is_unchanged() {
+        let message = foreign_crossing_refusal("the value can escape", "", 0, "");
+        assert_eq!(message, "the value can escape");
     }
 }

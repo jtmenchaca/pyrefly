@@ -979,7 +979,12 @@ const SHA256_H0: [u32; 8] = [
 ];
 
 /// `bytes`' SHA-256 digest as lowercase hex (FIPS 180-4 §6.2).
-fn sha256_hex(bytes: &[u8]) -> String {
+///
+/// `pub(crate)`: `foreign_edge_artifact.rs`'s target-integrity check
+/// reuses this exact digest rather than hand-rolling a second one, so a
+/// hash computed on the export side and a hash computed on the read
+/// side are provably the same function.
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     let mut state = SHA256_H0;
     // The padded message: the bytes, a 0x80 byte, zeros to 56 mod 64,
     // then the bit length as a big-endian u64.
