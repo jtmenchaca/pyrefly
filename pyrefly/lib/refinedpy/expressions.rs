@@ -5568,15 +5568,24 @@ mod tests {
         assert!((kernel.scalar_subset)(&everything, &result.set), "the sort-only answer must not invent bounds the transfer never certified");
     }
 
-    /// The EXCLUDED-operator row: `age % 7` where `age` is a seeded set —
-    /// `%` is never admitted (Python's divisor-sign remainder diverges
-    /// from the kernel's ECMA dividend-sign `Rem` row), so the set path
-    /// declines outright and `binary_arithmetic_value_with_kernel` falls
-    /// through to the ordinary known-values path, which also declines
-    /// (a Set is not one known value) — the whole call answers
-    /// `unknown()`, never a wrong-signed guess.
+    /// `age % 7` where `age` is a seeded Integer-sorted set `[0, 120]` —
+    /// `admitted_int_transfer_op` elects `rem.divisorSign` for `Mod` on
+    /// the int-sorted path (arith.4, the Python-owned remainder), so
+    /// `int_transfer_over_sets` asks the kernel rather than declining.
+    /// `theories/rem/divisor_sign.lean`'s own general-enclosure branch,
+    /// worked by hand for this exact operand pair: `age` is a range (not
+    /// a singleton), `7` is a singleton nonzero divisor, so the answer
+    /// comes from the `bothSingle = none` arm — `divisorBound = 7`
+    /// (finite), both operands Integer-sorted and `7` itself an integer
+    /// dyadic, so the TIGHTENED case applies (`magnitude = 7 − 1 = 6`);
+    /// the divisor is nonnegative, so the window sits on `[0, magnitude]`
+    /// with neither endpoint strict — `[0, 6]`, matching the fixture's
+    /// own `int_modulo_over_declared_range` row (`b-body-expressions.py`,
+    /// "`count % 7` lands in Remainder's 0..6"). Asserted via
+    /// `scalar_subset` both directions, the same pinning style
+    /// `test_set_plus_known_int_lowers_through_kernel_transfer` uses.
     #[test]
-    fn test_excluded_operator_mod_over_a_set_declines() {
+    fn test_mod_over_an_int_sorted_set_serves_the_divisor_sign_row() {
         let Some(kernel) = loaded_kernel() else { return };
         let age = known_set(
             make_refined_set(vec![integer(), at_least(0.0), refined_sets::refinement_forms::at_most(120.0)]),
@@ -5586,6 +5595,36 @@ mod tests {
         );
         let age = AbstractValue { kind_tag: Some(PrimitiveKind::Integer), ..age };
         let seven = known_values(vec![7.0], PrimitiveKind::Integer, TrustProved);
+        let result = binary_arithmetic_value_with_kernel(Operator::Mod, &age, &seven, &kernel);
+        assert_eq!(result.kind, Kind::Set);
+        assert_eq!(result.kind_tag, Some(PrimitiveKind::Integer));
+        let want = make_refined_set(vec![integer(), at_least(0.0), refined_sets::refinement_forms::at_most(6.0)]);
+        assert!((kernel.scalar_subset)(&result.set, &want), "result {:?} not ⊆ want {:?}", result.set, want);
+        assert!((kernel.scalar_subset)(&want, &result.set), "want {:?} not ⊆ result {:?}", want, result.set);
+    }
+
+    /// The FLOAT-path exclusion: `age % 7.0` where `age` is a
+    /// Float-sorted set — `admitted_transfer_op` (the float/mixed-sort
+    /// path `int_transfer_over_sets` falls through to whenever either
+    /// operand is not Integer-sorted) has no `Mod` arm at all, so
+    /// `transfer_over_sets` declines outright, and
+    /// `binary_arithmetic_value_with_kernel` falls through to the
+    /// ordinary known-values path, which also declines (a Set is not one
+    /// known value) — the whole call answers `unknown()`. `%`'s
+    /// divisor-sign election is admitted ONLY on the exact int theory
+    /// (`rem.divisorSign` has no float-sorted counterpart wired here);
+    /// this is the row the now-renamed test above no longer covers.
+    #[test]
+    fn test_mod_over_a_float_sorted_set_still_declines() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let age = known_set(
+            make_refined_set(vec![at_least(0.0), refined_sets::refinement_forms::at_most(120.0)]),
+            None,
+            TrustProved,
+            SetKindTag::None,
+        );
+        let age = AbstractValue { kind_tag: Some(PrimitiveKind::Float), ..age };
+        let seven = known_values(vec![7.0], PrimitiveKind::Float, TrustProved);
         let result = binary_arithmetic_value_with_kernel(Operator::Mod, &age, &seven, &kernel);
         assert_eq!(result.kind, Kind::Unknown);
     }

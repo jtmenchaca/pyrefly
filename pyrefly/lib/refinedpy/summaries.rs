@@ -45,6 +45,7 @@ use std::sync::Mutex;
 
 use refined_domain::abstract_value::float_sorted_unknown;
 use refined_domain::abstract_value::known_set;
+use refined_domain::abstract_value::known_values;
 use refined_domain::abstract_value::null_value;
 use refined_domain::abstract_value::unknown;
 use refined_domain::abstract_value::AbstractValue;
@@ -54,6 +55,7 @@ use refined_domain::abstract_value::SetKindTag;
 use refined_domain::lattice_operations::join_known;
 use refined_domain::lattice_operations::set_of_known;
 use refined_domain::lattice_operations::truthiness;
+use refined_domain::trust_grades::TrustProved;
 use refined_domain::trust_grades::TrustSpec;
 use refined_kernel::kernel_interface::RefinedTSKernel;
 use refined_kernel::narrow_questions::KnownStateWire;
@@ -62,11 +64,13 @@ use refined_kernel::summary_questions::ask_summarize;
 use refined_kernel::summary_questions::SummaryBlob;
 use refined_sets::codepoint_sets::strings;
 use refined_sets::refinement_forms::at_least;
+use refined_sets::refinement_forms::fold_ray_forms;
 use refined_sets::refinement_forms::integer;
 use refined_sets::refinement_forms::make_refined_set;
 use refined_sets::refinement_forms::one_of;
 use refined_sets::refinement_forms::Form;
 use refined_sets::refinement_forms::RefinedSet;
+use refined_sets::refinement_forms::Refinement;
 use ruff_python_ast::AtomicNodeIndex;
 use ruff_python_ast::Expr;
 use ruff_python_ast::ModModule;
@@ -527,10 +531,64 @@ fn kernel_summary_result(
     // (`returned_denotes`)
     let returned = exits[lowered.ret_index].returned();
     let value = value_of_exit_state(&returned)?;
-    Some(AbstractValue {
-        kind_tag: declared_return_sort(def),
-        ..value
-    })
+    let sort = declared_return_sort(def).or_else(|| argument_numeric_sort(arguments));
+    // A `Kind::Set` answer's `kind_tag` genuinely has no requirement — the
+    // existing "unstated sort leaves the answer untagged" reading applies
+    // exactly as before, whether or not `sort` found evidence.
+    if value.kind != Kind::Values {
+        return Some(AbstractValue { kind_tag: sort, ..value });
+    }
+    // A `Kind::Values` answer is a FRESH Python-sorted read (this route's
+    // own exact-scalar folding, just proved by the kernel), and
+    // `PrimitiveKind`'s own doc is explicit that such a read "always tags
+    // Integer or Float, never bare Number" — `Number` is reserved for a
+    // JOINED or otherwise-undetermined sort, neither of which applies to
+    // one value this route just derived outright. Lacking real evidence
+    // for which of the two this is (the wire carries no int/float
+    // distinction of its own — `KnownStateWire` is extended-reals only),
+    // this route declines rather than manufacture the placeholder `Number`
+    // tag `value_of_exit_state` set as its own internal default; the
+    // interpreter's fall-through reads the same literal concretely and
+    // tags it correctly from the source.
+    let Some(sort) = sort else {
+        return None;
+    };
+    Some(AbstractValue { kind_tag: Some(sort), ..value })
+}
+
+/// The one numeric `PrimitiveKind` every ARGUMENT this call passed
+/// agrees on, or `None` where they disagree (or there are none to read).
+/// Read only when `def` states no return annotation of its own
+/// (`declared_return_sort`'s own `None`): the lowering's arithmetic is
+/// total-or-decline over the arguments' own entry states (this file's
+/// module doc — the compile reaches no callee, no defaulted parameter,
+/// nothing that could introduce a DIFFERENT sort mid-body), so a body
+/// that compiles at all carries its answer's sort forward from its
+/// arguments exactly the way CPython's own `int + int -> int` /
+/// `float + anything -> float` arithmetic does — this is a DERIVATION
+/// from a concretely-sorted input, never the blind guess
+/// `declared_return_sort`'s own doc warns against for an unstated
+/// annotation. `Integer` wins only when every argument is Integer-tagged;
+/// any Float-tagged argument makes the whole answer Float-tagged
+/// (Python's own float-contagion rule); anything else (a bare `Number`
+/// tag, a `Boolean` tag, no arguments at all, or disagreement) answers
+/// `None`, leaving the result untagged exactly as before this reading
+/// existed.
+fn argument_numeric_sort(arguments: &[AbstractValue]) -> Option<PrimitiveKind> {
+    let mut sort: Option<PrimitiveKind> = None;
+    for argument in arguments {
+        let tag = argument.kind_tag?;
+        match tag {
+            PrimitiveKind::Float => return Some(PrimitiveKind::Float),
+            PrimitiveKind::Integer => {
+                if sort.is_none() {
+                    sort = Some(PrimitiveKind::Integer);
+                }
+            }
+            _ => return None,
+        }
+    }
+    sort
 }
 
 /// The SORT the `def` declares its return to be, read from its own
@@ -661,15 +719,60 @@ fn flag_is_definitely_up(exit: &KnownStateWire) -> bool {
         .any(|form| form.form == Form::OneOf && form.w.len() == 1 && form.w[0] == 1.0)
 }
 
+/// The folded form list's own exact scalar list, when the fold landed on
+/// one finite, non-empty `OneOf` — the one set shape whose canonical
+/// spelling is `Kind::Values`, matching `intersect_refinements.rs`'s own
+/// `exact_scalar_values` reading of a narrow's folded intersection
+/// (private there, so this file — the kernel-summary route's own owner —
+/// carries the identical reading rather than reaching across the crate
+/// boundary for it).
+fn exact_scalar_values(forms: &[Refinement]) -> Option<Vec<f64>> {
+    if forms.len() == 1 && forms[0].form == Form::OneOf && !forms[0].w.is_empty() {
+        return Some(forms[0].w.clone());
+    }
+    // The ARITHMETIC transfer's own exact-point spelling: a non-strict
+    // `AtLeast(v)` paired with a non-strict `AtMost(v)` at the SAME bound
+    // pins the set to exactly `{v}` — real arithmetic composes ray forms
+    // rather than folding all the way back down to a `OneOf`, so
+    // `double(3) == 6` exits as `[AtLeast(6), AtMost(6), Integer,
+    // MultipleOf(2)]`, never a bare `OneOf(6)`. Every OTHER conjunct
+    // alongside the pinned pair (`Integer`, `MultipleOf`, …) is a fact
+    // about that same single point, already proved consistent by the
+    // kernel's own derivation — this reading does not need to re-check
+    // them, only find the pair that narrows the ray forms to one value.
+    exact_point_of_ray_pair(forms)
+}
+
+/// The one point an `AtLeast`/`AtMost` ray pair pins, when both rays
+/// share the same finite bound — `None` when no such matching pair
+/// exists (an open range, a one-sided ray, two different bounds, or no
+/// ray forms at all).
+fn exact_point_of_ray_pair(forms: &[Refinement]) -> Option<Vec<f64>> {
+    let lower = forms.iter().find(|f| f.form == Form::AtLeast)?;
+    let upper = forms.iter().find(|f| f.form == Form::AtMost)?;
+    if lower.a.is_infinite() || upper.a.is_infinite() || lower.a != upper.a {
+        return None;
+    }
+    Some(vec![lower.a])
+}
+
 /// The result slot's exit state as this domain's value, or `None` where
 /// the exit says nothing worth answering. A TOP exit is exactly "the
 /// return value is unconstrained," which is what the interpreter would
 /// have to derive for itself — so this route declines and lets it, rather
 /// than serving a silence that would displace a real reading.
 ///
-/// The value crosses at SPEC grade: the claim is the kernel's own
-/// derivation over the entry states this call supplied, and the entries
-/// carried the arguments' own sets rather than their grades.
+/// A folded exit that lands on one finite scalar list crosses as
+/// `Kind::Values` at `TrustProved` — the same canonical spelling
+/// `interpret_body`'s own concrete arithmetic would answer for `double(3)
+/// == 6`, so a caller reading this route's answer never has to tell "the
+/// kernel proved exactly 6" apart from "the interpreter computed exactly
+/// 6." Every coarser exit (a real range, a union that never folds to one
+/// point) crosses as `Kind::Set` at SPEC grade instead: that claim is the
+/// kernel's own derivation over the entry states this call supplied, and
+/// the entries carried the arguments' own sets rather than their grades,
+/// so it can never overclaim PROVED for a fact only the kernel's
+/// derivation step established.
 fn value_of_exit_state(exit: &KnownStateWire) -> Option<AbstractValue> {
     if exit.top || exit.nan {
         return None;
@@ -681,6 +784,10 @@ fn value_of_exit_state(exit: &KnownStateWire) -> Option<AbstractValue> {
     }
     if exit.set.forms.is_empty() {
         return None;
+    }
+    let folded = fold_ray_forms(&exit.set.forms);
+    if let Some(values) = exact_scalar_values(&folded) {
+        return Some(known_values(values, PrimitiveKind::Number, TrustProved));
     }
     Some(known_set(exit.set.clone(), None, TrustSpec, SetKindTag::None))
 }
@@ -2049,11 +2156,23 @@ fn is_mutating_call_expr_shape(expr: &Expr) -> bool {
 /// receiver, which rebinds `name` so a LATER read in the same body (this
 /// function's own `return bucket[0]`) sees the write rather than the
 /// stale pre-call value. `None` when `name` is unbound or `mutated_receiver`
-/// does not recognize the method — this is only ever called once
-/// `is_mutating_call_expr_shape` has already confirmed the syntactic shape,
-/// so a `None` here always means "this interpreter's own contract cannot
-/// replay this specific mutation," and the whole call declines rather than
-/// silently keeping a stale receiver bound.
+/// does not recognize the method on a KNOWN receiver kind — this is only
+/// ever called once `is_mutating_call_expr_shape` has already confirmed the
+/// syntactic shape, so a `None` here always means "this interpreter's own
+/// contract cannot replay this specific mutation," and the whole call
+/// declines rather than silently keeping a stale receiver bound.
+///
+/// An UNKNOWN receiver (`grow_into_bucket`'s own shape when `bucket`'s
+/// module-level default is out of reach — no `enclosing` environment
+/// carries `_DEFAULT_BUCKET`) is not this same "unrecognized shape"
+/// decline: the statement syntactically IS a mutating method call, so it
+/// is a genuinely recognized, concretely-attempted effect whose OUTCOME
+/// happens to stay unknown — the receiver rebinds to `unknown()` rather
+/// than the whole call declining here. A later read of that same name
+/// (`return bucket[0]`) still declines on its own terms
+/// (`evaluate_expression`'s subscript-on-unknown reading), which is the
+/// honest place for THIS body's opacity to surface, not the mutation
+/// statement that merely could not resolve to a concrete value.
 fn write_mutating_call_expr(expr: &Expr, kernel: &Arc<RefinedTSKernel>, environment: &mut Environment) -> Option<()> {
     let Expr::Call(call) = expr else {
         return None;
@@ -2067,6 +2186,10 @@ fn write_mutating_call_expr(expr: &Expr, kernel: &Arc<RefinedTSKernel>, environm
     let receiver = environment.read(receiver_name.id.as_str())?.clone();
     let arguments: Vec<AbstractValue> =
         call.arguments.args.iter().map(|argument| evaluate_expression(argument, environment, kernel)).collect();
+    if receiver.kind == Kind::Unknown {
+        environment.bind(receiver_name.id.as_str(), unknown());
+        return Some(());
+    }
     let (new_receiver, _result) =
         crate::refinedpy::collection_models::mutated_receiver(attribute.attr.as_str(), &receiver, &arguments)?;
     environment.bind(receiver_name.id.as_str(), new_receiver);

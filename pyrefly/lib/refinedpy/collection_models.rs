@@ -417,6 +417,35 @@ fn known_state_of(value: &AbstractValue) -> Option<KnownStateWire> {
     Some(KnownStateWire { top: false, set, undef: false, null: false, nan: false, thrown: false })
 }
 
+/// A right-fold `Form::Union` tree whose every leaf is a singleton
+/// scalar `OneOf` (never a multi-codepoint string tuple, never a bare
+/// range/star/etc): the exact values it admits, in no particular
+/// order. This is the shape the kernel's `join_state` answers for two
+/// (or, folded further, more) distinct scalar values — `{40} ∪ {41}` —
+/// the same set `join_known`'s own untagged-numeric arm spells
+/// (`lattice_operations.rs`'s `known_set(make_refined_set(vec![union(left,
+/// right)]), ...)` tail) before this file's fold hands it to the
+/// kernel. A bare (non-union) singleton also qualifies — `word_of`
+/// alone reads it — so a one-member fold (no join ever ran) still
+/// converts. Any leaf that is not a length-one `word_of` result (a
+/// string tuple, a window, a star) fails the whole recognition: the
+/// caller must keep the `Kind::Set` form rather than guess at values
+/// that are not actually enumerated.
+fn scalars_of_union_of_singletons(set: &refined_sets::refinement_forms::RefinedSet) -> Option<Vec<f64>> {
+    if let Some(values) = refined_sets::refinement_forms::word_of(set) {
+        if values.len() == 1 {
+            return Some(values);
+        }
+        return None;
+    }
+    if set.forms.len() != 1 || set.forms[0].form != refined_sets::refinement_forms::Form::Union {
+        return None;
+    }
+    let mut values = scalars_of_union_of_singletons(set.forms[0].a_.as_ref().unwrap())?;
+    values.extend(scalars_of_union_of_singletons(set.forms[0].b.as_ref().unwrap())?);
+    Some(values)
+}
+
 /// The reverse of `known_state_of`: a kernel-answered state back to an
 /// `AbstractValue`, at the joined trust grade — only for the plain,
 /// flag-free state the two scalar-set rows above ever produce or ask
@@ -424,9 +453,43 @@ fn known_state_of(value: &AbstractValue) -> Option<KnownStateWire> {
 /// gate: any flag means the answer left the scalar-set world this fold
 /// lives in, and the caller falls back to `join_known` rather than
 /// misreading a flagged wire as a plain set.
-fn known_value_of_state(state: &KnownStateWire, grade: TrustLevel) -> Option<AbstractValue> {
+///
+/// The kernel's own wire carries no Python sort tag at all
+/// (`lattice_conformance.rs`'s module doc), so its answer is always a
+/// bare set shape — but when that shape is a union of singleton
+/// scalars (`scalars_of_union_of_singletons`), the ANSWER denotes the
+/// same exact values `join_known`'s local numeric-tagged arms would
+/// have kept as `Kind::Values`: reading it back that way, tagged with
+/// `shared_tag` (the caller's own agreement on both operands' Python
+/// sort — `Some(Integer)` when both sides were Integer, `Some(Float)`
+/// when both were Float, `None` otherwise), recovers the exact-values
+/// representation instead of losing it to a poorer `Kind::Set` — every
+/// transfer/min/max/sort-law consumer downstream of a kernel-joined
+/// dict read gets the richer shape either way. A leaf that is NOT a
+/// union of singletons (a range, a star, a multi-codepoint string
+/// tuple) stays `Kind::Set` — there are no enumerated values to lift.
+fn known_value_of_state(
+    state: &KnownStateWire,
+    grade: TrustLevel,
+    shared_tag: Option<PrimitiveKind>,
+) -> Option<AbstractValue> {
     if state.top || state.undef || state.null || state.nan || state.thrown {
         return None;
+    }
+    if let Some(tag) = shared_tag {
+        if let Some(values) = scalars_of_union_of_singletons(&state.set) {
+            // The kernel's join keeps both operands' members even when
+            // they repeat (`Union({40},{40})`); `join_known`'s own
+            // same-sort arms merge with a membership check, so the
+            // read-back applies the identical rule.
+            let mut merged: Vec<f64> = Vec::with_capacity(values.len());
+            for v in values {
+                if !merged.iter().any(|kept| *kept == v) {
+                    merged.push(v);
+                }
+            }
+            return Some(known_values(merged, tag, grade));
+        }
     }
     Some(known_set(state.set.clone(), None, grade, SetKindTag::None))
 }
@@ -444,6 +507,26 @@ fn known_value_of_state(state: &KnownStateWire, grade: TrustLevel) -> Option<Abs
 /// flagged answer, or a caught panic — `join_known` runs unchanged as
 /// the fallback; this function never weakens what `join_known` alone
 /// already proves.
+///
+/// `shared_tag_of` is the same rule `lattice_operations.rs`'s own
+/// same-sorted `join_known` arms follow (finding this fold must not
+/// special-case): both operands `Kind::Values` tagged the SAME
+/// Integer-or-Float sort keeps that tag; anything else (mixed sorts, a
+/// non-Values operand, an already-Set operand) states no shared sort,
+/// and `known_value_of_state` then keeps the untagged `Kind::Set`
+/// form — Integer ⊔ Float (or Integer ⊔ an unrelated set) is the bare
+/// "Number" reading, never one side's tag winning by omission.
+fn shared_tag_of(a: &AbstractValue, b: &AbstractValue) -> Option<PrimitiveKind> {
+    if a.kind != Kind::Values || b.kind != Kind::Values {
+        return None;
+    }
+    match (a.kind_tag, b.kind_tag) {
+        (Some(PrimitiveKind::Integer), Some(PrimitiveKind::Integer)) => Some(PrimitiveKind::Integer),
+        (Some(PrimitiveKind::Float), Some(PrimitiveKind::Float)) => Some(PrimitiveKind::Float),
+        _ => None,
+    }
+}
+
 fn kernel_joined_set(so_far: AbstractValue, found: AbstractValue) -> AbstractValue {
     let fallback = || join_known(so_far.clone(), found.clone());
     let Some(kernel) = kernel_if_loaded() else {
@@ -460,7 +543,8 @@ fn kernel_joined_set(so_far: AbstractValue, found: AbstractValue) -> AbstractVal
         return fallback();
     };
     let grade = min_trust_level(trust_level_of(&so_far), trust_level_of(&found));
-    match known_value_of_state(&joined_state, grade) {
+    let shared_tag = shared_tag_of(&so_far, &found);
+    match known_value_of_state(&joined_state, grade, shared_tag) {
         Some(value) => value,
         None => fallback(),
     }
@@ -1316,7 +1400,61 @@ mod tests {
         assert_eq!(dict_get_result(&written, &key, None), Some(integer(40.0)));
     }
 
-    // --- dict subscript keyed by a joined (Set-kind) string ---
+    // --- kernel-joined scalar sets read back as Kind::Values ---
+
+    // test_known_value_of_state_reads_a_union_of_singletons_back_as_values
+    // pins the conversion itself: a kernel `join_state` answer shaped
+    // `{40} ∪ {41}` (a right-fold Union of singleton OneOf forms — the
+    // exact shape `KnownState.join` in `known_state.lean` builds, and
+    // `wire_decode.rs`'s `union` arm decodes back verbatim, `a_`/`b` in
+    // call order) reads back as `Kind::Values{[40, 41], Some(Integer)}`
+    // when the caller states a shared Integer tag — the same richer
+    // shape `join_known`'s own same-tag arm would have built locally —
+    // never the poorer untagged `Kind::Set` the kernel's bare wire
+    // would otherwise force.
+    #[test]
+    fn test_known_value_of_state_reads_a_union_of_singletons_back_as_values() {
+        let union_of_singletons = make_refined_set(vec![refined_sets::refinement_forms::union(
+            make_refined_set(vec![refined_sets::refinement_forms::one_of(&[40.0])]),
+            make_refined_set(vec![refined_sets::refinement_forms::one_of(&[41.0])]),
+        )]);
+        let state = KnownStateWire {
+            top: false,
+            set: union_of_singletons,
+            undef: false,
+            null: false,
+            nan: false,
+            thrown: false,
+        };
+        let got = known_value_of_state(&state, TrustProved, Some(PrimitiveKind::Integer))
+            .expect("a flag-free state must convert");
+        assert_eq!(got, known_values(vec![40.0, 41.0], PrimitiveKind::Integer, TrustProved));
+    }
+
+    // test_known_value_of_state_a_non_singleton_arm_stays_a_set pins the
+    // refusal half: a union with ONE arm that is not a singleton scalar
+    // (here, an unbounded `atLeast` range) is not an enumerable set of
+    // exact values, so the conversion must decline and the caller keeps
+    // the plain `Kind::Set` shape — never guessing values that are not
+    // actually there.
+    #[test]
+    fn test_known_value_of_state_a_non_singleton_arm_stays_a_set() {
+        let union_with_a_range = make_refined_set(vec![refined_sets::refinement_forms::union(
+            make_refined_set(vec![refined_sets::refinement_forms::one_of(&[40.0])]),
+            make_refined_set(vec![at_least(0.0)]),
+        )]);
+        let state = KnownStateWire {
+            top: false,
+            set: union_with_a_range.clone(),
+            undef: false,
+            null: false,
+            nan: false,
+            thrown: false,
+        };
+        let got = known_value_of_state(&state, TrustProved, Some(PrimitiveKind::Integer))
+            .expect("a flag-free state must convert");
+        assert_eq!(got, known_set(union_with_a_range, None, TrustProved, SetKindTag::None));
+    }
 
     fn joined_string_key(a: &str, b: &str) -> AbstractValue {
         // `key = "age" if flag else "years"`'s own shape: join_known of

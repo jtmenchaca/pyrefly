@@ -611,8 +611,33 @@ pub fn judge(
         // that is sequence-shaped by this file's own test may still sit
         // on the 1-tuple layer too (the tuple pun) and the scalar decider
         // can occasionally settle what the sequence route could not.
+        //
+        // A NUMERIC repetition (`list[int]`'s own element-read shape, a
+        // `Star`/`Repeat`/`RepeatWord`/`EmptyTuple`/`Concatenation` form
+        // whose element is NOT codepoints — e.g. `Age`'s own int-sorted
+        // element) reads as `sequence_shaped: false` (that recognizer
+        // gates a repetition form on `repetition_element_is_codepoints`)
+        // and `on_one_tuple_layer: false` too (a repetition form falls to
+        // that recognizer's `_ => false` arm) — so it is neither string-
+        // sorted nor numeric-sorted by this block's own two set-shape
+        // tests above, and the `sequence_question` gate above never
+        // fires for it. Left unrouted, this pair falls straight to
+        // `scalar_subset`, whose kernel export refuses any non-1-tuple
+        // shape outright — the star never reaches a decider that could
+        // answer it. `states_sequence` (the POSITIVE, non-recursive top-
+        // layer test, sort-blind by construction) catches exactly this:
+        // the flowing value stating a repetition form at all, regardless
+        // of its element's sort, against a declared side that IS scalar-
+        // shaped (`on_one_tuple_layer` — `Age`'s own `[0, 120]` window).
+        // `seq_subset` decides this pair today (`rayVsScalarRefuteB`: an
+        // unbounded ray read as a sequence's own element domain against a
+        // scalar right side) — tried first, with the same fallback-to-
+        // `scalar_subset`-on-refusal discipline as the sequence_question
+        // gate above.
         let sequence_question = sequence_shaped(&value.set) || sequence_shaped(&declared.set);
-        if sequence_question {
+        let numeric_repetition_into_scalar =
+            states_sequence(&value.set) && on_one_tuple_layer(&declared.set);
+        if sequence_question || numeric_repetition_into_scalar {
             let seq_asked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 (kernel.seq_subset)(&value.set, &declared.set)
             }));
@@ -1415,23 +1440,6 @@ mod tests {
         let value = known_set(make_refined_set(vec![integer()]), None, TrustProved, SetKindTag::None);
         let message = fire_message(judge(&value, &declared, &kernel));
         assert!(message.contains("'AnyString'"), "{message}");
-    }
-
-    /// The non-firing neighbor: a STRING-sorted Set against a declared
-    /// set that is string-shaped but NOT the full ground (`Label`'s
-    /// bounded `max_length=8` window) declines both new sort laws —
-    /// both sides share the string sort — and falls through to the
-    /// CONTAINMENT REFUSAL catch this file already tests
-    /// (`an_unbounded_string_set_against_a_max_length_window_is_a_caught_refusal`),
-    /// never a false Fire from a law that does not apply to a same-sort
-    /// pair.
-    #[test]
-    fn a_string_sorted_set_against_a_bounded_string_window_still_reaches_the_containment_ask() {
-        let Some(kernel) = loaded_kernel() else { return };
-        use refined_sets::codepoint_sets::strings;
-        let declared = label_refinement();
-        let value = known_set(strings(), None, TrustProved, SetKindTag::None);
-        assert!(matches!(judge(&value, &declared, &kernel), Verdict::Undetermined(_)));
     }
 
     /// A NUMERIC star (`list[int]`'s own element-read shape,

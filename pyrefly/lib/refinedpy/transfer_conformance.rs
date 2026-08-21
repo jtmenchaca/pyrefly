@@ -143,9 +143,16 @@ mod tests {
     }
 
     /// The single value a `TransferAnswer` pins, when it pins exactly
-    /// one. `None` for the NaN, unknown, and set-valued replies — the
-    /// kernel declining to name one float.
+    /// one. The `NaN` reply IS such a value: the spec's Number type has
+    /// one NaN, and `transferAdd`'s singleton corner answers it exactly
+    /// ("the indeterminate corner IS the spec's NaN"), so the reply is
+    /// a determined answer, never a decline. `None` only for the
+    /// unknown and set-valued replies — the kernel declining to name
+    /// one float.
     fn kernel_exact_value(answer: &TransferAnswer) -> Option<f64> {
+        if answer.kind == TransferAnswerKind::NaN {
+            return Some(f64::NAN);
+        }
         if answer.kind != TransferAnswerKind::Values {
             return None;
         }
@@ -173,6 +180,12 @@ mod tests {
     /// signed-zero rows below would silently pass a wrong answer without
     /// this. Compares the IEEE bit patterns instead.
     fn same_float(a: f64, b: f64) -> bool {
+        // The spec's Number type has exactly one NaN value, so any NaN
+        // payload agrees with any other; hardware NaN bit patterns are
+        // not part of either route's claim.
+        if a.is_nan() && b.is_nan() {
+            return true;
+        }
         a.to_bits() == b.to_bits()
     }
 

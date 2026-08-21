@@ -2467,13 +2467,19 @@ fn rebinds_relational_name(
 /// body/orelse bind, PLUS every attribute-call/subscript-store receiver
 /// the unmodeled body only ever MUTATES — `forget_mutated_receivers_in_stmt`),
 /// so a stale pre-loop fact never survives an unmodeled loop that may
-/// have rebound it. NO-CHECKED-POSITION LAW: that blocker is recorded
-/// only when this body has a declared return/yield position or a
-/// declared slot (`aug_assign_refinements`) the loop could write —
-/// otherwise nothing anywhere in this walk is waiting on the loop's own
-/// answer, so declining to run it concretely states nothing worth
-/// reporting; the environment forgetting above still runs regardless,
-/// since a stale fact can survive even when there is no sink to judge.
+/// have rebound it. The blocker is recorded regardless of whether THIS
+/// body has already recorded a declared return/yield position or a
+/// declared slot (`aug_assign_refinements`) at the loop's OWN position —
+/// a slot declared LATER in the same straight-line body (an AnnAssign
+/// after the loop, e.g. `for_loop_over_an_unknown_iterable_blocks_and_
+/// forgets_its_stale_binding`'s own `check: Age = total`) still has a
+/// real sink waiting on this loop's answer, and `aug_assign_refinements`
+/// only ever holds what has been WALKED SO FAR — checking it at the
+/// loop's own position can never see a later declaration. Recording the
+/// blocker unconditionally is sound either way: a body with truly no
+/// checked position anywhere still records one blocker (first-blocker-
+/// wins, same as every other construct this walk cannot yet handle),
+/// never a second one.
 fn walk_loop(
     stmt: &Stmt,
     return_refinement: Option<&DeclaredRefinement>,
@@ -2548,21 +2554,6 @@ fn walk_loop(
                 out,
             );
         }
-        return;
-    }
-    // NO-CHECKED-POSITION LAW: a loop this module cannot concretely run
-    // is only a BLOCKER when some later read could have been judged
-    // against it — a declared return/yield position, or a declared
-    // slot (`x: Age = ...`) the body could write. Neither exists means
-    // there is no value anywhere in this walk waiting on the loop's own
-    // answer, so declining to run it concretely is not a blocker, it is
-    // nothing to report (q-decline-names.py's own `sum_rest`: `-> int`
-    // is not a refined alias and the body declares no slot, so its
-    // `for value in rest:` has no sink an unwalked loop could have
-    // served).
-    if return_refinement.is_none() && yield_refinement.is_none() && aug_assign_refinements.is_empty() {
-        forget_names_bound_by_stmt(stmt, environment);
-        forget_mutated_receivers_in_stmt(stmt, environment);
         return;
     }
     record_blocker(
@@ -8363,7 +8354,7 @@ mod tests {
     // --- NAMED-RECEIVER FIELD WRITE (write_named_field, e:357/q:203) ---
 
     #[test]
-    fn a_property_setter_write_through_a_local_variable_receiver_fires() {
+    fn a_property_setter_write_through_a_local_variable_receiver_fires_and_the_return_fires_too() {
         let Some(kernel) = loaded_kernel() else { return };
         // e-class-and-function.py's `property_getter_setter`: `over_box.age
         // = 200` writes through a `@property` setter on a LOCAL variable
@@ -8371,6 +8362,20 @@ mod tests {
         // write_self_field's own judged-and-rebound law past the literal
         // name `self`, this row's write silently forgot `over_box` instead
         // of judging the setter's own declared refinement.
+        //
+        // TWO fires are correct here, not one: the write's own value
+        // range (`write_named_field`'s judgment, `bind_or_forget_target`'s
+        // named-receiver branch) is the FIRST verdict, and `f`'s own
+        // `-> Age` return sink (`walk_return`) is a SECOND, independent
+        // verdict — the rebind the sibling test at :8406
+        // (`a_property_setter_write_lands_on_the_backing_field_a_later_
+        // getter_read_sees`) pins as sound is exactly what carries this
+        // same out-of-set 200 forward to `return over_box.age`, so the
+        // return sink judges the identical bad value against the
+        // identical `Age` set. Both messages read as the same text
+        // (`judge`'s message carries no location), so the ranges — not
+        // the text — are what prove these are two determined verdicts
+        // over two statements, not one write double-counted.
         let module = parsed(concat!(
             "from typing import Annotated\n",
             "from pydantic import Field\n",
@@ -8393,11 +8398,21 @@ mod tests {
         let fires: Vec<&Finding> = findings.iter().filter(|f| f.code == "RTS7001").collect();
         assert_eq!(
             fires.len(),
-            1,
-            "the setter's own write (200) must fire against its declared Age refinement: {:?}",
+            2,
+            "the setter's own write (200) must fire against its declared Age refinement, AND \
+             the rebind it leaves behind must carry 200 to f's own -> Age return sink, which \
+             fires independently: {:?}",
             findings.iter().map(|f| &f.message).collect::<Vec<_>>()
         );
         assert!(fires[0].message.contains("'200'"), "{}", fires[0].message);
+        assert!(fires[1].message.contains("'200'"), "{}", fires[1].message);
+        assert_ne!(
+            fires[0].range.start(),
+            fires[1].range.start(),
+            "two DIFFERENT sinks must have judged this value — the write's own literal and the \
+             return expression — never the same range firing twice: {:?}",
+            findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+        );
     }
 
     /// A DISCRIMINATING test for the write TARGET, not just the write's
