@@ -3682,6 +3682,21 @@ impl Server {
 
     fn did_save(&self, url: Url) {
         if let Some(path) = self.path_for_uri(&url) {
+            // Save-time fact export (fact-freshness.md, "Python side"):
+            // queued on the SAME recheck_queue rather than run inline,
+            // so `did_save` returns immediately and the notification
+            // never blocks on the export walk. Riding this queue means
+            // the export and the invalidation below are both heavy
+            // tasks the same worker drains in order; a future push for
+            // an independent (non-serialized) queue is fact-freshness.md's
+            // own open question 2, not decided here.
+            let export_path = path.clone();
+            self.recheck_queue.queue_task(
+                TelemetryEventKind::RefinedPyExportOnSave,
+                Box::new(move |_server, _telemetry, _telemetry_event| {
+                    refinedpy::export_fact_on_save(&export_path);
+                }),
+            );
             self.invalidate(TelemetryEventKind::InvalidateDisk, None, move |t| {
                 t.invalidate_disk(&[path])
             })
@@ -5219,7 +5234,7 @@ impl Server {
         let show_go_to_links = lsp_config
             .and_then(|c| c.show_hover_go_to_links)
             .unwrap_or(true);
-        Ok(get_hover_with_verbosity(
+        let mut result = get_hover_with_verbosity(
             transaction,
             &handle,
             position,
@@ -5227,7 +5242,15 @@ impl Server {
                 show_go_to_links,
                 verbosity_level,
             },
-        ))
+        );
+        // Additive, the same way `append_refinedpy_diagnostics` layers
+        // onto the host's own diagnostics: a missing kernel, a non-`.py`
+        // handle, or a position with nothing to say leaves `result`
+        // exactly as pyrefly's own hover built it.
+        if let Some(result) = result.as_mut() {
+            refinedpy::splice_refinedpy_hover(transaction, &handle, position, &mut result.hover);
+        }
+        Ok(result)
     }
 
     /// How long an inlay hint request should be deferred to debounce it, or

@@ -23,6 +23,39 @@
 //! return json.loads(result.stdout)
 //! ```
 //!
+//! Two other `subprocess` callees recognize the same argv/payload shape:
+//! `subprocess.check_output(...)` (the captured text is the CALL's own
+//! return, read bare — `json.loads(result)`, never `result.stdout`) and
+//! the two-statement `subprocess.Popen(...)` / `<stdout>, _ = <name>
+//! .communicate(json.dumps(...))` pair, where `.communicate()`'s own
+//! call carries the payload the `Popen(...)` call itself does not.
+//!
+//! The runner word at argv[0] (plus, for a two-word runner, argv[1])
+//! also recognizes beyond plain `"node"`: `"deno" "run"`, `"bun"`, and
+//! `"npx" "tsx"` all name a real script the same way `"node"` does, but
+//! only `"node"` discharges the runtime-identity premise against this
+//! checker's pinned `node-23+` band — the other three recognize the
+//! reference and then decline at that one premise (`Runner::word`'s own
+//! doc).
+//!
+//! argv[1] (the script) also resolves through a module-level constant
+//! this body reads (`TARGET_PATH = "./x.ts"` used as `["node",
+//! TARGET_PATH]`) — any other non-literal shape (an f-string, a
+//! parameter) declines with the law-2 sentence naming the fixable
+//! written-literal respelling.
+//!
+//! A SIBLING carrier: `subprocess.run(["node", "<script>.ts",
+//! json.dumps(<payload>)], capture_output=True, text=True)` — the
+//! payload rides the third argv element (`process.argv[2]`, node's own
+//! convention) rather than stdin, and carries no `input=` keyword at
+//! all (its presence alongside an argv payload is a real double-channel
+//! ambiguity, declined rather than silently picking one). The target's
+//! own artifact must declare a matching `surface.kind == "argv-json"`
+//! (with the same `argIndex`) for this shape to apply; an argv payload
+//! against a `stdin-json` target (or the reverse) declines naming the
+//! channel mismatch — recognized shapes on both sides, transports that
+//! do not meet.
+//!
 //! CROSS-LANGUAGE-EDGE.md §2's corollary makes this a real edge and not
 //! a manifest: the argv deterministically NAMES the code that runs
 //! next, so the checker treats the call the way it treats an import.
@@ -31,11 +64,10 @@
 //!
 //! WHAT THE ROUTE DOES, in order (mirrors the Go twin's own banner):
 //!
-//!  1. RECOGNIZE the call: an `Assign` of one name from `subprocess.run`,
-//!     with a literal `["node", "<script>.ts"]` argv and the three
-//!     required keywords (`input=json.dumps(...)`, `capture_output=True`,
-//!     `text=True`). Anything unrecognized declines, and every decline
-//!     NAMES what broke.
+//!  1. RECOGNIZE the call: an `Assign` of one name from a recognized
+//!     `subprocess` callee, with a written argv list naming a runner and
+//!     a script, and every required keyword. Anything unrecognized
+//!     declines, and every decline NAMES what broke.
 //!  2. READ the target's exported fact off disk through the sibling's
 //!     `read_foreign_ts_artifact` — target integrity, runtime identity,
 //!     and harness shape are the artifact reader's own premises.
@@ -83,18 +115,68 @@ use refined_kernel::kernel_interface::RefinedTSKernel;
 use refined_sets::refinement_forms::RefinedSet;
 use refined_sets::repetition_window_forms::as_repetition;
 use ruff_python_ast::Expr;
+use ruff_python_ast::ExprCall;
+use ruff_python_ast::ExprList;
+use ruff_python_ast::ExprName;
 use ruff_python_ast::Stmt;
+use ruff_python_ast::StmtAssign;
 use ruff_text_size::Ranged;
 use ruff_text_size::TextRange;
 
 use crate::refinedpy::diagnostic_sentences;
 use crate::refinedpy::env::Environment;
+use crate::refinedpy::foreign_edge_artifact::ForeignSurface;
 use crate::refinedpy::foreign_edge_artifact::ForeignTsArtifact;
 use crate::refinedpy::foreign_edge_artifact::ForeignTsEntry;
 #[cfg(test)]
 use crate::refinedpy::foreign_edge_artifact::ForeignTsFunctionFact;
 #[cfg(not(test))]
 use crate::refinedpy::foreign_edge_artifact::read_foreign_ts_artifact as read_foreign_ts_artifact_landed;
+
+/// How the return leg's sole consumer reads the captured text back off
+/// the bound name — the two shapes this crate's recognized calls
+/// produce. `subprocess.run` binds a result object and the captured
+/// text sits at its `.stdout` attribute; `subprocess.check_output`
+/// returns the captured text directly, and `subprocess.Popen`'s
+/// `.communicate()` tuple-unpacks it into a plain name — both of those
+/// are read the same bare way once `result_name` names the right
+/// variable.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResultRead {
+    /// `json.loads(<name>.stdout)` — `subprocess.run`'s own shape.
+    StdoutAttribute,
+    /// `json.loads(<name>)` — `subprocess.check_output`'s direct return,
+    /// and `subprocess.Popen`'s tuple-unpacked stdout name.
+    Bare,
+}
+
+/// Which carrier a recognized call sends its payload on — the SAME two
+/// tags `foreign_edge_artifact.rs`'s `ForeignSurface` names, read here
+/// off the call's own spelling rather than off a target's stated fact.
+/// `foreign_edge_at` compares this against the artifact's declared
+/// surface: a mismatch either way (stdin payload at an argv-json
+/// target, or the reverse) declines naming the channel that does not
+/// meet, before any outbound-leg fit question is even asked.
+///
+/// PREMISE: an argv element rides the OS argv byte array rather than a
+/// pipe, but the checker's identity claim about the crossing value is
+/// the SAME one `stdin-json` already cites — `surface.kind` names which
+/// carrier the bytes ride on, not a different transport model. Both
+/// carriers move the identical JSON text; the round-trip premise
+/// (`json.dumps` on this side, `JSON.parse` on the target's) is shared,
+/// which is why `check_outbound_leg`'s own fit checks apply unchanged
+/// to either channel.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Channel {
+    /// `input=json.dumps(<payload>)` — the payload rides the process's
+    /// stdin pipe.
+    Stdin,
+    /// The payload rides one argv element — node's own convention
+    /// makes the third argv entry `process.argv[2]`, so a three-element
+    /// argv list (`["node", script, json.dumps(payload)]`) reads as
+    /// `arg_index == 2`.
+    Argv { arg_index: i64 },
+}
 
 /// One recognized cross-language call: which node the call is, which
 /// `.ts` file it names, which expression crosses out, and which name
@@ -107,11 +189,30 @@ pub struct ForeignEdge {
     /// wrote it, which is the only reading that survives a moved cwd).
     pub target_path: String,
     /// The expression handed to `json.dumps` — the value that actually
-    /// crosses out.
+    /// crosses out. The SAME JSON-encoded value either channel carries;
+    /// only the carrier named by `channel` differs.
     pub payload: Expr,
-    /// The name the call's result binds, whose sole `json.loads(<name>
-    /// .stdout)` consumer receives the return fact.
+    /// Which carrier this call's own spelling used — checked against
+    /// the artifact's declared surface before the outbound-leg fit is
+    /// asked.
+    channel: Channel,
+    /// The name the call's result binds, whose sole consumer (read
+    /// per `result_read`) receives the return fact.
     pub result_name: String,
+    /// How the sole consumer reads `result_name` back.
+    result_read: ResultRead,
+    /// Where the return-leg's sole-consumer scan starts looking (the
+    /// statement AFTER this index): the call's own position for
+    /// `subprocess.run`/`subprocess.check_output`, and one further for
+    /// `subprocess.Popen` — the `.communicate()` statement its own
+    /// recognition already consumed is not itself a consumer to find
+    /// again.
+    consumer_scan_from: usize,
+    /// Which runner word this call spelled — `foreign_edge_at` checks
+    /// this against the artifact's own declared band once the artifact
+    /// is read, since only `Node` discharges the runtime-identity
+    /// premise against this checker's pinned `node-23+` band.
+    runner: Runner,
 }
 
 /// What the route decided at one statement. Exactly one of `override_value`
@@ -176,6 +277,25 @@ pub fn foreign_edge_at(
             });
         }
     };
+    // RUNTIME IDENTITY: the artifact's own band is a claim about the
+    // NODE runtime this checker's TypeScript pins commit to — a call
+    // recognized under a different runner (deno, bun, npx tsx) genuinely
+    // names the same script, but that runner is not the runtime the
+    // band was stated about, so the identity premise cannot be
+    // discharged. This is a determination gap, not a recognition gap:
+    // the reference is named, only the band claim does not carry.
+    if edge.runner != Runner::Node {
+        return Some(ForeignEdgeOutcome::Decline {
+            message: diagnostic_sentences::foreign_edge_runtime_band_gap(&artifact.runtime_band, edge.runner.word()),
+            range: edge.call,
+        });
+    }
+    // CARRIER IDENTITY: the call's own spelling states one channel, and
+    // the target's surface states the one it actually reads — a JSON
+    // transport model applies only when both name the SAME carrier.
+    if let Some(mismatch) = channel_mismatch_decline(edge.channel, &artifact.surface) {
+        return Some(ForeignEdgeOutcome::Decline { message: mismatch, range: edge.call });
+    }
     // the OUTBOUND leg: every premise about what crosses out, discharged
     // against the value the walk holds for it
     if let Some(outcome) = check_outbound_leg(&edge, &artifact, environment, kernel) {
@@ -192,12 +312,38 @@ pub fn foreign_edge_at(
         });
     }
     // the RETURN leg: the target's own fact, attached to the parse
-    match sole_parse_consumer_of(statements, index, &edge.result_name) {
+    match sole_parse_consumer_of(statements, edge.consumer_scan_from, &edge.result_name, edge.result_read) {
         Ok(parse_range) => Some(ForeignEdgeOutcome::Override {
             parse_range,
             value: foreign_return_value(&artifact),
         }),
         Err(message) => Some(ForeignEdgeOutcome::Decline { message, range: edge.call }),
+    }
+}
+
+/// Whether the call's own carrier and the target's declared surface
+/// name the SAME channel — `None` when they meet, the decline sentence
+/// naming the mismatch otherwise. Neither direction is a recognition
+/// failure: the call is a real, well-formed shape, and the target's
+/// fact is a real, well-formed fact; they simply do not speak the same
+/// carrier, so nothing here can apply the JSON transport model.
+fn channel_mismatch_decline(channel: Channel, surface: &ForeignSurface) -> Option<String> {
+    match (channel, surface) {
+        (Channel::Stdin, ForeignSurface::StdinJson) => None,
+        (Channel::Argv { arg_index }, ForeignSurface::ArgvJson { arg_index: declared_index })
+            if arg_index == *declared_index =>
+        {
+            None
+        }
+        (Channel::Stdin, ForeignSurface::ArgvJson { .. }) => {
+            Some(diagnostic_sentences::foreign_edge_channel_mismatch_stdin_at_argv_target())
+        }
+        (Channel::Argv { .. }, ForeignSurface::StdinJson) => {
+            Some(diagnostic_sentences::foreign_edge_channel_mismatch_argv_at_stdin_target())
+        }
+        (Channel::Argv { arg_index }, ForeignSurface::ArgvJson { arg_index: declared_index }) => {
+            Some(diagnostic_sentences::foreign_edge_channel_mismatch_argv_index(arg_index, *declared_index))
+        }
     }
 }
 
@@ -237,12 +383,155 @@ struct RecognitionDecline {
     range: TextRange,
 }
 
-/// Reads one statement as `<name> = subprocess.run(["node", "<script>
-/// .ts"], input=json.dumps(<payload>), capture_output=True, text=True)`.
+/// The recognized runner words — argv[0] (plus, for a two-word runner,
+/// argv[1]) that names the program the target `.ts` file runs under.
+/// Every runner recognizes the REFERENCE (the argv genuinely names one
+/// script), but only `Node` discharges the runtime-identity premise
+/// against this checker's own pinned `node-23+` band — the other three
+/// recognize and then decline at that premise (see `foreign_edge_at`'s
+/// own runtime-band check), never at argv shape.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Runner {
+    Node,
+    Deno,
+    Bun,
+    NpxTsx,
+}
+
+impl Runner {
+    /// The word a runtime-band-gap sentence names — the exact runner
+    /// text this call spells, not a category.
+    fn word(self) -> &'static str {
+        match self {
+            Runner::Node => "node",
+            Runner::Deno => "deno",
+            Runner::Bun => "bun",
+            Runner::NpxTsx => "npx tsx",
+        }
+    }
+}
+
+/// One argv list read as `[<runner words>, <script>]` — the runner
+/// identified and the script's own literal text resolved, independent
+/// of which `subprocess.*` callee is being recognized (`run`,
+/// `check_output`, and `Popen` all take the same argv shape).
+struct ArgvReading {
+    runner: Runner,
+    script_text: String,
+}
+
+/// Reads one `Expr::List` argv literal as `[runner_word(s), script]`:
+/// exactly two elements for `Node`/`Bun` (`["node", script]`), exactly
+/// three for `Deno`/`NpxTsx` (`["deno", "run", script]`,
+/// `["npx", "tsx", script]`). Any other length, or a two/three-element
+/// list whose runner word(s) do not match one of these four rows,
+/// answers `None` — "some other program, nothing owed" for a
+/// recognized-length list with an unrecognized word, and a decline
+/// (owed by the caller, since the shape genuinely does not fit ANY
+/// known runner) for every other length.
 ///
-/// `None` — not this shape at all, no sentence owed. `Some(Err(...))` —
-/// this IS a `subprocess.run` call and something about its spelling
-/// stopped the resolution, so the caller owes a sentence naming it.
+/// `None` is also the answer when argv[0] is not a written string
+/// literal — an interpreter read through a variable is not a shape any
+/// runner row here recognizes (`level_via_runner_variable`'s own row),
+/// so the caller declines naming that specifically.
+fn argv_runner_and_script(
+    argv_list: &ExprList,
+    environment: &Environment,
+) -> Option<Result<ArgvReading, RecognitionDecline>> {
+    let call_range = argv_list.range();
+    match argv_list.elts.as_slice() {
+        [interpreter, script] => {
+            let Some(interpreter_text) = literal_string(interpreter) else {
+                return Some(Err(RecognitionDecline {
+                    message: "this call's argv[0] is not a written string literal naming the interpreter"
+                        .to_owned(),
+                    range: call_range,
+                }));
+            };
+            let runner = match interpreter_text {
+                "node" => Runner::Node,
+                "bun" => Runner::Bun,
+                _ => return None,
+            };
+            Some(script_text_of(script, environment).map(|script_text| ArgvReading { runner, script_text }))
+        }
+        [interpreter, second_word, script] => {
+            let (Some(interpreter_text), Some(second_word_text)) =
+                (literal_string(interpreter), literal_string(second_word))
+            else {
+                return Some(Err(RecognitionDecline {
+                    message: "this call's argv[0] is not a written string literal naming the interpreter"
+                        .to_owned(),
+                    range: call_range,
+                }));
+            };
+            let runner = match (interpreter_text, second_word_text) {
+                ("deno", "run") => Runner::Deno,
+                ("npx", "tsx") => Runner::NpxTsx,
+                _ => return None,
+            };
+            Some(script_text_of(script, environment).map(|script_text| ArgvReading { runner, script_text }))
+        }
+        _ => Some(Err(RecognitionDecline {
+            message: "this call's argv does not hold exactly [\"node\", \"<script>.ts\"] (or a recognized \
+                deno/bun/npx-tsx runner row), so the checker cannot name the code that runs next"
+                .to_owned(),
+            range: call_range,
+        })),
+    }
+}
+
+/// Reads the script element's own text: a written string literal
+/// directly, or a bare `Name` this body never rebinds that resolves
+/// (through `environment.read`) to a known exact string — the
+/// module-level-constant path (`TARGET_PATH = "./targets/level_ok.ts"`
+/// used as `["node", TARGET_PATH]`). Every other shape (an f-string, a
+/// parameter, a computed expression) declines with the law-2 sentence:
+/// the path is computed, and the fix is to spell it as a written
+/// string literal.
+///
+/// A script position always owes either a resolved reading or the
+/// law-2 decline — never a bare `None` (that belongs to the caller's
+/// own runner-word match, not to this function).
+fn script_text_of(script: &Expr, environment: &Environment) -> Result<String, RecognitionDecline> {
+    if let Some(literal) = literal_string(script) {
+        return Ok(literal.to_owned());
+    }
+    if let Expr::Name(name) = script {
+        if let Some(bound) = environment.read(name.id.as_str()) {
+            if let Some(text) = exact_string_text(bound) {
+                return Ok(text);
+            }
+        }
+    }
+    Err(RecognitionDecline { message: diagnostic_sentences::script_path_not_a_literal(), range: script.range() })
+}
+
+/// The exact text an `AbstractValue` carries, if it is a `Kind::Values`
+/// state sorted `PrimitiveKind::String` — the same code-point-vector
+/// shape every other file in this crate decodes locally
+/// (`string_models.rs::exact_string_text`, reimplemented per file per
+/// this crate's own no-shared-private-helper convention rather than
+/// widening another module's visibility for one caller).
+fn exact_string_text(value: &AbstractValue) -> Option<String> {
+    if value.kind != Kind::Values || value.kind_tag != Some(PrimitiveKind::String) {
+        return None;
+    }
+    Some(value.values.iter().filter_map(|c| char::from_u32(*c as i64 as u32)).collect())
+}
+
+/// Reads one statement as `<name> = subprocess.run(...)`,
+/// `<name> = subprocess.check_output(...)`, or the two-statement
+/// `<name> = subprocess.Popen(...)` / `<a>, <b> = <name>.communicate(...)`
+/// pair — the three `subprocess` callees whose argv shape and keywords
+/// this checker reads.
+///
+/// `None` — not this shape at all, no sentence owed (including a plain
+/// `subprocess.Popen(...)` whose very first statement is not even a
+/// `subprocess` call, which is not this recognizer's concern at all).
+/// `Some(Err(...))` — this IS a recognized `subprocess.*` call and
+/// something about its spelling stopped the resolution, so the caller
+/// owes a sentence naming it.
 fn recognize_foreign_edge(
     statements: &[Stmt],
     index: usize,
@@ -251,6 +540,9 @@ fn recognize_foreign_edge(
     let Stmt::Assign(assign) = &statements[index] else {
         return None;
     };
+    if let Some(decline) = recognize_os_system(assign, environment) {
+        return Some(Err(decline));
+    }
     let [Expr::Name(target)] = assign.targets.as_slice() else {
         return None;
     };
@@ -269,16 +561,156 @@ fn recognize_foreign_edge(
     if module_name.id.as_str() != "subprocess" || environment.read("subprocess").is_some() {
         return None;
     }
-    if attribute.attr.as_str() != "run" {
+    match attribute.attr.as_str() {
+        "run" => recognize_subprocess_run(call, target, environment, index),
+        "check_output" => recognize_subprocess_check_output(call, target, environment, index),
+        "Popen" => recognize_subprocess_popen(statements, index, call, target, environment),
+        _ => None,
+    }
+}
+
+/// `<name> = os.system("<shell command>")` — never an override: `os
+/// .system` runs a shell command but captures no stdout at all
+/// (`library/os.rst`, `os.system`: "the exit status of the process" is
+/// the whole return; nothing here reads the command's output), so even
+/// a recognized, followed literal command has no captured-stdout leg
+/// for a return fact to attach to. `None` when this is not an
+/// `os.system` call at all (no sentence owed); `Some(decline)` — this
+/// checker sees the shape and every reachable outcome is undetermined.
+///
+/// A shadowed `os` name is not the module, mirroring the `subprocess`
+/// shadow-on-rebind check the other recognizers apply.
+fn recognize_os_system(assign: &StmtAssign, environment: &Environment) -> Option<RecognitionDecline> {
+    let Expr::Call(call) = assign.value.as_ref() else {
+        return None;
+    };
+    let Expr::Attribute(attribute) = call.func.as_ref() else {
+        return None;
+    };
+    let Expr::Name(module_name) = attribute.value.as_ref() else {
+        return None;
+    };
+    if module_name.id.as_str() != "os" || environment.read("os").is_some() {
         return None;
     }
-    // past this point the reader KNOWS it is looking at a subprocess.run
-    // call, so every remaining decline names what stopped it
+    if attribute.attr.as_str() != "system" {
+        return None;
+    }
+    let call_range = call.range();
+    let [command] = call.arguments.args.as_ref() else {
+        return Some(RecognitionDecline {
+            message: "this call passes other than one positional command argument, and the checker \
+                models only a single written shell-string argument"
+                .to_owned(),
+            range: call_range,
+        });
+    };
+    let Some(command_text) = literal_string(command) else {
+        return Some(RecognitionDecline {
+            message: diagnostic_sentences::os_system_shell_string_unreadable(),
+            range: call_range,
+        });
+    };
+    let Some(tokens) = tokenize_shell_command(command_text) else {
+        return Some(RecognitionDecline {
+            message: diagnostic_sentences::os_system_shell_string_unreadable(),
+            range: call_range,
+        });
+    };
+    let Some((runner_and_script, remainder)) = split_runner_and_script(&tokens) else {
+        return Some(RecognitionDecline {
+            message: diagnostic_sentences::os_system_shell_string_unreadable(),
+            range: call_range,
+        });
+    };
+    // "< infile" and "> outfile" are the two redirections this row reads
+    // past the runner and script, in either order or both — a command
+    // line's own way of naming stdin/stdout files. Any other trailing
+    // token is unsupported and named specifically rather than silently
+    // accepted.
+    let Some(redirection_suffix) = redirection_suffix_of(remainder) else {
+        return Some(RecognitionDecline {
+            message: format!(
+                "{} is followed by {}, which this checker's shell-string reader does not admit — only \
+                trailing \"< <file>\"/\"> <file>\" redirections are read past the runner and script",
+                runner_and_script,
+                remainder.join(" ")
+            ),
+            range: call_range,
+        });
+    };
+    let runner_and_script = runner_and_script + &redirection_suffix;
+    // even a followed literal command has no value channel: os.system
+    // never captures stdout, so there is no consumer leg to attach a
+    // return fact to, regardless of how cleanly the runner+script read
+    Some(RecognitionDecline {
+        message: diagnostic_sentences::os_system_no_stdout_capture(&runner_and_script),
+        range: call_range,
+    })
+}
+
+/// Reads zero, one, or both of a trailing `< infile` / `> outfile`
+/// redirection, in either order, off the tokens following the runner
+/// and script. `None` when the trailing tokens are not exactly this
+/// shape (an extra flag, a pipe, anything this reader does not admit).
+fn redirection_suffix_of(remainder: &[&str]) -> Option<String> {
+    match remainder {
+        [] => Some(String::new()),
+        ["<", input_file] => Some(format!(" < {input_file}")),
+        [">", output_file] => Some(format!(" > {output_file}")),
+        ["<", input_file, ">", output_file] => Some(format!(" < {input_file} > {output_file}")),
+        [">", output_file, "<", input_file] => Some(format!(" > {output_file} < {input_file}")),
+        _ => None,
+    }
+}
+
+/// Splits a shell command string on single spaces — the narrowest
+/// tokenizer this row needs (no quoting). `None` for an empty command.
+fn tokenize_shell_command(command_text: &str) -> Option<Vec<&str>> {
+    if command_text.is_empty() {
+        return None;
+    }
+    Some(command_text.split(' ').collect())
+}
+
+/// Reads the leading `[runner(+word), script]` prefix off a tokenized
+/// shell command, answering the recognized "runner script" text and
+/// whatever tokens follow it. `None` when the leading tokens are not
+/// one of the four recognized runner rows at all.
+fn split_runner_and_script<'a>(tokens: &'a [&'a str]) -> Option<(String, &'a [&'a str])> {
+    match tokens {
+        [runner_word, script, rest @ ..] if is_recognized_runner_word(runner_word) => {
+            Some((format!("{runner_word} {script}"), rest))
+        }
+        [runner_word, second_word, script, rest @ ..] if is_recognized_two_word_runner(runner_word, second_word) => {
+            Some((format!("{runner_word} {second_word} {script}"), rest))
+        }
+        _ => None,
+    }
+}
+
+/// Whether a token is a recognized one-word runner (`node`, `bun`).
+fn is_recognized_runner_word(word: &str) -> bool {
+    word == "node" || word == "bun"
+}
+
+/// Whether two tokens are a recognized two-word runner (`deno run`,
+/// `npx tsx`).
+fn is_recognized_two_word_runner(first: &str, second: &str) -> bool {
+    (first == "deno" && second == "run") || (first == "npx" && second == "tsx")
+}
+
+/// The argv list and its resolved runner/script — read once, shared by
+/// every callee's own recognition. `None` propagates a not-this-shape
+/// answer (an unrecognized argv[0] at a recognized length: "some other
+/// program, nothing owed"); `Some(Err(...))` is a decline the caller
+/// returns unchanged.
+fn recognized_argv(call: &ExprCall, environment: &Environment) -> Option<Result<ArgvReading, RecognitionDecline>> {
     let call_range = call.range();
     let [argv] = call.arguments.args.as_ref() else {
         return Some(Err(RecognitionDecline {
-            message: "this call runs subprocess.run with other than one positional argv argument, and \
-                the checker models only a written argv list naming one script"
+            message: "this call passes other than one positional argv argument, and the checker models \
+                only a written argv list naming one script"
                 .to_owned(),
             range: call_range,
         }));
@@ -291,40 +723,32 @@ fn recognize_foreign_edge(
             range: call_range,
         }));
     };
-    let [interpreter, script] = argv_list.elts.as_slice() else {
-        return Some(Err(RecognitionDecline {
-            message: "this call's argv does not hold exactly [\"node\", \"<script>.ts\"], so the checker \
-                cannot name the code that runs next"
-                .to_owned(),
-            range: call_range,
-        }));
-    };
-    let Some(interpreter_text) = literal_string(interpreter) else {
-        return Some(Err(RecognitionDecline {
-            message: "this call's argv[0] is not a written string literal naming the interpreter".to_owned(),
-            range: call_range,
-        }));
-    };
-    if interpreter_text != "node" {
-        // some other program: not a TS edge, nothing owed
-        return None;
+    argv_runner_and_script(argv_list, environment)
+}
+
+/// `<name> = subprocess.run(["node", "<script>.ts"], input=json.dumps(
+/// <payload>), capture_output=True, text=True)` — the result reads back
+/// at `<name>.stdout`. The sibling argv-json shape (`["node",
+/// "<script>.ts", json.dumps(<payload>)]`, no `input=` keyword) is tried
+/// first: it is a real ambiguity with the ordinary two-element-argv
+/// shape only when BOTH an argv payload and `input=` are present, which
+/// `argv_json_call_of` itself declines naming the double channel.
+fn recognize_subprocess_run(
+    call: &ExprCall,
+    target: &ExprName,
+    environment: &Environment,
+    index: usize,
+) -> Option<Result<ForeignEdge, RecognitionDecline>> {
+    if let Some(argv_json) = argv_json_call_of(call, target, environment, index) {
+        return Some(argv_json);
     }
-    let Some(script_text) = literal_string(script) else {
-        return Some(Err(RecognitionDecline {
-            message: "this call's argv is not one written string naming a script — the checker cannot \
-                name the code that runs next, so it models no edge here"
-                .to_owned(),
-            range: call_range,
-        }));
+    let call_range = call.range();
+    let reading = match recognized_argv(call, environment)? {
+        Ok(reading) => reading,
+        Err(decline) => return Some(Err(decline)),
     };
-    if !script_text.ends_with(".ts") {
-        return Some(Err(RecognitionDecline {
-            message: format!(
-                "this call runs node on {script_text}, which is not a .ts file — the checker models the \
-                edge only where the argv names TypeScript source it can read a fact for"
-            ),
-            range: call_range,
-        }));
+    if let Some(decline) = script_extension_decline(&reading.script_text, reading.runner, call_range) {
+        return Some(Err(decline));
     }
     let (payload, keywords_decline) = subprocess_run_keywords_of(call);
     if let Some(decline) = keywords_decline {
@@ -333,18 +757,263 @@ fn recognize_foreign_edge(
     let Some(payload) = payload else {
         return Some(Err(RecognitionDecline {
             message: format!(
-                "this call runs node on {script_text} and sends it no json.dumps(...) input, so \
-                nothing crosses out on stdin and the transport model has no outbound leg to apply"
+                "this call runs {} on {} and sends it no json.dumps(...) input, so nothing crosses out on \
+                stdin and the transport model has no outbound leg to apply",
+                reading.runner.word(),
+                reading.script_text
             ),
             range: call_range,
         }));
     };
     Some(Ok(ForeignEdge {
         call: call_range,
-        target_path: resolve_target_path(script_text),
+        target_path: resolve_target_path(&reading.script_text),
         payload,
+        channel: Channel::Stdin,
         result_name: target.id.as_str().to_owned(),
+        result_read: ResultRead::StdoutAttribute,
+        consumer_scan_from: index,
+        runner: reading.runner,
     }))
+}
+
+/// `<name> = subprocess.run(["node", "<script>.ts", json.dumps(<payload>)],
+/// capture_output=True, text=True)` — the payload rides the third argv
+/// element (node's own convention: `process.argv[2]`) rather than
+/// stdin. `None` when this is not that three-element shape at all (the
+/// ordinary two-element stdin call, an unrelated argv arity, or a
+/// three-element deno/npx-tsx runner row whose own trailing element is
+/// the SCRIPT, not a `json.dumps(...)` payload — `literal_string` on
+/// that element fails `json_dumps_argument_of`'s own call-shape check,
+/// so it falls through here unchanged). `Some(Err(...))` when the shape
+/// reads as an argv payload but something about it stops recognition:
+/// an unreadable runner/script, a wrong extension, or `input=` ALSO
+/// present (the double-channel decline — two crossing values are named
+/// and this checker recognizes exactly one transport per call).
+fn argv_json_call_of(
+    call: &ExprCall,
+    target: &ExprName,
+    environment: &Environment,
+    index: usize,
+) -> Option<Result<ForeignEdge, RecognitionDecline>> {
+    let call_range = call.range();
+    let [argv] = call.arguments.args.as_ref() else {
+        return None;
+    };
+    let Expr::List(argv_list) = argv else {
+        return None;
+    };
+    let [interpreter, script, third] = argv_list.elts.as_slice() else {
+        return None;
+    };
+    let payload = json_dumps_argument_of(third)?;
+    let Some(interpreter_text) = literal_string(interpreter) else {
+        return Some(Err(RecognitionDecline {
+            message: "this call's argv[0] is not a written string literal naming the interpreter".to_owned(),
+            range: call_range,
+        }));
+    };
+    let runner = match interpreter_text {
+        "node" => Runner::Node,
+        "bun" => Runner::Bun,
+        _ => {
+            return Some(Err(RecognitionDecline {
+                message: format!(
+                    "this call's argv names {interpreter_text} as the third-position payload's runner, and \
+                    the argv-json shape recognizes only node/bun at that position"
+                ),
+                range: call_range,
+            }));
+        }
+    };
+    let script_text = match script_text_of(script, environment) {
+        Ok(text) => text,
+        Err(decline) => return Some(Err(decline)),
+    };
+    if let Some(decline) = script_extension_decline(&script_text, runner, call_range) {
+        return Some(Err(decline));
+    }
+    let (input_present, keywords_decline) = subprocess_run_argv_json_keywords_of(call);
+    if let Some(decline) = keywords_decline {
+        return Some(Err(RecognitionDecline { message: decline, range: call_range }));
+    }
+    if input_present {
+        return Some(Err(RecognitionDecline {
+            message: diagnostic_sentences::foreign_edge_double_channel_declared(),
+            range: call_range,
+        }));
+    }
+    Some(Ok(ForeignEdge {
+        call: call_range,
+        target_path: resolve_target_path(&script_text),
+        payload,
+        channel: Channel::Argv { arg_index: 2 },
+        result_name: target.id.as_str().to_owned(),
+        result_read: ResultRead::StdoutAttribute,
+        consumer_scan_from: index,
+        runner,
+    }))
+}
+
+/// `<name> = subprocess.check_output(["node", "<script>.ts"], input=
+/// json.dumps(<payload>), text=True)` — the result IS the captured
+/// stdout text directly (`library/subprocess.rst`: "the return value is
+/// the command's output"), so the sole consumer reads `<name>` bare,
+/// never `<name>.stdout`. No `capture_output` keyword exists for this
+/// callee (`check_output` always captures), so it is not read here.
+fn recognize_subprocess_check_output(
+    call: &ExprCall,
+    target: &ExprName,
+    environment: &Environment,
+    index: usize,
+) -> Option<Result<ForeignEdge, RecognitionDecline>> {
+    let call_range = call.range();
+    let reading = match recognized_argv(call, environment)? {
+        Ok(reading) => reading,
+        Err(decline) => return Some(Err(decline)),
+    };
+    if let Some(decline) = script_extension_decline(&reading.script_text, reading.runner, call_range) {
+        return Some(Err(decline));
+    }
+    let (payload, keywords_decline) = subprocess_check_output_keywords_of(call);
+    if let Some(decline) = keywords_decline {
+        return Some(Err(RecognitionDecline { message: decline, range: call_range }));
+    }
+    let Some(payload) = payload else {
+        return Some(Err(RecognitionDecline {
+            message: format!(
+                "this call runs {} on {} and sends it no json.dumps(...) input, so nothing crosses out on \
+                stdin and the transport model has no outbound leg to apply",
+                reading.runner.word(),
+                reading.script_text
+            ),
+            range: call_range,
+        }));
+    };
+    Some(Ok(ForeignEdge {
+        call: call_range,
+        target_path: resolve_target_path(&reading.script_text),
+        payload,
+        channel: Channel::Stdin,
+        result_name: target.id.as_str().to_owned(),
+        result_read: ResultRead::Bare,
+        consumer_scan_from: index,
+        runner: reading.runner,
+    }))
+}
+
+/// `<name> = subprocess.Popen(["node", "<script>.ts"], stdin=subprocess
+/// .PIPE, stdout=subprocess.PIPE, text=True)` immediately followed by
+/// `<stdout_name>, <_> = <name>.communicate(json.dumps(<payload>))` —
+/// the SAME two-statement-unit discipline `foreign_edge_at`'s own
+/// return-leg scan already applies to the call-and-its-consumer, here
+/// applied one statement earlier: `.communicate()`'s own call is not a
+/// consumer to find again, it is where the payload and the captured
+/// name are read, so recognition consumes it here rather than leaving
+/// it for `sole_parse_consumer_of` to (mis)count as a second statement
+/// writing the name.
+fn recognize_subprocess_popen(
+    statements: &[Stmt],
+    index: usize,
+    call: &ExprCall,
+    target: &ExprName,
+    environment: &Environment,
+) -> Option<Result<ForeignEdge, RecognitionDecline>> {
+    let call_range = call.range();
+    let reading = match recognized_argv(call, environment)? {
+        Ok(reading) => reading,
+        Err(decline) => return Some(Err(decline)),
+    };
+    if let Some(decline) = script_extension_decline(&reading.script_text, reading.runner, call_range) {
+        return Some(Err(decline));
+    }
+    if let Some(decline) = subprocess_popen_keywords_of(call) {
+        return Some(Err(RecognitionDecline { message: decline, range: call_range }));
+    }
+    let Some(next) = statements.get(index + 1) else {
+        return Some(Err(RecognitionDecline {
+            message: format!(
+                "this call runs {} on {} through Popen and nothing follows it in this body, so the \
+                checker cannot find the .communicate() call that reads the captured output back",
+                reading.runner.word(),
+                reading.script_text
+            ),
+            range: call_range,
+        }));
+    };
+    let Some((stdout_name, payload)) = communicate_call_of(next, target.id.as_str()) else {
+        return Some(Err(RecognitionDecline {
+            message: format!(
+                "the statement after this Popen call is not exactly `<name>, <name> = {}.communicate(\
+                json.dumps(...))`, so the checker cannot find the captured output or the outbound payload",
+                target.id.as_str()
+            ),
+            range: call_range,
+        }));
+    };
+    Some(Ok(ForeignEdge {
+        call: call_range,
+        target_path: resolve_target_path(&reading.script_text),
+        payload,
+        channel: Channel::Stdin,
+        result_name: stdout_name,
+        result_read: ResultRead::Bare,
+        consumer_scan_from: index + 1,
+        runner: reading.runner,
+    }))
+}
+
+/// Whether the script text names a `.ts` file — the one extension this
+/// edge models a fact for.
+fn script_extension_decline(script_text: &str, runner: Runner, call_range: TextRange) -> Option<RecognitionDecline> {
+    if script_text.ends_with(".ts") {
+        return None;
+    }
+    Some(RecognitionDecline {
+        message: format!(
+            "this call runs {} on {script_text}, which is not a .ts file — the checker models the edge \
+            only where the argv names TypeScript source it can read a fact for",
+            runner.word()
+        ),
+        range: call_range,
+    })
+}
+
+/// Reads `<a>, <b> = <popen_name>.communicate(json.dumps(<payload>))` —
+/// exactly a two-element tuple target, a call to `.communicate` on the
+/// exact name Popen bound, with exactly one positional `json.dumps(...)`
+/// argument. Answers the first target name (the captured stdout text)
+/// and the payload expression.
+fn communicate_call_of(statement: &Stmt, popen_name: &str) -> Option<(String, Expr)> {
+    let Stmt::Assign(assign) = statement else {
+        return None;
+    };
+    let [Expr::Tuple(targets)] = assign.targets.as_slice() else {
+        return None;
+    };
+    let [Expr::Name(stdout_name), _] = targets.elts.as_slice() else {
+        return None;
+    };
+    let Expr::Call(call) = assign.value.as_ref() else {
+        return None;
+    };
+    let Expr::Attribute(attribute) = call.func.as_ref() else {
+        return None;
+    };
+    let Expr::Name(receiver) = attribute.value.as_ref() else {
+        return None;
+    };
+    if receiver.id.as_str() != popen_name || attribute.attr.as_str() != "communicate" {
+        return None;
+    }
+    if !call.arguments.keywords.is_empty() {
+        return None;
+    }
+    let [argument] = call.arguments.args.as_ref() else {
+        return None;
+    };
+    let payload = json_dumps_argument_of(argument)?;
+    Some((stdout_name.id.as_str().to_owned(), payload))
 }
 
 /// The `.ts` path resolved against the checked file's own directory —
@@ -367,7 +1036,7 @@ fn resolve_target_path(script_text: &str) -> String {
 /// declines. Answers the payload expression (`None` when `input` is
 /// absent or is not a stringify-shaped call) and, on the FIRST keyword
 /// shape that stops recognition, the decline sentence naming it.
-fn subprocess_run_keywords_of(call: &ruff_python_ast::ExprCall) -> (Option<Expr>, Option<String>) {
+fn subprocess_run_keywords_of(call: &ExprCall) -> (Option<Expr>, Option<String>) {
     let mut payload: Option<Expr> = None;
     let mut capture_output_true = false;
     let mut text_true = false;
@@ -421,6 +1090,173 @@ fn subprocess_run_keywords_of(call: &ruff_python_ast::ExprCall) -> (Option<Expr>
         );
     }
     (payload, None)
+}
+
+/// Reads the `subprocess.run` keyword arguments for the argv-json call
+/// shape: `capture_output=True` and `text=True` are required exactly as
+/// they are for the stdin shape, but `input` is admitted here ONLY to
+/// be detected and reported back — its presence alongside an argv
+/// payload is the double-channel case the caller declines, never a
+/// silent second reading of the payload. Any other keyword declines.
+fn subprocess_run_argv_json_keywords_of(call: &ExprCall) -> (bool, Option<String>) {
+    let mut input_present = false;
+    let mut capture_output_true = false;
+    let mut text_true = false;
+    for keyword in call.arguments.keywords.iter() {
+        let Some(name) = keyword.arg.as_ref() else {
+            return (
+                false,
+                Some("this call passes a keyword argument through **, which the checker cannot read \
+                    into a fixed set of premises"
+                    .to_owned()),
+            );
+        };
+        match name.as_str() {
+            "input" => input_present = true,
+            "capture_output" => capture_output_true = literal_true(&keyword.value),
+            "text" => text_true = literal_true(&keyword.value),
+            other => {
+                return (
+                    false,
+                    Some(format!(
+                        "this call passes the keyword {other}, which this edge's recognized shape does not admit"
+                    )),
+                );
+            }
+        }
+    }
+    if !capture_output_true {
+        return (
+            input_present,
+            Some("this call does not pass capture_output=True, so the checker cannot read the target's \
+                stdout back"
+                .to_owned()),
+        );
+    }
+    if !text_true {
+        return (
+            input_present,
+            Some("this call does not pass text=True, so its result is bytes rather than the target's \
+                JSON text — the return leg has no text to parse"
+                .to_owned()),
+        );
+    }
+    (input_present, None)
+}
+
+/// Reads the `subprocess.check_output` keyword arguments:
+/// `input=json.dumps(...)` and `text=True` — both required, any other
+/// keyword declines. `check_output` has no `capture_output` keyword at
+/// all (the callee always captures — `library/subprocess.rst`), so it
+/// is not read here.
+fn subprocess_check_output_keywords_of(call: &ExprCall) -> (Option<Expr>, Option<String>) {
+    let mut payload: Option<Expr> = None;
+    let mut text_true = false;
+    for keyword in call.arguments.keywords.iter() {
+        let Some(name) = keyword.arg.as_ref() else {
+            return (
+                None,
+                Some("this call passes a keyword argument through **, which the checker cannot read \
+                    into a fixed set of premises"
+                    .to_owned()),
+            );
+        };
+        match name.as_str() {
+            "input" => {
+                payload = json_dumps_argument_of(&keyword.value);
+                if payload.is_none() {
+                    return (
+                        None,
+                        Some("this call's input keyword is not json.dumps(...), so the checker cannot \
+                            read what crosses out on stdin"
+                            .to_owned()),
+                    );
+                }
+            }
+            "text" => text_true = literal_true(&keyword.value),
+            other => {
+                return (
+                    None,
+                    Some(format!(
+                        "this call passes the keyword {other}, which this edge's recognized shape does not admit"
+                    )),
+                );
+            }
+        }
+    }
+    if !text_true {
+        return (
+            None,
+            Some("this call does not pass text=True, so its result is bytes rather than the target's \
+                JSON text — the return leg has no text to parse"
+                .to_owned()),
+        );
+    }
+    (payload, None)
+}
+
+/// Reads the `subprocess.Popen` keyword arguments: `stdin=subprocess
+/// .PIPE`, `stdout=subprocess.PIPE`, `text=True` — ALL required
+/// (`.communicate()`'s own call, not this one, carries the payload), any
+/// other keyword declines. Answers the decline sentence naming the
+/// first shape that stops recognition, or `None` when every keyword
+/// checks out.
+fn subprocess_popen_keywords_of(call: &ExprCall) -> Option<String> {
+    let mut stdin_pipe = false;
+    let mut stdout_pipe = false;
+    let mut text_true = false;
+    for keyword in call.arguments.keywords.iter() {
+        let Some(name) = keyword.arg.as_ref() else {
+            return Some(
+                "this call passes a keyword argument through **, which the checker cannot read into a \
+                fixed set of premises"
+                    .to_owned(),
+            );
+        };
+        match name.as_str() {
+            "stdin" => stdin_pipe = is_subprocess_pipe(&keyword.value),
+            "stdout" => stdout_pipe = is_subprocess_pipe(&keyword.value),
+            "text" => text_true = literal_true(&keyword.value),
+            other => {
+                return Some(format!(
+                    "this call passes the keyword {other}, which this edge's recognized shape does not admit"
+                ));
+            }
+        }
+    }
+    if !stdin_pipe {
+        return Some(
+            "this call does not pass stdin=subprocess.PIPE, so the checker cannot tell that the payload \
+            crosses out on stdin"
+                .to_owned(),
+        );
+    }
+    if !stdout_pipe {
+        return Some(
+            "this call does not pass stdout=subprocess.PIPE, so the checker cannot read the target's \
+            stdout back"
+                .to_owned(),
+        );
+    }
+    if !text_true {
+        return Some(
+            "this call does not pass text=True, so its result is bytes rather than the target's JSON \
+            text — the return leg has no text to parse"
+                .to_owned(),
+        );
+    }
+    None
+}
+
+/// Whether an expression is exactly `subprocess.PIPE`.
+fn is_subprocess_pipe(expression: &Expr) -> bool {
+    let Expr::Attribute(attribute) = expression else {
+        return false;
+    };
+    let Expr::Name(module_name) = attribute.value.as_ref() else {
+        return false;
+    };
+    module_name.id.as_str() == "subprocess" && attribute.attr.as_str() == "PIPE"
 }
 
 /// Reads `json.dumps(<expr>)` and answers the single argument.
@@ -676,8 +1512,9 @@ fn fire_at(range: TextRange, said: String, artifact: &ForeignTsArtifact) -> Fore
 
 /* ── the return leg ───────────────────────────────────────────────── */
 
-/// Finds the `json.loads(<result_name>.stdout)` node the target's
-/// return fact attaches to, scanning the statements AFTER the call in
+/// Finds the `json.loads(<result_name>.stdout)` (or, for `result_read
+/// == Bare`, the plain `json.loads(<result_name>)`) node the target's
+/// return fact attaches to, scanning the statements AFTER `index` in
 /// the same function — the same same-function, count-the-occurrences
 /// discipline the Go twin's `soleParseConsumerOf` uses.
 ///
@@ -693,7 +1530,12 @@ fn fire_at(range: TextRange, said: String, artifact: &ForeignTsArtifact) -> Fore
 /// A parse inside a nested function body is not counted: that scope
 /// runs an unstated number of times, so the fact cannot be pinned to
 /// one evaluation.
-fn sole_parse_consumer_of(statements: &[Stmt], index: usize, result_name: &str) -> Result<TextRange, String> {
+fn sole_parse_consumer_of(
+    statements: &[Stmt],
+    index: usize,
+    result_name: &str,
+    result_read: ResultRead,
+) -> Result<TextRange, String> {
     let mut found: Option<TextRange> = None;
     let mut count = 0usize;
     let mut written = false;
@@ -701,7 +1543,7 @@ fn sole_parse_consumer_of(statements: &[Stmt], index: usize, result_name: &str) 
         if statement_writes_name(statement, result_name) {
             written = true;
         }
-        foreign_parse_calls_in(statement, result_name, &mut found, &mut count);
+        foreign_parse_calls_in(statement, result_name, result_read, &mut found, &mut count);
     }
     if written {
         return Err(format!(
@@ -781,12 +1623,18 @@ fn target_names(target: &Expr, name: &str) -> bool {
     }
 }
 
-/// Counts every `json.loads(<name>.stdout)` in a statement, recording
-/// the first — never descending into a nested function, the same
-/// boundary the Go twin's `foreignParseCallsIn` keeps.
-fn foreign_parse_calls_in(statement: &Stmt, name: &str, found: &mut Option<TextRange>, count: &mut usize) {
+/// Counts every parse of `<name>` (per `result_read`) in a statement,
+/// recording the first — never descending into a nested function, the
+/// same boundary the Go twin's `foreignParseCallsIn` keeps.
+fn foreign_parse_calls_in(
+    statement: &Stmt,
+    name: &str,
+    result_read: ResultRead,
+    found: &mut Option<TextRange>,
+    count: &mut usize,
+) {
     visit_statement_exprs(statement, &mut |expression| {
-        if is_foreign_parse_of(expression, name) {
+        if is_foreign_parse_of(expression, name, result_read) {
             if found.is_none() {
                 *found = Some(expression.range());
             }
@@ -795,8 +1643,10 @@ fn foreign_parse_calls_in(statement: &Stmt, name: &str, found: &mut Option<TextR
     });
 }
 
-/// Whether a node is exactly `json.loads(<name>.stdout)`.
-fn is_foreign_parse_of(expression: &Expr, name: &str) -> bool {
+/// Whether a node is exactly `json.loads(<name>.stdout)` (`result_read
+/// == StdoutAttribute`) or plain `json.loads(<name>)` (`result_read ==
+/// Bare`).
+fn is_foreign_parse_of(expression: &Expr, name: &str, result_read: ResultRead) -> bool {
     let Expr::Call(call) = expression else {
         return false;
     };
@@ -815,13 +1665,23 @@ fn is_foreign_parse_of(expression: &Expr, name: &str) -> bool {
     let [argument] = call.arguments.args.as_ref() else {
         return false;
     };
-    let Expr::Attribute(result_attribute) = argument else {
-        return false;
-    };
-    let Expr::Name(result_name) = result_attribute.value.as_ref() else {
-        return false;
-    };
-    result_name.id.as_str() == name && result_attribute.attr.as_str() == "stdout"
+    match result_read {
+        ResultRead::StdoutAttribute => {
+            let Expr::Attribute(result_attribute) = argument else {
+                return false;
+            };
+            let Expr::Name(result_name) = result_attribute.value.as_ref() else {
+                return false;
+            };
+            result_name.id.as_str() == name && result_attribute.attr.as_str() == "stdout"
+        }
+        ResultRead::Bare => {
+            let Expr::Name(result_name) = argument else {
+                return false;
+            };
+            result_name.id.as_str() == name
+        }
+    }
 }
 
 /// Walks every expression reachable from a statement without crossing
@@ -1013,6 +1873,7 @@ mod tests {
     use refined_sets::repetition_window_forms::repetition;
 
     use super::*;
+    use crate::refinedpy::foreign_edge_artifact::ForeignSurface;
 
     thread_local! {
         static FIXTURE_ARTIFACTS: RefCell<HashMap<String, ForeignTsArtifact>> = RefCell::new(HashMap::new());
@@ -1083,7 +1944,14 @@ mod tests {
             },
             target_file: "./audio_level.ts".to_owned(),
             runtime_band: "node-20+".to_owned(),
+            surface: ForeignSurface::StdinJson,
         }
+    }
+
+    /// The same fact, on an `argv-json` target reading its payload at
+    /// `argv[2]` — the fixture the argv-payload tests register.
+    fn audio_level_argv_json_artifact() -> ForeignTsArtifact {
+        ForeignTsArtifact { surface: ForeignSurface::ArgvJson { arg_index: 2 }, ..audio_level_ts_artifact() }
     }
 
     const FIXTURE_SOURCE: &str = concat!(
@@ -1111,7 +1979,7 @@ mod tests {
         let Some(kernel) = loaded_kernel() else { return };
         let body = def_body(FIXTURE_SOURCE);
         let environment = env_with(&[("boosted", boosted_sequence_value())]);
-        let outcome = foreign_edge_at(&body, 0, &environment, &kernel).expect("the shape recognizes");
+        let outcome = foreign_edge_at(&body, 0, &environment, &kernel, None).expect("the shape recognizes");
         match outcome {
             ForeignEdgeOutcome::Override { value, .. } => {
                 assert_eq!(value.kind, Kind::Set);
@@ -1129,7 +1997,7 @@ mod tests {
         environment.bind("subprocess", known_values(vec![0.0], PrimitiveKind::Integer, TrustProved));
         let Some(kernel) = loaded_kernel() else { return };
         assert!(
-            foreign_edge_at(&body, 0, &environment, &kernel).is_none(),
+            foreign_edge_at(&body, 0, &environment, &kernel, None).is_none(),
             "a locally shadowed subprocess must not be read as the module"
         );
     }
@@ -1148,7 +2016,7 @@ mod tests {
         let body = def_body(source);
         let environment = env_with(&[("boosted", boosted_sequence_value())]);
         let Some(kernel) = loaded_kernel() else { return };
-        match foreign_edge_at(&body, 0, &environment, &kernel).expect("the call is still recognized as subprocess.run") {
+        match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("the call is still recognized as subprocess.run") {
             ForeignEdgeOutcome::Decline { message, .. } => {
                 assert!(message.contains("capture_output"), "{message}");
             }
@@ -1174,7 +2042,7 @@ mod tests {
         let body = def_body(source);
         let environment = env_with(&[("boosted", boosted_sequence_value())]);
         let Some(kernel) = loaded_kernel() else { return };
-        match foreign_edge_at(&body, 0, &environment, &kernel).expect("the shape recognizes") {
+        match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("the shape recognizes") {
             ForeignEdgeOutcome::Decline { message, .. } => {
                 assert!(message.contains("2 times") || message.contains("parsed"), "{message}");
             }
@@ -1199,7 +2067,7 @@ mod tests {
         let body = def_body(source);
         let environment = env_with(&[("boosted", boosted_sequence_value())]);
         let Some(kernel) = loaded_kernel() else { return };
-        match foreign_edge_at(&body, 0, &environment, &kernel).expect("the shape recognizes") {
+        match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("the shape recognizes") {
             ForeignEdgeOutcome::Decline { message, .. } => {
                 assert!(message.contains("./nowhere.ts"), "{message}");
             }
@@ -1221,7 +2089,7 @@ mod tests {
             SetKindTag::None,
         );
         let environment = env_with(&[("boosted", too_wide)]);
-        match foreign_edge_at(&body, 0, &environment, &kernel).expect("the shape recognizes") {
+        match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("the shape recognizes") {
             ForeignEdgeOutcome::Fired { message, .. } => {
                 assert!(message.contains("audioLevel"), "{message}");
             }
@@ -1237,7 +2105,7 @@ mod tests {
         let body = def_body(FIXTURE_SOURCE);
         let nan_scalar = possibly_nan(known_values(vec![0.0], PrimitiveKind::Float, TrustProved));
         let environment = env_with(&[("boosted", nan_scalar)]);
-        match foreign_edge_at(&body, 0, &environment, &kernel).expect("the shape recognizes") {
+        match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("the shape recognizes") {
             ForeignEdgeOutcome::Fired { message, .. } => {
                 assert!(message.contains("NaN"), "{message}");
             }
@@ -1245,6 +2113,493 @@ mod tests {
             ForeignEdgeOutcome::Decline { message, .. } => {
                 panic!("wanted a NaN-freedom fire, got a decline: {message}")
             }
+        }
+    }
+
+    /* ── the argv-json payload shape ──────────────────────────────── */
+
+    const ARGV_JSON_FIXTURE_SOURCE: &str = concat!(
+        "def audio_level_via_argv(boosted):\n",
+        "    result = subprocess.run(\n",
+        "        [\"node\", \"./audio_level.ts\", json.dumps(boosted)],\n",
+        "        capture_output=True,\n",
+        "        text=True,\n",
+        "    )\n",
+        "    return json.loads(result.stdout)\n",
+    );
+
+    /// A fitting argv-json call against a matching argv-json target
+    /// recognizes and binds the proved return — silent (`Override`).
+    #[test]
+    fn a_fitting_argv_json_call_recognizes_and_binds_the_proved_return() {
+        register_fixture_artifact("./audio_level.ts", audio_level_argv_json_artifact());
+        let Some(kernel) = loaded_kernel() else { return };
+        let body = def_body(ARGV_JSON_FIXTURE_SOURCE);
+        let environment = env_with(&[("boosted", boosted_sequence_value())]);
+        match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("the argv-json shape recognizes") {
+            ForeignEdgeOutcome::Override { value, .. } => {
+                assert_eq!(value.kind, Kind::Set);
+                assert_eq!(value.kind_tag, Some(PrimitiveKind::Float));
+            }
+            ForeignEdgeOutcome::Decline { message, .. } => panic!("wanted an override, got a decline: {message}"),
+            ForeignEdgeOutcome::Fired { message, .. } => panic!("wanted an override, got a fire: {message}"),
+        }
+    }
+
+    /// An unfitting argv-json payload fires the same RTS7001 the stdin
+    /// leg fires — the outbound-leg fit checks are shared, unchanged by
+    /// the carrier.
+    #[test]
+    fn an_unfitting_argv_json_call_fires() {
+        register_fixture_artifact("./audio_level.ts", audio_level_argv_json_artifact());
+        let Some(kernel) = loaded_kernel() else { return };
+        let body = def_body(ARGV_JSON_FIXTURE_SOURCE);
+        let too_wide = known_set(
+            make_refined_set(vec![star(make_refined_set(vec![at_least(-1000.0), at_most(1000.0)]))]),
+            None,
+            TrustProved,
+            SetKindTag::None,
+        );
+        let environment = env_with(&[("boosted", too_wide)]);
+        match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("the argv-json shape recognizes") {
+            ForeignEdgeOutcome::Fired { message, .. } => {
+                assert!(message.contains("audioLevel"), "{message}");
+            }
+            ForeignEdgeOutcome::Override { .. } => panic!("wanted a fire, got an override"),
+            ForeignEdgeOutcome::Decline { message, .. } => panic!("wanted a fire, got a decline: {message}"),
+        }
+    }
+
+    /// An argv-json call against a `stdin-json` target declines with the
+    /// channel-mismatch sentence: the call names a real reference and
+    /// the target states a real fact, but the two carriers do not meet.
+    #[test]
+    fn an_argv_json_call_at_a_stdin_json_target_declines_with_the_mismatch_sentence() {
+        register_fixture_artifact("./audio_level.ts", audio_level_ts_artifact());
+        let Some(kernel) = loaded_kernel() else { return };
+        let body = def_body(ARGV_JSON_FIXTURE_SOURCE);
+        let environment = env_with(&[("boosted", boosted_sequence_value())]);
+        match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("the argv-json shape recognizes") {
+            ForeignEdgeOutcome::Decline { message, .. } => {
+                assert!(message.contains("argv element"), "{message}");
+                assert!(message.contains("stdin"), "{message}");
+                assert!(message.contains("channels do not meet"), "{message}");
+            }
+            ForeignEdgeOutcome::Override { .. } => panic!("wanted a channel-mismatch decline, got an override"),
+            ForeignEdgeOutcome::Fired { message, .. } => {
+                panic!("wanted a channel-mismatch decline, got a fire: {message}")
+            }
+        }
+    }
+
+    /// A stdin-json call (`input=json.dumps(...)`, plain two-element
+    /// argv) against an `argv-json` target declines with the mismatch
+    /// sentence, symmetrically.
+    #[test]
+    fn a_stdin_json_call_at_an_argv_json_target_declines_with_the_mismatch_sentence() {
+        register_fixture_artifact("./audio_level.ts", audio_level_argv_json_artifact());
+        let Some(kernel) = loaded_kernel() else { return };
+        let body = def_body(FIXTURE_SOURCE);
+        let environment = env_with(&[("boosted", boosted_sequence_value())]);
+        match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("the stdin shape recognizes") {
+            ForeignEdgeOutcome::Decline { message, .. } => {
+                assert!(message.contains("stdin"), "{message}");
+                assert!(message.contains("argv element"), "{message}");
+                assert!(message.contains("channels do not meet"), "{message}");
+            }
+            ForeignEdgeOutcome::Override { .. } => panic!("wanted a channel-mismatch decline, got an override"),
+            ForeignEdgeOutcome::Fired { message, .. } => {
+                panic!("wanted a channel-mismatch decline, got a fire: {message}")
+            }
+        }
+    }
+
+    /// `input=json.dumps(...)` alongside an argv-json payload declines
+    /// naming the double channel — two crossing values are stated and
+    /// this checker recognizes exactly one transport per call.
+    #[test]
+    fn input_keyword_alongside_an_argv_json_payload_declines_the_double_channel() {
+        let source = concat!(
+            "def f(boosted):\n",
+            "    result = subprocess.run(\n",
+            "        [\"node\", \"./audio_level.ts\", json.dumps(boosted)],\n",
+            "        input=json.dumps(boosted),\n",
+            "        capture_output=True,\n",
+            "        text=True,\n",
+            "    )\n",
+            "    return json.loads(result.stdout)\n",
+        );
+        let body = def_body(source);
+        let environment = env_with(&[("boosted", boosted_sequence_value())]);
+        let Some(kernel) = loaded_kernel() else { return };
+        match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("the call is still recognized") {
+            ForeignEdgeOutcome::Decline { message, .. } => {
+                assert!(message.contains("argv element"), "{message}");
+                assert!(message.contains("input=json.dumps"), "{message}");
+            }
+            _ => panic!("wanted a decline naming the double channel"),
+        }
+    }
+
+    /* ── subprocess.check_output ──────────────────────────────────── */
+
+    #[test]
+    fn check_output_recognizes_and_binds_the_proved_return() {
+        register_fixture_artifact("./audio_level.ts", audio_level_ts_artifact());
+        let Some(kernel) = loaded_kernel() else { return };
+        let source = concat!(
+            "def f(boosted):\n",
+            "    result = subprocess.check_output(\n",
+            "        [\"node\", \"./audio_level.ts\"],\n",
+            "        input=json.dumps(boosted),\n",
+            "        text=True,\n",
+            "    )\n",
+            "    return json.loads(result)\n",
+        );
+        let body = def_body(source);
+        let environment = env_with(&[("boosted", boosted_sequence_value())]);
+        match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("the shape recognizes") {
+            ForeignEdgeOutcome::Override { value, .. } => {
+                assert_eq!(value.kind, Kind::Set);
+                assert_eq!(value.kind_tag, Some(PrimitiveKind::Float));
+            }
+            ForeignEdgeOutcome::Decline { message, .. } => panic!("wanted an override, got a decline: {message}"),
+            ForeignEdgeOutcome::Fired { message, .. } => panic!("wanted an override, got a fire: {message}"),
+        }
+    }
+
+    #[test]
+    fn check_output_with_no_text_keyword_declines() {
+        let source = concat!(
+            "def f(boosted):\n",
+            "    result = subprocess.check_output(\n",
+            "        [\"node\", \"./audio_level.ts\"],\n",
+            "        input=json.dumps(boosted),\n",
+            "    )\n",
+            "    return json.loads(result)\n",
+        );
+        let body = def_body(source);
+        let environment = env_with(&[("boosted", boosted_sequence_value())]);
+        let Some(kernel) = loaded_kernel() else { return };
+        match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("the call is still recognized") {
+            ForeignEdgeOutcome::Decline { message, .. } => assert!(message.contains("text=True"), "{message}"),
+            _ => panic!("wanted a decline naming the missing text keyword"),
+        }
+    }
+
+    /* ── runner words: deno / bun / npx tsx ──────────────────────────── */
+
+    #[test]
+    fn a_deno_run_call_recognizes_the_reference_and_declines_the_runtime_band() {
+        register_fixture_artifact("./audio_level.ts", audio_level_ts_artifact());
+        let Some(kernel) = loaded_kernel() else { return };
+        let source = concat!(
+            "def f(boosted):\n",
+            "    result = subprocess.run(\n",
+            "        [\"deno\", \"run\", \"./audio_level.ts\"],\n",
+            "        input=json.dumps(boosted),\n",
+            "        capture_output=True,\n",
+            "        text=True,\n",
+            "    )\n",
+            "    return json.loads(result.stdout)\n",
+        );
+        let body = def_body(source);
+        let environment = env_with(&[("boosted", boosted_sequence_value())]);
+        match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("the reference recognizes") {
+            ForeignEdgeOutcome::Decline { message, .. } => {
+                assert!(message.contains("deno"), "{message}");
+                assert!(message.contains("node-20+") || message.contains("node"), "{message}");
+            }
+            ForeignEdgeOutcome::Override { .. } => panic!("wanted a runtime-band decline, got an override"),
+            ForeignEdgeOutcome::Fired { message, .. } => panic!("wanted a runtime-band decline, got a fire: {message}"),
+        }
+    }
+
+    #[test]
+    fn a_bun_call_recognizes_the_reference_and_declines_the_runtime_band() {
+        register_fixture_artifact("./audio_level.ts", audio_level_ts_artifact());
+        let Some(kernel) = loaded_kernel() else { return };
+        let source = concat!(
+            "def f(boosted):\n",
+            "    result = subprocess.run(\n",
+            "        [\"bun\", \"./audio_level.ts\"],\n",
+            "        input=json.dumps(boosted),\n",
+            "        capture_output=True,\n",
+            "        text=True,\n",
+            "    )\n",
+            "    return json.loads(result.stdout)\n",
+        );
+        let body = def_body(source);
+        let environment = env_with(&[("boosted", boosted_sequence_value())]);
+        match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("the reference recognizes") {
+            ForeignEdgeOutcome::Decline { message, .. } => assert!(message.contains("bun"), "{message}"),
+            ForeignEdgeOutcome::Override { .. } => panic!("wanted a runtime-band decline, got an override"),
+            ForeignEdgeOutcome::Fired { message, .. } => panic!("wanted a runtime-band decline, got a fire: {message}"),
+        }
+    }
+
+    #[test]
+    fn an_npx_tsx_call_recognizes_the_reference_and_declines_the_runtime_band() {
+        register_fixture_artifact("./audio_level.ts", audio_level_ts_artifact());
+        let Some(kernel) = loaded_kernel() else { return };
+        let source = concat!(
+            "def f(boosted):\n",
+            "    result = subprocess.run(\n",
+            "        [\"npx\", \"tsx\", \"./audio_level.ts\"],\n",
+            "        input=json.dumps(boosted),\n",
+            "        capture_output=True,\n",
+            "        text=True,\n",
+            "    )\n",
+            "    return json.loads(result.stdout)\n",
+        );
+        let body = def_body(source);
+        let environment = env_with(&[("boosted", boosted_sequence_value())]);
+        match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("the reference recognizes") {
+            ForeignEdgeOutcome::Decline { message, .. } => assert!(message.contains("npx tsx"), "{message}"),
+            ForeignEdgeOutcome::Override { .. } => panic!("wanted a runtime-band decline, got an override"),
+            ForeignEdgeOutcome::Fired { message, .. } => panic!("wanted a runtime-band decline, got a fire: {message}"),
+        }
+    }
+
+    #[test]
+    fn a_three_element_argv_with_an_unrecognized_two_word_runner_is_not_this_shape() {
+        let source = concat!(
+            "def f(boosted):\n",
+            "    result = subprocess.run(\n",
+            "        [\"yarn\", \"dlx\", \"./audio_level.ts\"],\n",
+            "        input=json.dumps(boosted),\n",
+            "        capture_output=True,\n",
+            "        text=True,\n",
+            "    )\n",
+            "    return json.loads(result.stdout)\n",
+        );
+        let body = def_body(source);
+        let environment = env_with(&[("boosted", boosted_sequence_value())]);
+        let Some(kernel) = loaded_kernel() else { return };
+        assert!(
+            foreign_edge_at(&body, 0, &environment, &kernel, None).is_none(),
+            "an unrecognized two-word runner is some other program, nothing owed"
+        );
+    }
+
+    /* ── the const-held literal path ──────────────────────────────────── */
+
+    #[test]
+    fn a_module_level_constant_script_path_resolves_and_binds() {
+        register_fixture_artifact("./audio_level.ts", audio_level_ts_artifact());
+        let Some(kernel) = loaded_kernel() else { return };
+        let source = concat!(
+            "def f(boosted):\n",
+            "    result = subprocess.run(\n",
+            "        [\"node\", TARGET_PATH],\n",
+            "        input=json.dumps(boosted),\n",
+            "        capture_output=True,\n",
+            "        text=True,\n",
+            "    )\n",
+            "    return json.loads(result.stdout)\n",
+        );
+        let body = def_body(source);
+        let environment = env_with(&[
+            ("boosted", boosted_sequence_value()),
+            ("TARGET_PATH", string_literal_value_for_test("./audio_level.ts")),
+        ]);
+        match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("the const-held path resolves") {
+            ForeignEdgeOutcome::Override { value, .. } => {
+                assert_eq!(value.kind, Kind::Set);
+                assert_eq!(value.kind_tag, Some(PrimitiveKind::Float));
+            }
+            ForeignEdgeOutcome::Decline { message, .. } => panic!("wanted an override, got a decline: {message}"),
+            ForeignEdgeOutcome::Fired { message, .. } => panic!("wanted an override, got a fire: {message}"),
+        }
+    }
+
+    /// The exact code-point-vector shape a known string constant carries
+    /// — the same shape `exact_string_text` decodes, built directly here
+    /// (this test module has no import rights into `string_models.rs`'s
+    /// own `string_literal_value`).
+    fn string_literal_value_for_test(text: &str) -> AbstractValue {
+        known_values(text.chars().map(|c| c as u32 as f64).collect(), PrimitiveKind::String, TrustProved)
+    }
+
+    #[test]
+    fn an_fstring_script_path_declines_with_the_law_2_sentence() {
+        let source = concat!(
+            "def f(boosted):\n",
+            "    name = \"audio_level\"\n",
+            "    result = subprocess.run(\n",
+            "        [\"node\", f\"./{name}.ts\"],\n",
+            "        input=json.dumps(boosted),\n",
+            "        capture_output=True,\n",
+            "        text=True,\n",
+            "    )\n",
+            "    return json.loads(result.stdout)\n",
+        );
+        let body = def_body(source);
+        let environment = env_with(&[("boosted", boosted_sequence_value())]);
+        let Some(kernel) = loaded_kernel() else { return };
+        match foreign_edge_at(&body, 1, &environment, &kernel, None).expect("the call is still recognized as subprocess.run") {
+            ForeignEdgeOutcome::Decline { message, .. } => {
+                assert!(message.contains("computed"), "{message}");
+                assert!(message.contains("written string literal"), "{message}");
+            }
+            _ => panic!("wanted the law-2 decline naming a computed script path"),
+        }
+    }
+
+    #[test]
+    fn a_parameter_script_path_declines_with_the_law_2_sentence() {
+        let source = concat!(
+            "def f(boosted, script_path):\n",
+            "    result = subprocess.run(\n",
+            "        [\"node\", script_path],\n",
+            "        input=json.dumps(boosted),\n",
+            "        capture_output=True,\n",
+            "        text=True,\n",
+            "    )\n",
+            "    return json.loads(result.stdout)\n",
+        );
+        let body = def_body(source);
+        let environment = env_with(&[("boosted", boosted_sequence_value())]);
+        let Some(kernel) = loaded_kernel() else { return };
+        match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("the call is still recognized as subprocess.run") {
+            ForeignEdgeOutcome::Decline { message, .. } => {
+                assert!(message.contains("computed"), "{message}");
+                assert!(message.contains("written string literal"), "{message}");
+            }
+            _ => panic!("wanted the law-2 decline naming a computed script path"),
+        }
+    }
+
+    /* ── os.system ────────────────────────────────────────────────────── */
+
+    #[test]
+    fn os_system_with_a_recognized_command_declines_naming_the_missing_stdout_capture() {
+        let source = concat!(
+            "def f(boosted):\n",
+            "    exit_code = os.system(\"node ./audio_level.ts < in.json > out.json\")\n",
+            "    with open(\"out.json\") as handle:\n",
+            "        return json.load(handle)\n",
+        );
+        let body = def_body(source);
+        let environment = env_with(&[("boosted", boosted_sequence_value())]);
+        let Some(kernel) = loaded_kernel() else { return };
+        match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("os.system is recognized") {
+            ForeignEdgeOutcome::Decline { message, .. } => {
+                assert!(message.contains("captures no stdout"), "{message}");
+                assert!(message.contains("subprocess.run"), "{message}");
+            }
+            _ => panic!("wanted a decline naming the missing captured-stdout leg"),
+        }
+    }
+
+    #[test]
+    fn os_system_with_a_variable_command_declines_with_the_shell_string_sentence() {
+        let source = concat!(
+            "def f(boosted):\n",
+            "    command = \"node ./audio_level.ts\"\n",
+            "    exit_code = os.system(command)\n",
+            "    with open(\"out.json\") as handle:\n",
+            "        return json.load(handle)\n",
+        );
+        let body = def_body(source);
+        let environment = env_with(&[("boosted", boosted_sequence_value())]);
+        let Some(kernel) = loaded_kernel() else { return };
+        match foreign_edge_at(&body, 1, &environment, &kernel, None).expect("os.system is recognized") {
+            ForeignEdgeOutcome::Decline { message, .. } => {
+                assert!(message.contains("shell string"), "{message}");
+                assert!(message.contains("argv list"), "{message}");
+            }
+            _ => panic!("wanted the shell-string law-2 decline"),
+        }
+    }
+
+    #[test]
+    fn os_system_with_an_unsupported_trailing_token_names_it() {
+        let source = concat!(
+            "def f(boosted):\n",
+            "    exit_code = os.system(\"node ./audio_level.ts --extra-flag\")\n",
+            "    with open(\"out.json\") as handle:\n",
+            "        return json.load(handle)\n",
+        );
+        let body = def_body(source);
+        let environment = env_with(&[("boosted", boosted_sequence_value())]);
+        let Some(kernel) = loaded_kernel() else { return };
+        match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("os.system is recognized") {
+            ForeignEdgeOutcome::Decline { message, .. } => {
+                assert!(message.contains("--extra-flag"), "{message}");
+            }
+            _ => panic!("wanted a decline naming the unsupported trailing token"),
+        }
+    }
+
+    /* ── subprocess.Popen ─────────────────────────────────────────────── */
+
+    #[test]
+    fn popen_with_communicate_recognizes_and_binds_the_proved_return() {
+        register_fixture_artifact("./audio_level.ts", audio_level_ts_artifact());
+        let Some(kernel) = loaded_kernel() else { return };
+        let source = concat!(
+            "def f(boosted):\n",
+            "    process = subprocess.Popen(\n",
+            "        [\"node\", \"./audio_level.ts\"],\n",
+            "        stdin=subprocess.PIPE,\n",
+            "        stdout=subprocess.PIPE,\n",
+            "        text=True,\n",
+            "    )\n",
+            "    stdout, _stderr = process.communicate(json.dumps(boosted))\n",
+            "    return json.loads(stdout)\n",
+        );
+        let body = def_body(source);
+        let environment = env_with(&[("boosted", boosted_sequence_value())]);
+        match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("the Popen pair recognizes") {
+            ForeignEdgeOutcome::Override { value, .. } => {
+                assert_eq!(value.kind, Kind::Set);
+                assert_eq!(value.kind_tag, Some(PrimitiveKind::Float));
+            }
+            ForeignEdgeOutcome::Decline { message, .. } => panic!("wanted an override, got a decline: {message}"),
+            ForeignEdgeOutcome::Fired { message, .. } => panic!("wanted an override, got a fire: {message}"),
+        }
+    }
+
+    #[test]
+    fn popen_with_no_following_communicate_declines() {
+        let source = concat!(
+            "def f(boosted):\n",
+            "    process = subprocess.Popen(\n",
+            "        [\"node\", \"./audio_level.ts\"],\n",
+            "        stdin=subprocess.PIPE,\n",
+            "        stdout=subprocess.PIPE,\n",
+            "        text=True,\n",
+            "    )\n",
+            "    return process\n",
+        );
+        let body = def_body(source);
+        let environment = env_with(&[("boosted", boosted_sequence_value())]);
+        let Some(kernel) = loaded_kernel() else { return };
+        match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("Popen itself is recognized") {
+            ForeignEdgeOutcome::Decline { message, .. } => assert!(message.contains("communicate"), "{message}"),
+            _ => panic!("wanted a decline naming the missing .communicate() call"),
+        }
+    }
+
+    #[test]
+    fn popen_with_a_missing_stdin_pipe_keyword_declines() {
+        let source = concat!(
+            "def f(boosted):\n",
+            "    process = subprocess.Popen(\n",
+            "        [\"node\", \"./audio_level.ts\"],\n",
+            "        stdout=subprocess.PIPE,\n",
+            "        text=True,\n",
+            "    )\n",
+            "    stdout, _stderr = process.communicate(json.dumps(boosted))\n",
+            "    return json.loads(stdout)\n",
+        );
+        let body = def_body(source);
+        let environment = env_with(&[("boosted", boosted_sequence_value())]);
+        let Some(kernel) = loaded_kernel() else { return };
+        match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("Popen itself is recognized") {
+            ForeignEdgeOutcome::Decline { message, .. } => assert!(message.contains("stdin"), "{message}"),
+            _ => panic!("wanted a decline naming the missing stdin=subprocess.PIPE keyword"),
         }
     }
 
@@ -1287,10 +2642,11 @@ mod tests {
         let element = make_refined_set(vec![at_least(-2.0), at_most(2.0)]);
         let return_set = make_refined_set(vec![integer(), at_least(0.0), at_most(1.0)]);
         json!({
-            "refined": {"kind": "typescript-fact-artifact", "version": 1},
+            "refined": {"kind": "fact-artifact", "version": 2},
             "target": {"file": "audio_level.ts", "contentHash": format!("sha256:{}", crate::refinedpy::fact_export::sha256_hex(source))},
+            "language": "typescript",
             "runtime": {"band": "node-23+"},
-            "harness": {"stdin": "json", "stdout": "json", "calls": "audioLevel"},
+            "surface": {"kind": "stdin-json", "stdin": "json", "stdout": "json", "calls": "audioLevel"},
             "functions": {
                 "audioLevel": {
                     "entry": [{"name": "boosted", "sequence": {"element": wire_set(&element), "lengthAtLeast": 1}}],
@@ -1328,7 +2684,7 @@ mod tests {
         );
         let body = def_body(&source_body);
         let environment = env_with(&[("boosted", boosted_sequence_value())]);
-        match foreign_edge_at(&body, 0, &environment, &kernel).expect("the shape recognizes") {
+        match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("the shape recognizes") {
             ForeignEdgeOutcome::Override { value, .. } => {
                 assert_eq!(value.kind, Kind::Set);
                 assert_eq!(value.kind_tag, Some(PrimitiveKind::Float));

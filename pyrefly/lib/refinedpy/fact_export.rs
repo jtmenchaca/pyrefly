@@ -40,6 +40,7 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::path::Path;
 use std::sync::Arc;
 
 use refined_domain::abstract_value::AbstractValue;
@@ -53,6 +54,7 @@ use ruff_python_ast::CmpOp;
 use ruff_python_ast::ExceptHandler;
 use ruff_python_ast::Expr;
 use ruff_python_ast::ModModule;
+use ruff_python_ast::Number;
 use ruff_python_ast::Stmt;
 use ruff_python_ast::StmtFunctionDef;
 use serde_json::Map;
@@ -62,6 +64,7 @@ use serde_json::json;
 use crate::refinedpy::check::derived_return_values;
 use crate::refinedpy::cross_module::ModuleResolver;
 use crate::refinedpy::env::Environment;
+use crate::refinedpy::surface::AliasEntry;
 use crate::refinedpy::surface::SurfaceImports;
 use crate::refinedpy::surface::compile_aliases;
 use crate::refinedpy::surface::surface_imports;
@@ -70,9 +73,18 @@ use crate::refinedpy::typereading::base_sort_return_refinement;
 use crate::refinedpy::typereading::declared_refinement;
 
 /// The artifact's own kind tag and version — the Go consumer matches on
-/// both before reading a single fact.
-const ARTIFACT_KIND: &str = "python-fact-artifact";
-const ARTIFACT_VERSION: i64 = 1;
+/// both before reading a single fact. Schema v2
+/// (docs/one-checker/schema-v2.md): one (kind, version) pair shared by
+/// every producer language; `language` (below) is what tells the
+/// consumer which pins to check the runtime band against, so adding a
+/// language never adds a new artifact kind.
+const ARTIFACT_KIND: &str = "fact-artifact";
+const ARTIFACT_VERSION: i64 = 2;
+
+/// The language this producer states — schema v2's own field, read
+/// beside `runtime.band` so a consumer checks the band against the
+/// right pins.
+const ARTIFACT_LANGUAGE: &str = "python";
 
 /// The semantics band every fact in this artifact inherits: the Python
 /// pins commit to CPython 3.11+ behaviour, not to "Python"
@@ -136,16 +148,16 @@ pub fn export_module(
         "target".to_owned(),
         json!({"file": basename, "contentHash": format!("sha256:{}", sha256_hex(source_bytes))}),
     );
+    artifact.insert("language".to_owned(), json!(ARTIFACT_LANGUAGE));
     artifact.insert("runtime".to_owned(), json!({"band": RUNTIME_BAND}));
-    if let Some(called) = harness_call(module) {
-        // A harness is exported only when the module's `__main__` block
-        // IS the stdin-JSON/stdout-JSON shape; absence of the key is the
-        // consumer's "no harness fact" (§11's own reading), never a
-        // guessed default.
-        artifact.insert(
-            "harness".to_owned(),
-            json!({"stdin": "json", "stdout": "json", "calls": called}),
-        );
+    if let Some(shape) = harness_shape(module) {
+        // A surface is exported only when the module's `__main__` block
+        // IS one of the two recognized shapes; absence of the key is the
+        // consumer's "no surface fact" (§11's own reading), never a
+        // guessed default. `kind` is v2's tagged union — `stdin-json` and
+        // `argv-scalar` are the two surface kinds this producer states
+        // today.
+        artifact.insert("surface".to_owned(), harness_shape_json(&shape));
     }
     artifact.insert("functions".to_owned(), Value::Object(functions));
 
@@ -153,6 +165,84 @@ pub fn export_module(
         artifact: Value::Object(artifact),
         omissions,
     }
+}
+
+/// Whether `module` has ANY top-level `def` this export could carry —
+/// the save-hook's own gate (docs/one-checker/fact-freshness.md, "Cheap
+/// gate: shallow scan for annotated top-level defs before the full
+/// walk"). Cheap on purpose: it reads each parameter's own annotation
+/// exactly as `entry_rows` does, but never calls `derived_return_values`
+/// (the kernel walk `export_module` pays for every def whether or not
+/// this gate would have skipped the module) and never checks
+/// `entry_shape`'s container-specific reading (a `list[X]` with no
+/// crossable element still passes this gate — the full export is what
+/// finds that and omits the def; this gate only answers "worth trying").
+///
+/// A `false` answer means `export_module` would omit every def in the
+/// module (every parameter unannotated, or every annotation unreadable,
+/// or the module declaring no top-level def at all) — the save hook
+/// skips the full walk rather than paying it for an artifact that would
+/// carry no functions.
+pub(crate) fn has_exportable_defs(module: &ModModule) -> bool {
+    let aliases = compile_aliases(module);
+    let imports = surface_imports(module);
+    let environment = Environment::new(HashSet::new());
+    top_level_defs(module).any(|def| def_has_a_declared_entry(def, &aliases, &imports, &environment))
+}
+
+/// Whether `def` states at least one parameter this table can read a
+/// refinement from, and carries no `*args`/`**kwargs` tail — the same
+/// two obstacles `entry_rows` declines on, checked here without building
+/// the `EntryRow` vector or reading `entry_shape`.
+fn def_has_a_declared_entry(
+    def: &StmtFunctionDef,
+    aliases: &HashMap<String, AliasEntry>,
+    imports: &SurfaceImports,
+    environment: &Environment,
+) -> bool {
+    if def.parameters.vararg.is_some() || def.parameters.kwarg.is_some() {
+        return false;
+    }
+    let parameters: Vec<_> = def
+        .parameters
+        .posonlyargs
+        .iter()
+        .chain(def.parameters.args.iter())
+        .chain(def.parameters.kwonlyargs.iter())
+        .collect();
+    if parameters.is_empty() {
+        return false;
+    }
+    parameters.iter().all(|parameter| {
+        let Some(annotation) = parameter.parameter.annotation.as_deref() else {
+            return false;
+        };
+        declared_refinement(annotation, aliases, imports, environment).is_some()
+            || base_sort_return_refinement(annotation).is_some()
+    })
+}
+
+/// Reads the cached artifact at `artifact_path`, when one is present,
+/// and answers whether its `target.contentHash` equals sha256 of
+/// `source_bytes` — the save hook's content-hash short-circuit
+/// (docs/one-checker/fact-freshness.md, "Content-hash short-circuit":
+/// skip the export when the cache already states the fact for these
+/// exact bytes). `false` for a missing, unreadable, or malformed cache
+/// entry — the caller re-exports rather than trusting a cache it cannot
+/// read, exactly the same "an artifact is a file, not a promise"
+/// discipline `foreign_edge_artifact.rs` applies to a foreign artifact.
+pub(crate) fn cached_hash_matches(artifact_path: &Path, source_bytes: &[u8]) -> bool {
+    let Ok(raw) = std::fs::read(artifact_path) else {
+        return false;
+    };
+    let Ok(parsed) = serde_json::from_slice::<Value>(&raw) else {
+        return false;
+    };
+    let Some(stated) = parsed.get("target").and_then(|target| target.get("contentHash")).and_then(Value::as_str)
+    else {
+        return false;
+    };
+    stated == format!("sha256:{}", sha256_hex(source_bytes))
 }
 
 /// Every top-level `def` in `module`, in source order.
@@ -174,7 +264,7 @@ fn export_function(
     def: &StmtFunctionDef,
     module: &ModModule,
     line_starts: &[usize],
-    aliases: &HashMap<String, RefinedSet>,
+    aliases: &HashMap<String, AliasEntry>,
     imports: &SurfaceImports,
     derived_returns: &HashMap<String, AbstractValue>,
 ) -> Result<Value, String> {
@@ -231,7 +321,7 @@ enum EntryShape {
 /// unseeded omits the def rather than crossing an unfounded set.
 fn entry_rows(
     def: &StmtFunctionDef,
-    aliases: &HashMap<String, RefinedSet>,
+    aliases: &HashMap<String, AliasEntry>,
     imports: &SurfaceImports,
 ) -> Result<Vec<EntryRow>, String> {
     // A variadic tail has no fixed arity and therefore no entry row a
@@ -571,13 +661,39 @@ fn is_pure_builtin(name: &str) -> bool {
 
 // --- THE HARNESS -----------------------------------------------------
 
-/// The function a module's `if __name__ == "__main__":` block calls,
-/// when that block IS the stdin-JSON/stdout-JSON shape §11 names:
-/// `print(json.dumps(<f>(json.load(sys.stdin))))`. `None` for a module
-/// with no main block, or with a block of any other shape — the artifact
-/// omits the harness key entirely then, and the consumer reads that
-/// absence as "no harness fact".
-fn harness_call(module: &ModModule) -> Option<String> {
+/// The two harness shapes this reader recognizes in a module's
+/// `if __name__ == "__main__":` block. Every other shape is not a
+/// harness fact at all — `harness_shape` answers `None` for it, and the
+/// artifact omits the `surface` key entirely.
+enum HarnessShape {
+    /// `print(json.dumps(<f>(json.load(sys.stdin))))` — the inbound
+    /// channel is stdin, one JSON payload.
+    StdinJson { called: String },
+    /// `print(json.dumps(<f>(float(sys.argv[<n>]))))`, the argv read
+    /// possibly bound through one intermediate assignment first — the
+    /// inbound channel is one argv string, parsed as a float.
+    ArgvScalar { called: String, arg_index: i64 },
+}
+
+/// `harness_shape_json`'s JSON for one recognized shape — schema v2's
+/// tagged union, §11's `stdin-json` row and this leg's `argv-scalar` row.
+fn harness_shape_json(shape: &HarnessShape) -> Value {
+    match shape {
+        HarnessShape::StdinJson { called } => {
+            json!({"kind": "stdin-json", "stdin": "json", "stdout": "json", "calls": called})
+        }
+        HarnessShape::ArgvScalar { called, arg_index } => {
+            json!({"kind": "argv-scalar", "argIndex": arg_index, "parse": "float", "stdout": "json", "calls": called})
+        }
+    }
+}
+
+/// The module's `if __name__ == "__main__":` block read for one of the
+/// two recognized harness shapes. `None` for a module with no main
+/// block, or with a block of any other shape — the artifact omits the
+/// harness key entirely then, and the consumer reads that absence as "no
+/// harness fact".
+fn harness_shape(module: &ModModule) -> Option<HarnessShape> {
     for stmt in &module.body {
         let Stmt::If(if_stmt) = stmt else {
             continue;
@@ -585,16 +701,124 @@ fn harness_call(module: &ModModule) -> Option<String> {
         if !is_main_guard(if_stmt.test.as_ref()) {
             continue;
         }
-        for inner in &if_stmt.body {
-            let Stmt::Expr(expr_stmt) = inner else {
-                continue;
-            };
-            if let Some(called) = harness_shape_call(expr_stmt.value.as_ref()) {
-                return Some(called);
-            }
+        return argv_scalar_harness(&if_stmt.body).or_else(|| stdin_json_harness(&if_stmt.body));
+    }
+    None
+}
+
+/// The stdin-JSON shape: some statement in the block is
+/// `print(json.dumps(<f>(json.load(sys.stdin))))`.
+fn stdin_json_harness(body: &[Stmt]) -> Option<HarnessShape> {
+    for inner in body {
+        let Stmt::Expr(expr_stmt) = inner else {
+            continue;
+        };
+        if let Some(called) = harness_shape_call(expr_stmt.value.as_ref()) {
+            return Some(HarnessShape::StdinJson { called });
         }
     }
     None
+}
+
+/// The argv-scalar shape: some statement in the block is
+/// `print(json.dumps(<f>(<argv-read>)))`, where `<argv-read>` is
+/// `float(sys.argv[<literal int>])` either written inline as the call's
+/// sole argument, or bound one statement earlier by a plain assignment
+/// (`gain = float(sys.argv[1])`) and then referenced by that same name.
+/// Any other shape — a second argument beside the argv read, `int(...)`
+/// or `str(...)` in place of `float(...)`, an argv-read expression this
+/// reader does not recognize — answers `None`.
+fn argv_scalar_harness(body: &[Stmt]) -> Option<HarnessShape> {
+    for (index, inner) in body.iter().enumerate() {
+        let Stmt::Expr(expr_stmt) = inner else {
+            continue;
+        };
+        let Some((called, argument)) = harness_sole_argument_call(expr_stmt.value.as_ref()) else {
+            continue;
+        };
+        if let Some(arg_index) = argv_float_read(argument) {
+            return Some(HarnessShape::ArgvScalar { called, arg_index });
+        }
+        // The one intermediate assignment the brief allows: the
+        // statement directly before this one binds a bare name to
+        // `float(sys.argv[<n>])`, and this call's sole argument is that
+        // same name.
+        let Expr::Name(referenced) = argument else {
+            continue;
+        };
+        let Some(Stmt::Assign(assign)) = index.checked_sub(1).and_then(|previous| body.get(previous)) else {
+            continue;
+        };
+        let [target] = assign.targets.as_slice() else {
+            continue;
+        };
+        let Expr::Name(bound) = target else {
+            continue;
+        };
+        if bound.id.as_str() != referenced.id.as_str() {
+            continue;
+        }
+        if let Some(arg_index) = argv_float_read(assign.value.as_ref()) {
+            return Some(HarnessShape::ArgvScalar { called, arg_index });
+        }
+    }
+    None
+}
+
+/// `print(json.dumps(<f>(<argument>)))` read for `<f>` and its sole
+/// argument — the same print/dumps wrapping `harness_shape_call` reads,
+/// stopping short of reading what the innermost argument itself is
+/// (`argv_float_read` and the caller's assignment-following do that).
+fn harness_sole_argument_call<'a>(expr: &'a Expr) -> Option<(String, &'a Expr)> {
+    let printed = single_argument_of(expr, &CalleeSpelling::BareName("print"))?;
+    let dumped = single_argument_of(printed, &CalleeSpelling::Attribute("json", "dumps"))?;
+    let Expr::Call(inner) = dumped else {
+        return None;
+    };
+    let Expr::Name(called) = inner.func.as_ref() else {
+        return None;
+    };
+    if !inner.arguments.keywords.is_empty() {
+        return None;
+    }
+    let [argument] = inner.arguments.args.as_ref() else {
+        return None;
+    };
+    Some((called.id.as_str().to_owned(), argument))
+}
+
+/// Whether `expr` is exactly `float(sys.argv[<literal int>])`, read for
+/// that literal index. `int(...)`/`str(...)` in the parse position, a
+/// non-literal or negative subscript, or any other spelling answers
+/// `None` — this reader states only the one parse this unit recognizes.
+fn argv_float_read(expr: &Expr) -> Option<i64> {
+    let argument = single_argument_of(expr, &CalleeSpelling::BareName("float"))?;
+    let Expr::Subscript(subscript) = argument else {
+        return None;
+    };
+    if !is_sys_argv(subscript.value.as_ref()) {
+        return None;
+    }
+    let Expr::NumberLiteral(literal) = subscript.slice.as_ref() else {
+        return None;
+    };
+    match &literal.value {
+        Number::Int(value) => value.as_i64(),
+        Number::Float(_) | Number::Complex { .. } => None,
+    }
+}
+
+/// Whether `expr` is `sys.argv` (or a bare `argv` a `from sys import
+/// argv` would bind).
+fn is_sys_argv(expr: &Expr) -> bool {
+    match expr {
+        Expr::Name(name) => name.id.as_str() == "argv",
+        Expr::Attribute(attribute) => {
+            attribute.attr.as_str() == "argv"
+                && matches!(attribute.value.as_ref(), Expr::Name(receiver) if receiver.id.as_str() == "sys")
+        }
+        _ => false,
+    }
 }
 
 /// Whether `test` is `__name__ == "__main__"` (either order).
@@ -619,25 +843,12 @@ fn is_main_guard(test: &Expr) -> bool {
 /// and a `json.load(sys.stdin)` innermost. Any deviation answers `None`
 /// — a harness this reader half-recognizes is not a harness fact.
 fn harness_shape_call(expr: &Expr) -> Option<String> {
-    let printed = single_argument_of(expr, &CalleeSpelling::BareName("print"))?;
-    let dumped = single_argument_of(printed, &CalleeSpelling::Attribute("json", "dumps"))?;
-    let Expr::Call(inner) = dumped else {
-        return None;
-    };
-    let Expr::Name(called) = inner.func.as_ref() else {
-        return None;
-    };
-    if !inner.arguments.keywords.is_empty() {
-        return None;
-    }
-    let [loaded] = inner.arguments.args.as_ref() else {
-        return None;
-    };
-    let stdin = single_argument_of(loaded, &CalleeSpelling::Attribute("json", "load"))?;
+    let (called, argument) = harness_sole_argument_call(expr)?;
+    let stdin = single_argument_of(argument, &CalleeSpelling::Attribute("json", "load"))?;
     if !is_sys_stdin(stdin) {
         return None;
     }
-    Some(called.id.as_str().to_owned())
+    Some(called)
 }
 
 /// How a harness layer's callee must be spelled.
@@ -1099,7 +1310,56 @@ mod tests {
         )
         .expect("test module parses")
         .into_syntax();
-        assert_eq!(harness_call(&module).as_deref(), Some("f"));
+        let Some(HarnessShape::StdinJson { called }) = harness_shape(&module) else {
+            panic!("expected the stdin-JSON shape");
+        };
+        assert_eq!(called, "f");
+    }
+
+    /// A module whose `__main__` block IS the recognized stdin-JSON
+    /// shape exports schema v2's `surface` object exactly: the tagged
+    /// union's `kind` present alongside the carried-forward
+    /// stdin/stdout/calls fields.
+    #[test]
+    fn a_recognized_main_block_exports_the_v2_surface_object() {
+        let Some(kernel) = loaded_kernel() else {
+            return;
+        };
+        let source = b"def f(x: int) -> int:\n    return x\n\n\nif __name__ == \"__main__\":\n    import json\n    import sys\n    print(json.dumps(f(json.load(sys.stdin))))\n";
+        let text = String::from_utf8(source.to_vec()).expect("the fixture is UTF-8");
+        let module = ruff_python_parser::parse_module(&text)
+            .expect("the fixture parses")
+            .into_syntax();
+        let no_imports: ModuleResolver = &|_: &str| None;
+        let export = export_module(&module, source, "f.py", no_imports, &kernel);
+        let artifact = export.artifact.as_object().expect("the artifact is an object");
+        assert_eq!(
+            artifact["surface"],
+            json!({"kind": "stdin-json", "stdin": "json", "stdout": "json", "calls": "f"})
+        );
+    }
+
+    /// A module whose `__main__` block IS the recognized argv-scalar
+    /// shape — `level_gain_argv.py`'s own anatomy, one intermediate
+    /// assignment binding `gain = float(sys.argv[1])` before the call —
+    /// exports schema v2's `surface` object exactly.
+    #[test]
+    fn a_recognized_argv_scalar_main_block_exports_the_v2_surface_object() {
+        let Some(kernel) = loaded_kernel() else {
+            return;
+        };
+        let source = b"def f(gain: float) -> float:\n    return gain\n\n\nif __name__ == \"__main__\":\n    import json\n    import sys\n\n    gain = float(sys.argv[1])\n    print(json.dumps(f(gain)))\n";
+        let text = String::from_utf8(source.to_vec()).expect("the fixture is UTF-8");
+        let module = ruff_python_parser::parse_module(&text)
+            .expect("the fixture parses")
+            .into_syntax();
+        let no_imports: ModuleResolver = &|_: &str| None;
+        let export = export_module(&module, source, "f.py", no_imports, &kernel);
+        let artifact = export.artifact.as_object().expect("the artifact is an object");
+        assert_eq!(
+            artifact["surface"],
+            json!({"kind": "argv-scalar", "argIndex": 1, "parse": "float", "stdout": "json", "calls": "f"})
+        );
     }
 
     #[test]
@@ -1109,12 +1369,66 @@ mod tests {
         )
         .expect("test module parses")
         .into_syntax();
-        assert!(harness_call(&module).is_none());
+        assert!(harness_shape(&module).is_none());
 
         let no_main = ruff_python_parser::parse_module("def f(x): return x\n")
             .expect("test module parses")
             .into_syntax();
-        assert!(harness_call(&no_main).is_none());
+        assert!(harness_shape(&no_main).is_none());
+    }
+
+    /// The main-block reader recognizes the argv-scalar shape spelled
+    /// exactly as `level_gain_argv.py`'s own main block spells it: one
+    /// intermediate assignment (`gain = float(sys.argv[1])`), then the
+    /// called function's sole argument is that bound name.
+    #[test]
+    fn the_harness_reader_recognizes_the_argv_scalar_shape_via_intermediate_assignment() {
+        let module = ruff_python_parser::parse_module(
+            "import json\nimport sys\n\n\ndef f(gain: float) -> float: return gain\n\n\nif __name__ == \"__main__\":\n    gain = float(sys.argv[1])\n    print(json.dumps(f(gain)))\n",
+        )
+        .expect("test module parses")
+        .into_syntax();
+        let Some(HarnessShape::ArgvScalar { called, arg_index }) = harness_shape(&module) else {
+            panic!("expected the argv-scalar shape");
+        };
+        assert_eq!(called, "f");
+        assert_eq!(arg_index, 1);
+    }
+
+    /// The same shape read with the argv expression written inline as
+    /// the call's sole argument, no intermediate assignment at all.
+    #[test]
+    fn the_harness_reader_recognizes_the_argv_scalar_shape_written_inline() {
+        let module = ruff_python_parser::parse_module(
+            "import json\nimport sys\n\n\ndef f(gain: float) -> float: return gain\n\n\nif __name__ == \"__main__\":\n    print(json.dumps(f(float(sys.argv[2]))))\n",
+        )
+        .expect("test module parses")
+        .into_syntax();
+        let Some(HarnessShape::ArgvScalar { called, arg_index }) = harness_shape(&module) else {
+            panic!("expected the argv-scalar shape");
+        };
+        assert_eq!(called, "f");
+        assert_eq!(arg_index, 2);
+    }
+
+    /// An `int(...)` parse in the argv position is not the one recognized
+    /// parse — the block states no harness at all, rather than a
+    /// guessed `argv-scalar` with the wrong `parse` field.
+    #[test]
+    fn an_int_parsing_harness_declines_with_no_shape_recognized() {
+        let module = ruff_python_parser::parse_module(
+            "import json\nimport sys\n\n\ndef f(n: int) -> int: return n\n\n\nif __name__ == \"__main__\":\n    n = int(sys.argv[1])\n    print(json.dumps(f(n)))\n",
+        )
+        .expect("test module parses")
+        .into_syntax();
+        assert!(harness_shape(&module).is_none());
+
+        let inline = ruff_python_parser::parse_module(
+            "import json\nimport sys\n\n\ndef f(n: int) -> int: return n\n\n\nif __name__ == \"__main__\":\n    print(json.dumps(f(int(sys.argv[1]))))\n",
+        )
+        .expect("test module parses")
+        .into_syntax();
+        assert!(harness_shape(&inline).is_none());
     }
 
     /// A `print` anywhere in the body — or in a same-module def the body
@@ -1191,10 +1505,11 @@ mod tests {
         assert!(hash.starts_with("sha256:"), "contentHash = {hash}");
         assert_eq!(hash.len(), "sha256:".len() + 64, "contentHash = {hash}");
         assert_eq!(&hash["sha256:".len()..], sha256_hex(&source).as_str());
+        assert_eq!(artifact["language"], ARTIFACT_LANGUAGE);
         assert_eq!(artifact["runtime"]["band"], RUNTIME_BAND);
-        // the fixture has no `__main__` block, so the harness key is
+        // the fixture has no `__main__` block, so the surface key is
         // absent rather than guessed
-        assert!(!artifact.contains_key("harness"));
+        assert!(!artifact.contains_key("surface"));
 
         let functions = artifact["functions"]
             .as_object()
@@ -1251,5 +1566,93 @@ mod tests {
             assert!(said.contains("samples"), "said = {said:?}");
             assert!(said.contains("derive"), "said = {said:?}");
         }
+    }
+
+    /// A def with one annotated parameter passes the gate; a def with no
+    /// parameters, an unannotated parameter, or a `*args`/`**kwargs`
+    /// tail does not — the same three obstacles `entry_rows` declines
+    /// on, checked here without the kernel walk.
+    #[test]
+    fn has_exportable_defs_reads_the_same_obstacles_entry_rows_declines_on() {
+        let annotated = ruff_python_parser::parse_module("def f(x: int) -> int:\n    return x\n")
+            .expect("test module parses")
+            .into_syntax();
+        assert!(has_exportable_defs(&annotated));
+
+        let no_parameters = ruff_python_parser::parse_module("def f() -> int:\n    return 1\n")
+            .expect("test module parses")
+            .into_syntax();
+        assert!(!has_exportable_defs(&no_parameters));
+
+        let unannotated = ruff_python_parser::parse_module("def f(x) -> int:\n    return x\n")
+            .expect("test module parses")
+            .into_syntax();
+        assert!(!has_exportable_defs(&unannotated));
+
+        let varargs = ruff_python_parser::parse_module("def f(x: int, *args) -> int:\n    return x\n")
+            .expect("test module parses")
+            .into_syntax();
+        assert!(!has_exportable_defs(&varargs));
+
+        let no_defs = ruff_python_parser::parse_module("x = 1\n")
+            .expect("test module parses")
+            .into_syntax();
+        assert!(!has_exportable_defs(&no_defs));
+    }
+
+    /// ONE def out of several carrying a declared entry is enough for
+    /// the module to pass the gate — the scan need not find every
+    /// exportable def, only that at least one exists.
+    #[test]
+    fn has_exportable_defs_is_true_when_only_one_def_qualifies() {
+        let module = ruff_python_parser::parse_module(
+            "def unreadable(x) -> int:\n    return x\n\n\ndef readable(x: int) -> int:\n    return x\n",
+        )
+        .expect("test module parses")
+        .into_syntax();
+        assert!(has_exportable_defs(&module));
+    }
+
+    /// A missing cache entry, an unreadable one, and one whose hash
+    /// differs all answer `false`; a cache entry whose
+    /// `target.contentHash` is the real sha256 of the given bytes
+    /// answers `true`.
+    #[test]
+    fn cached_hash_matches_reads_the_cached_target_content_hash() {
+        let dir = std::env::temp_dir().join(format!(
+            "refinedpy_fact_export_cached_hash_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = b"def f(x: int) -> int:\n    return x\n";
+
+        let missing_path = dir.join("missing.refined.json");
+        assert!(!cached_hash_matches(&missing_path, source));
+
+        let unreadable_path = dir.join("unreadable.refined.json");
+        std::fs::write(&unreadable_path, b"not json").expect("write unreadable cache entry");
+        assert!(!cached_hash_matches(&unreadable_path, source));
+
+        let stale_path = dir.join("stale.refined.json");
+        std::fs::write(
+            &stale_path,
+            json!({"target": {"contentHash": format!("sha256:{}", sha256_hex(b"different bytes"))}}).to_string(),
+        )
+        .expect("write stale cache entry");
+        assert!(!cached_hash_matches(&stale_path, source));
+
+        let matching_path = dir.join("matching.refined.json");
+        std::fs::write(
+            &matching_path,
+            json!({"target": {"contentHash": format!("sha256:{}", sha256_hex(source))}}).to_string(),
+        )
+        .expect("write matching cache entry");
+        assert!(cached_hash_matches(&matching_path, source));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

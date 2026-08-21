@@ -1563,25 +1563,27 @@ mod tests {
         assert!(message.contains("admits values outside"), "{message}");
     }
 
-    /// CONTAINMENT REFUSAL, the sequence case: the kernel's subset
-    /// decider REFUSES the `strings()`-vs-length-window pair today (its
-    /// panic message: "subset is decided for scalar and sequence shapes
-    /// today" — this pair's shape is outside the decided fragment). The
-    /// refusal is CAUGHT and answered as Undetermined naming the shape,
-    /// never read as a refutation — a false fire here would be unsound.
-    /// When the kernel's sequence-containment fragment grows to decide
-    /// this pair, this test flips to the Fire the overlap semantics
-    /// warrant ("admits strings over 8 characters").
+    /// CONTAINMENT REFUTATION, the sequence case: the kernel's
+    /// `seq_subset` decider now DECIDES the `strings()`-vs-length-window
+    /// pair (the sequence-containment fragment grew past the earlier
+    /// refusal this test used to pin — its old panic message, "subset is
+    /// decided for scalar and sequence shapes today," is no longer
+    /// reachable for this shape). `strings()` is the full, UNBOUNDED
+    /// codepoint ground; `Label`'s declared set caps length at 8
+    /// (`repeat_of(codepoints(), 0, Some(8))`), so the unbounded set is
+    /// never a subset of the capped one — `seq_subset` proves `false`,
+    /// a decided refutation, and `judge` fires the CONTAINMENT-REFUTATION
+    /// message ("the flowing set admits values outside the declared
+    /// set").
     #[test]
-    fn an_unbounded_string_set_against_a_max_length_window_is_a_caught_refusal() {
+    fn an_unbounded_string_set_against_a_max_length_window_fires_containment() {
         let Some(kernel) = loaded_kernel() else { return };
         use refined_sets::codepoint_sets::strings;
         let declared = label_refinement();
         let value = known_set(strings(), None, TrustProved, SetKindTag::None);
-        let Verdict::Undetermined(sentence) = judge(&value, &declared, &kernel) else {
-            panic!("a kernel refusal must answer Undetermined, never a fire or silence");
-        };
-        assert!(sentence.contains("containment"), "{sentence}");
+        let message = fire_message(judge(&value, &declared, &kernel));
+        assert!(message.contains("'Label'"), "{message}");
+        assert!(message.contains("admits values outside"), "{message}");
     }
 
     /// The SEQ_SUBSET ROUTING law's own pin: `e-class-and-function.py:610`'s

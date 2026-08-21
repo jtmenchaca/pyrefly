@@ -15,19 +15,29 @@
 //! about the FILE THIS CHECK READS (the content hash, the target-
 //! integrity premise, not a convenience).
 //!
-//! The schema is frozen (docs/one-checker/reverse-pair.md, "Shared
-//! decisions"); the TypeScript side's exporter writes it and this side
-//! consumes it verbatim:
+//! One envelope is admitted (docs/one-checker/schema-v2.md):
 //!
-//!   {"refined": {"kind": "typescript-fact-artifact", "version": 1},
+//!   {"refined": {"kind": "fact-artifact", "version": 2},
 //!    "target": {"file", "contentHash": "sha256:<hex>"},
+//!    "language": "typescript",
 //!    "runtime": {"band": "node-23+"},
-//!    "harness": {"stdin": "json", "stdout": "json", "calls": "<fn>"},
+//!    "surface": {"kind": "stdin-json", "stdin": "json", "stdout": "json", "calls": "<fn>"}
+//!      | {"kind": "argv-json", "argIndex": n, "stdout": "json", "calls": "<fn>"},
 //!    "functions": {"<name>": {
 //!      "entry": [{"name", "sequence": {"element": <set>, "lengthAtLeast": n}}
 //!               |{"name", "set": <set>}],
 //!      "return": {"set": <set>, "stdoutPure": bool},
 //!      "provenance": {"line": n, "said": "..."}}}}
+//!
+//! `surface.kind` names which carrier the JSON transport model rides
+//! on — a pipe (`stdin-json`) or one argv element (`argv-json`,
+//! `argIndex` naming which one: the node convention makes the third
+//! argv element `process.argv[2]`). Both apply the identical transport
+//! model to the payload (JSON text, the same round-trip premise); only
+//! the carrier differs, so `argv-json` carries no `stdin` field at all.
+//!
+//! Any other (kind, version, language) triple declines, naming the
+//! triple it saw and the one form this reader accepts.
 //!
 //! Every <set> is the kernel's own forms JSON, decoded by
 //! `refined_kernel::wire_decode::decode_wire_set` — the SAME decoder
@@ -62,11 +72,14 @@ use crate::refinedpy::fact_export::sha256_hex;
 /// `.refined/cache/<relpath>/audio-level.ts.refined.json`.
 const FOREIGN_ARTIFACT_SUFFIX: &str = ".refined.json";
 
-/// The envelope this consumer admits. A different kind or version is a
-/// decline, never a best-effort read: the fields' meanings are what the
-/// version pins.
-const FOREIGN_ARTIFACT_KIND: &str = "typescript-fact-artifact";
-const FOREIGN_ARTIFACT_VERSION: i64 = 1;
+/// The one envelope this consumer admits (schema-v2.md). `language` is
+/// checked alongside `(kind, version)` — the kind is shared across every
+/// producer language, so the language field is what routes to the right
+/// runtime-band pins. A different triple is a decline, never a
+/// best-effort read: the fields' meanings are what the version pins.
+const FOREIGN_ARTIFACT_KIND: &str = "fact-artifact";
+const FOREIGN_ARTIFACT_VERSION: i64 = 2;
+const FOREIGN_ARTIFACT_LANGUAGE: &str = "typescript";
 
 /// The runtime band this checker's TypeScript pins commit to.
 ///
@@ -121,8 +134,26 @@ pub struct ForeignTsFunctionFact {
     pub provenance_said: String,
 }
 
-/// The artifact as consumed: the runtime band it commits to, and the
-/// ONE function the harness calls, already selected.
+/// Which carrier the JSON transport model rides on — the two `surface
+/// .kind` tags this reader admits. Both apply the SAME transport model
+/// (the value crosses as JSON text; `stdoutPure` and the outbound-leg
+/// fit checks apply identically to either): only the carrier differs,
+/// a pipe versus one argv element.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForeignSurface {
+    /// `{"kind": "stdin-json", "stdin": "json", "stdout": "json"}` — the
+    /// payload rides on the process's stdin pipe.
+    StdinJson,
+    /// `{"kind": "argv-json", "argIndex": n, "stdout": "json"}` — the
+    /// payload is `JSON.parse`'d from `process.argv[argIndex]`; there is
+    /// no `stdin` field at all (the two carriers are mutually exclusive
+    /// by construction, never a joint claim).
+    ArgvJson { arg_index: i64 },
+}
+
+/// The artifact as consumed: the runtime band it commits to, which
+/// carrier the JSON transport rides on, and the ONE function the
+/// harness calls, already selected.
 #[derive(Debug, Clone)]
 pub struct ForeignTsArtifact {
     /// The artifact file itself, for the diagnostics.
@@ -131,6 +162,10 @@ pub struct ForeignTsArtifact {
     /// the artifact spells it — the hash is what ties them).
     pub target_file: String,
     pub runtime_band: String,
+    /// Which carrier the target's `surface` states — `foreign_edge.rs`
+    /// checks a recognized call's own channel against this before
+    /// applying the outbound-leg fit checks.
+    pub surface: ForeignSurface,
     pub called: ForeignTsFunctionFact,
 }
 
@@ -223,9 +258,28 @@ fn read_foreign_ts_artifact_uncached(
     read_and_verify_foreign_ts_artifact(target_path, artifact_path)
 }
 
+/// The project root stated outright (typically `refinedpy-check`'s
+/// `--project-root` flag, set by a caller — the `refined` front door —
+/// that already resolved it), bypassing the `.git`-walk in
+/// `project_root_of` for both the cache path and producer resolution.
+/// `None` (the default) leaves the walk in place.
+fn project_root_override() -> &'static Mutex<Option<PathBuf>> {
+    static OVERRIDE: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+    OVERRIDE.get_or_init(|| Mutex::new(None))
+}
+
+/// States the project root outright. See `project_root_override`.
+pub fn set_project_root_override(root: Option<PathBuf>) {
+    *project_root_override().lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = root;
+}
+
 /// The nearest ancestor of `target`'s directory holding `.git` — the
-/// project root (the target's own directory when none is found).
+/// project root (the target's own directory when none is found) —
+/// unless `set_project_root_override` named the root outright.
 pub fn project_root_of(target: &Path) -> PathBuf {
+    if let Some(overridden) = project_root_override().lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone() {
+        return overridden;
+    }
     let absolute = std::path::absolute(target).unwrap_or_else(|_| target.to_path_buf());
     let start = absolute.parent().unwrap_or(Path::new("."));
     let mut root = start.to_path_buf();
@@ -376,8 +430,8 @@ fn read_and_verify_foreign_ts_artifact(
             ),
         );
     }
-    let called_name = match harness_called_name(&parsed, &artifact_path_words) {
-        Ok(name) => name,
+    let (surface, called_name) = match harness_surface_of(&parsed, &artifact_path_words) {
+        Ok(surface_and_name) => surface_and_name,
         Err(sentence) => return (None, sentence),
     };
     let fact = match function_fact_of(&parsed, &called_name, &artifact_path_words) {
@@ -390,14 +444,17 @@ fn read_and_verify_foreign_ts_artifact(
             path: artifact_path.to_path_buf(),
             target_file: target_path.to_owned(),
             runtime_band: band,
+            surface,
             called: fact,
         }),
         String::new(),
     )
 }
 
-/// Reads the `refined` envelope: the kind this consumer knows and the
-/// version whose field meanings it was written against.
+/// Reads the `refined` envelope and checks the `(kind, version,
+/// language)` triple. Any triple outside the one admitted form is a
+/// decline naming the triple it saw and the one form this reader
+/// accepts.
 fn check_artifact_envelope(parsed: &Value, artifact_path_words: &str) -> Result<(), String> {
     let Some(envelope) = parsed.get("refined").and_then(Value::as_object) else {
         return Err(format!(
@@ -405,21 +462,28 @@ fn check_artifact_envelope(parsed: &Value, artifact_path_words: &str) -> Result<
         ));
     };
     let kind = envelope.get("kind").and_then(Value::as_str).unwrap_or("");
-    if kind != FOREIGN_ARTIFACT_KIND {
-        return Err(format!(
-            "{artifact_path_words} states the kind \"{kind}\", and this edge consumes \"{FOREIGN_ARTIFACT_KIND}\" \
-             — nothing else"
-        ));
-    }
     let version = envelope.get("version").and_then(Value::as_i64);
-    if version != Some(FOREIGN_ARTIFACT_VERSION) {
-        let stated = version.map(|v| v.to_string()).unwrap_or_else(|| "nothing".to_owned());
-        return Err(format!(
-            "{artifact_path_words} states artifact version {stated}, and this edge reads version \
-             {FOREIGN_ARTIFACT_VERSION} — the field meanings are what the version pins"
-        ));
+    let language = parsed.get("language").and_then(Value::as_str).unwrap_or("");
+
+    if kind == FOREIGN_ARTIFACT_KIND && version == Some(FOREIGN_ARTIFACT_VERSION) {
+        if language != FOREIGN_ARTIFACT_LANGUAGE {
+            return Err(format!(
+                "{artifact_path_words} states (kind \"{kind}\", version {}, language {}), and this edge reads \
+                 language \"{FOREIGN_ARTIFACT_LANGUAGE}\" for that pair — the language field is what selects \
+                 the runtime-band pins",
+                FOREIGN_ARTIFACT_VERSION,
+                quoted_or_none(language)
+            ));
+        }
+        return Ok(());
     }
-    Ok(())
+
+    let stated_version = version.map(|v| v.to_string()).unwrap_or_else(|| "nothing".to_owned());
+    Err(format!(
+        "{artifact_path_words} states (kind \"{kind}\", version {stated_version}), and this edge reads only \
+         (kind \"{FOREIGN_ARTIFACT_KIND}\", version {FOREIGN_ARTIFACT_VERSION}, language \
+         \"{FOREIGN_ARTIFACT_LANGUAGE}\") — the field meanings are what the version pins"
+    ))
 }
 
 /// CROSS-LANGUAGE-EDGE.md's target-integrity premise, discharged by
@@ -447,36 +511,68 @@ fn check_target_integrity(parsed: &Value, target_path: &str, artifact_path_words
     Ok(())
 }
 
-/// Reads the stdio harness: the wire is JSON in both directions, and one
-/// named function is what the entry point calls. The edge's whole claim
-/// is about THAT function — a target whose harness reads a different
-/// encoding, or calls nothing this artifact names, transports something
-/// the JSON model does not describe.
-fn harness_called_name(parsed: &Value, artifact_path_words: &str) -> Result<String, String> {
-    let Some(harness) = parsed.get("harness").and_then(Value::as_object) else {
+/// Reads the `surface` object: the wire is JSON, carried either on
+/// stdin or on one argv element, and one named function is what the
+/// entry point calls. The edge's whole claim is about THAT function —
+/// a target whose surface reads a different encoding, or calls nothing
+/// this artifact names, transports something the JSON model does not
+/// describe. `surface` carries a tagged `kind`; only `"stdin-json"` and
+/// `"argv-json"` have a transport model here (schema-v2.md: the other
+/// sketched kinds have no reader yet).
+fn harness_surface_of(parsed: &Value, artifact_path_words: &str) -> Result<(ForeignSurface, String), String> {
+    let Some(surface) = parsed.get("surface").and_then(Value::as_object) else {
         return Err(format!(
-            "{artifact_path_words} describes no harness, so nothing says what the target does with stdin and \
-             stdout — the JSON transport model has nothing to apply to"
+            "{artifact_path_words} describes no surface, so nothing says what the target does with stdin \
+             and stdout — the JSON transport model has nothing to apply to"
         ));
     };
-    let stdin = harness.get("stdin").and_then(Value::as_str).unwrap_or("");
-    let stdout = harness.get("stdout").and_then(Value::as_str).unwrap_or("");
-    if stdin != "json" || stdout != "json" {
-        return Err(format!(
-            "{artifact_path_words} states a harness reading {} on stdin and writing {} on stdout, and this edge \
-             applies the JSON transport model to both legs",
-            quoted_or_none(stdin),
-            quoted_or_none(stdout)
-        ));
-    }
-    let called = harness.get("calls").and_then(Value::as_str).unwrap_or("");
+    let surface_kind = surface.get("kind").and_then(Value::as_str).unwrap_or("");
+    let stdout = surface.get("stdout").and_then(Value::as_str).unwrap_or("");
+    let channel = match surface_kind {
+        "stdin-json" => {
+            let stdin = surface.get("stdin").and_then(Value::as_str).unwrap_or("");
+            if stdin != "json" || stdout != "json" {
+                return Err(format!(
+                    "{artifact_path_words} states a surface reading {} on stdin and writing {} on stdout, and \
+                     this edge applies the JSON transport model to both legs",
+                    quoted_or_none(stdin),
+                    quoted_or_none(stdout)
+                ));
+            }
+            ForeignSurface::StdinJson
+        }
+        "argv-json" => {
+            if stdout != "json" {
+                return Err(format!(
+                    "{artifact_path_words} states an argv-json surface writing {} on stdout, and this edge \
+                     reads only \"json\" on that leg",
+                    quoted_or_none(stdout)
+                ));
+            }
+            let Some(arg_index) = surface.get("argIndex").and_then(Value::as_i64) else {
+                return Err(format!(
+                    "{artifact_path_words} states an argv-json surface with no argIndex, so nothing says \
+                     which argv element carries the JSON payload"
+                ));
+            };
+            ForeignSurface::ArgvJson { arg_index }
+        }
+        other => {
+            return Err(format!(
+                "{artifact_path_words} states a surface of kind {}, and this edge reads only \"stdin-json\" \
+                 or \"argv-json\"",
+                quoted_or_none(other)
+            ));
+        }
+    };
+    let called = surface.get("calls").and_then(Value::as_str).unwrap_or("");
     if called.is_empty() {
         return Err(format!(
-            "{artifact_path_words} states no harness.calls function, so nothing names the code that runs when \
-             this call executes"
+            "{artifact_path_words} states no surface.calls function, so nothing names the code that runs \
+             when this call executes"
         ));
     }
-    Ok(called.to_owned())
+    Ok((channel, called.to_owned()))
 }
 
 /// Reads one named function's row: its entry positions, its return, and
@@ -623,8 +719,9 @@ mod tests {
         json!({
             "refined": {"kind": FOREIGN_ARTIFACT_KIND, "version": FOREIGN_ARTIFACT_VERSION},
             "target": {"file": "target.ts", "contentHash": format!("sha256:{}", sha256_hex(source))},
+            "language": FOREIGN_ARTIFACT_LANGUAGE,
             "runtime": {"band": FOREIGN_RUNTIME_BAND},
-            "harness": {"stdin": "json", "stdout": "json", "calls": called},
+            "surface": {"kind": "stdin-json", "stdin": "json", "stdout": "json", "calls": called},
             "functions": {
                 called: {
                     "entry": [{"name": "x", "set": refined_kernel::wire_format::wire_set(&scalar)}],
@@ -653,6 +750,69 @@ mod tests {
         assert!(artifact.called.entry[0].scalar.is_some());
         assert!(artifact.called.stdout_pure);
         assert_eq!(artifact.called.provenance_line, 3);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The `argv-json` sibling of `well_formed_artifact` — the same
+    /// function fact, carried on an argv element instead of stdin.
+    fn well_formed_argv_json_artifact(source: &[u8], called: &str, arg_index: i64) -> Value {
+        let scalar = make_refined_set(vec![integer(), at_least(0.0)]);
+        json!({
+            "refined": {"kind": FOREIGN_ARTIFACT_KIND, "version": FOREIGN_ARTIFACT_VERSION},
+            "target": {"file": "target.ts", "contentHash": format!("sha256:{}", sha256_hex(source))},
+            "language": FOREIGN_ARTIFACT_LANGUAGE,
+            "runtime": {"band": FOREIGN_RUNTIME_BAND},
+            "surface": {"kind": "argv-json", "argIndex": arg_index, "stdout": "json", "calls": called},
+            "functions": {
+                called: {
+                    "entry": [{"name": "x", "set": refined_kernel::wire_format::wire_set(&scalar)}],
+                    "return": {"set": refined_kernel::wire_format::wire_set(&scalar), "stdoutPure": true},
+                    "provenance": {"line": 3, "said": "given 'x' is a nonnegative integer, this body's returns derive a nonnegative integer"},
+                }
+            }
+        })
+    }
+
+    /// A well-formed `argv-json` artifact reads its channel as
+    /// `ForeignSurface::ArgvJson` with the stated `argIndex` carried
+    /// through, and every other field reads exactly as the stdin-json
+    /// case does — the same transport model, a different carrier.
+    #[test]
+    fn a_well_formed_argv_json_artifact_reads_its_channel_and_index() {
+        let root = temp_project_root("argv_json_well_formed");
+        let target = root.join("target.ts");
+        fs::write(&target, b"export function f(x: number): number { return x; }\n").expect("write target");
+        let source = fs::read(&target).expect("read target back");
+        let artifact_path = cache_artifact_path(target.to_str().unwrap());
+        fs::create_dir_all(artifact_path.parent().unwrap()).expect("create cache dir");
+        fs::write(&artifact_path, well_formed_argv_json_artifact(&source, "f", 2).to_string()).expect("write artifact");
+
+        let read = read_foreign_ts_artifact(target.to_str().unwrap());
+        let artifact = read.expect("a well-formed argv-json artifact reads as a fact");
+        assert_eq!(artifact.surface, ForeignSurface::ArgvJson { arg_index: 2 });
+        assert_eq!(artifact.called.name, "f");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// An `argv-json` surface with no `argIndex` at all declines — the
+    /// carrier is named but the position it reads from is not.
+    #[test]
+    fn an_argv_json_surface_with_no_arg_index_declines() {
+        let root = temp_project_root("argv_json_missing_index");
+        let target = root.join("target.ts");
+        fs::write(&target, b"export function f(x: number): number { return x; }\n").expect("write target");
+        let source = fs::read(&target).expect("read target back");
+        let mut artifact = well_formed_argv_json_artifact(&source, "f", 2);
+        artifact["surface"].as_object_mut().unwrap().remove("argIndex");
+        let artifact_path = cache_artifact_path(target.to_str().unwrap());
+        fs::create_dir_all(artifact_path.parent().unwrap()).expect("create cache dir");
+        fs::write(&artifact_path, artifact.to_string()).expect("write artifact");
+
+        let read = read_foreign_ts_artifact(target.to_str().unwrap());
+        let sentence = read.expect_err("an argv-json surface with no argIndex must decline");
+        assert!(sentence.contains("argIndex"), "sentence = {sentence:?}");
 
         fs::remove_dir_all(&root).ok();
     }
@@ -734,6 +894,191 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
+    /* ── the premise-conformance corpus ──────────────────────────────
+     *
+     * docs/one-checker/premise-unification.md names the deliverable: a
+     * hand-built fact-artifact corpus — valid and broken, each broken
+     * row naming exactly ONE premise — read by BOTH consumers' test
+     * suites. Cross-language code cannot be shared between the Go and
+     * Rust readers; the corpus (packages/refinedts/edge-premise-fixtures/)
+     * and its manifest.json are the shared part.
+     *
+     * SCOPE: this test exercises only the rows whose premise
+     * `read_foreign_ts_artifact` itself discharges — the envelope,
+     * target integrity, runtime band, harness shape, and the kernel's
+     * set decoder. Two manifest rows (crossing-fit, NaN-admission) are
+     * NOT reader premises: they are judged against the WALK's crossing
+     * value by `check_outbound_leg`, which needs a live kernel and an
+     * `Environment` this reader-focused module does not construct —
+     * those rows are exercised by this crate's `foreign_edge.rs` test
+     * module instead. The stdout-not-pure row IS read here, but only
+     * for the flag the reader carries through; the decline sentence
+     * naming channel purity is built one layer up, in
+     * `foreign_edge_at`, and is exercised there, not duplicated here.
+     * See the corpus's own manifest.json and README.md.
+     */
+
+    /// The corpus directory's absolute path, derived from `file!()` at
+    /// compile time via `CARGO_MANIFEST_DIR` — the same idiom
+    /// `fact_export.rs`'s own `the_tutorial_fixture_exports_its_structure`
+    /// test already uses, never an environment variable read at run
+    /// time.
+    fn conformance_fixtures_dir() -> PathBuf {
+        // this crate's manifest: packages/refinedpy/pyrefly/pyrefly
+        // the corpus:            packages/refinedts/edge-premise-fixtures
+        PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../refinedts/edge-premise-fixtures"))
+    }
+
+    /// One manifest row, read generically off the JSON — only the
+    /// fields this test consults.
+    struct ConformanceRow {
+        id: String,
+        artifact: String,
+        target_source: String,
+        premise_broken: String,
+        verdict: String,
+        key_phrase_rust: Option<String>,
+        exercised_by: Vec<String>,
+        /// A row mid-respell to v2 carries `"rustSentenceStale": true`
+        /// while its paired `.artifact.json` no longer matches this
+        /// reader's actual decline wording — see
+        /// `the_conformance_corpus_reads_as_the_manifest_expects`, which
+        /// fails loudly on this flag rather than silently comparing
+        /// against a phrase the reader has already moved past.
+        rust_sentence_stale: bool,
+    }
+
+    fn load_conformance_manifest(dir: &Path) -> Vec<ConformanceRow> {
+        let raw = fs::read(dir.join("manifest.json")).expect("the conformance corpus manifest is committed");
+        let parsed: Value = serde_json::from_slice(&raw).expect("manifest.json parses");
+        let rows = parsed.get("rows").and_then(Value::as_array).expect("manifest.json states a rows array");
+        rows.iter()
+            .map(|row| ConformanceRow {
+                id: row.get("id").and_then(Value::as_str).unwrap_or("").to_owned(),
+                artifact: row.get("artifact").and_then(Value::as_str).unwrap_or("").to_owned(),
+                target_source: row.get("targetSource").and_then(Value::as_str).unwrap_or("").to_owned(),
+                premise_broken: row.get("premiseBroken").and_then(Value::as_str).unwrap_or("").to_owned(),
+                verdict: row.get("verdict").and_then(Value::as_str).unwrap_or("").to_owned(),
+                key_phrase_rust: row
+                    .get("keyPhrase")
+                    .and_then(Value::as_object)
+                    .and_then(|phrases| phrases.get("rust"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                exercised_by: row
+                    .get("exercisedBy")
+                    .and_then(Value::as_array)
+                    .map(|list| list.iter().filter_map(Value::as_str).map(str::to_owned).collect())
+                    .unwrap_or_default(),
+                rust_sentence_stale: row.get("rustSentenceStale").and_then(Value::as_bool).unwrap_or(false),
+            })
+            .collect()
+    }
+
+    /// Whether a manifest row names this side ("rust-reader") among
+    /// what exercises it — the rows whose premise lives one layer
+    /// above the reader (crossing-fit, NaN-admission) name only the
+    /// existing edge-level tests, and this loop must skip them rather
+    /// than force them through a harness that cannot construct a
+    /// crossing value.
+    fn exercised_by_rust_reader(row: &ConformanceRow) -> bool {
+        row.exercised_by.iter().any(|who| who.starts_with("rust-reader"))
+    }
+
+    /// Writes the row's artifact (with `{{HASH}}` substituted against
+    /// the REAL sha256 of its paired target-source, computed at run
+    /// time — a hash cannot be hand-pasted and stay honest) into a
+    /// fresh temp project root, and answers the target path to read
+    /// the artifact against.
+    fn materialize_conformance_row(dir: &Path, row: &ConformanceRow) -> (PathBuf, PathBuf) {
+        let root = temp_project_root(&format!("conformance_{}", row.id));
+        let mut artifact_text =
+            String::from_utf8(fs::read(dir.join(&row.artifact)).expect("reading the row's artifact")).expect("artifact is UTF-8");
+
+        // the target's extension follows the artifact's own declared
+        // language field — a row with no target-source (it declines
+        // before target integrity) still needs a real file at the
+        // resolved cache path, and defaults to .py, since the
+        // placeholder's content is never actually read
+        let is_typescript = artifact_text.contains(r#""language": "typescript""#);
+        let target_name = if is_typescript { "audio_level.ts" } else { "audio_level.py" };
+        let target = root.join(target_name);
+
+        if !row.target_source.is_empty() {
+            let source = fs::read(dir.join(&row.target_source)).expect("reading the row's target-source");
+            fs::write(&target, &source).expect("write target");
+            let hash = format!("sha256:{}", sha256_hex(&source));
+            artifact_text = artifact_text.replace("{{HASH}}", &hash);
+        } else {
+            // rows that decline before the hash check (kind/version)
+            // carry no paired target-source; write a placeholder target
+            // so a read attempt that DID reach the hash check would fail
+            // loudly rather than silently pass against a missing file
+            fs::write(&target, b"placeholder - this row declines before target integrity\n").expect("write placeholder target");
+        }
+
+        let artifact_path = cache_artifact_path(target.to_str().unwrap());
+        fs::create_dir_all(artifact_path.parent().unwrap()).expect("create cache dir");
+        fs::write(&artifact_path, &artifact_text).expect("writing the artifact");
+        (target, root)
+    }
+
+    /// Iterates `packages/refinedts/edge-premise-fixtures/manifest.json`
+    /// and runs each reader-level row through
+    /// `read_foreign_ts_artifact`, asserting the verdict class
+    /// (consumed vs. declined) and — for a decline — that the sentence
+    /// contains the manifest's own recorded key phrase.
+    #[test]
+    fn the_conformance_corpus_reads_as_the_manifest_expects() {
+        let dir = conformance_fixtures_dir();
+        let rows = load_conformance_manifest(&dir);
+        assert!(!rows.is_empty(), "the manifest must state at least one row");
+
+        for row in rows.iter().filter(|row| exercised_by_rust_reader(row)) {
+            assert!(
+                !row.rust_sentence_stale,
+                "row {:?} is marked rustSentenceStale — this reader's decline wording changed and the \
+                 manifest's keyPhrase.rust was not updated to match; fill in the respelled phrase and clear \
+                 the flag before this row can be trusted",
+                row.id
+            );
+            let (target, root) = materialize_conformance_row(&dir, row);
+            let read = read_foreign_ts_artifact(target.to_str().unwrap());
+
+            match row.verdict.as_str() {
+                "consumed" => {
+                    read.unwrap_or_else(|sentence| {
+                        panic!("row {:?} (premise {:?}) expected to be consumed, but declined: {sentence}", row.id, row.premise_broken)
+                    });
+                }
+                "declined" => {
+                    let sentence = read.expect_err(&format!(
+                        "row {:?} (premise {:?}) expected to decline, but was consumed",
+                        row.id, row.premise_broken
+                    ));
+                    let phrase = row
+                        .key_phrase_rust
+                        .as_deref()
+                        .unwrap_or_else(|| panic!("row {:?} declined verdict has no manifest keyPhrase.rust", row.id));
+                    assert!(
+                        sentence.contains(phrase),
+                        "row {:?} sentence {sentence:?} does not contain the manifest's key phrase {phrase:?}",
+                        row.id
+                    );
+                }
+                "consumed-with-flag-false" => {
+                    let artifact = read.unwrap_or_else(|sentence| {
+                        panic!("row {:?} expected to be consumed (stdoutPure false carried through), but declined: {sentence}", row.id)
+                    });
+                    assert!(!artifact.called.stdout_pure, "row {:?} expected stdout_pure == false, got true", row.id);
+                }
+                other => panic!("row {:?} states an unhandled verdict class {other:?}", row.id),
+            }
+
+            fs::remove_dir_all(&root).ok();
+        }
+    }
+
     #[test]
     fn a_changed_mtime_refreshes_the_memo() {
         let root = temp_project_root("mtime_refresh");
@@ -755,6 +1100,53 @@ mod tests {
 
         let second = read_foreign_ts_artifact(target.to_str().unwrap()).expect("second read succeeds");
         assert_eq!(second.called.name, "g", "the memo must refresh once the artifact's mtime changes");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A `(kind, version)` pair outside the one admitted form declines,
+    /// naming the triple it saw and the accepted form — never a
+    /// best-effort read of a schema this reader does not know.
+    #[test]
+    fn an_unknown_kind_version_triple_declines_naming_the_accepted_form() {
+        let root = temp_project_root("unknown_triple");
+        let target = root.join("target.ts");
+        fs::write(&target, b"export function f(x: number): number { return x; }\n").expect("write target");
+        let source = fs::read(&target).expect("read target back");
+        let mut artifact = well_formed_artifact(&source, "f");
+        artifact["refined"] = json!({"kind": "fact-artifact", "version": 3});
+        let artifact_path = cache_artifact_path(target.to_str().unwrap());
+        fs::create_dir_all(artifact_path.parent().unwrap()).expect("create cache dir");
+        fs::write(&artifact_path, artifact.to_string()).expect("write artifact");
+
+        let read = read_foreign_ts_artifact(target.to_str().unwrap());
+        let sentence = read.expect_err("an unknown (kind, version) pair must decline");
+        assert!(sentence.contains("fact-artifact"), "sentence = {sentence:?}");
+        assert!(sentence.contains('3'), "sentence = {sentence:?}");
+        assert!(sentence.contains(FOREIGN_ARTIFACT_KIND), "sentence = {sentence:?}");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// An envelope whose `language` is not "typescript" declines — the
+    /// kind is shared across producer languages, so the language field
+    /// (not the kind) is what this reader checks per-language.
+    #[test]
+    fn an_envelope_of_another_language_declines() {
+        let root = temp_project_root("wrong_language");
+        let target = root.join("target.ts");
+        fs::write(&target, b"export function f(x: number): number { return x; }\n").expect("write target");
+        let source = fs::read(&target).expect("read target back");
+        let mut artifact = well_formed_artifact(&source, "f");
+        artifact["language"] = json!("python");
+        let artifact_path = cache_artifact_path(target.to_str().unwrap());
+        fs::create_dir_all(artifact_path.parent().unwrap()).expect("create cache dir");
+        fs::write(&artifact_path, artifact.to_string()).expect("write artifact");
+
+        let read = read_foreign_ts_artifact(target.to_str().unwrap());
+        let sentence = read.expect_err("an envelope naming a different language must decline");
+        assert!(sentence.contains("python"), "sentence = {sentence:?}");
+        assert!(sentence.contains("language"), "sentence = {sentence:?}");
 
         fs::remove_dir_all(&root).ok();
     }

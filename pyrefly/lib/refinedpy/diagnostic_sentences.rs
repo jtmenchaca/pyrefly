@@ -119,6 +119,84 @@ pub const SENTENCE: Sentences = Sentences {
     tuple_position: "a fixed-arity-tuple-declared position holds a value this table does not yet read",
 };
 
+/// A recognized non-node runner's runtime-band gap: the argv names the
+/// TypeScript file cleanly, but the target's own exported fact commits
+/// to a `node` band and this call runs a different runtime — the
+/// runtime-identity premise cannot be discharged against a claim made
+/// for a runtime this call never runs. A true determination gap (the
+/// construct is named: the runner word), never a recognition gap.
+pub fn foreign_edge_runtime_band_gap(declared_band: &str, runner_word: &str) -> String {
+    format!("the target's fact declares {declared_band}; this call runs {runner_word} — no band claim exists for {runner_word}")
+}
+
+/// `os.system`'s own undetermined reason for a command whose runner and
+/// script DID read cleanly: even a followed literal shell command has
+/// no value channel, because `os.system` never captures stdout — names
+/// both the missing captured-stdout leg and the fixable argv-list
+/// respelling.
+pub fn os_system_no_stdout_capture(runner_and_script: &str) -> String {
+    format!(
+        "{runner_and_script} runs, but os.system captures no stdout — there is no captured-stdout leg for a \
+        return fact to attach to; spell the call as subprocess.run([...], input=..., capture_output=True, \
+        text=True) instead"
+    )
+}
+
+/// The shell-string law-2 decline: `os.system`'s argument is not one
+/// written string literal, so its tokens cannot be read at all.
+pub fn os_system_shell_string_unreadable() -> String {
+    "this command is a shell string the checker cannot read; spell it as an argv list \
+    (subprocess.run([\"node\", \"<script>.ts\"], ...))"
+        .to_owned()
+}
+
+/// The law-2 decline for a script path that is neither a written string
+/// literal directly in the argv list nor a module-level constant this
+/// body can resolve (an f-string, a parameter, any other computed
+/// expression) — reused by every remaining non-literal argv[1] shape.
+pub fn script_path_not_a_literal() -> String {
+    "the script path is computed; spell it as a written string literal".to_owned()
+}
+
+/// The channel-mismatch decline when the call sends its payload on
+/// stdin but the target's own fact serves JSON on an argv element — the
+/// reverse of `foreign_edge_channel_mismatch_argv_at_stdin_target`.
+/// Neither side is malformed; the two simply do not name the same
+/// carrier, so the JSON transport model has nothing to apply to.
+pub fn foreign_edge_channel_mismatch_stdin_at_argv_target() -> String {
+    "the call passes the payload on stdin, but the target's fact serves JSON on an argv element — the \
+    channels do not meet"
+        .to_owned()
+}
+
+/// The channel-mismatch decline when the call sends its payload as an
+/// argv element but the target's own fact serves JSON on stdin.
+pub fn foreign_edge_channel_mismatch_argv_at_stdin_target() -> String {
+    "the call passes the payload as an argv element, but the target's fact serves JSON on stdin — the \
+    channels do not meet"
+        .to_owned()
+}
+
+/// The channel-mismatch decline when both sides name an argv carrier
+/// but at different indices — the call writes the payload at one
+/// position and the target reads it from another.
+pub fn foreign_edge_channel_mismatch_argv_index(called_index: i64, declared_index: i64) -> String {
+    format!(
+        "the call passes the payload at argv[{called_index}], but the target's fact reads its payload at \
+        argv[{declared_index}] — the channels do not meet"
+    )
+}
+
+/// The double-channel decline when a call names BOTH an argv-json
+/// payload and an `input=` keyword — a real ambiguity, not a recognition
+/// gap: two crossing values are stated and this checker names one
+/// transport per call.
+pub fn foreign_edge_double_channel_declared() -> String {
+    "this call passes the payload both as an argv element and through input=json.dumps(...) — two crossing \
+    channels are named and this checker recognizes exactly one transport per call"
+        .to_owned()
+}
+
 /// A cross-language crossing's refutation: the reason the value cannot
 /// cross, with the target's own provenance appended — the second step
 /// of the two-language explanation, in the message-text form
@@ -146,6 +224,21 @@ pub fn foreign_crossing_refusal(
     format!("{said}. {where_said} said: {provenance_said}")
 }
 
+/// A stale expect-error marker's own diagnostic (the RTS7005 role):
+/// the marker expected a fire on its covered line and nothing fired.
+/// Mirrors the Go host's editor-view wording; the marker's captured
+/// reason text, when present, rides in parentheses so the reader sees
+/// what the author expected to be caught.
+pub fn stale_marker_refusal(expected_line: usize, reason: Option<&str>) -> String {
+    let base = format!(
+        "expected a refinement fire on line {expected_line} and nothing fired — remove the '# refinedpy: expect-error' marker or restore the failing code"
+    );
+    match reason {
+        Some(reason) if !reason.is_empty() => format!("{base} ({reason})"),
+        _ => base,
+    }
+}
+
 /// A member's own refutation, keyed by the name it escaped under — the
 /// dict/TypedDict element law's own suffix.
 pub fn at_key(message: &str, key: &str) -> String {
@@ -156,6 +249,27 @@ pub fn at_key(message: &str, key: &str) -> String {
 /// list/tuple element law's own suffix.
 pub fn at_index(message: &str, index: usize) -> String {
     format!("{message} (at index {index})")
+}
+
+/// The empty-set sentence — an annotation compiles to a set the kernel
+/// proves admits nothing. Mirrors the Go twin's own RTS7003 wording
+/// (`annotation_file_facts.go`: `"this annotation denotes the empty
+/// set: '" + FormatForDiagnostics(set) + "'"`), spelling the compiled
+/// set's own contents so the reader sees WHY, not just THAT, it is
+/// empty.
+pub fn empty_set(set: &RefinedSet) -> String {
+    format!("this annotation denotes the empty set: '{}'", format_for_diagnostics(set))
+}
+
+/// The unhonorable-statement sentence — an annotation recognizably
+/// spells this table's OWN vocabulary (an `Annotated[...]` rooted at
+/// the module's imported `Annotated` identity) but this table could
+/// not compile it. Mirrors the Go twin's own RTS7004 wording
+/// (`annotation_file_facts.go`'s `compiled.Unsupported` /
+/// `compiled.Unsupported.Unsupported` messages): names the spelling
+/// so the reader sees which statement was refused.
+pub fn unhonorable_annotation(spelling: &str) -> String {
+    format!("this annotation '{spelling}' is recognized as a refinement statement but this table could not compile it")
 }
 
 #[cfg(test)]
@@ -239,6 +353,80 @@ mod tests {
         assert!(at_index("a value", 2).contains("at index 2"));
     }
 
+    /// The runtime-band-gap sentence names both the declared band and
+    /// the runner that cannot discharge it.
+    #[test]
+    fn the_runtime_band_gap_sentence_names_the_band_and_the_runner() {
+        let message = foreign_edge_runtime_band_gap("node-23+", "deno");
+        assert!(message.contains("node-23+"), "{message}");
+        assert!(message.contains("deno"), "{message}");
+        assert!(message.contains("no band claim exists for deno"), "{message}");
+    }
+
+    /// The os.system no-stdout-capture sentence names the runner and
+    /// script that ran, states the missing captured-stdout leg, and
+    /// teaches the fixable argv-list respelling.
+    #[test]
+    fn the_os_system_no_stdout_capture_sentence_names_the_missing_leg_and_the_fix() {
+        let message = os_system_no_stdout_capture("node ./audio_level.ts");
+        assert!(message.contains("node ./audio_level.ts"), "{message}");
+        assert!(message.contains("captures no stdout"), "{message}");
+        assert!(message.contains("subprocess.run"), "{message}");
+    }
+
+    /// The shell-string law-2 sentence teaches the argv-list respelling.
+    #[test]
+    fn the_shell_string_sentence_teaches_the_argv_list_respelling() {
+        let message = os_system_shell_string_unreadable();
+        assert!(message.contains("shell string"), "{message}");
+        assert!(message.contains("argv list"), "{message}");
+    }
+
+    /// The computed-script-path law-2 sentence teaches the written
+    /// string literal respelling.
+    #[test]
+    fn the_script_path_sentence_teaches_the_written_literal_respelling() {
+        let message = script_path_not_a_literal();
+        assert!(message.contains("computed"), "{message}");
+        assert!(message.contains("written string literal"), "{message}");
+    }
+
+    /// The stdin-payload-at-argv-json-target mismatch names both
+    /// carriers and states they do not meet.
+    #[test]
+    fn the_stdin_at_argv_target_mismatch_names_both_carriers() {
+        let message = foreign_edge_channel_mismatch_stdin_at_argv_target();
+        assert!(message.contains("stdin"), "{message}");
+        assert!(message.contains("argv element"), "{message}");
+        assert!(message.contains("do not meet"), "{message}");
+    }
+
+    /// The argv-payload-at-stdin-json-target mismatch names both
+    /// carriers and states they do not meet.
+    #[test]
+    fn the_argv_at_stdin_target_mismatch_names_both_carriers() {
+        let message = foreign_edge_channel_mismatch_argv_at_stdin_target();
+        assert!(message.contains("argv element"), "{message}");
+        assert!(message.contains("stdin"), "{message}");
+        assert!(message.contains("do not meet"), "{message}");
+    }
+
+    /// A mismatched argv index names both positions.
+    #[test]
+    fn the_argv_index_mismatch_names_both_positions() {
+        let message = foreign_edge_channel_mismatch_argv_index(1, 2);
+        assert!(message.contains("argv[1]"), "{message}");
+        assert!(message.contains("argv[2]"), "{message}");
+    }
+
+    /// The double-channel sentence names both channels as stated.
+    #[test]
+    fn the_double_channel_sentence_names_both_channels() {
+        let message = foreign_edge_double_channel_declared();
+        assert!(message.contains("argv element"), "{message}");
+        assert!(message.contains("input=json.dumps"), "{message}");
+    }
+
     /// A crossing refusal appends the target's own located provenance.
     #[test]
     fn a_crossing_refusal_appends_the_located_provenance() {
@@ -262,5 +450,24 @@ mod tests {
     fn a_crossing_refusal_with_no_provenance_is_unchanged() {
         let message = foreign_crossing_refusal("the value can escape", "", 0, "");
         assert_eq!(message, "the value can escape");
+    }
+
+    /// The empty-set sentence spells the compiled set's own contents.
+    #[test]
+    fn the_empty_set_sentence_spells_the_sets_own_contents() {
+        let set = make_refined_set(vec![integer(), at_least(10.0), at_most(5.0)]);
+        let message = empty_set(&set);
+        assert!(message.contains("denotes the empty set"), "{message}");
+    }
+
+    /// The unhonorable-statement sentence names the refused spelling.
+    #[test]
+    fn the_unhonorable_annotation_sentence_names_the_spelling() {
+        let message = unhonorable_annotation("Annotated[int, Ge(0), NotARealConstructor()]");
+        assert!(
+            message.contains("Annotated[int, Ge(0), NotARealConstructor()]"),
+            "{message}"
+        );
+        assert!(message.contains("could not compile it"), "{message}");
     }
 }

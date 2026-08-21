@@ -29,6 +29,7 @@ use ruff_python_ast::UnaryOp;
 use ruff_python_parser::parse_expression;
 
 use crate::refinedpy::env::Environment;
+use crate::refinedpy::surface::AliasEntry;
 use crate::refinedpy::surface::SurfaceImports;
 use crate::refinedpy::surface::annotated_expression_set;
 
@@ -111,7 +112,7 @@ pub struct GeneratorRefinement {
 /// none this table can read. A None never approximates — it declines.
 pub fn declared_refinement(
     annotation: &Expr,
-    aliases: &HashMap<String, RefinedSet>,
+    aliases: &HashMap<String, AliasEntry>,
     imports: &SurfaceImports,
     environment: &Environment,
 ) -> Option<DeclaredRefinement> {
@@ -125,13 +126,47 @@ pub fn declared_refinement(
             if !environment.alias_is_visible(spelling) {
                 return None;
             }
-            let set = aliases.get(spelling)?;
+            let entry = aliases.get(spelling)?;
+            // A container alias (`Boosted = Annotated[list[BoostedSample],
+            // Field(min_length=1)]`, `entry.element` Some) seeds the
+            // IDENTICAL shape the inline `Annotated[list[X],
+            // Field(min_length=…)]` arm below builds: the element's own
+            // set wrapped as a scalar `DeclaredRefinement`, the
+            // container's own length window, and a spelling of the same
+            // `"list[…]"` shape (`entry.head` carries the head word) —
+            // so `check.rs::seed_parameters`' `spelling.starts_with
+            // ("list[")` gate (and its `set[`/`Sequence[` siblings) fires
+            // identically whether the parameter names the alias or
+            // spells the container inline. The element's spelling is its
+            // OWN WRITTEN spelling (`entry.element`'s second tuple slot,
+            // `surface::element_set_and_spelling_for_alias`'s own answer)
+            // — never a reformatting of its resolved set — so
+            // `list[BoostedSample]` reconstructs as `"list[BoostedSample]"`,
+            // matching the inline path's own nested `declared_refinement`
+            // recursion exactly (a bare alias name's spelling IS the name).
+            let element = entry.element.as_ref().map(|element_entry| {
+                let (element_set, element_spelling) = element_entry.as_ref();
+                Box::new(DeclaredRefinement {
+                    set: element_set.clone(),
+                    spelling: element_spelling.clone(),
+                    admits_none: false,
+                    element: None,
+                    element_length: None,
+                    generator: None,
+                    members: None,
+                    positions: None,
+                })
+            });
+            let container_spelling = match (entry.head, &element) {
+                (Some(head), Some(element_declared)) => Some(format!("{}[{}]", head, element_declared.spelling)),
+                _ => None,
+            };
             Some(DeclaredRefinement {
-                set: set.clone(),
-                spelling: spelling.to_owned(),
+                set: entry.set.clone(),
+                spelling: container_spelling.unwrap_or_else(|| spelling.to_owned()),
                 admits_none: false,
-                element: None,
-                element_length: None,
+                element,
+                element_length: entry.length_window,
                 generator: None,
                 members: None,
                 positions: None,
@@ -424,7 +459,14 @@ pub fn declared_refinement(
             // `list[Sample]` resolves the same way whether or not an
             // outer `Annotated[...]`/`Field(min_length=…)` wraps it.
             if let Some((head, element_expr)) = annotated_sequence_container(annotation, imports) {
-                let (_container_set, length_window) = annotated_expression_set(annotation, imports, aliases)?;
+                // `annotated_expression_set` only reads its own `aliases`
+                // parameter through `element_container_element`, which
+                // never dereferences it (that function's own doc) — a
+                // scalar-set view of this table is enough to answer the
+                // container/length-window question here.
+                let sets_by_name: HashMap<String, RefinedSet> =
+                    aliases.iter().map(|(name, entry)| (name.clone(), entry.set.clone())).collect();
+                let (_container_set, length_window) = annotated_expression_set(annotation, imports, &sets_by_name)?;
                 if let Some(element_declared) = declared_refinement(element_expr, aliases, imports, environment)
                     .or_else(|| base_sort_return_refinement(element_expr))
                 {
@@ -442,7 +484,9 @@ pub fn declared_refinement(
                 }
                 return None;
             }
-            let (set, _length_window) = annotated_expression_set(annotation, imports, aliases)?;
+            let sets_by_name: HashMap<String, RefinedSet> =
+                aliases.iter().map(|(name, entry)| (name.clone(), entry.set.clone())).collect();
+            let (set, _length_window) = annotated_expression_set(annotation, imports, &sets_by_name)?;
             let spelling = format_for_diagnostics(&set);
             Some(DeclaredRefinement {
                 set,
@@ -558,7 +602,7 @@ fn annotated_sequence_container<'a>(annotation: &'a Expr, imports: &SurfaceImpor
 /// base-sort return annotation states.
 pub fn callable_return_refinement(
     annotation: &Expr,
-    aliases: &HashMap<String, RefinedSet>,
+    aliases: &HashMap<String, AliasEntry>,
     imports: &SurfaceImports,
     environment: &Environment,
 ) -> Option<DeclaredRefinement> {
@@ -699,7 +743,7 @@ pub fn typed_dict_return_refinement(
 fn generator_refinement(
     head: &str,
     slice: &Expr,
-    aliases: &HashMap<String, RefinedSet>,
+    aliases: &HashMap<String, AliasEntry>,
     imports: &SurfaceImports,
     environment: &Environment,
 ) -> Option<GeneratorRefinement> {
@@ -859,7 +903,10 @@ mod tests {
     #[test]
     fn a_visible_alias_name_resolves_with_its_name_as_spelling() {
         let mut aliases = HashMap::new();
-        aliases.insert("PositiveInt".to_owned(), make_refined_set(vec![at_least(1.0)]));
+        aliases.insert(
+            "PositiveInt".to_owned(),
+            AliasEntry { set: make_refined_set(vec![at_least(1.0)]), head: None, element: None, length_window: None },
+        );
         let imports = no_imports();
         let environment = no_locals();
 
@@ -1001,7 +1048,10 @@ mod tests {
     #[test]
     fn list_of_an_alias_element_still_resolves_through_the_alias_path() {
         let mut aliases = HashMap::new();
-        aliases.insert("Age".to_owned(), make_refined_set(vec![at_least(0.0)]));
+        aliases.insert(
+            "Age".to_owned(),
+            AliasEntry { set: make_refined_set(vec![at_least(0.0)]), head: None, element: None, length_window: None },
+        );
         let imports = no_imports();
         let environment = no_locals();
         let parsed = parse_expression("list[Age]").expect("test source must parse");
@@ -1011,6 +1061,117 @@ mod tests {
         let element = got.element.expect("element present");
         assert_eq!(element.spelling, "Age");
         assert_eq!(element.set, make_refined_set(vec![at_least(0.0)]));
+    }
+
+    // --- Aliased sequence carries the same window as the inline spelling ---
+
+    /// `boosted: Boosted` (`Boosted = Annotated[list[BoostedSample],
+    /// Field(min_length=1)]`, the exact shape
+    /// audio-level-reverse.py uses) seeds the IDENTICAL
+    /// `DeclaredRefinement` shape — same element set, same length
+    /// window, same `"list[…]"` spelling prefix — as the inline
+    /// `boosted: Annotated[list[BoostedSample], Field(min_length=1)]`
+    /// spelling. A BOUNDED element (`BoostedSample`, not bare `float`)
+    /// is deliberate: `check.rs::seed_parameters` only takes the
+    /// repetition-window branch when the element's own set is
+    /// non-empty, so this is the shape that actually exercises it. This
+    /// is the determination gap the reverse-crossing fixture surfaced
+    /// (ISSUES.md): before this fix, the alias table dropped the
+    /// container window and `element`/`element_length` came back `None`.
+    #[test]
+    fn an_aliased_sequence_parameter_seeds_the_same_shape_as_the_inline_spelling() {
+        let module = ruff_python_parser::parse_module(
+            "from pydantic import Field\n\
+             from typing import Annotated\n\
+             BoostedSample = Annotated[float, Field(ge=-2.0, le=2.0)]\n\
+             Boosted = Annotated[list[BoostedSample], Field(min_length=1)]\n\
+             def boost_samples(boosted: Boosted) -> None: ...\n",
+        )
+        .expect("test module parses")
+        .into_syntax();
+        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let aliases = crate::refinedpy::surface::compile_aliases(&module);
+        let environment = no_locals();
+
+        let alias_annotation = name_expr("Boosted");
+        let via_alias = declared_refinement(&alias_annotation, &aliases, &imports, &environment)
+            .expect("Boosted resolves through the alias table");
+
+        let inline_parsed = parse_expression("Annotated[list[BoostedSample], Field(min_length=1)]")
+            .expect("inline annotation parses");
+        let via_inline = declared_refinement(&inline_parsed.into_expr(), &aliases, &imports, &environment)
+            .expect("the inline spelling resolves directly");
+
+        assert_eq!(via_alias.spelling, via_inline.spelling);
+        // The written element NAME, not its unpacked bounds — the alias
+        // path must reconstruct "list[BoostedSample]", never
+        // "list[>= -2 && <= 2]" (the gate finding this test caught).
+        assert_eq!(via_alias.spelling, "list[BoostedSample]");
+        assert_eq!(via_alias.element_length, via_inline.element_length);
+        assert_eq!(via_alias.element_length, Some((1, None)));
+        let alias_element = via_alias.element.expect("alias path carries an element");
+        let inline_element = via_inline.element.expect("inline path carries an element");
+        assert_eq!(alias_element.set, inline_element.set);
+        assert_eq!(alias_element.spelling, inline_element.spelling);
+        assert_eq!(alias_element.spelling, "BoostedSample");
+        assert!(!alias_element.set.forms.is_empty(), "BoostedSample's element set carries its ge/le bound");
+        assert!(via_alias.spelling.starts_with("list["));
+    }
+
+    /// All three alias spellings (`type X = ...`, `X = Annotated[...]`,
+    /// `X: TypeAlias = Annotated[...]`) seed the identical parameter
+    /// shape once read through `declared_refinement`.
+    #[test]
+    fn all_three_alias_spellings_seed_the_same_parameter_shape() {
+        let sources = [
+            "from pydantic import Field\n\
+             from typing import Annotated\n\
+             type Boosted = Annotated[list[float], Field(min_length=1)]\n",
+            "from pydantic import Field\n\
+             from typing import Annotated\n\
+             Boosted = Annotated[list[float], Field(min_length=1)]\n",
+            "from pydantic import Field\n\
+             from typing import Annotated, TypeAlias\n\
+             Boosted: TypeAlias = Annotated[list[float], Field(min_length=1)]\n",
+        ];
+        let environment = no_locals();
+        let mut shapes = Vec::new();
+        for source in sources {
+            let module = ruff_python_parser::parse_module(source)
+                .expect("test module parses")
+                .into_syntax();
+            let imports = crate::refinedpy::surface::surface_imports(&module);
+            let aliases = crate::refinedpy::surface::compile_aliases(&module);
+            let got = declared_refinement(&name_expr("Boosted"), &aliases, &imports, &environment)
+                .expect("Boosted resolves for every spelling");
+            shapes.push((got.spelling, got.element_length, got.element.map(|e| e.set)));
+        }
+        assert_eq!(shapes[0], shapes[1]);
+        assert_eq!(shapes[1], shapes[2]);
+    }
+
+    /// A scalar alias (`Age`) sitting beside a sequence alias in the
+    /// same module is unaffected — it still resolves with no element/
+    /// length-window fields.
+    #[test]
+    fn a_scalar_alias_parameter_is_unaffected_by_the_sequence_carry() {
+        let module = ruff_python_parser::parse_module(
+            "from pydantic import Field\n\
+             from typing import Annotated\n\
+             type Age = Annotated[int, Field(ge=0)]\n\
+             Boosted = Annotated[list[float], Field(min_length=1)]\n",
+        )
+        .expect("test module parses")
+        .into_syntax();
+        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let aliases = crate::refinedpy::surface::compile_aliases(&module);
+        let environment = no_locals();
+
+        let got = declared_refinement(&name_expr("Age"), &aliases, &imports, &environment)
+            .expect("Age resolves");
+        assert!(got.element.is_none());
+        assert!(got.element_length.is_none());
+        assert_eq!(got.spelling, "Age");
     }
 
     #[test]
@@ -1045,7 +1206,10 @@ mod tests {
     #[test]
     fn a_locally_rebound_alias_name_states_nothing() {
         let mut aliases = HashMap::new();
-        aliases.insert("PositiveInt".to_owned(), make_refined_set(vec![at_least(1.0)]));
+        aliases.insert(
+            "PositiveInt".to_owned(),
+            AliasEntry { set: make_refined_set(vec![at_least(1.0)]), head: None, element: None, length_window: None },
+        );
         let imports = no_imports();
         let mut locally_bound = HashSet::new();
         locally_bound.insert("PositiveInt".to_owned());
@@ -1058,7 +1222,10 @@ mod tests {
     #[test]
     fn a_string_annotation_naming_a_visible_alias_resolves() {
         let mut aliases = HashMap::new();
-        aliases.insert("PositiveInt".to_owned(), make_refined_set(vec![at_least(1.0)]));
+        aliases.insert(
+            "PositiveInt".to_owned(),
+            AliasEntry { set: make_refined_set(vec![at_least(1.0)]), head: None, element: None, length_window: None },
+        );
         let imports = no_imports();
         let environment = no_locals();
 
@@ -1124,10 +1291,16 @@ mod tests {
         })
     }
 
-    fn age_aliases() -> HashMap<String, RefinedSet> {
+    fn age_aliases() -> HashMap<String, AliasEntry> {
         let mut aliases = HashMap::new();
-        aliases.insert("Age".to_owned(), make_refined_set(vec![at_least(0.0)]));
-        aliases.insert("Label".to_owned(), make_refined_set(vec![at_least(1.0)]));
+        aliases.insert(
+            "Age".to_owned(),
+            AliasEntry { set: make_refined_set(vec![at_least(0.0)]), head: None, element: None, length_window: None },
+        );
+        aliases.insert(
+            "Label".to_owned(),
+            AliasEntry { set: make_refined_set(vec![at_least(1.0)]), head: None, element: None, length_window: None },
+        );
         aliases
     }
 

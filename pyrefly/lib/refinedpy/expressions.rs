@@ -81,6 +81,20 @@ pub fn evaluate_expression(
     if let Some(published) = environment.evaluated_node(expression.range()) {
         return published.clone();
     }
+    let value = evaluate_expression_dispatch(expression, environment, kernel);
+    // Recorded ONLY when a caller asked for it (env.rs's own doc on
+    // `evaluations`/`record_evaluation`) — an ordinary check never
+    // opts in, so this is a no-op `Option` check for every node on
+    // every walk except `check.rs::refined_set_at_position`'s own.
+    environment.record_evaluation(expression.range(), value.clone());
+    value
+}
+
+fn evaluate_expression_dispatch(
+    expression: &Expr,
+    environment: &Environment,
+    kernel: &Arc<RefinedTSKernel>,
+) -> AbstractValue {
     match expression {
         // parenthesization carries no AST node of its own — ruff folds
         // `(x)` into `x` at parse time, so there is no case to write here

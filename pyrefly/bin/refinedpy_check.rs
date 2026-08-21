@@ -37,6 +37,7 @@ use pyrefly::refinedpy::check::findings_for_module_at;
 use pyrefly::refinedpy::cross_module::disk_resolver;
 use pyrefly::refinedpy::fact_export::export_module;
 use pyrefly::refinedpy::foreign_edge_artifact::cache_artifact_path;
+use pyrefly::refinedpy::foreign_edge_artifact::set_project_root_override;
 use pyrefly::refinedpy::kernel_path::resolve_kernel_dylib;
 use pyrefly::refinedpy::markers::line_col;
 use pyrefly::refinedpy::markers::line_starts_of;
@@ -73,16 +74,17 @@ fn check_file(path: &str, kernel: &Arc<RefinedTSKernel>) -> (usize, Vec<String>)
 
     for finding in &findings {
         let (line, col) = line_col(&line_starts, usize::from(finding.range.start()));
-        // RTS7002 is the undetermined channel — a body's blocker, never
-        // an expectation a marker can hold. A marker matching one would
-        // silently swallow the very row saying nothing was determined,
-        // faking progress; RTS7002 always prints.
-        if finding.code != "RTS7002" {
-            let matched = markers.iter().enumerate().find(|(_, m)| m.expected_line == line);
-            if let Some((index, _)) = matched {
-                matched_markers[index] = true;
-                continue;
-            }
+        // `Marker::covers` is the one place the RTS7002 exclusion and
+        // the optional code narrowing both apply — a marker matching
+        // 7002 would silently swallow the row saying nothing was
+        // determined, faking progress; RTS7002 always prints.
+        let matched = markers
+            .iter()
+            .enumerate()
+            .find(|(_, m)| m.expected_line == line && m.covers(finding.code));
+        if let Some((index, _)) = matched {
+            matched_markers[index] = true;
+            continue;
         }
         printed += 1;
         lines_output.push(format!(
@@ -186,7 +188,8 @@ fn export_file(path: &str, output: &Path, kernel: &Arc<RefinedTSKernel>) -> Exit
 /// The command line read into one of the two modes: `--export-fact
 /// <file.py> [-o <path>]`, or the ordinary list of files to judge. A
 /// command line that is neither answers `None` and the caller prints the
-/// usage line.
+/// usage line. `--project-root <path>`, when given, is read here and
+/// applied via `set_project_root_override` before either mode runs.
 enum Invocation {
     Judge(Vec<String>),
     Export { file: String, output: PathBuf },
@@ -195,6 +198,7 @@ enum Invocation {
 fn read_invocation(arguments: &[String]) -> Option<Invocation> {
     let mut export_target: Option<String> = None;
     let mut output: Option<PathBuf> = None;
+    let mut project_root: Option<PathBuf> = None;
     let mut files: Vec<String> = Vec::new();
     let mut index = 0;
     while index < arguments.len() {
@@ -207,11 +211,21 @@ fn read_invocation(arguments: &[String]) -> Option<Invocation> {
                 output = Some(PathBuf::from(arguments.get(index + 1)?));
                 index += 2;
             }
+            "--project-root" => {
+                project_root = Some(PathBuf::from(arguments.get(index + 1)?));
+                index += 2;
+            }
             other => {
                 files.push(other.to_owned());
                 index += 1;
             }
         }
+    }
+    // set BEFORE the -o default is computed below, so a stated
+    // --project-root reaches cache_artifact_path's own .git-walk here
+    // exactly as it would reach it inside the checker
+    if let Some(root) = &project_root {
+        set_project_root_override(Some(root.clone()));
     }
     if let Some(file) = export_target {
         // extra positional files alongside --export-fact would be
@@ -231,8 +245,8 @@ fn read_invocation(arguments: &[String]) -> Option<Invocation> {
 fn main() -> ExitCode {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     let Some(invocation) = read_invocation(&arguments) else {
-        eprintln!("usage: refinedpy-check <file.py> [...]");
-        eprintln!("       refinedpy-check --export-fact <file.py> [-o <path>]");
+        eprintln!("usage: refinedpy-check <file.py> [...] [--project-root <path>]");
+        eprintln!("       refinedpy-check --export-fact <file.py> [-o <path>] [--project-root <path>]");
         return ExitCode::from(2);
     };
     let Some(dylib) = resolve_kernel_dylib() else {

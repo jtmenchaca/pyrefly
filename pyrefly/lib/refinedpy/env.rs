@@ -299,6 +299,25 @@ pub struct Environment {
     /// a per-environment `Vec` would silently drop every branch arm's
     /// returns. Sharing the one map makes the recording fork-blind.
     returned_values: Option<Arc<Mutex<Vec<AbstractValue>>>>,
+    /// Every expression node this walk evaluated, paired with its own
+    /// AST range, in evaluation order — `None` unless a caller installed
+    /// a recorder (`set_evaluations_recorder`). `expressions.rs::
+    /// evaluate_expression` records the value at its own exit path, for
+    /// every node its own dispatch actually ran (a node `evaluated_node`
+    /// short-circuits returns early and is NOT recorded here — its value
+    /// was already recorded at whichever earlier call published it). An
+    /// ordinary check never opts in, so this costs one `Option` check
+    /// per node evaluated and nothing more.
+    ///
+    /// `Arc<Mutex<...>>` for the same fork-blind reason `returned_
+    /// values` is: a position the caller asks about may sit inside any
+    /// arm of an `if`/`for`/`try`, or inside a nested `def`'s own body
+    /// — `check.rs::refined_set_at_position` shares ONE recorder across
+    /// the whole module walk by threading it through `WalkContext`
+    /// (read by `walk_body_with_self_binding` at the moment it builds
+    /// each body's own fresh `Environment`), so every nested body's
+    /// walk writes into the same `Vec` the caller reads back afterward.
+    evaluations: Option<Arc<Mutex<Vec<(TextRange, AbstractValue)>>>>,
 }
 
 impl Environment {
@@ -319,6 +338,7 @@ impl Environment {
             lambda_keys_by_range: Arc::new(Mutex::new(HashMap::new())),
             evaluated_node: None,
             returned_values: None,
+            evaluations: None,
         }
     }
 
@@ -524,6 +544,34 @@ impl Environment {
         )
     }
 
+    /// Installs `recorder` as this environment's own evaluations sink —
+    /// the SAME `Arc` a caller (`check.rs::refined_set_at_position`,
+    /// through `WalkContext::evaluations_recorder`) already holds, so
+    /// every write this body's walk makes lands in the one `Vec` the
+    /// caller reads back once the whole module walk finishes. Unlike
+    /// `collect_returned_values` (which mints a FRESH recorder scoped
+    /// to one body), this shares an EXISTING one across every body the
+    /// module walk reaches — the aggregation `refined_set_at_position`
+    /// needs, since the asked-about position may sit inside any nested
+    /// `def`'s own body, each of which builds its own fresh
+    /// `Environment`.
+    pub fn set_evaluations_recorder(&mut self, recorder: Arc<Mutex<Vec<(TextRange, AbstractValue)>>>) {
+        self.evaluations = Some(recorder);
+    }
+
+    /// Records one expression node's own range and value, when this
+    /// walk was asked to collect them. A no-op otherwise, which is
+    /// every ordinary check.
+    pub fn record_evaluation(&self, range: TextRange, value: AbstractValue) {
+        let Some(recorder) = self.evaluations.as_ref() else {
+            return;
+        };
+        recorder
+            .lock()
+            .expect("evaluations recorder poisoned by an earlier panic")
+            .push((range, value));
+    }
+
     /// Record what a name holds after a statement the walk understood.
     pub fn bind(&mut self, name: &str, value: AbstractValue) {
         self.bindings.insert(name.to_owned(), value);
@@ -570,6 +618,10 @@ impl Environment {
             // the SAME recorder, never a copy: a `return` inside the arm
             // this fork walks must reach the asker (the field's own doc)
             returned_values: self.returned_values.clone(),
+            // the SAME recorder too, for the identical reason — a node
+            // evaluated inside this arm must still reach whoever asked
+            // for the whole module walk's recordings
+            evaluations: self.evaluations.clone(),
         }
     }
 
@@ -596,6 +648,9 @@ impl Environment {
         // both arms forked from one environment, so they hold the SAME
         // recorder `Arc` — carrying `a`'s carries both arms' recordings
         let returned_values = a.returned_values;
+        // same reasoning: both arms share the one evaluations `Arc`,
+        // so carrying `a`'s loses nothing either arm recorded
+        let evaluations = a.evaluations;
         for (name, value_a) in a.bindings {
             if let Some(value_b) = b.bindings.get(&name) {
                 bindings.insert(
@@ -619,6 +674,7 @@ impl Environment {
             // node, so nothing carries forward
             evaluated_node: None,
             returned_values,
+            evaluations,
         }
     }
 }

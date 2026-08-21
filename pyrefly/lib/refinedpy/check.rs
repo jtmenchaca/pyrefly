@@ -25,23 +25,26 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use refined_domain::abstract_value::{known_set, known_values, unknown, AbstractValue, Kind, ObjectKey, PrimitiveKind, SetKindTag};
-use refined_domain::known_constructors::known_list;
+use refined_domain::known_constructors::{known_list, known_object};
 use refined_domain::trust_grades::{TrustProved, TrustSpec};
 use refined_kernel::kernel_interface::RefinedTSKernel;
-use refined_sets::refinement_forms::{make_refined_set, on_one_tuple_layer, repeat_of, requires_integer, RefinedSet};
+use refined_sets::format_for_diagnostics::format_for_diagnostics;
+use refined_sets::refinement_forms::{make_refined_set, on_one_tuple_layer, one_of, repeat_of, requires_integer, RefinedSet};
 use ruff_python_ast::{
     Alias, AtomicNodeIndex, CmpOp, ExceptHandler, ExceptHandlerExceptHandler, Expr, ExprAttribute, ExprSubscript,
     ModModule, Parameters, Stmt, StmtAnnAssign, StmtAssign, StmtAugAssign, StmtClassDef, StmtFunctionDef,
     StmtIf, StmtMatch, StmtRaise, StmtReturn, StmtTry, StmtWith, WithItem,
 };
-use ruff_text_size::{Ranged, TextRange};
+use ruff_text_size::{Ranged, TextRange, TextSize};
 
 use crate::refinedpy::assignability::{judge, states_sequence, Verdict};
 use crate::refinedpy::bytes_models::{self, BytesAnswer};
 use crate::refinedpy::collection_models::{dict_get_result, dict_with_item, dict_without_item, list_literal_value, list_with_item, mutated_receiver, subscript_read};
 use crate::refinedpy::cross_module::{module_surface, ModuleResolver, IMPORT_DEPTH_CAP};
+use crate::refinedpy::diagnostic_sentences::{empty_set, unhonorable_annotation};
 use crate::refinedpy::env::Environment;
 use crate::refinedpy::expressions::{binary_arithmetic_value, evaluate_expression, fieldless_exception_value, provable_raise, register_retained_callables};
 use crate::refinedpy::foreign_edge;
@@ -54,7 +57,7 @@ use crate::refinedpy::match_arms::match_taken_environment;
 use crate::refinedpy::narrowing::assume;
 use crate::refinedpy::relational_sum;
 use crate::refinedpy::summaries;
-use crate::refinedpy::surface::{compile_aliases, strict_int_alias_names, surface_imports};
+use crate::refinedpy::surface::{compile_aliases, strict_int_alias_names, surface_imports, AliasEntry};
 use crate::refinedpy::typereading::{base_sort_return_refinement, callable_return_refinement, declared_refinement, typed_dict_return_refinement, DeclaredRefinement};
 
 /// One refinement finding: the range it anchors to, the RTS code, and
@@ -76,7 +79,7 @@ pub struct Finding {
 /// descent) pass one reference instead of many, without hiding what
 /// each field means behind a generic "options" name.
 struct WalkContext<'a> {
-    aliases: &'a HashMap<String, RefinedSet>,
+    aliases: &'a HashMap<String, AliasEntry>,
     imports: &'a crate::refinedpy::surface::SurfaceImports,
     kernel: &'a Arc<RefinedTSKernel>,
     functions: Arc<FunctionTable>,
@@ -115,6 +118,17 @@ struct WalkContext<'a> {
     /// (the resolver-less test entry points) leaves relative targets
     /// unresolved, which declines honestly downstream.
     entry_directory: Option<std::path::PathBuf>,
+    /// The whole module walk's shared evaluations recorder, when a
+    /// caller asked for one (`refined_set_at_position`'s own doc).
+    /// `walk_body_with_self_binding` installs this SAME `Arc` on every
+    /// body's fresh `Environment` the moment it builds one
+    /// (`Environment::set_evaluations_recorder`), so the module body,
+    /// every top-level `def`, and every nested `def`/method all write
+    /// into the one `Vec` the caller reads back once the whole walk
+    /// finishes. `None` for every ordinary check (`findings_for_
+    /// module_at`, `derived_return_values`) — ordinary walks never pay
+    /// for recording they never asked for.
+    evaluations_recorder: Option<Arc<Mutex<Vec<(TextRange, AbstractValue)>>>>,
 }
 
 /// Every finding in one module, resolving no imports — the LSP seam's
@@ -158,10 +172,19 @@ pub fn findings_for_module_at(
     entry_directory: Option<&std::path::Path>,
 ) -> Vec<Finding> {
     let aliases = compile_aliases(module);
-    if aliases.is_empty() {
+    let imports = surface_imports(module);
+    if aliases.is_empty() && imports.annotated_names.is_empty() {
+        // Neither a module-level `type X = Annotated[...]` alias NOR a
+        // recognized `Annotated` import is present, so no statement in
+        // this module can carry refinement vocabulary this checker
+        // reads — the fast, zero-cost early return. A module with an
+        // inline-only `Annotated[...]` parameter annotation and NO
+        // `type` alias still has `imports.annotated_names` populated
+        // (`surface_imports` reads only import statements, cheap before
+        // any walk), so it reaches the walk below rather than being
+        // silently skipped.
         return Vec::new();
     }
-    let imports = surface_imports(module);
     let surface = module_surface(module, resolver, kernel, IMPORT_DEPTH_CAP);
     let own_functions = function_table(module);
     let functions = Arc::new(merged(&own_functions, surface.functions.as_ref()));
@@ -219,10 +242,204 @@ pub fn findings_for_module_at(
         strict_int_aliases: &strict_int_aliases,
         typed_dicts,
         entry_directory: entry_directory.map(|dir| dir.to_path_buf()),
+        evaluations_recorder: None,
     };
     let mut out = Vec::new();
     walk_body(&module.body, None, None, None, &context, &mut out);
     out
+}
+
+/// The refined set stated or known at one position in the module — the
+/// LSP hover's own query. A STATED refinement first (a parameter's own
+/// annotation, or the enclosing function's `-> Annotation` when the
+/// position sits inside the `returns` node): the developer wrote this
+/// claim, so it answers before anything the flow walk derives, the
+/// same preference order refined-ts-go's own `AnswerAt` keeps between
+/// a stated annotation and `FlowAnswerAt`'s derived knowledge
+/// (service/hover_provider.go). Where nothing is stated, the walk runs
+/// with recording enabled (`WalkContext::evaluations_recorder`) and
+/// the answer is the SMALLEST recorded expression range containing
+/// `position` — the innermost node the walk evaluated there, mirroring
+/// how a hover always names the tightest enclosing expression rather
+/// than an outer one that merely contains it. `None` where neither
+/// says anything: an unreadable module (no `type` alias AND no
+/// recognized `Annotated` import — the same early exit
+/// `findings_for_module_at` takes), a position outside every annotation
+/// and outside every recorded node, or a recorded value this table
+/// cannot read back as a set (`abstract_value_as_refined_set`'s own
+/// doc).
+pub fn refined_set_at_position(
+    module: &ModModule,
+    resolver: ModuleResolver,
+    kernel: &Arc<RefinedTSKernel>,
+    position: TextSize,
+) -> Option<RefinedSet> {
+    let aliases = compile_aliases(module);
+    let imports = surface_imports(module);
+    if aliases.is_empty() && imports.annotated_names.is_empty() {
+        // Same gate `findings_for_module_at` takes, and for the same
+        // reason: a module with neither a `type` alias nor a recognized
+        // `Annotated` import carries no refinement vocabulary at all.
+        return None;
+    }
+    if let Some(stated) = stated_refinement_at(module, &aliases, &imports, position) {
+        return Some(stated);
+    }
+    let surface = module_surface(module, resolver, kernel, IMPORT_DEPTH_CAP);
+    let own_functions = function_table(module);
+    let functions = Arc::new(merged(&own_functions, surface.functions.as_ref()));
+    let own_classes = class_table(module, &aliases, &imports, kernel);
+    let mut classes = Arc::try_unwrap(surface.classes)
+        .unwrap_or_else(|_| panic!("module_surface's own Arc<classes> has no other owner yet"));
+    for (name, model) in own_classes {
+        classes.insert(name, model);
+    }
+    for def in module.body.iter().filter_map(|stmt| match stmt {
+        Stmt::FunctionDef(def) => Some(def),
+        _ => None,
+    }) {
+        for (name, model) in local_class_table(&def.body, &aliases, &imports, kernel) {
+            classes.insert(name, model);
+        }
+    }
+    let module_callable_returns = Arc::new(module_level_callable_returns(module, &aliases, &imports));
+    let strict_int_aliases = strict_int_alias_names(module);
+    let typed_dicts = Arc::new(instances::typed_dict_table(module, &aliases, &imports));
+    let recorder = Arc::new(Mutex::new(Vec::new()));
+    let context = WalkContext {
+        aliases: &aliases,
+        imports: &imports,
+        kernel,
+        functions,
+        classes: Arc::new(classes),
+        module_bindings: surface.bindings,
+        module_callable_returns,
+        strict_int_aliases: &strict_int_aliases,
+        typed_dicts,
+        entry_directory: None,
+        evaluations_recorder: Some(recorder.clone()),
+    };
+    let mut discarded_findings = Vec::new();
+    walk_body(&module.body, None, None, None, &context, &mut discarded_findings);
+    let recorded = recorder
+        .lock()
+        .expect("evaluations recorder poisoned by an earlier panic")
+        .clone();
+    smallest_covering_set(&recorded, position)
+}
+
+/// A declared refinement stated exactly AT `position`: a function
+/// parameter's own annotation (`declared_refinement`, the same read
+/// `check.rs::seed_parameters` uses to seed it), or a function's own
+/// `-> Annotation` when `position` sits inside the `returns` node
+/// (`declared_refinement`, falling back to `base_sort_return_refinement`
+/// and `typed_dict_return_refinement` — the same three-reader fallback
+/// chain `walk_function_def` already runs to build a body's own
+/// `return_refinement`). Recurses into every nested `def`/`class` body
+/// so the INNERMOST enclosing function's own parameter/return wins —
+/// the same "innermost node" preference the derived-flow fallback
+/// keeps for a recorded range.
+fn stated_refinement_at(
+    module: &ModModule,
+    aliases: &HashMap<String, AliasEntry>,
+    imports: &crate::refinedpy::surface::SurfaceImports,
+    position: TextSize,
+) -> Option<RefinedSet> {
+    stated_refinement_in_body(&module.body, aliases, imports, position)
+}
+
+fn stated_refinement_in_body(
+    body: &[Stmt],
+    aliases: &HashMap<String, AliasEntry>,
+    imports: &crate::refinedpy::surface::SurfaceImports,
+    position: TextSize,
+) -> Option<RefinedSet> {
+    for stmt in body {
+        match stmt {
+            Stmt::FunctionDef(def) if def.range.contains_inclusive(position) => {
+                // the innermost enclosing def wins: a position inside a
+                // NESTED def's own body is checked against that nested
+                // def's own parameters/return first
+                if let Some(inner) = stated_refinement_in_body(&def.body, aliases, imports, position) {
+                    return Some(inner);
+                }
+                let outer_environment = Environment::new(HashSet::new());
+                for parameter in def
+                    .parameters
+                    .posonlyargs
+                    .iter()
+                    .chain(def.parameters.args.iter())
+                    .chain(def.parameters.kwonlyargs.iter())
+                {
+                    let Some(annotation) = parameter.parameter.annotation.as_deref() else {
+                        continue;
+                    };
+                    if annotation.range().contains_inclusive(position) {
+                        return declared_refinement(annotation, aliases, imports, &outer_environment)
+                            .map(|declared| declared.set);
+                    }
+                }
+                if let Some(returns) = def.returns.as_deref() {
+                    if returns.range().contains_inclusive(position) {
+                        return declared_refinement(returns, aliases, imports, &outer_environment)
+                            .or_else(|| base_sort_return_refinement(returns))
+                            .map(|declared| declared.set);
+                    }
+                }
+                return None;
+            }
+            Stmt::ClassDef(def) if def.range.contains_inclusive(position) => {
+                return stated_refinement_in_body(&def.body, aliases, imports, position);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The smallest recorded `(range, value)` whose range contains
+/// `position`, converted to a `RefinedSet` — the derived-flow fallback
+/// once `stated_refinement_at` finds nothing declared there. "Smallest"
+/// rather than "first" or "last": several recorded nodes can nest around
+/// one position (`total / len(samples)` records the division AND both
+/// operands), and the hover should name the innermost one, the same
+/// preference a source-map lookup or an LSP's own token-at-position
+/// query keeps. `None` when no recorded range covers the position, or
+/// the covering value's own kind cannot be read back as a set
+/// (`abstract_value_as_refined_set`'s own doc).
+fn smallest_covering_set(recorded: &[(TextRange, AbstractValue)], position: TextSize) -> Option<RefinedSet> {
+    let mut best: Option<&(TextRange, AbstractValue)> = None;
+    for entry in recorded {
+        let (range, _) = entry;
+        if !range.contains_inclusive(position) {
+            continue;
+        }
+        match best {
+            Some((best_range, _)) if best_range.len() <= range.len() => {}
+            _ => best = Some(entry),
+        }
+    }
+    let (_, value) = best?;
+    abstract_value_as_refined_set(value)
+}
+
+/// The refined set a recorded `AbstractValue` states, or `None` when
+/// its kind carries no set this table can hand back. `Kind::Set`
+/// carries one directly; `Kind::Values` (a scalar literal join —
+/// `known_values`'s own shape) is read back as the `one_of` of exactly
+/// those values, matching the singleton-membership set the SAME values
+/// would compile to if the developer had written them as a `Literal[
+/// ...]` annotation. Every other kind (an object, a variable, a
+/// callable, …) declines rather than approximate — this table states a
+/// REFINED SET, not a general value description.
+fn abstract_value_as_refined_set(value: &AbstractValue) -> Option<RefinedSet> {
+    match value.kind {
+        Kind::Set => Some(value.set.clone()),
+        Kind::Values if !value.values.is_empty() => {
+            Some(make_refined_set(vec![one_of(&value.values)]))
+        }
+        _ => None,
+    }
 }
 
 /// Every top-level `name: Callable[[...], R] [| None] = ...` at the
@@ -237,7 +454,7 @@ pub fn findings_for_module_at(
 /// judgment, it never approximates.
 fn module_level_callable_returns(
     module: &ModModule,
-    aliases: &HashMap<String, RefinedSet>,
+    aliases: &HashMap<String, AliasEntry>,
     imports: &crate::refinedpy::surface::SurfaceImports,
 ) -> HashMap<String, DeclaredRefinement> {
     let no_locals = Environment::new(HashSet::new());
@@ -351,6 +568,14 @@ fn walk_body_with_self_binding(
     let mut environment = Environment::new(locally_bound);
     if returned_values_out.is_some() {
         environment.collect_returned_values();
+    }
+    // Shares the module walk's ONE evaluations recorder (if the caller
+    // asked for one) onto THIS body's fresh environment — the seam
+    // `refined_set_at_position` depends on: a nested `def`'s own body
+    // gets its own fresh `Environment` here, so without this the
+    // recordings from every body but the outermost would be lost.
+    if let Some(recorder) = context.evaluations_recorder.clone() {
+        environment.set_evaluations_recorder(recorder);
     }
     environment.set_functions(Arc::new(merged(&local_function_table(body), &context.functions)));
     environment.set_classes(merged_classes_for_body(body, context));
@@ -641,7 +866,7 @@ fn merged_classes_for_body(body: &[Stmt], context: &WalkContext) -> Arc<HashMap<
 /// the farther one, Python's own scoping rule).
 fn local_class_table(
     body: &[Stmt],
-    aliases: &HashMap<String, RefinedSet>,
+    aliases: &HashMap<String, AliasEntry>,
     imports: &crate::refinedpy::surface::SurfaceImports,
     kernel: &Arc<RefinedTSKernel>,
 ) -> HashMap<String, ClassModel> {
@@ -786,6 +1011,29 @@ fn seed_parameters(parameters: &Parameters, context: &WalkContext, environment: 
         let Some(annotation) = parameter.parameter.annotation.as_deref() else {
             continue;
         };
+        // A bare CLASS-NAME parameter (`request: AudioRequest`, the class
+        // itself declaring annotated fields — self-authored, `@dataclass`,
+        // or pydantic `BaseModel` alike) seeds a TAGGED `Kind::Object`
+        // instance exactly as `judge_construction` tags one built from a
+        // real call: `source` carries the class name so `evaluate_attribute_
+        // read` (expressions.rs) finds `model` in `environment.classes()`/
+        // `context.classes` and reads through `instances::field_read_
+        // through_model`, which — for an ordinary stored field, the only
+        // shape a parameter's fields are — resolves to `instances::
+        // field_read`'s linear scan of the INSTANCE'S OWN `keys`. The read
+        // path never re-derives a field's value from `ClassModel.fields`;
+        // it consumes only what this seed puts in `keys`, so every
+        // declared field is populated here (per-field, from `ClassField.
+        // declared`) rather than left for a later lookup to reconstruct.
+        // A name that is not a class in this table falls through to the
+        // ordinary `declared_refinement` read below, unchanged.
+        if let Expr::Name(class_name) = annotation {
+            if let Some(model) = context.classes.get(class_name.id.as_str()) {
+                let instance = class_parameter_object(model);
+                environment.bind(parameter.parameter.name.id.as_str(), instance);
+                continue;
+            }
+        }
         // A bare `int`/`float`/`str` PARAMETER seeds its sort claim (the
         // whole-int ray etc. — typereading's own base-sort reader), so
         // `age: int` flowing into a refined sink refuses by containment
@@ -907,6 +1155,82 @@ fn seed_parameters(parameters: &Parameters, context: &WalkContext, environment: 
         };
         environment.bind(parameter.parameter.name.id.as_str(), seeded);
     }
+}
+
+/// A CLASS-NAME parameter's own instance value: a `Kind::Object` tagged
+/// with `source = model.name` (the SAME tag `judge_construction` writes
+/// for a real call — the tag `evaluate_attribute_read` and every other
+/// `receiver.source`-keyed reader already consult), one `ObjectKey` per
+/// declared field IN `model.fields`' own order. A field with no declared
+/// refinement (`ClassField.declared` `None`) seeds NOTHING for that key —
+/// absent from `keys` entirely, not a fabricated unrefined set — so a
+/// later read of it stays undetermined naming the true blocker (there is
+/// no declaration to read), rather than reading as a false "any value at
+/// all" claim this seed did not earn.
+fn class_parameter_object(model: &ClassModel) -> AbstractValue {
+    let entries: Vec<ObjectKey> = model
+        .fields
+        .iter()
+        .filter_map(|field| {
+            let declared = field.declared.as_ref()?;
+            Some(ObjectKey {
+                name: field.name.clone(),
+                numeric: false,
+                value: class_field_value(declared),
+            })
+        })
+        .collect();
+    let mut instance = known_object(entries, None, true, TrustSpec, false);
+    instance.source = model.name.clone();
+    instance
+}
+
+/// One declared field's own seeded value — the same two shapes
+/// `seed_parameters` already builds for a top-level parameter of the
+/// same declared shape, so a field reads back exactly like a parameter
+/// would: a sequence-shaped field (`declared.element` Some, a scalar-
+/// sorted element — the same gate `seed_parameters`' sequence-container
+/// branch reads) becomes a repetition set carrying the element's own
+/// numeric sort on `kind_tag`, so `samples: Annotated[list[float],
+/// Field(min_length=1)]` flows into sum/min/max/relational reads
+/// exactly as a top-level `samples: list[float]` parameter would. A
+/// scalar field with a numeric-ground declared set carries that sort on
+/// `kind_tag` the same way a scalar parameter does. `set_kind_tag` stays
+/// `SetKindTag::None` in both shapes — that field wears the bigint/symbol
+/// distinction, unrelated to `kind_tag`'s numeric sort, and this seed
+/// states nothing about it either way.
+fn class_field_value(declared: &DeclaredRefinement) -> AbstractValue {
+    if let Some(element) = &declared.element {
+        if !element.set.forms.is_empty() {
+            let (lo, hi) = declared.element_length.unwrap_or((0, None));
+            let sort = if requires_integer(&element.set) {
+                PrimitiveKind::Integer
+            } else {
+                PrimitiveKind::Float
+            };
+            return AbstractValue {
+                kind_tag: Some(sort),
+                ..known_set(
+                    make_refined_set(vec![repeat_of(element.set.clone(), lo, hi)]),
+                    None,
+                    TrustSpec,
+                    SetKindTag::None,
+                )
+            };
+        }
+    }
+    if on_one_tuple_layer(&declared.set) && !states_sequence(&declared.set) {
+        let sort = if requires_integer(&declared.set) {
+            PrimitiveKind::Integer
+        } else {
+            PrimitiveKind::Float
+        };
+        return AbstractValue {
+            kind_tag: Some(sort),
+            ..known_set(declared.set.clone(), None, TrustSpec, SetKindTag::None)
+        };
+    }
+    known_set(declared.set.clone(), None, TrustSpec, SetKindTag::None)
 }
 
 /// Record this body's one blocker, if it has not already recorded one.
@@ -1467,22 +1791,22 @@ fn walk_function_def(def: &StmtFunctionDef, context: &WalkContext, out: &mut Vec
 /// and every def walks against it, so an N-def module resolves its
 /// imports once rather than N times.
 ///
-/// An empty map when the module states no aliases at all (the same early
-/// exit `findings_for_module_with_resolver` takes). A def whose body
-/// produced no `return` value this walk could read is simply absent from
-/// the map — never an entry holding a guessed value. The findings the
-/// walks produce are discarded here: the export judges nothing; it
-/// reports what the walk derived.
+/// An empty map when the module states no `type` alias AND no recognized
+/// `Annotated` import (the same early exit `findings_for_module_at`
+/// takes). A def whose body produced no `return` value this walk could
+/// read is simply absent from the map — never an entry holding a guessed
+/// value. The findings the walks produce are discarded here: the export
+/// judges nothing; it reports what the walk derived.
 pub fn derived_return_values(
     module: &ModModule,
     resolver: ModuleResolver,
     kernel: &Arc<RefinedTSKernel>,
 ) -> HashMap<String, AbstractValue> {
     let aliases = compile_aliases(module);
-    if aliases.is_empty() {
+    let imports = surface_imports(module);
+    if aliases.is_empty() && imports.annotated_names.is_empty() {
         return HashMap::new();
     }
-    let imports = surface_imports(module);
     let surface = module_surface(module, resolver, kernel, IMPORT_DEPTH_CAP);
     let own_functions = function_table(module);
     let functions = Arc::new(merged(&own_functions, surface.functions.as_ref()));
@@ -1516,6 +1840,7 @@ pub fn derived_return_values(
         // the export derivation runs no foreign edge today — a .py body
         // that itself crosses to TypeScript is a later composition
         entry_directory: None,
+        evaluations_recorder: None,
     };
     let mut derived = HashMap::new();
     for def in module.body.iter().filter_map(|stmt| match stmt {
@@ -3233,6 +3558,27 @@ fn walk_ann_assign(
                 ),
                 out,
             );
+        } else if let Some(spelling) = unhonorable_annotated_spelling(assign.annotation.as_ref(), context.imports) {
+            // UNHONORABLE STATEMENT (RTS7004): the annotation is
+            // recognizably this table's OWN vocabulary — an
+            // `Annotated[...]` subscript rooted at the module's
+            // imported `Annotated` identity (`surface::
+            // annotated_expression_set`'s own head-identity gate) —
+            // but `declared_refinement` still read nothing from it,
+            // meaning something PAST that gate refused (an
+            // unrecognized base sort, an unrecognized metadata
+            // kwarg/constructor, or a pattern the grammar compiler
+            // rejected). Mirrors the Go twin's own gate
+            // (`RootsInSurface` in `annotation_file_facts.go`): a
+            // recognized-root annotation the checker cannot read is
+            // never dropped silently, unlike a plain-Python name this
+            // table has no vocabulary for at all (that case falls
+            // through below, unchanged).
+            out.push(Finding {
+                range: assign.annotation.range(),
+                code: "RTS7004",
+                message: unhonorable_annotation(&spelling),
+            });
         }
         // PROVABLY-UNBOUND READS: `x: int` (valueless, and no declared
         // refinement this table reads) leaves `x` locally bound
@@ -3253,6 +3599,26 @@ fn walk_ann_assign(
         bind_target_from_value_expr(assign.target.as_ref(), assign.value.as_deref(), environment, context.kernel);
         return;
     };
+
+    // THE EMPTY SET (RTS7003): this annotation compiled to a scalar or
+    // sequence set the kernel proves admits nothing — the declaration
+    // itself can never be honored by any value, independent of what
+    // the write assigns. Mirrors the Go twin's own per-occurrence fire
+    // (`annotation_file_facts.go`'s `emptiness` ask, immediately after
+    // a successful compile): asked once per annotated statement, the
+    // same "courtesy, never a blocker" posture the Go doc names — a
+    // kernel refusal on this set's shape (caught, never a crash, the
+    // same `catch_unwind` idiom `truthiness_conformance.rs`'s own
+    // emptiness ask already holds every kernel closure to) answers
+    // "not decided" and this diagnostic simply does not fire, the
+    // declaration still compiles and judges normally either way.
+    if let Some(true) = declared_set_is_empty(&declared.set, context.kernel) {
+        out.push(Finding {
+            range: assign.annotation.range(),
+            code: "RTS7003",
+            message: empty_set(&declared.set),
+        });
+    }
 
     if let Expr::Name(target_name) = assign.target.as_ref() {
         aug_assign_refinements.insert(target_name.id.as_str().to_owned(), declared.clone());
@@ -3424,7 +3790,7 @@ fn optional_base_sort_annotation(annotation: &Expr) -> Option<DeclaredRefinement
 /// same shape itself.
 fn direct_alias_annotation(
     annotation: &Expr,
-    aliases: &HashMap<String, RefinedSet>,
+    aliases: &HashMap<String, AliasEntry>,
     environment: &Environment,
 ) -> Option<DeclaredRefinement> {
     let Expr::Name(name) = annotation else {
@@ -3433,17 +3799,83 @@ fn direct_alias_annotation(
     if !environment.alias_is_visible(name.id.as_str()) {
         return None;
     }
-    let set = aliases.get(name.id.as_str())?;
+    let entry = aliases.get(name.id.as_str())?;
+    // Same container carry as `declared_refinement`'s own bare-Name arm
+    // (`typereading.rs` doc) — a `Boosted`-shaped alias must not lose its
+    // element/length window just because this AnnAssign path reads it
+    // before the general table gets a chance to. The element's spelling
+    // is its own WRITTEN spelling (`entry.element`'s second tuple slot),
+    // never a reformatting of its resolved set — the same fidelity
+    // `declared_refinement`'s own bare-Name arm keeps.
+    let element = entry.element.as_ref().map(|element_entry| {
+        let (element_set, element_spelling) = element_entry.as_ref();
+        Box::new(DeclaredRefinement {
+            set: element_set.clone(),
+            spelling: element_spelling.clone(),
+            admits_none: false,
+            element: None,
+            element_length: None,
+            generator: None,
+            members: None,
+            positions: None,
+        })
+    });
+    let container_spelling = match (entry.head, &element) {
+        (Some(head), Some(element_declared)) => Some(format!("{}[{}]", head, element_declared.spelling)),
+        _ => None,
+    };
     Some(DeclaredRefinement {
-        set: set.clone(),
-        spelling: name.id.as_str().to_owned(),
+        set: entry.set.clone(),
+        spelling: container_spelling.unwrap_or_else(|| name.id.as_str().to_owned()),
         admits_none: false,
-        element: None,
-        element_length: None,
+        element,
+        element_length: entry.length_window,
         generator: None,
         members: None,
         positions: None,
     })
+}
+
+/// Recognizes an annotation as this table's OWN `Annotated[...]`
+/// vocabulary — the module's imported `Annotated` (or
+/// `typing_extensions.Annotated`) identity as the subscript's head —
+/// the exact gate `surface::annotated_expression_set` itself opens
+/// with before reading any base sort or metadata. Reads `imports`'
+/// `annotated_names` set directly rather than re-deriving it, so this
+/// stays exactly as narrow as the compiler's own recognition and never
+/// drifts from it. Returns the recognized spelling (`"Annotated[...]"`)
+/// for the RTS7004 message when the annotation matches this shape;
+/// `None` for every other shape (a bare alias name, `dict[...]`,
+/// `list[...]`, or any expression this table has no vocabulary for at
+/// all) — those are ordinary Python, never this diagnostic's business.
+fn unhonorable_annotated_spelling(annotation: &Expr, imports: &crate::refinedpy::surface::SurfaceImports) -> Option<String> {
+    let Expr::Subscript(subscript) = annotation else {
+        return None;
+    };
+    let Expr::Name(head) = subscript.value.as_ref() else {
+        return None;
+    };
+    if !imports.annotated_names.contains(head.id.as_str()) {
+        return None;
+    }
+    Some(format!("{}[...]", head.id.as_str()))
+}
+
+/// Whether a compiled declared set is proved empty — the courtesy ask
+/// RTS7003 fires on. Tries the scalar decider first, then the sequence
+/// decider (the same two-decider order `truthiness_conformance.rs`'s
+/// own `state_is_uninhabited` takes), each guarded by `catch_unwind` so
+/// a kernel refusal on a set shape neither decider speaks to reads as
+/// `None` (not decided) rather than a crash. `None` means this
+/// diagnostic simply does not fire — the annotation still compiled and
+/// still judges normally.
+fn declared_set_is_empty(set: &RefinedSet, kernel: &Arc<RefinedTSKernel>) -> Option<bool> {
+    let scalar_asked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (kernel.scalar_empty)(set)));
+    if let Ok(empty) = scalar_asked {
+        return Some(empty);
+    }
+    let seq_asked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (kernel.seq_empty)(set)));
+    seq_asked.ok()
 }
 
 /// After an AnnAssign is judged (or declined), the target still binds:
@@ -4495,7 +4927,7 @@ fn adapter_alias_verdict(
     context: &WalkContext,
     environment: &Environment,
 ) -> Option<ConstructionVerdict> {
-    let declared_set = context.aliases.get(class_name.id.as_str())?;
+    let declared_entry = context.aliases.get(class_name.id.as_str())?;
     if !call_arguments.keywords.is_empty() {
         return None;
     }
@@ -4503,7 +4935,7 @@ fn adapter_alias_verdict(
         return None;
     };
     let declared = DeclaredRefinement {
-        set: declared_set.clone(),
+        set: declared_entry.set.clone(),
         spelling: class_name.id.as_str().to_owned(),
         admits_none: false,
         element: None,
@@ -4545,7 +4977,7 @@ fn adapter_alias_verdict(
     // a Float-sorted or str-sorted declared set never coerces.
     if value.kind == Kind::Values
         && value.kind_tag == Some(PrimitiveKind::String)
-        && requires_integer(declared_set)
+        && requires_integer(&declared_entry.set)
         && !context.strict_int_aliases.contains(class_name.id.as_str())
     {
         if let Some(parsed) = plain_digit_string_value(&value.values) {
@@ -5667,6 +6099,101 @@ mod tests {
         Some(load_kernel(&path).expect("load_kernel"))
     }
 
+    fn no_imports_resolver() -> ModuleResolver<'static> {
+        &|_: &str| None
+    }
+
+    /// The byte offset of `needle`'s own first character in `source` —
+    /// a readable way to name a test position ("the `s` of `samples`")
+    /// rather than a bare integer that says nothing about what it
+    /// points at.
+    fn offset_of(source: &str, needle: &str) -> TextSize {
+        let byte_offset = source.find(needle).unwrap_or_else(|| panic!("{needle:?} not found in fixture"));
+        TextSize::try_from(byte_offset).expect("fixture offsets fit in TextSize")
+    }
+
+    /// `refined_set_at_position` at a PARAMETER's own annotation
+    /// position answers the declared set — a-audio-level.py's own
+    /// `samples: Annotated[list[Sample], Field(min_length=1)]` row.
+    /// The stated branch reads through the SAME `declared_refinement`
+    /// `seed_parameters` calls to seed the parameter itself, so this
+    /// pins that the query and the seed never drift apart.
+    #[test]
+    fn a_parameter_annotation_position_answers_its_declared_set() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let source = concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "Sample = Annotated[float, Field(ge=-2.0, le=2.0)]\n",
+            "\n",
+            "def audio_level(samples: Sample) -> None:\n",
+            "    pass\n",
+        );
+        let module = parsed(source);
+        // a position inside the PARAMETER's own annotation name ("Sample"
+        // in "samples: Sample")
+        let position = offset_of(source, "Sample) -> None");
+        let set = refined_set_at_position(&module, no_imports_resolver(), &kernel, position)
+            .unwrap_or_else(|| panic!("expected a declared set at the parameter annotation"));
+        assert_eq!(format_for_diagnostics(&set), ">= -2 && <= 2");
+    }
+
+    /// `refined_set_at_position` at the RETURN annotation's own
+    /// position answers the declared set — audio_level.py's own `->
+    /// Level` (`Level = Annotated[float, Field(ge=0.0, le=1.0)]`). The
+    /// brief that specified this unit named "the Level parameter", but
+    /// `Level` is the fixture's RETURN annotation, not a parameter —
+    /// this test covers the position the fixture actually has.
+    #[test]
+    fn a_return_annotation_position_answers_its_declared_set() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let source = concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "Level = Annotated[float, Field(ge=0.0, le=1.0)]\n",
+            "\n",
+            "def audio_level(x: float) -> Level:\n",
+            "    return x\n",
+        );
+        let module = parsed(source);
+        let position = offset_of(source, "Level:\n    return");
+        let set = refined_set_at_position(&module, no_imports_resolver(), &kernel, position)
+            .unwrap_or_else(|| panic!("expected a declared set at the return annotation"));
+        assert_eq!(format_for_diagnostics(&set), ">= 0 && <= 1");
+    }
+
+    /// A position that names neither a parameter's own annotation, a
+    /// return annotation, nor any expression the walk evaluated (here,
+    /// the function's OWN NAME) answers nothing — the stated branch
+    /// declines, and no recorded range covers a name the walk never
+    /// evaluates as an expression.
+    ///
+    /// A narrowed LOCAL's own position (`age = 40; if age > 0: <hover
+    /// age here>`) is the derived-flow case the brief also asks about;
+    /// asserting it needs the walk to have recorded a node exactly at
+    /// the READ site, which in turn needs an LSP-shaped identifier
+    /// resolution this unit does not build (`evaluate_expression` is
+    /// keyed on the EXPRESSION node's own range, and a bare `Expr::Name`
+    /// read is one such node, so the machinery here already covers it —
+    /// but pinning "reachable" requires walking a guarded branch and
+    /// then locating the exact `Expr::Name` byte range the guard body
+    /// re-reads, which is fixture-fragile in a way the declared-position
+    /// tests above are not). Recorded here as a gap rather than a test
+    /// built to look green: the declared-branch tests above are the
+    /// ones this unit can assert without guessing at ruff's own byte
+    /// offsets for a re-read name.
+    #[test]
+    fn a_position_naming_neither_a_declaration_nor_a_recorded_expression_answers_nothing() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let source = concat!(
+            "def audio_level() -> None:\n",
+            "    pass\n",
+        );
+        let module = parsed(source);
+        let position = offset_of(source, "audio_level");
+        assert!(refined_set_at_position(&module, no_imports_resolver(), &kernel, position).is_none());
+    }
+
     #[test]
     fn an_out_of_set_literal_fires_and_an_in_set_literal_stays_silent() {
         let Some(kernel) = loaded_kernel() else { return };
@@ -5691,6 +6218,158 @@ mod tests {
         assert!(messages[0].contains("'200'"), "{messages:?}");
         assert!(messages[1].contains("'7.5'"), "{messages:?}");
         assert!(messages[2].contains("'-1'"), "{messages:?}");
+    }
+
+    /// A module whose ONLY refinement vocabulary is an inline
+    /// `Annotated[...]` parameter annotation — no `type X = ...`
+    /// statement anywhere — still walks and fires. Before this gate
+    /// read `imports.annotated_names`, `compile_aliases` alone fed the
+    /// early-return check, so this exact shape returned zero findings
+    /// for the whole module regardless of what its body did.
+    #[test]
+    fn an_inline_only_annotated_parameter_with_no_type_alias_still_fires() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "def check_age(age: Annotated[int, Field(ge=0, le=120)]) -> None:\n",
+            "    over: Annotated[int, Field(ge=0, le=120)] = 200\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        assert_eq!(
+            findings.len(),
+            1,
+            "want the fire for 200, from a module with no `type` alias at all: {:?}",
+            findings.iter().map(|f| (&f.code, &f.message)).collect::<Vec<_>>()
+        );
+        assert_eq!(findings[0].code, "RTS7001");
+        assert!(findings[0].message.contains("'200'"), "{}", findings[0].message);
+    }
+
+    /// A module with neither a `type` alias nor a recognized `Annotated`
+    /// import — ordinary Python this checker has no vocabulary for —
+    /// still returns empty through the same zero-cost early return, never
+    /// reaching the walk.
+    #[test]
+    fn a_module_with_no_aliases_and_no_annotated_import_stays_empty() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "def add(a: int, b: int) -> int:\n",
+            "    return a + b\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        assert!(findings.is_empty(), "{:?}", findings.iter().map(|f| (&f.code, &f.message)).collect::<Vec<_>>());
+    }
+
+    /// RTS7003 — an inline `Annotated[...]` annotation compiles, but its
+    /// two bounds contradict each other, so the kernel proves the
+    /// declared set admits nothing. Mirrors the Go twin's own emptiness
+    /// fire (`annotation_file_facts.go`, the `emptiness` ask
+    /// immediately after a successful compile).
+    #[test]
+    fn an_annotation_whose_bounds_contradict_denotes_the_empty_set() {
+        let Some(kernel) = loaded_kernel() else { return };
+        // `findings_for_module_at` returns no findings at all when the
+        // module has neither a `type X = ...` alias NOR a recognized
+        // `Annotated` import (its own early-return guard) — this
+        // fixture's `from typing import Annotated` line alone already
+        // clears that guard, so the `type Age` alias here is present to
+        // exercise the alias path too, not because it is required.
+        let module = parsed(concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Age = Annotated[int, Field(ge=0, le=120)]\n",
+            "def rows() -> None:\n",
+            "    impossible: Annotated[int, Field(ge=10, le=5)] = 7\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        let empties: Vec<&Finding> = findings.iter().filter(|f| f.code == "RTS7003").collect();
+        assert_eq!(
+            empties.len(),
+            1,
+            "want exactly one empty-set finding: {:?}",
+            findings.iter().map(|f| (&f.code, &f.message)).collect::<Vec<_>>()
+        );
+        assert!(empties[0].message.contains("denotes the empty set"), "{}", empties[0].message);
+    }
+
+    /// A ordinary, inhabited `Annotated[...]` annotation never fires
+    /// RTS7003 — the emptiness ask is a courtesy on an already-compiled
+    /// set, never a blocker on a set that admits values.
+    #[test]
+    fn an_ordinary_inhabited_annotation_never_fires_the_empty_set_finding() {
+        let Some(kernel) = loaded_kernel() else { return };
+        // see the `type Age` comment above — the `from typing import
+        // Annotated` line alone already clears
+        // `findings_for_module_at`'s alias-or-Annotated-import guard.
+        let module = parsed(concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Age = Annotated[int, Field(ge=0, le=120)]\n",
+            "def rows() -> None:\n",
+            "    fine: Annotated[int, Field(ge=0, le=120)] = 42\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        assert!(
+            findings.iter().all(|f| f.code != "RTS7003"),
+            "{:?}",
+            findings.iter().map(|f| (&f.code, &f.message)).collect::<Vec<_>>()
+        );
+    }
+
+    /// RTS7004 — the annotation is recognizably this table's OWN
+    /// `Annotated[...]` vocabulary (the imported `Annotated` identity as
+    /// the subscript head), but an unrecognized `Field` kwarg refuses
+    /// the whole statement. Mirrors the Go twin's own `RootsInSurface`
+    /// gate (`annotation_file_facts.go`): a recognized-root annotation
+    /// the checker cannot read is never dropped silently.
+    #[test]
+    fn an_annotated_statement_with_an_unrecognized_field_kwarg_is_unhonorable() {
+        let Some(kernel) = loaded_kernel() else { return };
+        // see the `type Age` comment above — the `from typing import
+        // Annotated` line alone already clears
+        // `findings_for_module_at`'s alias-or-Annotated-import guard.
+        let module = parsed(concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Age = Annotated[int, Field(ge=0, le=120)]\n",
+            "def rows() -> None:\n",
+            "    over: Annotated[int, Field(unknown_kwarg=1)] = 42\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        assert_eq!(
+            findings.len(),
+            1,
+            "want exactly one unhonorable-statement finding: {:?}",
+            findings.iter().map(|f| (&f.code, &f.message)).collect::<Vec<_>>()
+        );
+        assert_eq!(findings[0].code, "RTS7004");
+        assert!(findings[0].message.contains("Annotated[...]"), "{}", findings[0].message);
+    }
+
+    /// A plain, no-vocabulary annotation (an ordinary class name, not
+    /// this table's `Annotated[...]` root) never fires RTS7004 — it is
+    /// ordinary Python this table has no vocabulary for, not a refused
+    /// statement.
+    #[test]
+    fn a_plain_unrelated_annotation_never_fires_the_unhonorable_statement_finding() {
+        let Some(kernel) = loaded_kernel() else { return };
+        // see the `type Age` comment above — the `from typing import
+        // Annotated` line alone already clears
+        // `findings_for_module_at`'s alias-or-Annotated-import guard.
+        let module = parsed(concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Age = Annotated[int, Field(ge=0, le=120)]\n",
+            "def rows() -> None:\n",
+            "    label: str = \"ok\"\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        assert!(
+            findings.iter().all(|f| f.code != "RTS7004"),
+            "{:?}",
+            findings.iter().map(|f| (&f.code, &f.message)).collect::<Vec<_>>()
+        );
     }
 
     /// `f-type-nodes.py`'s `list_annotation_parameter` row: a `list[int]`
@@ -5732,6 +6411,146 @@ mod tests {
         ));
         let findings = findings_for_module(&module, &kernel);
         assert_eq!(findings.len(), 0, "{:?}", findings.iter().map(|f| &f.message).collect::<Vec<_>>());
+    }
+
+    // --- BARE CLASS-NAME PARAMETERS (`seed_parameters`' class branch) ---
+
+    /// A PARAMETER annotated with a bare class name (`request: AudioRequest`)
+    /// whose class declares an annotated scalar field: the field read
+    /// through `request.level` is judged against `Level`'s own [0, 100]
+    /// window — in range stays Silent, out of range fires RTS7001. Pins
+    /// that `seed_parameters`' new class branch binds the parameter as a
+    /// tagged `Kind::Object` whose `keys` the ordinary attribute-read path
+    /// (`evaluate_attribute_read` → `field_read_through_model` →
+    /// `field_read`) actually consumes — this is the fix's whole point:
+    /// before it, `request` was never bound at all, and both reads below
+    /// stayed silently unknown with nothing firing.
+    #[test]
+    fn a_bare_class_name_parameters_scalar_field_read_judges_against_its_declared_set() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Level = Annotated[int, Field(ge=0, le=100)]\n",
+            "class AudioRequest:\n",
+            "    def __init__(self, level: Level) -> None:\n",
+            "        self.level = level\n",
+            "def in_range(request: AudioRequest) -> Level:\n",
+            "    return request.level\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        assert_eq!(
+            findings.len(),
+            0,
+            "a parameter's own declared field read back against its own declared set is Silent: {:?}",
+            findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// The same class-name parameter shape, but the field is read into a
+    /// NARROWER declared return than the field's own declaration: the
+    /// parameter's `Level` field ([0, 100]) admits values outside a
+    /// tighter `Quiet` ([0, 20]) return, so this fires RTS7001 — the
+    /// out-of-set leg of the same fix.
+    #[test]
+    fn a_bare_class_name_parameters_scalar_field_read_fires_against_a_narrower_declared_set() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Level = Annotated[int, Field(ge=0, le=100)]\n",
+            "type Quiet = Annotated[int, Field(ge=0, le=20)]\n",
+            "class AudioRequest:\n",
+            "    def __init__(self, level: Level) -> None:\n",
+            "        self.level = level\n",
+            "def maybe_quiet(request: AudioRequest) -> Quiet:\n",
+            "    return request.level\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        assert_eq!(findings.len(), 1, "{:?}", findings.iter().map(|f| &f.message).collect::<Vec<_>>());
+        assert_eq!(findings[0].code, "RTS7001");
+        assert!(findings[0].message.contains("'Quiet'"), "{}", findings[0].message);
+    }
+
+    /// A bare class-name parameter whose class declares a SEQUENCE field
+    /// (`samples: Annotated[list[float], Field(min_length=1)]`): indexing
+    /// the field proves the sequence machinery sees both the window and
+    /// the sort — mirrors `a_list_int_parameters_element_read_fires_
+    /// against_a_narrower_declared_set` above (a bare `float`'s own
+    /// unbounded ray admits values outside `Score`'s [0.0, 1.0] window),
+    /// but the sequence lives one level down, inside a field, rather than
+    /// at the parameter itself: `class_field_value`'s sequence arm must
+    /// build the SAME `Kind::Set` repetition `seed_parameters`' own
+    /// sequence-container branch builds, or `batch.samples[0]` would read
+    /// as `unknown()` (undetermined, not a fire) instead.
+    #[test]
+    fn a_bare_class_name_parameters_sequence_field_element_read_fires_against_a_narrower_declared_set() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Score = Annotated[float, Field(ge=0.0, le=1.0)]\n",
+            "class ScoredBatch:\n",
+            "    def __init__(self, samples: Annotated[list[float], Field(min_length=1)]) -> None:\n",
+            "        self.samples = samples\n",
+            "def first_score(batch: ScoredBatch) -> Score:\n",
+            "    return batch.samples[0]\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        assert_eq!(findings.len(), 1, "{:?}", findings.iter().map(|f| &f.message).collect::<Vec<_>>());
+        assert_eq!(findings[0].code, "RTS7001");
+        assert!(findings[0].message.contains("'Score'"), "{}", findings[0].message);
+    }
+
+    /// A parameter annotated with a name that is NOT a class in this
+    /// module's table (an ordinary undeclared name, or a name that never
+    /// resolves to any `ClassModel`): the new branch must decline exactly
+    /// as today — no binding, no finding — falling through to the ordinary
+    /// `declared_refinement` read, which also states nothing for it.
+    #[test]
+    fn a_class_name_not_in_the_table_still_declines_as_today() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "def uses_unknown_class(thing: NotAClass) -> None:\n",
+            "    pass\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        assert!(
+            findings.is_empty(),
+            "an annotation naming no known class must decline without fabricating a finding: {:?}",
+            findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// A class-name parameter whose field has NO declared refinement (an
+    /// ordinary unannotated `self.level = level` field): `class_parameter_
+    /// object` seeds NOTHING for that key (absent, not a fabricated set),
+    /// so `request.level` reads back as `unknown()` — flowing into a
+    /// declared `-> Level` return, `judge` falls through every typed arm to
+    /// its undetermined catch-all, firing RTS7002 naming that blocker
+    /// (`"the flowing value is not yet readable"`), never silently
+    /// admitted and never a false RTS7001.
+    #[test]
+    fn a_class_name_parameters_field_with_no_declared_refinement_reads_undetermined() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Level = Annotated[int, Field(ge=0, le=100)]\n",
+            "class AudioRequest:\n",
+            "    def __init__(self, level) -> None:\n",
+            "        self.level = level\n",
+            "def read_it(request: AudioRequest) -> Level:\n",
+            "    return request.level\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        assert_eq!(findings.len(), 1, "{:?}", findings.iter().map(|f| &f.message).collect::<Vec<_>>());
+        assert_eq!(findings[0].code, "RTS7002");
+        assert!(
+            findings[0].message.contains("not yet readable"),
+            "{}",
+            findings[0].message
+        );
     }
 
     #[test]

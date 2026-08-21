@@ -18,10 +18,11 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 
 use refined_sets::codepoint_sets::{string_tuple, strings};
+use refined_sets::format_for_diagnostics::format_for_diagnostics;
 use refined_sets::regex_compiler::format_grammar;
 use refined_sets::refinement_forms::{
     Refinement, RefinedSet, above, at_least, at_most, below, integer, make_refined_set,
-    multiple_of, one_of, union,
+    multiple_of, numbers, one_of, union,
 };
 use refined_sets::repetition_window_forms::repetition;
 use ruff_python_ast::{Expr, ModModule, Number, Operator, Stmt, StmtImport, StmtImportFrom, UnaryOp};
@@ -37,19 +38,56 @@ const INERT_FIELD_KWARGS: &[&str] = &[
     "title",
 ];
 
+/// One compiled alias: its own scalar set (empty for a container alias,
+/// the same "the container itself states nothing" convention
+/// `annotated_expression_set` keeps), plus — when the alias names a
+/// `list[X]`/`set[X]`/`Sequence[X]` container — the container's own
+/// head spelling, the element's own resolved set AND written spelling,
+/// and the container's own length window. A scalar alias (`Age =
+/// Annotated[int, Field(ge=0)]`) carries `head: None, element: None,
+/// length_window: None`; a container alias (`Boosted =
+/// Annotated[list[BoostedSample], Field(min_length=1)]`) carries `head:
+/// Some("list")`, `element: Some((<BoostedSample's set>,
+/// "BoostedSample"))`, `length_window: Some((1, None))`.
+///
+/// `element`'s second slot is the element's WRITTEN spelling, not a
+/// re-derived one: when the element is itself an alias name
+/// (`BoostedSample`), the reconstructed container spelling must read
+/// `"list[BoostedSample]"`, the name as written, never
+/// `"list[<BoostedSample's unpacked bounds>]"` — the two spell
+/// differently even though the compiled SETS are identical, and
+/// `declared_refinement`'s own inline `Annotated[list[X],
+/// Field(min_length=…)]` arm always preserves the element's own
+/// spelling (a nested `declared_refinement` recursion, which reads a
+/// bare alias name's spelling as the name itself). Carrying the written
+/// spelling here — rather than reformatting the resolved set — is what
+/// makes an alias-sourced parameter and an inline-spelled one produce
+/// the IDENTICAL `DeclaredRefinement.spelling`
+/// (`check.rs::seed_parameters`'s `spelling.starts_with("list[")` gate
+/// reads either one the same way regardless).
+#[derive(Clone, PartialEq, Debug)]
+pub struct AliasEntry {
+    pub set: RefinedSet,
+    pub head: Option<&'static str>,
+    pub element: Option<Box<(RefinedSet, String)>>,
+    pub length_window: Option<(i64, Option<i64>)>,
+}
+
 /// Every `type X = Annotated[int|float, Field(…)]` alias at the
 /// module's top level, lowered to its refined set, plus alias-of-alias
 /// (`type Adult = Age`, where `Age` already named a compiled set),
 /// plus a bare `type Pick = Literal[…]` alias (`literal_alias_set`),
 /// plus a union of two `Literal[…]` aliases (`type PickUnion =
 /// Literal[10, 20, 30] | Literal["ten", "twenty"]`,
-/// `literal_union_alias_set`). Statements walk in source order so a
-/// later alias can point at an earlier one. Aliases the table cannot
-/// lower faithfully are absent — absence declines judgment, it never
+/// `literal_union_alias_set`), plus a `list[X]`/`set[X]`/`Sequence[X]`
+/// container alias carrying its element set and length window
+/// (`AliasEntry` doc). Statements walk in source order so a later
+/// alias can point at an earlier one. Aliases the table cannot lower
+/// faithfully are absent — absence declines judgment, it never
 /// approximates.
-pub fn compile_aliases(module: &ModModule) -> HashMap<String, RefinedSet> {
+pub fn compile_aliases(module: &ModModule) -> HashMap<String, AliasEntry> {
     let imports = surface_imports(module);
-    let mut out = HashMap::new();
+    let mut out: HashMap<String, AliasEntry> = HashMap::new();
     for stmt in module.body.iter() {
         // The three spellings of one module-level alias: the 3.12
         // `type X = ...` statement, the plain `X = Annotated[...]`
@@ -84,16 +122,51 @@ pub fn compile_aliases(module: &ModModule) -> HashMap<String, RefinedSet> {
             }
             _ => continue,
         };
-        // A module-level alias names ONE set, never a sequence's own
-        // length bounds — `annotated_expression_set`'s second tuple
-        // element (the container length window) has no slot in this
-        // table's `HashMap<String, RefinedSet>` output, so it is
-        // dropped here; only a PARAMETER annotation
-        // (`declared_refinement`'s own call site) reads it.
-        let set = annotated_expression_set(value, &imports, &out)
-            .map(|(set, _length_window)| set)
-            .or_else(|| literal_alias_set(value))
-            .or_else(|| literal_union_alias_set(value))
+        let sets_by_name: HashMap<String, RefinedSet> =
+            out.iter().map(|(name, entry)| (name.clone(), entry.set.clone())).collect();
+        // A container base's length window rides `annotated_expression_set`'s
+        // OWN second tuple slot now — the table's value carries it
+        // (`AliasEntry::length_window`) instead of dropping it, and the
+        // element itself is resolved by `element_set_and_spelling_for_alias`
+        // below using the same fallback chain `declared_refinement`'s own
+        // inline container arm applies. `annotated_base_expr` re-reads the
+        // SAME `Annotated[...]` subscript's first tuple slot
+        // `annotated_expression_set` destructures internally, so
+        // `element_container_element` is asked about the actual base
+        // (`list[X]`), never the outer `Annotated[...]` wrapper.
+        let entry = annotated_expression_set(value, &imports, &sets_by_name)
+            .and_then(|(set, length_window)| {
+                let base = annotated_base_expr(value, &imports);
+                let container = base.and_then(|base| container_head_and_element(base, &imports, &sets_by_name));
+                let (head, element) = match container {
+                    Some((head, element_expr)) => {
+                        (Some(head), Some(element_set_and_spelling_for_alias(element_expr, &imports, &out)?))
+                    }
+                    None => (None, None),
+                };
+                Some(AliasEntry {
+                    set,
+                    head,
+                    element: element.map(Box::new),
+                    length_window,
+                })
+            })
+            .or_else(|| {
+                literal_alias_set(value).map(|set| AliasEntry {
+                    set,
+                    head: None,
+                    element: None,
+                    length_window: None,
+                })
+            })
+            .or_else(|| {
+                literal_union_alias_set(value).map(|set| AliasEntry {
+                    set,
+                    head: None,
+                    element: None,
+                    length_window: None,
+                })
+            })
             .or_else(|| {
                 // `type Adult = Age`: the RHS is a bare name that already
                 // names a compiled set in this same table.
@@ -102,11 +175,86 @@ pub fn compile_aliases(module: &ModModule) -> HashMap<String, RefinedSet> {
                 };
                 out.get(rhs.id.as_str()).cloned()
             });
-        if let Some(set) = set {
-            out.insert(name.to_owned(), set);
+        if let Some(entry) = entry {
+            out.insert(name.to_owned(), entry);
         }
     }
     out
+}
+
+/// A container alias's own element expression resolved to `(the
+/// resolved RefinedSet, the element's own WRITTEN spelling)` — the same
+/// fallback chain `declared_refinement`'s inline container arm applies
+/// to a `list[X]`/`set[X]`/`Sequence[X]` element (a bare alias name
+/// already compiled earlier in `out`, spelled as the alias name itself;
+/// a bare `int`/`float`/`str` base sort, spelled `"int"`/`"float"`/
+/// `"str"` with the IDENTICAL unbounded sets
+/// `typereading.rs::base_sort_return_refinement` gives that sort
+/// everywhere else it is read — `int` is the whole-number ray, `float`
+/// is the unbounded real ray `numbers()`, never the empty set; a
+/// nested inline `Annotated[…]` via `annotated_expression_set`,
+/// restricted to the non-container case, spelled through
+/// `format_for_diagnostics`; or a `Literal[…]`/`Literal[…] |
+/// Literal[…]`, spelled the same way), so `list[float]`,
+/// `list[SomeAlias]`, and `list[Literal[1, 2]]` elements all resolve to
+/// the SAME set AND the SAME spelling a bare parameter of that same
+/// element type would — carrying the alias name's own spelling forward
+/// (rather than reformatting its resolved set) is what makes
+/// `list[BoostedSample]` reconstruct as `"list[BoostedSample]"`, never
+/// `"list[<BoostedSample's unpacked bounds>]"`. `None` when the element
+/// expression matches none of these — declines the whole container
+/// alias rather than guessing an empty element set.
+fn element_set_and_spelling_for_alias(
+    element_expr: &Expr,
+    imports: &SurfaceImports,
+    out: &HashMap<String, AliasEntry>,
+) -> Option<(RefinedSet, String)> {
+    if let Expr::Name(name) = element_expr {
+        let spelling = name.id.as_str();
+        // A bare alias name first — `declared_refinement`'s own bare-Name
+        // arm tries the alias table BEFORE `base_sort_return_refinement`'s
+        // fallback, so an alias that happens to be named `int`/`float`/
+        // `str` (impossible in practice, since those are keywords/builtins
+        // no alias could shadow as a bare Name target — but the ORDER
+        // matters for fidelity) takes the alias reading, never the base
+        // sort's. The WRITTEN name is the spelling — never the alias's own
+        // unpacked set, formatted — the exact distinction the
+        // alias-vs-inline spelling equivalence in `declared_refinement`'s
+        // bare-Name arm depends on.
+        if let Some(entry) = out.get(spelling) {
+            return Some((entry.set.clone(), spelling.to_owned()));
+        }
+        // The bare `int`/`float`/`str` base-sort fallback
+        // (`base_sort_return_refinement`'s own three sets, exactly):
+        // `int` is the whole-number ray, `float` is the unbounded real
+        // ray `numbers()` (never the empty set), `str` is the whole-
+        // strings ground. `StrictInt` is NOT a recognized element sort
+        // here — `base_sort_return_refinement` itself does not match it
+        // either, so a bare `list[StrictInt]` element declines through
+        // this same fallback chain, matching the inline path exactly.
+        match spelling {
+            "int" => {
+                return Some((make_refined_set(vec![integer(), at_least(f64::NEG_INFINITY)]), spelling.to_owned()));
+            }
+            "float" => return Some((numbers(), spelling.to_owned())),
+            "str" => return Some((strings(), spelling.to_owned())),
+            _ => {}
+        }
+    }
+    let sets_by_name: HashMap<String, RefinedSet> =
+        out.iter().map(|(name, entry)| (name.clone(), entry.set.clone())).collect();
+    if let Some((set, length_window)) = annotated_expression_set(element_expr, imports, &sets_by_name) {
+        if length_window.is_none() {
+            let spelling = format_for_diagnostics(&set);
+            return Some((set, spelling));
+        }
+        return None;
+    }
+    if let Some(set) = literal_alias_set(element_expr).or_else(|| literal_union_alias_set(element_expr)) {
+        let spelling = format_for_diagnostics(&set);
+        return Some((set, spelling));
+    }
+    None
 }
 
 /// Every `type X = Annotated[StrictInt, …]` alias name at the module's
@@ -444,6 +592,30 @@ pub fn annotated_expression_set(
     Some((make_refined_set(forms), None))
 }
 
+/// An `Annotated[...]` expression's own first tuple slot (the `base` every
+/// other reader in this file destructures from `value` directly) — the
+/// same `Subscript` → `Annotated` name check → `Tuple` → first-element
+/// walk `annotated_expression_set` does at its own top, factored out so
+/// `compile_aliases` can hand `element_container_element` the actual
+/// base rather than the outer `Annotated[...]` wrapper. `None` for
+/// anything that is not this exact shape, matching every other reader
+/// here.
+fn annotated_base_expr<'a>(value: &'a Expr, imports: &SurfaceImports) -> Option<&'a Expr> {
+    let Expr::Subscript(subscript) = value else {
+        return None;
+    };
+    let Expr::Name(head) = subscript.value.as_ref() else {
+        return None;
+    };
+    if !imports.annotated_names.contains(head.id.as_str()) {
+        return None;
+    }
+    let Expr::Tuple(arguments) = subscript.slice.as_ref() else {
+        return None;
+    };
+    arguments.elts.first()
+}
+
 /// Whether `base` (the first slot of an `Annotated[...]` subscript) is
 /// itself a `list[X]`/`set[X]`/`Sequence[X]` container shape — recognized
 /// by bare-Name head only, the same no-import-identity convention
@@ -474,6 +646,35 @@ fn element_container_element<'a>(
         return None;
     }
     Some(subscript.slice.as_ref())
+}
+
+/// `element_container_element`'s own recognition, plus the container's
+/// head spelling (`"list"`/`"set"`/`"Sequence"`) alongside the element
+/// expression — `compile_aliases`' own use, so a container alias's
+/// `AliasEntry::head` matches the exact spelling
+/// `declared_refinement`'s own inline container arm builds
+/// (`typereading.rs::annotated_sequence_container`'s twin, mirrored
+/// locally for the same import-direction reason `literal_alias_set`'s
+/// doc already gives).
+fn container_head_and_element<'a>(
+    base: &'a Expr,
+    imports: &SurfaceImports,
+    aliases: &HashMap<String, RefinedSet>,
+) -> Option<(&'static str, &'a Expr)> {
+    let Expr::Subscript(subscript) = base else {
+        return None;
+    };
+    let Expr::Name(head) = subscript.value.as_ref() else {
+        return None;
+    };
+    let head_spelling = match head.id.as_str() {
+        "list" => "list",
+        "set" => "set",
+        "Sequence" => "Sequence",
+        _ => return None,
+    };
+    let element = element_container_element(base, imports, aliases)?;
+    Some((head_spelling, element))
 }
 
 /// The codepoint ground (`C`, one scalar) `min_length`/`max_length`
@@ -800,6 +1001,22 @@ mod tests {
         assert_eq!(out.get("Age"), out.get("Adult"));
     }
 
+    /// A bare scalar alias carries no container fields — `head`,
+    /// `element`, and `length_window` are all `None`.
+    #[test]
+    fn a_scalar_alias_carries_no_container_fields() {
+        let module = parsed(
+            "from pydantic import Field\n\
+             from typing import Annotated\n\
+             type Age = Annotated[int, Field(ge=0)]\n",
+        );
+        let out = compile_aliases(&module);
+        let compiled = out.get("Age").expect("Age compiles");
+        assert!(compiled.head.is_none());
+        assert!(compiled.element.is_none());
+        assert!(compiled.length_window.is_none());
+    }
+
     /// An anchored `pattern=r"^[0-9a-f]+$"` compiles — the alias's set
     /// is exactly what `format_grammar` gives the same pattern string
     /// directly, so a matching literal ("1a2b", o-file's in-set row)
@@ -821,7 +1038,7 @@ mod tests {
         // alias's forms (matching o-file's "1a2b" is a hex string, "zz"
         // is not — both judge against this same conjunct at check time)
         assert!(
-            compiled.forms.iter().any(|f| direct.set.forms.contains(f)),
+            compiled.set.forms.iter().any(|f| direct.set.forms.contains(f)),
             "the anchored pattern's own compiled form must appear in Hex's forms"
         );
     }
@@ -843,7 +1060,7 @@ mod tests {
         let direct = format_grammar("^id-", "");
         assert!(direct.ok);
         assert!(
-            compiled.forms.iter().any(|f| direct.set.forms.contains(f)),
+            compiled.set.forms.iter().any(|f| direct.set.forms.contains(f)),
             "the unanchored pattern's own padded form must appear in Anchored's forms"
         );
     }
@@ -875,7 +1092,7 @@ mod tests {
         );
         let out = compile_aliases(&module);
         let compiled = out.get("Handle").expect("Handle compiles");
-        let read_back = refined_sets::repetition_window_forms::as_repetition(compiled)
+        let read_back = refined_sets::repetition_window_forms::as_repetition(&compiled.set)
             .expect("a length-window-only str alias reads back as one repetition");
         assert_eq!(read_back.lo, 2);
         assert_eq!(read_back.hi, Some(6));
@@ -892,7 +1109,7 @@ mod tests {
         );
         let out = compile_aliases(&module);
         let compiled = out.get("AtLeastTwo").expect("AtLeastTwo compiles");
-        let read_back = refined_sets::repetition_window_forms::as_repetition(compiled)
+        let read_back = refined_sets::repetition_window_forms::as_repetition(&compiled.set)
             .expect("a min_length-only str alias reads back as one repetition");
         assert_eq!(read_back.lo, 2);
         assert_eq!(read_back.hi, None);
@@ -923,8 +1140,8 @@ mod tests {
         let out = compile_aliases(&module);
         let compiled = out.get("Pick").expect("Pick compiles");
         assert_eq!(
-            compiled,
-            &make_refined_set(vec![refined_sets::refinement_forms::one_of(&[10.0, 20.0, 30.0])])
+            compiled.set,
+            make_refined_set(vec![refined_sets::refinement_forms::one_of(&[10.0, 20.0, 30.0])])
         );
     }
 
@@ -944,7 +1161,7 @@ mod tests {
             string_tuple("ten"),
             string_tuple("twenty"),
         )]);
-        assert_eq!(compiled, &make_refined_set(vec![union(int_arm, string_arm)]));
+        assert_eq!(compiled.set, make_refined_set(vec![union(int_arm, string_arm)]));
     }
 
     /// A union of a Literal arm and a non-Literal arm declines whole —
@@ -974,8 +1191,8 @@ mod tests {
         let out = compile_aliases(&module);
         let compiled = out.get("AgeAT").expect("AgeAT compiles");
         assert_eq!(
-            compiled,
-            &make_refined_set(vec![integer(), at_least(0.0), at_most(120.0)])
+            compiled.set,
+            make_refined_set(vec![integer(), at_least(0.0), at_most(120.0)])
         );
     }
 
@@ -993,7 +1210,7 @@ mod tests {
         );
         let out = compile_aliases(&module);
         let compiled = out.get("LabelAT").expect("LabelAT compiles");
-        let read_back = refined_sets::repetition_window_forms::as_repetition(compiled)
+        let read_back = refined_sets::repetition_window_forms::as_repetition(&compiled.set)
             .expect("MinLen + Field(max_length) folds to one repetition window");
         assert_eq!(read_back.lo, 1);
         assert_eq!(read_back.hi, Some(8));
@@ -1011,8 +1228,8 @@ mod tests {
         let out = compile_aliases(&module);
         let compiled = out.get("EvenAge").expect("EvenAge compiles");
         assert_eq!(
-            compiled,
-            &make_refined_set(vec![integer(), above(0.0), below(120.0), multiple_of(2.0)])
+            compiled.set,
+            make_refined_set(vec![integer(), above(0.0), below(120.0), multiple_of(2.0)])
         );
     }
 
@@ -1061,5 +1278,128 @@ mod tests {
         let strict_names = strict_int_alias_names(&module);
         assert!(strict_names.contains("StrictAge"));
         assert!(!strict_names.contains("LaxAge"));
+    }
+
+    // --- Sequence alias container window (Boosted-shaped) ---
+
+    /// `Boosted = Annotated[list[float], Field(min_length=1)]` carries
+    /// its OWN length window — the alias table no longer drops it (the
+    /// determination gap the reverse-crossing fixture surfaced). The
+    /// bare `float` element resolves to the UNBOUNDED real ray
+    /// (`numbers()`, `typereading.rs::base_sort_return_refinement`'s own
+    /// set for a bare `float` — never the empty set), spelled `"float"`.
+    #[test]
+    fn a_sequence_alias_carries_its_own_length_window() {
+        let module = parsed(
+            "from pydantic import Field\n\
+             from typing import Annotated\n\
+             Boosted = Annotated[list[float], Field(min_length=1)]\n",
+        );
+        let out = compile_aliases(&module);
+        let compiled = out.get("Boosted").expect("Boosted compiles");
+        assert_eq!(compiled.head, Some("list"));
+        assert_eq!(compiled.length_window, Some((1, None)));
+        let (element_set, element_spelling) = compiled.element.as_deref().expect("Boosted carries an element set");
+        assert_eq!(element_spelling.as_str(), "float");
+        assert!(!element_set.forms.is_empty(), "a bare float element carries the unbounded real ray");
+    }
+
+    /// The alias's compiled element set and spelling are IDENTICAL to
+    /// what a bare `float` parameter's own `DeclaredRefinement` would be
+    /// (`numbers()`, spelled `"float"`), and the container's own scalar
+    /// `set` field stays empty (the container states nothing itself,
+    /// the same convention `annotated_expression_set` keeps for the
+    /// inline `Annotated[list[X], …]` case).
+    #[test]
+    fn a_sequence_alias_element_matches_the_bare_element_sort_exactly() {
+        let module = parsed(
+            "from pydantic import Field\n\
+             from typing import Annotated\n\
+             Boosted = Annotated[list[float], Field(min_length=1)]\n",
+        );
+        let out = compile_aliases(&module);
+        let compiled = out.get("Boosted").expect("Boosted compiles");
+        assert!(compiled.set.forms.is_empty(), "the container's own set states nothing");
+        let (element_set, element_spelling) = compiled.element.as_deref().expect("Boosted carries an element set");
+        assert_eq!(element_set, &refined_sets::refinement_forms::numbers());
+        assert_eq!(element_spelling.as_str(), "float");
+    }
+
+    /// A `min_length`+`max_length` sequence alias element resolving
+    /// through a NESTED alias name (`Boosted = Annotated[list[Age],
+    /// Field(min_length=1, max_length=4)]`) reads `Age`'s own compiled
+    /// set as the element, spelled `"Age"` — the WRITTEN name, not
+    /// `Age`'s own unpacked bound — exactly like `declared_refinement`'s
+    /// inline `list[Age]` arm does.
+    #[test]
+    fn a_sequence_alias_element_resolves_through_a_nested_alias_name() {
+        let module = parsed(
+            "from pydantic import Field\n\
+             from typing import Annotated\n\
+             type Age = Annotated[int, Field(ge=0)]\n\
+             Boosted = Annotated[list[Age], Field(min_length=1, max_length=4)]\n",
+        );
+        let out = compile_aliases(&module);
+        let age = out.get("Age").expect("Age compiles").set.clone();
+        let compiled = out.get("Boosted").expect("Boosted compiles");
+        assert_eq!(compiled.head, Some("list"));
+        assert_eq!(compiled.length_window, Some((1, Some(4))));
+        let (element_set, element_spelling) = compiled.element.as_deref().expect("Boosted carries an element");
+        assert_eq!(element_set, &age);
+        assert_eq!(element_spelling.as_str(), "Age");
+    }
+
+    /// All three alias spellings — the 3.12 `type X = ...` statement,
+    /// the plain `X = Annotated[...]` assignment, and the `X: TypeAlias
+    /// = Annotated[...]` form — carry the IDENTICAL container window for
+    /// the same `list[float]`/`min_length=1` shape.
+    #[test]
+    fn all_three_alias_spellings_carry_the_identical_sequence_window() {
+        let type_stmt = parsed(
+            "from pydantic import Field\n\
+             from typing import Annotated\n\
+             type Boosted = Annotated[list[float], Field(min_length=1)]\n",
+        );
+        let plain_assign = parsed(
+            "from pydantic import Field\n\
+             from typing import Annotated\n\
+             Boosted = Annotated[list[float], Field(min_length=1)]\n",
+        );
+        let type_alias_assign = parsed(
+            "from pydantic import Field\n\
+             from typing import Annotated, TypeAlias\n\
+             Boosted: TypeAlias = Annotated[list[float], Field(min_length=1)]\n",
+        );
+        let from_type_stmt = compile_aliases(&type_stmt).get("Boosted").cloned().expect("type-stmt spelling compiles");
+        let from_plain_assign = compile_aliases(&plain_assign).get("Boosted").cloned().expect("plain-assign spelling compiles");
+        let from_type_alias_assign = compile_aliases(&type_alias_assign)
+            .get("Boosted")
+            .cloned()
+            .expect("TypeAlias-annotated spelling compiles");
+        assert_eq!(from_type_stmt, from_plain_assign);
+        assert_eq!(from_plain_assign, from_type_alias_assign);
+    }
+
+    /// A scalar alias (`Age`) is unaffected by the container carry — it
+    /// still compiles to a bare `RefinedSet` with no container fields,
+    /// exercised earlier by `a_scalar_alias_carries_no_container_fields`;
+    /// this variant additionally checks a scalar alias sitting BESIDE a
+    /// sequence alias in the same module does not pick up the other's
+    /// container fields by accident.
+    #[test]
+    fn a_scalar_alias_beside_a_sequence_alias_stays_unaffected() {
+        let module = parsed(
+            "from pydantic import Field\n\
+             from typing import Annotated\n\
+             type Age = Annotated[int, Field(ge=0)]\n\
+             Boosted = Annotated[list[float], Field(min_length=1)]\n",
+        );
+        let out = compile_aliases(&module);
+        let age = out.get("Age").expect("Age compiles");
+        assert!(age.head.is_none());
+        assert!(age.element.is_none());
+        assert!(age.length_window.is_none());
+        let boosted = out.get("Boosted").expect("Boosted compiles");
+        assert_eq!(boosted.head, Some("list"));
     }
 }

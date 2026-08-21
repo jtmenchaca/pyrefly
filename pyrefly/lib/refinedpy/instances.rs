@@ -37,7 +37,6 @@ use refined_domain::lattice_operations::truthiness;
 use refined_domain::trust_grades::TrustSpec;
 use refined_kernel::kernel_interface::RefinedTSKernel;
 use refined_sets::refinement_forms::make_refined_set;
-use refined_sets::refinement_forms::RefinedSet;
 use ruff_python_ast::{Expr, ExprCall, ModModule, Number, Stmt, StmtClassDef, StmtFunctionDef, UnaryOp};
 use ruff_text_size::TextRange;
 
@@ -45,7 +44,7 @@ use crate::refinedpy::assignability::{judge, Verdict};
 use crate::refinedpy::env::Environment;
 use crate::refinedpy::expressions::evaluate_expression;
 use crate::refinedpy::function_table::FunctionTable;
-use crate::refinedpy::surface::SurfaceImports;
+use crate::refinedpy::surface::{AliasEntry, SurfaceImports};
 use crate::refinedpy::typereading::{declared_refinement, DeclaredRefinement};
 
 /// One class's declared shape: its name, its fields (in construction
@@ -150,7 +149,7 @@ pub struct ConstructionVerdict {
 /// already served, exactly as the mission specifies.
 pub fn class_table(
     module: &ModModule,
-    aliases: &HashMap<String, RefinedSet>,
+    aliases: &HashMap<String, AliasEntry>,
     imports: &SurfaceImports,
     kernel: &Arc<RefinedTSKernel>,
 ) -> HashMap<String, ClassModel> {
@@ -186,7 +185,7 @@ pub fn class_table(
 /// through an import alias.
 pub fn typed_dict_table(
     module: &ModModule,
-    aliases: &HashMap<String, RefinedSet>,
+    aliases: &HashMap<String, AliasEntry>,
     imports: &SurfaceImports,
 ) -> HashMap<String, Vec<(String, DeclaredRefinement)>> {
     let empty_environment = Environment::new(Default::default());
@@ -227,7 +226,7 @@ pub fn typed_dict_table(
 fn build_class_model(
     name: &str,
     defs: &HashMap<String, &StmtClassDef>,
-    aliases: &HashMap<String, RefinedSet>,
+    aliases: &HashMap<String, AliasEntry>,
     imports: &SurfaceImports,
     kernel: &Arc<RefinedTSKernel>,
     out: &mut HashMap<String, ClassModel>,
@@ -326,7 +325,7 @@ fn single_bare_name_base(def: &StmtClassDef) -> Option<&str> {
 ///   sharing no name.
 fn class_model_of(
     def: &StmtClassDef,
-    aliases: &HashMap<String, RefinedSet>,
+    aliases: &HashMap<String, AliasEntry>,
     imports: &SurfaceImports,
     kernel: &Arc<RefinedTSKernel>,
     parent: Option<&ClassModel>,
@@ -568,7 +567,7 @@ fn own_method_table(def: &StmtClassDef) -> HashMap<String, StmtFunctionDef> {
 ///    `field_read`/`field_write_judgment` can reach by name.
 fn init_derived_fields(
     init: &StmtFunctionDef,
-    aliases: &HashMap<String, RefinedSet>,
+    aliases: &HashMap<String, AliasEntry>,
     imports: &SurfaceImports,
     kernel: &Arc<RefinedTSKernel>,
 ) -> Option<Vec<ClassField>> {
@@ -700,7 +699,7 @@ fn init_derived_fields(
 fn super_init_fields(
     init: &StmtFunctionDef,
     parent_fields: &[ClassField],
-    aliases: &HashMap<String, RefinedSet>,
+    aliases: &HashMap<String, AliasEntry>,
     imports: &SurfaceImports,
 ) -> Vec<ClassField> {
     let Some(call) = super_init_call(init) else {
@@ -885,7 +884,7 @@ fn is_class_var(annotation: &Expr) -> bool {
 /// has no backing name to record.
 fn property_table(
     def: &StmtClassDef,
-    aliases: &HashMap<String, RefinedSet>,
+    aliases: &HashMap<String, AliasEntry>,
     imports: &SurfaceImports,
 ) -> HashMap<String, PropertyModel> {
     let empty_environment = Environment::new(Default::default());

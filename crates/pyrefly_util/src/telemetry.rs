@@ -83,6 +83,9 @@ pub enum TelemetryEventKind {
     ExternalReferences,
     ExternalWorkspaceSymbols,
     LspStartup,
+    /// RefinedPy's save-time fact export (`refinedpy::export_fact_on_save`),
+    /// queued from `did_save` so the notification never blocks on it.
+    RefinedPyExportOnSave,
 }
 
 pub struct TelemetryEvent {
