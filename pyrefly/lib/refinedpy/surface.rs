@@ -51,32 +51,59 @@ pub fn compile_aliases(module: &ModModule) -> HashMap<String, RefinedSet> {
     let imports = surface_imports(module);
     let mut out = HashMap::new();
     for stmt in module.body.iter() {
-        let Stmt::TypeAlias(alias) = stmt else {
-            continue;
+        // The three spellings of one module-level alias: the 3.12
+        // `type X = ...` statement, the plain `X = Annotated[...]`
+        // assignment, and the `X: TypeAlias = Annotated[...]` form —
+        // the two assignment spellings are the ONLY ones a
+        // cpython-3.11 runtime parses, and the exported runtime band
+        // admits 3.11, so the reader must admit them too. A plain
+        // assignment whose RHS is not an alias shape simply fails the
+        // lowering below and is skipped, exactly like an unreadable
+        // `type` RHS.
+        let (name, value) = match stmt {
+            Stmt::TypeAlias(alias) => {
+                let Expr::Name(name) = alias.name.as_ref() else {
+                    continue;
+                };
+                (name.id.as_str(), alias.value.as_ref())
+            }
+            Stmt::Assign(assign) => {
+                let [Expr::Name(name)] = assign.targets.as_slice() else {
+                    continue;
+                };
+                (name.id.as_str(), assign.value.as_ref())
+            }
+            Stmt::AnnAssign(annotated) => {
+                let Expr::Name(name) = annotated.target.as_ref() else {
+                    continue;
+                };
+                let Some(value) = annotated.value.as_deref() else {
+                    continue;
+                };
+                (name.id.as_str(), value)
+            }
+            _ => continue,
         };
-        let Expr::Name(name) = alias.name.as_ref() else {
-            continue;
-        };
-        // A module-level `type X = ...` alias names ONE set, never a
-        // sequence's own length bounds — `annotated_expression_set`'s
-        // second tuple element (the container length window) has no
-        // slot in this table's `HashMap<String, RefinedSet>` output, so
-        // it is dropped here; only a PARAMETER annotation
+        // A module-level alias names ONE set, never a sequence's own
+        // length bounds — `annotated_expression_set`'s second tuple
+        // element (the container length window) has no slot in this
+        // table's `HashMap<String, RefinedSet>` output, so it is
+        // dropped here; only a PARAMETER annotation
         // (`declared_refinement`'s own call site) reads it.
-        let set = annotated_expression_set(alias.value.as_ref(), &imports, &out)
+        let set = annotated_expression_set(value, &imports, &out)
             .map(|(set, _length_window)| set)
-            .or_else(|| literal_alias_set(alias.value.as_ref()))
-            .or_else(|| literal_union_alias_set(alias.value.as_ref()))
+            .or_else(|| literal_alias_set(value))
+            .or_else(|| literal_union_alias_set(value))
             .or_else(|| {
                 // `type Adult = Age`: the RHS is a bare name that already
                 // names a compiled set in this same table.
-                let Expr::Name(rhs) = alias.value.as_ref() else {
+                let Expr::Name(rhs) = value else {
                     return None;
                 };
                 out.get(rhs.id.as_str()).cloned()
             });
         if let Some(set) = set {
-            out.insert(name.id.as_str().to_owned(), set);
+            out.insert(name.to_owned(), set);
         }
     }
     out
@@ -96,13 +123,32 @@ pub fn strict_int_alias_names(module: &ModModule) -> HashSet<String> {
     let imports = surface_imports(module);
     let mut out = HashSet::new();
     for stmt in module.body.iter() {
-        let Stmt::TypeAlias(alias) = stmt else {
-            continue;
+        // the same three alias spellings compile_aliases admits
+        let (name, value) = match stmt {
+            Stmt::TypeAlias(alias) => {
+                let Expr::Name(name) = alias.name.as_ref() else {
+                    continue;
+                };
+                (name, alias.value.as_ref())
+            }
+            Stmt::Assign(assign) => {
+                let [Expr::Name(name)] = assign.targets.as_slice() else {
+                    continue;
+                };
+                (name, assign.value.as_ref())
+            }
+            Stmt::AnnAssign(annotated) => {
+                let Expr::Name(name) = annotated.target.as_ref() else {
+                    continue;
+                };
+                let Some(value) = annotated.value.as_deref() else {
+                    continue;
+                };
+                (name, value)
+            }
+            _ => continue,
         };
-        let Expr::Name(name) = alias.name.as_ref() else {
-            continue;
-        };
-        let Expr::Subscript(subscript) = alias.value.as_ref() else {
+        let Expr::Subscript(subscript) = value else {
             continue;
         };
         let Expr::Name(head) = subscript.value.as_ref() else {
