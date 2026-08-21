@@ -18,8 +18,12 @@
 //! Exit 0 when nothing prints — every expectation held.
 //!
 //! `--export-fact <file.py>` is the OTHER mode: instead of judging, it
-//! writes the module's fact artifact (`refinedpy::fact_export`) to
-//! `<file.py>.refined.json`, or to the path `-o` names. Every def with a
+//! writes the module's fact artifact (`refinedpy::fact_export`) into
+//! the project cache — `<projectRoot>/.refined/cache/<relpath>.refined.json`,
+//! where the project root is the nearest ancestor holding `.git` (the
+//! file's own directory when none is found), the same derivation the
+//! TypeScript consumer reads by. `-o <path>` overrides the location —
+//! internal tooling, not consulted by any consumer. Every def with a
 //! fully declared refined entry and a derivable return set is carried;
 //! every def that is not is named on stderr with the construct that
 //! stopped it. Exit 0 when the artifact was written.
@@ -142,11 +146,46 @@ fn export_file(path: &str, output: &Path, kernel: &Arc<RefinedTSKernel>) -> Exit
             return ExitCode::from(2);
         }
     };
+    if let Some(parent) = output.parent() {
+        if let Err(err) = std::fs::create_dir_all(parent) {
+            eprintln!("{}: the cache directory could not be created: {err}", parent.display());
+            return ExitCode::from(2);
+        }
+    }
     if let Err(err) = std::fs::write(output, format!("{rendered}\n")) {
         eprintln!("{}: the artifact could not be written: {err}", output.display());
         return ExitCode::from(2);
     }
     ExitCode::SUCCESS
+}
+
+/// The target's project-cache entry: the nearest ancestor holding
+/// `.git` is the project root (the target's own directory when none is
+/// found), and the entry mirrors the target's path relative to that
+/// root — the SAME derivation the TypeScript consumer reads by, so the
+/// two checkers meet at one file without either being told where.
+fn cache_artifact_path(target: &str) -> PathBuf {
+    let absolute = std::path::absolute(target).unwrap_or_else(|_| PathBuf::from(target));
+    let start = absolute.parent().unwrap_or(Path::new("."));
+    let mut root = start.to_path_buf();
+    let mut walk = Some(start);
+    while let Some(dir) = walk {
+        if dir.join(".git").exists() {
+            root = dir.to_path_buf();
+            break;
+        }
+        walk = dir.parent();
+    }
+    let relative = absolute.strip_prefix(&root).unwrap_or_else(|_| {
+        Path::new(absolute.file_name().map(|name| name.as_ref()).unwrap_or(Path::new("artifact").as_os_str()))
+    });
+    let mut entry = root.join(".refined").join("cache").join(relative);
+    let file_name = entry
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "artifact".to_owned());
+    entry.set_file_name(format!("{file_name}.refined.json"));
+    entry
 }
 
 /// The command line read into one of the two modes: `--export-fact
@@ -185,7 +224,7 @@ fn read_invocation(arguments: &[String]) -> Option<Invocation> {
         if !files.is_empty() {
             return None;
         }
-        let output = output.unwrap_or_else(|| PathBuf::from(format!("{file}.refined.json")));
+        let output = output.unwrap_or_else(|| cache_artifact_path(&file));
         return Some(Invocation::Export { file, output });
     }
     if output.is_some() || files.is_empty() {
