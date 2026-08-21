@@ -119,16 +119,6 @@ pub const SENTENCE: Sentences = Sentences {
     tuple_position: "a fixed-arity-tuple-declared position holds a value this table does not yet read",
 };
 
-/// A recognized non-node runner's runtime-band gap: the argv names the
-/// TypeScript file cleanly, but the target's own exported fact commits
-/// to a `node` band and this call runs a different runtime — the
-/// runtime-identity premise cannot be discharged against a claim made
-/// for a runtime this call never runs. A true determination gap (the
-/// construct is named: the runner word), never a recognition gap.
-pub fn foreign_edge_runtime_band_gap(declared_band: &str, runner_word: &str) -> String {
-    format!("the target's fact declares {declared_band}; this call runs {runner_word} — no band claim exists for {runner_word}")
-}
-
 /// `os.system`'s own undetermined reason for a command whose runner and
 /// script DID read cleanly: even a followed literal shell command has
 /// no value channel, because `os.system` never captures stdout — names
@@ -399,16 +389,6 @@ mod tests {
     fn member_suffixes_name_the_offending_position() {
         assert!(at_key("a value", "age").contains("at key 'age'"));
         assert!(at_index("a value", 2).contains("at index 2"));
-    }
-
-    /// The runtime-band-gap sentence names both the declared band and
-    /// the runner that cannot discharge it.
-    #[test]
-    fn the_runtime_band_gap_sentence_names_the_band_and_the_runner() {
-        let message = foreign_edge_runtime_band_gap("node-23+", "deno");
-        assert!(message.contains("node-23+"), "{message}");
-        assert!(message.contains("deno"), "{message}");
-        assert!(message.contains("no band claim exists for deno"), "{message}");
     }
 
     /// The os.system no-stdout-capture sentence names the runner and

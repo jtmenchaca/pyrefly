@@ -32,11 +32,13 @@
 //!
 //! The runner word at argv[0] (plus, for a two-word runner, argv[1])
 //! also recognizes beyond plain `"node"`: `"deno" "run"`, `"bun"`, and
-//! `"npx" "tsx"` all name a real script the same way `"node"` does, but
-//! only `"node"` discharges the runtime-identity premise against this
-//! checker's pinned `node-23+` band — the other three recognize the
-//! reference and then decline at that one premise (`Runner::word`'s own
-//! doc).
+//! `"npx" "tsx"` all name a real script the same way `"node"` does. The
+//! band this checker's TypeScript pins commit to (`es2023+`) names an
+//! ECMA-262 spec level, not one runtime binary (ruling, 2026-08-21), so
+//! every recognized runner discharges the runtime-identity premise
+//! identically once the artifact declares that band — the artifact
+//! reader's own band check (`foreign_edge_artifact.rs`) is the only gate,
+//! and it applies the same way regardless of which runner the call names.
 //!
 //! argv[1] (the script) also resolves through a module-level constant
 //! this body reads (`TARGET_PATH = "./x.ts"` used as `["node",
@@ -235,10 +237,11 @@ pub struct ForeignEdge {
     /// recognition already consumed is not itself a consumer to find
     /// again.
     consumer_scan_from: usize,
-    /// Which runner word this call spelled — `foreign_edge_at` checks
-    /// this against the artifact's own declared band once the artifact
-    /// is read, since only `Node` discharges the runtime-identity
-    /// premise against this checker's pinned `node-23+` band.
+    /// Which runner word this call spelled — carried through for the
+    /// decline sentences that name it (an unfit-input decline, an
+    /// unrecognized script extension); every recognized runner
+    /// discharges the runtime-identity premise identically once the
+    /// artifact's own band check (`foreign_edge_artifact.rs`) passes.
     runner: Runner,
 }
 
@@ -304,19 +307,12 @@ pub fn foreign_edge_at(
             });
         }
     };
-    // RUNTIME IDENTITY: the artifact's own band is a claim about the
-    // NODE runtime this checker's TypeScript pins commit to — a call
-    // recognized under a different runner (deno, bun, npx tsx) genuinely
-    // names the same script, but that runner is not the runtime the
-    // band was stated about, so the identity premise cannot be
-    // discharged. This is a determination gap, not a recognition gap:
-    // the reference is named, only the band claim does not carry.
-    if edge.runner != Runner::Node {
-        return Some(ForeignEdgeOutcome::Decline {
-            message: diagnostic_sentences::foreign_edge_runtime_band_gap(&artifact.runtime_band, edge.runner.word()),
-            range: edge.call,
-        });
-    }
+    // RUNTIME IDENTITY: the artifact's own band names an ECMA-262 spec
+    // level, not one runtime binary (ruling, 2026-08-21) — the sibling
+    // reader already checked the band against this checker's pinned
+    // `es2023+` string, so any recognized runner (node, deno, bun, npx
+    // tsx) discharges this premise identically once that check passed.
+    //
     // CARRIER IDENTITY: the call's own spelling states one channel, and
     // the target's surface states the one it actually reads — a JSON
     // transport model applies only when both name the SAME carrier.
@@ -433,10 +429,9 @@ struct RecognitionDecline {
 /// The recognized runner words — argv[0] (plus, for a two-word runner,
 /// argv[1]) that names the program the target `.ts` file runs under.
 /// Every runner recognizes the REFERENCE (the argv genuinely names one
-/// script), but only `Node` discharges the runtime-identity premise
-/// against this checker's own pinned `node-23+` band — the other three
-/// recognize and then decline at that premise (see `foreign_edge_at`'s
-/// own runtime-band check), never at argv shape.
+/// script) and, once the artifact declares the shared `es2023+` band,
+/// discharges the runtime-identity premise identically — the band names
+/// an ECMA-262 spec level, not one runtime binary (ruling, 2026-08-21).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Runner {
     Node,
@@ -446,8 +441,9 @@ enum Runner {
 }
 
 impl Runner {
-    /// The word a runtime-band-gap sentence names — the exact runner
-    /// text this call spells, not a category.
+    /// The exact runner text this call spells — carried into a decline
+    /// sentence that names the runner (an unfit-input decline, an
+    /// unrecognized script extension), never a category.
     fn word(self) -> &'static str {
         match self {
             Runner::Node => "node",
@@ -2355,7 +2351,7 @@ mod tests {
                 provenance_said: "audioLevel's own kernel summary".to_owned(),
             },
             target_file: "./audio_level.ts".to_owned(),
-            runtime_band: "node-20+".to_owned(),
+            runtime_band: "es2023+".to_owned(),
             surface: ForeignSurface::StdinJson,
         }
     }
@@ -2933,8 +2929,14 @@ mod tests {
 
     /* ── runner words: deno / bun / npx tsx ──────────────────────────── */
 
+    /// A `deno run` call recognizes the reference and, once the
+    /// artifact's own band check passes (this fixture declares the
+    /// shared `es2023+` band), proceeds to ordinary premise judging
+    /// exactly like a `node` call — the runner-word band gap retired
+    /// with the ruling that the band names an ECMA-262 spec level, not
+    /// one runtime binary.
     #[test]
-    fn a_deno_run_call_recognizes_the_reference_and_declines_the_runtime_band() {
+    fn a_deno_run_call_recognizes_the_reference_and_judges_like_node() {
         register_fixture_artifact("./audio_level.ts", audio_level_ts_artifact());
         let Some(kernel) = loaded_kernel() else { return };
         let source = concat!(
@@ -2949,18 +2951,20 @@ mod tests {
         );
         let body = def_body(source);
         let environment = env_with(&[("boosted", boosted_sequence_value())]);
-        match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("the reference recognizes") {
-            ForeignEdgeOutcome::Decline { message, .. } => {
-                assert!(message.contains("deno"), "{message}");
-                assert!(message.contains("node-20+") || message.contains("node"), "{message}");
+        match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("the shape recognizes") {
+            ForeignEdgeOutcome::Override { value, .. } => {
+                assert_eq!(value.kind, Kind::Set);
+                assert_eq!(value.kind_tag, Some(PrimitiveKind::Float));
             }
-            ForeignEdgeOutcome::Override { .. } => panic!("wanted a runtime-band decline, got an override"),
-            ForeignEdgeOutcome::Fired { message, .. } => panic!("wanted a runtime-band decline, got a fire: {message}"),
+            ForeignEdgeOutcome::Decline { message, .. } => panic!("wanted an override, got a decline: {message}"),
+            ForeignEdgeOutcome::Fired { message, .. } => panic!("wanted an override, got a fire: {message}"),
         }
     }
 
+    /// A `bun` call recognizes the reference and judges like `node` —
+    /// same rationale as the `deno run` sibling above.
     #[test]
-    fn a_bun_call_recognizes_the_reference_and_declines_the_runtime_band() {
+    fn a_bun_call_recognizes_the_reference_and_judges_like_node() {
         register_fixture_artifact("./audio_level.ts", audio_level_ts_artifact());
         let Some(kernel) = loaded_kernel() else { return };
         let source = concat!(
@@ -2975,15 +2979,20 @@ mod tests {
         );
         let body = def_body(source);
         let environment = env_with(&[("boosted", boosted_sequence_value())]);
-        match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("the reference recognizes") {
-            ForeignEdgeOutcome::Decline { message, .. } => assert!(message.contains("bun"), "{message}"),
-            ForeignEdgeOutcome::Override { .. } => panic!("wanted a runtime-band decline, got an override"),
-            ForeignEdgeOutcome::Fired { message, .. } => panic!("wanted a runtime-band decline, got a fire: {message}"),
+        match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("the shape recognizes") {
+            ForeignEdgeOutcome::Override { value, .. } => {
+                assert_eq!(value.kind, Kind::Set);
+                assert_eq!(value.kind_tag, Some(PrimitiveKind::Float));
+            }
+            ForeignEdgeOutcome::Decline { message, .. } => panic!("wanted an override, got a decline: {message}"),
+            ForeignEdgeOutcome::Fired { message, .. } => panic!("wanted an override, got a fire: {message}"),
         }
     }
 
+    /// An `npx tsx` call recognizes the reference and judges like `node`
+    /// — same rationale as the `deno run`/`bun` siblings above.
     #[test]
-    fn an_npx_tsx_call_recognizes_the_reference_and_declines_the_runtime_band() {
+    fn an_npx_tsx_call_recognizes_the_reference_and_judges_like_node() {
         register_fixture_artifact("./audio_level.ts", audio_level_ts_artifact());
         let Some(kernel) = loaded_kernel() else { return };
         let source = concat!(
@@ -2998,10 +3007,13 @@ mod tests {
         );
         let body = def_body(source);
         let environment = env_with(&[("boosted", boosted_sequence_value())]);
-        match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("the reference recognizes") {
-            ForeignEdgeOutcome::Decline { message, .. } => assert!(message.contains("npx tsx"), "{message}"),
-            ForeignEdgeOutcome::Override { .. } => panic!("wanted a runtime-band decline, got an override"),
-            ForeignEdgeOutcome::Fired { message, .. } => panic!("wanted a runtime-band decline, got a fire: {message}"),
+        match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("the shape recognizes") {
+            ForeignEdgeOutcome::Override { value, .. } => {
+                assert_eq!(value.kind, Kind::Set);
+                assert_eq!(value.kind_tag, Some(PrimitiveKind::Float));
+            }
+            ForeignEdgeOutcome::Decline { message, .. } => panic!("wanted an override, got a decline: {message}"),
+            ForeignEdgeOutcome::Fired { message, .. } => panic!("wanted an override, got a fire: {message}"),
         }
     }
 
@@ -3289,7 +3301,7 @@ mod tests {
             "refined": {"kind": "fact-artifact", "version": 2},
             "target": {"file": "audio_level.ts", "contentHash": format!("sha256:{}", crate::refinedpy::fact_export::sha256_hex(source))},
             "language": "typescript",
-            "runtime": {"band": "node-23+"},
+            "runtime": {"band": "es2023+"},
             "surface": {"kind": "stdin-json", "stdin": "json", "stdout": "json", "calls": "audioLevel"},
             "functions": {
                 "audioLevel": {

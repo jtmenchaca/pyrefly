@@ -20,7 +20,7 @@
 //!   {"refined": {"kind": "fact-artifact", "version": 2},
 //!    "target": {"file", "contentHash": "sha256:<hex>"},
 //!    "language": "typescript",
-//!    "runtime": {"band": "node-23+"},
+//!    "runtime": {"band": "es2023+"},
 //!    "surface": {"kind": "stdin-json", "stdin": "json", "stdout": "json", "calls": "<fn>"}
 //!      | {"kind": "argv-json", "argIndex": n, "stdout": "json", "calls": "<fn>"}
 //!      | {"kind": "file-json", "argIndex": n, "stdout": "json", "calls": "<fn>"},
@@ -88,11 +88,13 @@ const FOREIGN_ARTIFACT_LANGUAGE: &str = "typescript";
 
 /// The runtime band this checker's TypeScript pins commit to.
 ///
-/// PROVISIONAL: no `js.*` naming ruling has landed yet (reverse-pair.md
-/// item 2); "node-23+" is a placeholder until that ruling names the
-/// real band string. Changing it is a one-line edit once the ruling
-/// lands.
-const FOREIGN_RUNTIME_BAND: &str = "node-23+";
+/// One JS-family band claiming ECMA-262-level behaviour (ruling,
+/// 2026-08-21): every premise the edge discharges is an ECMA-262 claim,
+/// so any recognized JS runner (node, deno, bun, npx tsx) satisfies this
+/// band premise once the artifact declares it — the band names the
+/// SPEC LEVEL the target's checked code runs against, not one runtime
+/// binary.
+const FOREIGN_RUNTIME_BAND: &str = "es2023+";
 
 /// The command that writes a missing artifact — carried into the
 /// diagnostic sentence, so a missing fact reads as a work-queue item
