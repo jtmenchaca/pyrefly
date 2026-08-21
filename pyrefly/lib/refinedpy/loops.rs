@@ -91,6 +91,8 @@ use refined_sets::refinement_forms::at_most;
 use refined_sets::refinement_forms::below;
 use refined_sets::refinement_forms::make_refined_set;
 use refined_sets::refinement_forms::one_of;
+use refined_sets::refinement_forms::RefinedSet;
+use refined_sets::repetition_window_forms::as_repetition;
 use ruff_python_ast::CmpOp;
 use ruff_python_ast::Expr;
 use ruff_python_ast::ExprAttribute;
@@ -303,6 +305,7 @@ fn for_loop_final_environment(
     }
     abstract_element_sort_pass(for_stmt, environment, kernel, judge_context)
         .or_else(|| custom_iterator_element_pass(for_stmt, environment, kernel, judge_context))
+        .or_else(|| repetition_window_element_pass(for_stmt, environment, kernel, judge_context))
 }
 
 /// `for`/`async for` over a CUSTOM ITERATOR — a class instance whose own
@@ -368,7 +371,80 @@ fn custom_iterator_element_pass(
             return Some(LoopAnswer { environment: one_pass, else_runs: false, returned: Some((value, range)) });
         }
     }
-    let joined = Environment::join(environment.fork(), &one_pass);
+    let joined = stabilized_join(
+        environment,
+        &one_pass,
+        &for_stmt.body,
+        for_stmt.target.as_ref(),
+        &element,
+        kernel,
+        judge_context,
+    )?;
+    Some(LoopAnswer { environment: joined, else_runs: true, returned: None })
+}
+
+/// `for`/`async for` over a KNOWN-LENGTH-UNKNOWN, known-element-set
+/// receiver — `Kind::Set` whose only form is the repetition window
+/// `check.rs::seed_parameters` builds for a declared `list[X]`/`set[X]`/
+/// `Sequence[X]` parameter (the element set repeated rather than nested
+/// into exact positional slots, `collection_models::star_element_read`'s
+/// own doc — the same window shape, read the same way, never a second
+/// reader). Every position of the window draws from the SAME element
+/// set, so there is exactly one abstraction to bind the target against:
+/// `as_repetition` reads the window back to its element
+/// (`refined_sets::repetition_window_forms`), the target binds to
+/// `known_set(element, ...)` carrying the SEQUENCE's own trust grade
+/// (`trust_level_of(receiver)` — the same grade `star_element_read`
+/// assigns a read element), and the body runs ONE judged pass over that
+/// single binding, joined with the pre-loop environment for the same
+/// zero-or-more honesty `abstract_element_sort_pass` states in its own
+/// doc.
+///
+/// `None` when the iterable's evaluated value is not a bare repetition
+/// window (any other `Kind::Set` shape, or a different `Kind` — the
+/// concrete `iterable_values` path and `custom_iterator_element_pass`
+/// both already declined by the time this pass runs), when `as_
+/// repetition` cannot read the window back, or when the one abstract
+/// pass hits a statement shape `run_body_once` does not recognize.
+fn repetition_window_element_pass(
+    for_stmt: &StmtFor,
+    environment: &Environment,
+    kernel: &Arc<RefinedTSKernel>,
+    judge_context: &mut JudgeContext,
+) -> Option<LoopAnswer> {
+    let receiver = evaluate_expression(for_stmt.iter.as_ref(), environment, kernel);
+    if receiver.kind != Kind::Set || receiver.set_kind_tag != SetKindTag::None {
+        return None;
+    }
+    let repeated = as_repetition(&receiver.set)?;
+    // The element inherits the sequence's own numeric sort — the same
+    // threading the comprehension's element bind and star_element_read
+    // perform, so a body term like `s * s` reaches the sort-gated
+    // transfer models.
+    let element = AbstractValue {
+        kind_tag: receiver.kind_tag,
+        ..known_set(repeated.element, None, trust_level_of(&receiver), SetKindTag::None)
+    };
+
+    let mut one_pass = environment.fork();
+    if !bind_for_target(for_stmt.target.as_ref(), &element, &mut one_pass) {
+        return None;
+    }
+    match run_body_once(&for_stmt.body, &mut one_pass, kernel, judge_context)? {
+        BodyOutcome::Fell | BodyOutcome::Continued | BodyOutcome::Broke => {}
+        BodyOutcome::Returned(value, range) => {
+            return Some(LoopAnswer { environment: one_pass, else_runs: false, returned: Some((value, range)) });
+        }
+    }
+    let joined = stabilized_join(
+        environment,
+        &one_pass,
+        &for_stmt.body,
+        for_stmt.target.as_ref(),
+        &element,
+        kernel,
+        judge_context,
+    )?;
     Some(LoopAnswer { environment: joined, else_runs: true, returned: None })
 }
 
@@ -440,10 +516,280 @@ fn abstract_element_sort_pass(
             return Some(LoopAnswer { environment: one_pass, else_runs: false, returned: Some((value, range)) });
         }
     }
-    let joined = Environment::join(environment.fork(), &one_pass);
+    let joined = stabilized_join(
+        environment,
+        &one_pass,
+        &for_stmt.body,
+        for_stmt.target.as_ref(),
+        &element_sort,
+        kernel,
+        judge_context,
+    )?;
     Some(LoopAnswer { environment: joined, else_runs: true, returned: None })
 }
 
+/// The loop target's own bare-name spelling, if the target is one — a
+/// tuple target's own sub-names are read the same way `bind_for_target`
+/// binds them, but every one of these three passes only ever binds a
+/// SINGLE element abstraction to the whole target, so a tuple target
+/// here is out of scope for the same reason it already declines
+/// `bind_for_target` widely elsewhere: this helper only needs the bare
+/// case to build the exclusion set `stabilized_join` compares against.
+fn target_names(target: &Expr, names: &mut std::collections::HashSet<String>) {
+    match target {
+        Expr::Name(name) => {
+            names.insert(name.id.to_string());
+        }
+        Expr::Tuple(tuple) => {
+            for element in &tuple.elts {
+                target_names(element, names);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Every bare name a loop body's own statements write to, collected
+/// SYNTACTICALLY (never by reading bindings back) — `Assign`/`AnnAssign`
+/// targets, `AugAssign` targets, a subscript-store's/mutating-method-
+/// call's own receiver name (`run_subscript_assign_once`/`run_expr_
+/// statement_once`'s own rebind), recursed into every `if`/`elif`/`else`
+/// arm the same way `run_body_once`/`run_if_once` walk them. The set is
+/// a superset of what any ONE concrete pass actually writes (an untaken
+/// `if` arm's names are included too), which is the safe direction for
+/// `stabilized_join`'s own use: a name this walk never actually wrote on
+/// either pass reads identically from both (nothing rebinds it), so
+/// including it in the comparison costs nothing — it is never found
+/// unstable, just checked and confirmed stable.
+fn written_names(body: &[Stmt], names: &mut std::collections::HashSet<String>) {
+    for stmt in body {
+        match stmt {
+            Stmt::Assign(assign) => {
+                for target in &assign.targets {
+                    match target {
+                        Expr::Name(name) => {
+                            names.insert(name.id.to_string());
+                        }
+                        Expr::Subscript(subscript) => {
+                            if let Expr::Name(name) = subscript.value.as_ref() {
+                                names.insert(name.id.to_string());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Stmt::AnnAssign(assign) => {
+                if let Expr::Name(name) = assign.target.as_ref() {
+                    names.insert(name.id.to_string());
+                }
+            }
+            Stmt::AugAssign(assign) => {
+                if let Expr::Name(name) = assign.target.as_ref() {
+                    names.insert(name.id.to_string());
+                }
+            }
+            Stmt::If(if_stmt) => {
+                written_names(&if_stmt.body, names);
+                for clause in &if_stmt.elif_else_clauses {
+                    written_names(&clause.body, names);
+                }
+            }
+            Stmt::Expr(expr_stmt) => {
+                if let Expr::Call(call) = expr_stmt.value.as_ref()
+                    && let Expr::Attribute(attribute) = call.func.as_ref()
+                {
+                    // both the bare mutating-call shape and the chained
+                    // `setdefault(...).append(...)` shape rebind the
+                    // OUTERMOST receiver name — `run_expr_statement_once`/
+                    // `run_setdefault_append_once`'s own `environment.bind`
+                    // call — found by descending through `.value` past any
+                    // number of chained attribute/call layers to the
+                    // innermost bare Name.
+                    let mut receiver = attribute.value.as_ref();
+                    loop {
+                        match receiver {
+                            Expr::Name(name) => {
+                                names.insert(name.id.to_string());
+                                break;
+                            }
+                            Expr::Call(inner_call) => match inner_call.func.as_ref() {
+                                Expr::Attribute(inner_attribute) => receiver = inner_attribute.value.as_ref(),
+                                _ => break,
+                            },
+                            _ => break,
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Whether `narrower.set` is provably contained in `wider.set` — the
+/// question `stabilized_join` asks when the structural rejoin test
+/// cannot answer stability for a `Kind::Set` pair, because `join_known`'s
+/// general set-combining path has NO STRUCTURAL FIXPOINT: it always
+/// wraps both operand sets in a fresh, unreduced `union(...)` node
+/// (`lattice_operations.rs`'s fallback), so `join(J, second_pass)`
+/// re-wraps rather than converging back to `J`'s own shape even when the
+/// second pass denotes nothing new — a raw element set and that same set
+/// folded one layer deeper through a prior `union` never compare equal
+/// under `RefinedSet`'s derived `PartialEq`, no matter how many times the
+/// rejoin runs. Stability under repetition means exactly that the second
+/// pass's set is already covered by the first join's set (join only
+/// grows, so "the rejoin adds nothing" and "the second pass's set ⊆ the
+/// first join's set" are the same claim) — a question the KERNEL decides
+/// on the actual admitted values, not on either side's syntactic form.
+///
+/// `kernel.scalar_subset` is tried first — the ordinary 1-tuple-layer
+/// question, covering the two-passes-of-a-numeric-set case both
+/// `g_iter_bind`/`g_iter_mul` are — then `kernel.seq_subset` when
+/// `scalar_subset` refuses (a sequence-shaped set the scalar decider
+/// cannot read; `assignability.rs`'s own containment law tries the same
+/// two asks, ordered by which shape is more likely, with the same
+/// fallback-on-refusal posture). Both asks panic inside the kernel
+/// closure on a refusal — the crate's established `catch_unwind`/
+/// `AssertUnwindSafe` idiom (`assignability.rs`, `lattice_conformance.rs`)
+/// catches that and reads it as "no proof," never a crash. `true` from
+/// either ask is a theorem; `false`, or a refusal from both, is not a
+/// disproof — it is simply no proof of stability, so the caller havocs,
+/// the same posture every other refused containment ask in this crate
+/// already takes.
+fn stable_by_containment(narrower: &RefinedSet, wider: &RefinedSet, kernel: &Arc<RefinedTSKernel>) -> bool {
+    let scalar_asked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        (kernel.scalar_subset)(narrower, wider)
+    }));
+    if let Ok(subset) = scalar_asked {
+        return subset;
+    }
+    let seq_asked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (kernel.seq_subset)(narrower, wider)));
+    matches!(seq_asked, Ok(true))
+}
+
+/// The stability check every one-pass-plus-join abstract loop pass
+/// shares: a body that only REBINDS its written names (`last = s`) sees
+/// the same value on a second pass as the first, so joining the pre-loop
+/// state with one pass is already a fixpoint. A body that ACCUMULATES
+/// (`total += s * s`) does not — a second pass adds another term on top
+/// of the first pass's own joined value, so the name a single join would
+/// report is a bound the real, unboundedly-many-iteration run can
+/// exceed. This function tells the two apart by running the body a
+/// SECOND time, from a fork of the join of `environment` (pre-loop) and
+/// `one_pass` (the first pass's own environment) — call that join `J` —
+/// and testing, for every name the body writes, whether joining the
+/// SECOND pass's own value into `J` changes `J` at all: a name is stable
+/// when `join(J, second_pass) == J`, since `join_known` is idempotent
+/// exactly where the second pass adds no new information beyond what `J`
+/// already states. `PartialEq` alone answers this correctly for a
+/// `Kind::Values` pair (the same-tag join arms only append values not
+/// already present, so an already-covered join reproduces the identical
+/// `Vec<f64>`), but `join_known` HAS NO STRUCTURAL FIXPOINT for a
+/// `Kind::Set` pair — its general fallback always wraps both sides in a
+/// fresh `union(...)` node, so a rejoin that denotes nothing new still
+/// produces a NEW, differently-shaped `RefinedSet` that `PartialEq` calls
+/// unequal. For that case (both sides `Kind::Set`, `SetKindTag::None`)
+/// the structural mismatch is not read as instability outright — the
+/// kernel is asked the real question instead, `stable_by_containment`'s
+/// own containment verdict: the second pass's set is stable exactly when
+/// it is CONTAINED in `J`'s set, which is what "the rejoin adds nothing"
+/// actually means once the join no longer has a structural fixed point
+/// to compare against. A name whose value is still `PartialEq`-unequal
+/// AND (for a Set pair) not kernel-proved contained is REBOUND to
+/// `unknown()` in the final environment, since it holds no claim this
+/// walk can make; every other name — including one the body never
+/// actually touches on this concrete run — keeps its `J` value. The loop
+/// target itself is excluded from this comparison and this havoc: it is
+/// rebound to a fresh element abstraction every iteration by construction
+/// (`bind_for_target`'s own call at each pass), never accumulated, so
+/// comparing it across passes would only ever measure two different
+/// intentional bindings and never a genuine instability.
+///
+/// The names compared are every bare name `written_names` finds
+/// SYNTACTICALLY in `body` (a superset of what one concrete pass
+/// actually writes is safe here — see that function's own doc). For each
+/// one, `J`'s own value and the second pass's own value are re-joined
+/// through the same `lattice_operations::join_known` every ordinary
+/// branch join already uses (via `Environment::join` on two single-
+/// binding forks). A value that happens to be `PartialEq`-different from
+/// `J` after the re-join, and is not a `Kind::Set` pair the kernel proves
+/// contained, is at worst treated as unstable and havoced to unknown,
+/// which is always a weaker, still-undetermined answer, never a wrong
+/// one — a question the kernel refuses leaves the name havoced, the same
+/// as a structural mismatch it never had the chance to ask about.
+///
+/// Returns `None` when the second pass hits a statement shape `run_body_
+/// once` cannot run (the same "this loop is not this module's shape"
+/// decline the first pass already uses) — an unwalkable second pass
+/// gives no stability answer to trust, so the whole loop declines rather
+/// than publish the first pass's own join unchecked. The second pass's
+/// own control-flow outcome (`Broke`/`Continued`/`Returned`) is read only
+/// as this success/failure signal; its `Returned` value is not itself
+/// used to build the answer since the second pass's whole purpose here
+/// is the stability comparison, not a fresh answer to return through.
+fn stabilized_join(
+    environment: &Environment,
+    one_pass: &Environment,
+    body: &[Stmt],
+    target: &Expr,
+    element: &AbstractValue,
+    kernel: &Arc<RefinedTSKernel>,
+    judge_context: &mut JudgeContext,
+) -> Option<Environment> {
+    let joined = Environment::join(environment.fork(), one_pass);
+
+    let mut second_pass = joined.fork();
+    if !bind_for_target(target, element, &mut second_pass) {
+        return None;
+    }
+    run_body_once(body, &mut second_pass, kernel, judge_context)?;
+
+    let mut excluded = std::collections::HashSet::new();
+    target_names(target, &mut excluded);
+    let mut candidates = std::collections::HashSet::new();
+    written_names(body, &mut candidates);
+
+    let mut result = joined.fork();
+    for name in candidates {
+        if excluded.contains(&name) {
+            continue;
+        }
+        let Some(joined_value) = joined.read(&name) else {
+            continue;
+        };
+        let Some(second_value) = second_pass.read(&name) else {
+            continue;
+        };
+        // a single-name fork carrying just this one binding, joined
+        // against the same single-name binding off `joined` — the
+        // per-name reading of `join(J, second_pass) == J`, built out of
+        // the same two-environment `Environment::join` every call site
+        // already uses rather than a new per-value join entry point.
+        let mut left = joined.fork();
+        left.bind(&name, joined_value.clone());
+        let mut right = joined.fork();
+        right.bind(&name, second_value.clone());
+        let rejoined = Environment::join(left, &right);
+        let rejoined_value = rejoined.read(&name);
+        let mut stable = rejoined_value == joined.read(&name);
+        // the structural rejoin has no fixpoint for a Set pair — ask the
+        // kernel whether the second pass's set is genuinely covered by
+        // `J`'s set before havocing what may be a real determination.
+        if !stable
+            && joined_value.kind == Kind::Set
+            && second_value.kind == Kind::Set
+            && joined_value.set_kind_tag == SetKindTag::None
+            && second_value.set_kind_tag == SetKindTag::None
+        {
+            stable = stable_by_containment(&second_value.set, &joined_value.set, kernel);
+        }
+        if !stable {
+            result.bind(&name, unknown());
+        }
+    }
+    Some(result)
+}
 
 /// `while <name> <op> <literal>: <body> [else: <body>]`, where `<op>`
 /// is `<` or `<=` and the loop is a plain counter this function can run

@@ -286,6 +286,19 @@ pub struct Environment {
     /// retained-callable tables need: this value never has to outlive
     /// the statement whose walk set it.
     evaluated_node: Option<(TextRange, AbstractValue)>,
+    /// Every value this body's `return` statements produced, in walk
+    /// order — `None` unless a caller asked for them
+    /// (`collect_returned_values`). `check.rs::walk_return` records the
+    /// value it already computed for judging; nothing else writes here,
+    /// and a walk that never opts in pays one `Option` check per return.
+    ///
+    /// `Arc<Mutex<...>>` for the same reason `retained_callables` is:
+    /// a `return` inside an `if`/`for`/`try` arm runs against a FORK of
+    /// this environment and the fork's own writes must still reach the
+    /// asker after the arms rejoin — `join` keeps only `a`'s tables, so
+    /// a per-environment `Vec` would silently drop every branch arm's
+    /// returns. Sharing the one map makes the recording fork-blind.
+    returned_values: Option<Arc<Mutex<Vec<AbstractValue>>>>,
 }
 
 impl Environment {
@@ -305,6 +318,7 @@ impl Environment {
             retained_callable_counter: Arc::new(AtomicU32::new(0)),
             lambda_keys_by_range: Arc::new(Mutex::new(HashMap::new())),
             evaluated_node: None,
+            returned_values: None,
         }
     }
 
@@ -477,6 +491,39 @@ impl Environment {
         }
     }
 
+    /// Asks this body's walk to record every value its `return`
+    /// statements produce (`returned_values`'s own doc). Called once,
+    /// before the body walks; every fork made afterwards shares the one
+    /// recorder.
+    pub fn collect_returned_values(&mut self) {
+        self.returned_values = Some(Arc::new(Mutex::new(Vec::new())));
+    }
+
+    /// Records one `return`'s value, when this walk was asked for them.
+    /// A no-op otherwise, which is every ordinary walk.
+    pub fn record_returned_value(&self, value: AbstractValue) {
+        let Some(recorder) = self.returned_values.as_ref() else {
+            return;
+        };
+        recorder
+            .lock()
+            .expect("returned-values recorder poisoned by an earlier panic")
+            .push(value);
+    }
+
+    /// Every value this body's `return` statements produced, in walk
+    /// order — an empty vector for a walk that recorded none, `None`
+    /// for a walk that was never asked to record.
+    pub fn returned_values(&self) -> Option<Vec<AbstractValue>> {
+        Some(
+            self.returned_values
+                .as_ref()?
+                .lock()
+                .expect("returned-values recorder poisoned by an earlier panic")
+                .clone(),
+        )
+    }
+
     /// Record what a name holds after a statement the walk understood.
     pub fn bind(&mut self, name: &str, value: AbstractValue) {
         self.bindings.insert(name.to_owned(), value);
@@ -520,6 +567,9 @@ impl Environment {
             // own element pass, a branch arm), so the published node
             // travels with it
             evaluated_node: self.evaluated_node.clone(),
+            // the SAME recorder, never a copy: a `return` inside the arm
+            // this fork walks must reach the asker (the field's own doc)
+            returned_values: self.returned_values.clone(),
         }
     }
 
@@ -543,6 +593,9 @@ impl Environment {
         let retained_callables = a.retained_callables;
         let retained_callable_counter = a.retained_callable_counter;
         let lambda_keys_by_range = a.lambda_keys_by_range;
+        // both arms forked from one environment, so they hold the SAME
+        // recorder `Arc` — carrying `a`'s carries both arms' recordings
+        let returned_values = a.returned_values;
         for (name, value_a) in a.bindings {
             if let Some(value_b) = b.bindings.get(&name) {
                 bindings.insert(
@@ -565,6 +618,7 @@ impl Environment {
             // a join lands past the statement whose walk published a
             // node, so nothing carries forward
             evaluated_node: None,
+            returned_values,
         }
     }
 }

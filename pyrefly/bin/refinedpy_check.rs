@@ -16,13 +16,22 @@
 //! - a file that does not parse prints `path: the entry file did not parse`.
 //!
 //! Exit 0 when nothing prints — every expectation held.
+//!
+//! `--export-fact <file.py>` is the OTHER mode: instead of judging, it
+//! writes the module's fact artifact (`refinedpy::fact_export`) to
+//! `<file.py>.refined.json`, or to the path `-o` names. Every def with a
+//! fully declared refined entry and a derivable return set is carried;
+//! every def that is not is named on stderr with the construct that
+//! stopped it. Exit 0 when the artifact was written.
 
 use std::path::Path;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
 use pyrefly::refinedpy::check::findings_for_module_with_resolver;
 use pyrefly::refinedpy::cross_module::disk_resolver;
+use pyrefly::refinedpy::fact_export::export_module;
 use pyrefly::refinedpy::kernel_path::resolve_kernel_dylib;
 use pyrefly::refinedpy::markers::line_col;
 use pyrefly::refinedpy::markers::line_starts_of;
@@ -91,12 +100,107 @@ fn check_file(path: &str, kernel: &Arc<RefinedTSKernel>) -> (usize, Vec<String>)
     (printed, lines_output)
 }
 
-fn main() -> ExitCode {
-    let files: Vec<String> = std::env::args().skip(1).collect();
-    if files.is_empty() {
-        eprintln!("usage: refinedpy-check <file.py> [...]");
+/// Writes `path`'s fact artifact to `output` (the path `-o` named, or
+/// `<path>.refined.json`). Every omitted def is named on stderr with the
+/// construct that stopped it; the artifact itself carries only computed
+/// facts. Non-zero only when the file cannot be read, cannot be parsed,
+/// or the artifact cannot be written.
+fn export_file(path: &str, output: &Path, kernel: &Arc<RefinedTSKernel>) -> ExitCode {
+    let Ok(source) = std::fs::read(path) else {
+        eprintln!("{path}: the entry file could not be read");
+        return ExitCode::from(2);
+    };
+    let Ok(text) = String::from_utf8(source.clone()) else {
+        eprintln!("{path}: the entry file is not UTF-8");
+        return ExitCode::from(2);
+    };
+    let Ok(parsed) = ruff_python_parser::parse_module(&text) else {
+        eprintln!("{path}: the entry file did not parse");
+        return ExitCode::from(2);
+    };
+    let module = parsed.into_syntax();
+    // The same resolver the judging path uses, so a def reading an
+    // imported name derives exactly what the checker derives for it.
+    let entry_directory = Path::new(path).parent().filter(|dir| !dir.as_os_str().is_empty());
+    let resolver = disk_resolver(entry_directory.unwrap_or_else(|| Path::new(".")).to_path_buf());
+    let basename = Path::new(path)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_owned());
+
+    let export = export_module(&module, &source, &basename, &resolver, kernel);
+    for omission in &export.omissions {
+        eprintln!(
+            "{path}: '{}' is not exported: {}",
+            omission.function, omission.reason
+        );
+    }
+    let rendered = match serde_json::to_string_pretty(&export.artifact) {
+        Ok(rendered) => rendered,
+        Err(err) => {
+            eprintln!("{path}: the artifact could not be rendered: {err}");
+            return ExitCode::from(2);
+        }
+    };
+    if let Err(err) = std::fs::write(output, format!("{rendered}\n")) {
+        eprintln!("{}: the artifact could not be written: {err}", output.display());
         return ExitCode::from(2);
     }
+    ExitCode::SUCCESS
+}
+
+/// The command line read into one of the two modes: `--export-fact
+/// <file.py> [-o <path>]`, or the ordinary list of files to judge. A
+/// command line that is neither answers `None` and the caller prints the
+/// usage line.
+enum Invocation {
+    Judge(Vec<String>),
+    Export { file: String, output: PathBuf },
+}
+
+fn read_invocation(arguments: &[String]) -> Option<Invocation> {
+    let mut export_target: Option<String> = None;
+    let mut output: Option<PathBuf> = None;
+    let mut files: Vec<String> = Vec::new();
+    let mut index = 0;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--export-fact" => {
+                export_target = Some(arguments.get(index + 1)?.clone());
+                index += 2;
+            }
+            "-o" => {
+                output = Some(PathBuf::from(arguments.get(index + 1)?));
+                index += 2;
+            }
+            other => {
+                files.push(other.to_owned());
+                index += 1;
+            }
+        }
+    }
+    if let Some(file) = export_target {
+        // extra positional files alongside --export-fact would be
+        // silently ignored, which is worse than refusing the line
+        if !files.is_empty() {
+            return None;
+        }
+        let output = output.unwrap_or_else(|| PathBuf::from(format!("{file}.refined.json")));
+        return Some(Invocation::Export { file, output });
+    }
+    if output.is_some() || files.is_empty() {
+        return None;
+    }
+    Some(Invocation::Judge(files))
+}
+
+fn main() -> ExitCode {
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    let Some(invocation) = read_invocation(&arguments) else {
+        eprintln!("usage: refinedpy-check <file.py> [...]");
+        eprintln!("       refinedpy-check --export-fact <file.py> [-o <path>]");
+        return ExitCode::from(2);
+    };
     let Some(dylib) = resolve_kernel_dylib() else {
         eprintln!("refinedpy-check: kernel dylib not found (set REFINEDPY_KERNEL_DYLIB or build it: pnpm kernel:native)");
         return ExitCode::from(2);
@@ -107,6 +211,11 @@ fn main() -> ExitCode {
             eprintln!("refinedpy-check: kernel failed to load: {err:?}");
             return ExitCode::from(2);
         }
+    };
+
+    let files = match invocation {
+        Invocation::Export { file, output } => return export_file(&file, &output, &kernel),
+        Invocation::Judge(files) => files,
     };
 
     let mut total_printed = 0;

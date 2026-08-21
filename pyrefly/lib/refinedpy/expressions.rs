@@ -3496,11 +3496,19 @@ fn comprehension_target_and_elements<'a>(
 /// concrete path first and only reaches here on ITS decline. The
 /// window's own `{lo, hi}` rides back alongside the element so the
 /// caller can restate it on the mapped result.
+///
+/// The SOURCE NAME — the iterable's own spelling, when `clause.iter` is
+/// a plain `Expr::Name` — rides back too, `None` for any other iterable
+/// expression (a call, an attribute read, a subscript). The caller uses
+/// it to record that the mapped result's own length is proved equal to
+/// that name's (`AbstractValue::same_length_as`), which only holds for
+/// a plain-name source: an iterable built by an expression has no
+/// single binding whose later `len(...)` this value could be tied to.
 fn comprehension_target_and_star_element<'a>(
     generators: &'a [ruff_python_ast::Comprehension],
     environment: &Environment,
     kernel: &Arc<RefinedTSKernel>,
-) -> Option<(Vec<&'a str>, &'a [Expr], AbstractValue, i64, Option<i64>)> {
+) -> Option<(Vec<&'a str>, &'a [Expr], AbstractValue, i64, Option<i64>, Option<&'a str>)> {
     let [clause] = generators else {
         return None;
     };
@@ -3508,13 +3516,28 @@ fn comprehension_target_and_star_element<'a>(
         return None;
     }
     let target_names = comprehension_target_names(&clause.target)?;
+    let source_name = match &clause.iter {
+        Expr::Name(name) => Some(name.id.as_str()),
+        _ => None,
+    };
     let iterable = evaluate_expression(&clause.iter, environment, kernel);
     if iterable.kind != Kind::Set || iterable.set_kind_tag != SetKindTag::None {
         return None;
     }
     let repeated = as_repetition(&iterable.set)?;
-    let element = known_set(repeated.element, None, TrustSpec, SetKindTag::None);
-    Some((target_names, &clause.ifs, element, repeated.lo, repeated.hi))
+    // The element's own sort is the SEQUENCE's tag, not re-derived: the
+    // sequence value carries `kind_tag` off its declared element sort
+    // (`check.rs::seed_parameters`'s sequence-container arm), so peeling
+    // one element out of the repetition keeps that same tag rather than
+    // rebuilding it — `min_max_scalar_operand` (builtin_models.rs) reads
+    // an element pulled this way as a `Kind::Set` operand and needs its
+    // own `kind_tag` to answer `min`/`max` over two comprehension-bound
+    // names.
+    let element = AbstractValue {
+        kind_tag: iterable.kind_tag,
+        ..known_set(repeated.element, None, TrustSpec, SetKindTag::None)
+    };
+    Some((target_names, &clause.ifs, element, repeated.lo, repeated.hi, source_name))
 }
 
 /// The star-shaped result of a list/set/generator comprehension over an
@@ -3534,13 +3557,24 @@ fn comprehension_target_and_star_element<'a>(
 /// can drop positions down to zero, so `lo` widens to 0 whenever
 /// `conditions` is non-empty; `hi` is unaffected either way (a filter
 /// only ever removes positions, never adds them).
+///
+/// SOUNDNESS LINE for `AbstractValue::same_length_as`: the result's
+/// length is proved EQUAL to the source's own length -- not merely
+/// bounded by the same window -- only when `conditions` is empty. A
+/// filtered comprehension can drop positions, so `len(result) <=
+/// len(source)` but never provably `==`; `same_length_as` must NOT be
+/// set in that case, on pain of `relational_sum.rs::is_len_of`
+/// accepting a division by a count the accumulation never actually ran
+/// over. This mirrors the `lo` widening below: both readings state the
+/// same fact (whether every position survived), once as a window bound
+/// and once as a name link.
 fn comprehension_star_elements(
     element_expr: &Expr,
     generators: &[ruff_python_ast::Comprehension],
     environment: &Environment,
     kernel: &Arc<RefinedTSKernel>,
 ) -> Option<AbstractValue> {
-    let (target_names, conditions, element, source_lo, source_hi) =
+    let (target_names, conditions, element, source_lo, source_hi, source_name) =
         comprehension_target_and_star_element(generators, environment, kernel)?;
     let mut fork = environment.fork();
     if !bind_comprehension_target(&mut fork, &target_names, &element) {
@@ -3555,8 +3589,17 @@ fn comprehension_star_elements(
     }
     let lo = if conditions.is_empty() { source_lo } else { 0 };
     let window = repetition(mapped.set.clone(), lo, source_hi);
+    // `conditions.is_empty()` gates this the SAME way it gates `lo`
+    // above: a filter can drop positions, so the length link would be
+    // an unproved claim once one is present.
+    let same_length_as = if conditions.is_empty() {
+        source_name.map(str::to_owned)
+    } else {
+        None
+    };
     Some(AbstractValue {
         kind_tag: mapped.kind_tag,
+        same_length_as,
         ..known_set(window, None, TrustSpec, SetKindTag::None)
     })
 }

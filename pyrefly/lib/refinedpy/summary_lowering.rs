@@ -60,6 +60,7 @@
 //! | a bare name naming a slot | `var` (a numeric read) |
 //! | an `int`/`float` literal | `const` holding that one value |
 //! | `True` / `False` | `const` holding 1 / 0 |
+//! | `a * a` — the SAME source variable on both sides | `sq` (the correlated square image) |
 //! | `a + b`, `a - b`, `a * b` | the matching `binary64` binary |
 //! | `a / b`, `a // b`, `a % b`, `a ** b`, the bitwise operators | declines |
 //! | `-a` | `binary64.neg` |
@@ -486,6 +487,25 @@ impl Lowering {
                 UnaryOp::UAdd => self.lower_expression(unary.operand.as_ref()),
                 _ => None,
             },
+            // `x * x` — the SAME source variable on both sides — is a
+            // structural square: the kernel's `Effect.sq` answers the
+            // correlated image `[0, max²]`, which the general product
+            // `Binary(Mul, Var(i), Var(i))` cannot, since the kernel no
+            // longer recognizes x*x by syntax (unsound under
+            // renaming). Read directly off the two `Expr::Name` nodes,
+            // before either side lowers: this is the one place the
+            // identifier binding is honestly known.
+            Expr::BinOp(binop) if is_same_name_square(binop) => {
+                let Expr::Name(name) = binop.left.as_ref() else {
+                    unreachable!("is_same_name_square only matches two Expr::Name operands");
+                };
+                let index = self.slot_of(name.id.as_str())?;
+                Some(LoopEffect {
+                    kind: LoopEffectKind::Sq,
+                    index,
+                    ..Default::default()
+                })
+            }
             Expr::BinOp(binop) => {
                 let op = arithmetic_op(binop.op)?;
                 let left = self.lower_expression(binop.left.as_ref())?;
@@ -495,6 +515,23 @@ impl Lowering {
             _ => None,
         }
     }
+}
+
+/// Whether a `BinOp` is `<name> * <name>` for the SAME identifier on
+/// both sides — decided from the source AST's own two `Expr::Name`
+/// nodes, never from a lowered effect, which has already erased which
+/// variable a term came from. A different identifier on each side (or
+/// anything but two bare names) keeps the general `Mul` lowering,
+/// since only a proven-identical source binding licenses the
+/// correlated square.
+fn is_same_name_square(binop: &ruff_python_ast::ExprBinOp) -> bool {
+    if !matches!(binop.op, Operator::Mult) {
+        return false;
+    }
+    let (Expr::Name(left), Expr::Name(right)) = (binop.left.as_ref(), binop.right.as_ref()) else {
+        return false;
+    };
+    left.id.as_str() == right.id.as_str()
 }
 
 /// The three Python operators whose meaning the kernel's `binary64`
@@ -760,6 +797,30 @@ mod tests {
         assert!(lower_function_body(&parsed_def("def half(x):\n    return x // 2\n")).is_none());
         assert!(lower_function_body(&parsed_def("def rest(x):\n    return x % 2\n")).is_none());
         assert!(lower_function_body(&parsed_def("def square(x):\n    return x ** 2\n")).is_none());
+    }
+
+    #[test]
+    fn a_name_multiplied_by_itself_lowers_to_the_structural_square() {
+        // slots: x=0, #done=1, #ret=2 — the return writes #ret first
+        let def = parsed_def("def square(x):\n    return x * x\n");
+        let lowered = lower_function_body(&def).expect("x * x lowers");
+        assert_eq!(
+            wires(&lowered)[0],
+            r#"{"assign":{"target":2,"e":{"sq":0}}}"#,
+            "x * x must lower to the sq effect, not the general mul"
+        );
+    }
+
+    #[test]
+    fn two_distinct_names_multiplied_keep_the_general_mul_lowering() {
+        // slots: x=0, y=1, #done=2, #ret=3
+        let def = parsed_def("def product(x, y):\n    return x * y\n");
+        let lowered = lower_function_body(&def).expect("x * y lowers");
+        assert_eq!(
+            wires(&lowered)[0],
+            r#"{"assign":{"target":3,"e":{"op":"binary64.mul","A":{"var":0},"B":{"var":1}}}}"#,
+            "distinct operands must keep the general mul lowering"
+        );
     }
 
     #[test]

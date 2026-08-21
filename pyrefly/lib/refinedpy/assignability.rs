@@ -739,7 +739,7 @@ fn sequence_shaped(set: &refined_sets::refinement_forms::RefinedSet) -> bool {
 /// length-1 encoding is bare `OneOf`, no `Concatenation` wrapper), so
 /// the sort law must see an actual sequence form before it may read
 /// "on the one-tuple layer" as "numeric."
-fn states_sequence(set: &refined_sets::refinement_forms::RefinedSet) -> bool {
+pub(crate) fn states_sequence(set: &refined_sets::refinement_forms::RefinedSet) -> bool {
     use refined_sets::refinement_forms::Form;
     set.forms.iter().any(|form| {
         matches!(

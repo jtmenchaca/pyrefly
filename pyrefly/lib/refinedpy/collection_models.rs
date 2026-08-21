@@ -95,7 +95,10 @@ use refined_domain::abstract_value::{
     known_set, known_values, null_value, unknown, AbstractValue, Kind, ObjectKey, PrimitiveKind, SetKindTag,
 };
 use refined_domain::known_constructors::{known_list, known_object};
-use refined_domain::trust_grades::{trust_level_of, TrustProved};
+use refined_domain::lattice_operations::{join_known, set_of_known};
+use refined_domain::trust_grades::{min_trust_level, trust_level_of, TrustLevel, TrustProved};
+use refined_kernel::kernel_bridge::kernel_if_loaded;
+use refined_kernel::kernel_interface::KnownStateWire;
 use refined_sets::refinement_forms::at_least;
 use refined_sets::refinement_forms::at_most;
 use refined_sets::refinement_forms::make_refined_set;
@@ -390,6 +393,79 @@ fn dict_key_read(keys: &[ObjectKey], key: &DictKey) -> Option<AbstractValue> {
         .map(|entry| entry.value.clone())
 }
 
+/// The kernel state a SCALAR knowledge value denotes — narrowed to the
+/// two shapes `dict_key_set_read`'s fold ever hands it: an untagged
+/// numeric-or-other `Kind::Values` singleton set, or a plain `Kind::Set`
+/// (`set_kind_tag == SetKindTag::None`). Mirrors
+/// `lattice_conformance.rs`'s own `state_of_known`, cut down to the
+/// scalar-set rows this call site can produce — no Undef/Null/NaN/
+/// wrapper arm, since a dict entry's own value never reaches this fold
+/// in one of those shapes without already having declined earlier
+/// (`dict_key_read` hands back the entry's `AbstractValue` verbatim,
+/// and `word_tuples_of`'s gate above only ever supplies exact-string
+/// keys, never an absent/NaN VALUE). `set_of_known` is the existing
+/// tuple-layer reader every other kernel-asking row in this crate
+/// already uses to reach a `RefinedSet`.
+fn known_state_of(value: &AbstractValue) -> Option<KnownStateWire> {
+    if value.kind != Kind::Values && value.kind != Kind::Set {
+        return None;
+    }
+    if value.kind == Kind::Set && value.set_kind_tag != SetKindTag::None {
+        return None; // a worn set (bigint/symbol) carries no ℝ̄ member — set_of_known refuses it too
+    }
+    let set = set_of_known(value)?;
+    Some(KnownStateWire { top: false, set, undef: false, null: false, nan: false, thrown: false })
+}
+
+/// The reverse of `known_state_of`: a kernel-answered state back to an
+/// `AbstractValue`, at the joined trust grade — only for the plain,
+/// flag-free state the two scalar-set rows above ever produce or ask
+/// about. `top`/`undef`/`null`/`nan`/`thrown` all being unset is the
+/// gate: any flag means the answer left the scalar-set world this fold
+/// lives in, and the caller falls back to `join_known` rather than
+/// misreading a flagged wire as a plain set.
+fn known_value_of_state(state: &KnownStateWire, grade: TrustLevel) -> Option<AbstractValue> {
+    if state.top || state.undef || state.null || state.nan || state.thrown {
+        return None;
+    }
+    Some(known_set(state.set.clone(), None, grade, SetKindTag::None))
+}
+
+/// The delegate-first fold `dict_key_set_read` folds two dict-entry
+/// values through: ask the kernel's proved `join_state`
+/// (`kernel_interface.rs`'s `join_state` field, the same entry
+/// `lattice_conformance.rs`'s own conformance suite holds
+/// `refined_domain::lattice_operations::join_known` to) when both sides
+/// convert to a scalar kernel state, and use ITS answer over the local
+/// `join_known`. `catch_unwind` turns a kernel panic into a refusal
+/// rather than a crash — the same discipline `assignability.rs`/
+/// `builtin_models.rs` already hold every kernel ask to. On any
+/// refusal — no loaded kernel, a non-convertible operand shape, a
+/// flagged answer, or a caught panic — `join_known` runs unchanged as
+/// the fallback; this function never weakens what `join_known` alone
+/// already proves.
+fn kernel_joined_set(so_far: AbstractValue, found: AbstractValue) -> AbstractValue {
+    let fallback = || join_known(so_far.clone(), found.clone());
+    let Some(kernel) = kernel_if_loaded() else {
+        return fallback();
+    };
+    let Some(state_a) = known_state_of(&so_far) else {
+        return fallback();
+    };
+    let Some(state_b) = known_state_of(&found) else {
+        return fallback();
+    };
+    let asked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (kernel.join_state)(&state_a, &state_b)));
+    let Ok(joined_state) = asked else {
+        return fallback();
+    };
+    let grade = min_trust_level(trust_level_of(&so_far), trust_level_of(&found));
+    match known_value_of_state(&joined_state, grade) {
+        Some(value) => value,
+        None => fallback(),
+    }
+}
+
 /// `container[key]` on a known DICT receiver with a key that is a
 /// FINITE UNION of known exact strings (`key = "age" if flag else
 /// "years"`'s own joined shape, `Kind::Set` — `lattice_operations
@@ -409,7 +485,10 @@ fn dict_key_read(keys: &[ObjectKey], key: &DictKey) -> Option<AbstractValue> {
 /// narrowing rows use the identical reader); a set that is not this
 /// union-of-known-words shape (an unbounded range, an unrelated form)
 /// answers `None` from `word_tuples_of` itself, and this function
-/// declines in step.
+/// declines in step. The fold asks the kernel's `join_state` first
+/// (`kernel_joined_set`) when both accumulated values are scalar-set
+/// shaped, falling back to the local `join_known` otherwise — see that
+/// function's own doc.
 fn dict_key_set_read(keys: &[ObjectKey], index: &AbstractValue) -> Option<AbstractValue> {
     if index.kind != Kind::Set || index.kind_tag.is_some_and(|tag| tag != PrimitiveKind::String) {
         return None;
@@ -423,7 +502,7 @@ fn dict_key_set_read(keys: &[ObjectKey], index: &AbstractValue) -> Option<Abstra
         let text: String = points.iter().filter_map(|point| char::from_u32(*point as i64 as u32)).collect();
         let found = dict_key_read(keys, &DictKey::string(&text))?;
         joined = Some(match joined {
-            Some(so_far) => refined_domain::lattice_operations::join_known(so_far, found),
+            Some(so_far) => kernel_joined_set(so_far, found),
             None => found,
         });
     }
@@ -458,7 +537,10 @@ fn star_element_read(container: &AbstractValue, index: &AbstractValue) -> Option
     }
     known_integer_index(index)?;
     let repeated = as_repetition(&container.set)?;
-    Some(known_set(repeated.element, None, trust_level_of(container), SetKindTag::None))
+    Some(AbstractValue {
+        kind_tag: container.kind_tag,
+        ..known_set(repeated.element, None, trust_level_of(container), SetKindTag::None)
+    })
 }
 
 /// `container[index]` — the subscription read (expressions.rst,
@@ -1268,6 +1350,60 @@ mod tests {
         let joined_key = joined_string_key("age", "years");
         let got = subscript_read(&built, &joined_key).expect("both candidate keys are present");
         assert_eq!(got, refined_domain::lattice_operations::join_known(integer(40.0), integer(41.0)));
+    }
+
+    /// `loaded_kernel` mirrors `assignability.rs`/`builtin_models.rs`'s
+    /// own test helper: a missing dylib artifact prints to stderr and
+    /// the caller returns early, never failing the run.
+    fn loaded_kernel() -> Option<std::sync::Arc<refined_kernel::kernel_interface::RefinedTSKernel>> {
+        let path = refined_kernel::kernel_bridge::dylib_path();
+        if !refined_kernel::kernel_bridge::kernel_artifacts_present(&path) {
+            eprintln!("native kernel dylib absent — build it first");
+            return None;
+        }
+        Some(refined_kernel::kernel_bridge::load_kernel(&path).expect("load_kernel"))
+    }
+
+    #[test]
+    fn kernel_joined_set_agrees_with_join_known_on_two_scalar_sets() {
+        // The shape `dict_key_set_read`'s fold hands `kernel_joined_set`:
+        // two DIFFERENT known-Integer scalar sets, exactly the shape a
+        // `{"age": 40, "years": 41}` read against a joined string key
+        // builds (subscript_read_joined_string_key_different_values_
+        // answers_their_join's own scenario, isolated to the fold step
+        // alone). `load_kernel` adopts a process-wide singleton
+        // (`kernel_bridge.rs`'s own doc), so `kernel_if_loaded` inside
+        // `kernel_joined_set` sees the same instance this test loads.
+        //
+        // Compared by mutual SET CONTENT, not `AbstractValue::eq`: the
+        // kernel's own wire carries no Python sort tag at all
+        // (`lattice_conformance.rs`'s module doc), so `kernel_joined_set`
+        // always answers a bare `Kind::Set`, while `join_known`'s own
+        // same-Integer-tag arm keeps the answer `Kind::Values` tagged
+        // Integer — two different SHAPES for the identical set {40, 41},
+        // the same reason `lattice_conformance.rs`'s own `same_state`
+        // compares by mutual `scalar_subset` rather than `==`.
+        let Some(kernel) = loaded_kernel() else { return };
+        let via_kernel = kernel_joined_set(integer(40.0), integer(41.0));
+        let via_local = join_known(integer(40.0), integer(41.0));
+        let kernel_set = set_of_known(&via_kernel).expect("kernel_joined_set answers a set-shaped value");
+        let local_set = set_of_known(&via_local).expect("join_known(40, 41) answers a set-shaped value");
+        assert!(
+            (kernel.scalar_subset)(&kernel_set, &local_set) && (kernel.scalar_subset)(&local_set, &kernel_set),
+            "kernel_joined_set(40, 41) = {via_kernel:?}, want the same set content as join_known's {via_local:?}"
+        );
+    }
+
+    #[test]
+    fn kernel_joined_set_falls_back_to_join_known_on_a_non_set_shaped_operand() {
+        // An Object-shaped operand converts through neither
+        // `known_state_of` gate — the fold must fall back to the local
+        // `join_known` rather than misreading `set_of_known`'s own
+        // refusal as a kernel answer.
+        let object_side = known_object(vec![], None, true, TrustProved, false);
+        let via_fallback = kernel_joined_set(object_side.clone(), integer(41.0));
+        let via_local = join_known(object_side, integer(41.0));
+        assert_eq!(via_fallback, via_local);
     }
 
     #[test]

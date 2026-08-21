@@ -180,7 +180,10 @@ fn sum_call(arguments: &[AbstractValue]) -> Option<AbstractValue> {
 /// (`star_numeric_hull` returning `NEG_INFINITY`/`INFINITY`) also falls
 /// into this undetermined case, since neither comparison holds. Sort
 /// widens to Float the moment either the start value or the element
-/// set is Float-sorted, the same rule `sum_call`'s exact row applies.
+/// set is Float-sorted, the same rule `sum_call`'s exact row applies —
+/// requires the iterable's own element sort to be KNOWN (Integer or
+/// Float; anything else, including an unset sort, declines) so the
+/// widening rule always has both addend sorts in hand.
 fn sum_call_over_star(arguments: &[AbstractValue]) -> Option<AbstractValue> {
     let (iterable, start) = match arguments {
         [iterable] => (iterable, None),
@@ -188,11 +191,16 @@ fn sum_call_over_star(arguments: &[AbstractValue]) -> Option<AbstractValue> {
         _ => return None,
     };
     let (element_lo, element_hi) = star_numeric_hull(iterable)?;
+    let element_sort = match iterable.kind_tag {
+        Some(PrimitiveKind::Integer) => PrimitiveKind::Integer,
+        Some(PrimitiveKind::Float) => PrimitiveKind::Float,
+        _ => return None,
+    };
     let (start_value, start_sort) = match start {
         Some(start_value) => single_known_numeric(start_value)?,
         None => (0.0, PrimitiveKind::Integer),
     };
-    let all_int = start_sort == PrimitiveKind::Integer && iterable.kind_tag == Some(PrimitiveKind::Integer);
+    let all_int = start_sort == PrimitiveKind::Integer && element_sort == PrimitiveKind::Integer;
     let sort = if all_int { PrimitiveKind::Integer } else { PrimitiveKind::Float };
     let grade = derived_trust_level(TrustSpec, &[iterable.clone()]);
     let window = if element_lo >= 0.0 {

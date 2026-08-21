@@ -20,6 +20,7 @@ pub mod cross_module;
 pub mod diagnostic_sentences;
 pub mod env;
 pub mod expressions;
+pub mod fact_export;
 pub mod function_table;
 pub mod instances;
 pub mod kernel_path;

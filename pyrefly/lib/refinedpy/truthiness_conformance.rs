@@ -148,14 +148,45 @@ mod tests {
     }
 
     /// Whether a knowledge state admits nothing at all: not top, no
-    /// flags, and an EMPTY scalar set by the kernel's own proved
-    /// emptiness decider. This is the reading that turns `narrow_state`'s
+    /// flags, and an EMPTY set by the kernel's own proved emptiness
+    /// deciders. This is the reading that turns `narrow_state`'s
     /// two-sided answer into a truthiness verdict.
-    fn state_is_uninhabited(kernel: &RefinedTSKernel, state: &KnownStateWire) -> bool {
-        if state.top || state.undef || state.null || state.nan || state.thrown {
-            return false;
+    ///
+    /// A `top` state admits every value by construction — it is never
+    /// uninhabited, and answering that needs no kernel ask at all.
+    ///
+    /// The set the narrowing leaves behind is not always scalar-shaped:
+    /// a `top` state narrows to a `Difference(Intersection [], ...)`
+    /// (`scalarB`, `set_functions/emptiness.lean:46`, requires a
+    /// NON-EMPTY refinements list, so the kernel refuses it), and a
+    /// multi-value `Kind::Values` word becomes a `Concatenation`
+    /// (`set_of_known`'s tuple layer) — a sequence shape, not a scalar
+    /// one. Both are legitimate shapes the scalar decider does not
+    /// speak to, so this tries `scalar_empty` first and, on a kernel
+    /// refusal (caught, never a crash — the established
+    /// `catch_unwind`/`AssertUnwindSafe` idiom `assignability.rs`'s
+    /// containment ask and `narrowing.rs`'s narrow ask already hold
+    /// every kernel closure to), tries `seq_empty`. `None` means
+    /// neither decider spoke to this set's shape — not decided, and the
+    /// caller must read that as its own outcome rather than as either
+    /// answer.
+    fn state_is_uninhabited(kernel: &RefinedTSKernel, state: &KnownStateWire) -> Option<bool> {
+        if state.top {
+            return Some(false);
         }
-        (kernel.scalar_empty)(&state.set)
+        if state.undef || state.null || state.nan || state.thrown {
+            return Some(false);
+        }
+        let scalar_asked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            (kernel.scalar_empty)(&state.set)
+        }));
+        if let Ok(empty) = scalar_asked {
+            return Some(empty);
+        }
+        let seq_asked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            (kernel.seq_empty)(&state.set)
+        }));
+        seq_asked.ok()
     }
 
     /// The kernel's truthiness verdict for a state, as the same
@@ -163,15 +194,19 @@ mod tests {
     ///
     /// - falsy side uninhabited → definitely truthy `(true, true)`,
     /// - truthy side uninhabited → definitely falsy `(false, true)`,
-    /// - both inhabited → undecided `(false, false)`.
+    /// - both inhabited → undecided `(false, false)`,
+    /// - either side not decided (both emptiness deciders refused its
+    ///   shape) → undecided `(false, false)`, the same reading as "both
+    ///   inhabited": a refusal never counts as a claim that a side is
+    ///   empty.
     ///
     /// Both sides uninhabited would mean the state itself was empty —
     /// no value flows there at all — which is not a truthiness verdict
     /// and is returned as undecided rather than as a claim.
     fn kernel_truthiness(kernel: &RefinedTSKernel, state: &KnownStateWire) -> (bool, bool) {
         let (when_true, when_false) = (kernel.narrow_state)(state, "js.truthyNum", 0.0, false);
-        let truthy_empty = state_is_uninhabited(kernel, &when_true);
-        let falsy_empty = state_is_uninhabited(kernel, &when_false);
+        let truthy_empty = state_is_uninhabited(kernel, &when_true).unwrap_or(false);
+        let falsy_empty = state_is_uninhabited(kernel, &when_false).unwrap_or(false);
         match (truthy_empty, falsy_empty) {
             (true, true) => (false, false),
             (false, true) => (true, true),
@@ -407,9 +442,11 @@ mod tests {
 
     /// LEDGER ROW T5, the vocabulary bound: a MULTI-value
     /// `Kind::Values` state answers `(false, false)` on the adapter, and
-    /// its scalar reading is a `oneOf` of all its members — which the
-    /// kernel then decides. So this is a gap of the same family as T1,
-    /// arising from the adapter's own arm rather than from the wire.
+    /// `set_of_known` reads it as a `Concatenation` of the members'
+    /// singletons (the tuple layer) — a sequence shape `seq_empty`
+    /// decides, not a scalar one `scalar_empty` speaks to. So this is a
+    /// gap of the same family as T1, arising from the adapter's own arm
+    /// rather than from the wire.
     #[test]
     fn test_determination_gap_multi_value_states_are_undecided_adapter_side() {
         let Some(kernel) = loaded_kernel() else { return };
@@ -470,8 +507,8 @@ mod tests {
         assert!(
             when_true.nan
                 || when_false.nan
-                || !state_is_uninhabited(&kernel, &when_true)
-                || !state_is_uninhabited(&kernel, &when_false),
+                || state_is_uninhabited(&kernel, &when_true) != Some(true)
+                || state_is_uninhabited(&kernel, &when_false) != Some(true),
             "a NaN-flagged state must survive the truthy narrowing on one side or the other"
         );
     }

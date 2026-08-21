@@ -174,15 +174,46 @@ mod tests {
     /// `same_state` is `sameState` in the TS source (the Go twin's own
     /// `sameState`): both top, or equal flags and mutually contained
     /// sets.
+    ///
+    /// `scalar_subset` speaks only to scalar-shaped sets (`scalarB`,
+    /// `set_functions/emptiness.lean:46`, needs a non-empty refinements
+    /// list) and refuses — panics inside the kernel closure — on a set
+    /// outside that shape. That refusal is caught here, the same
+    /// `catch_unwind`/`AssertUnwindSafe` idiom `assignability.rs`'s
+    /// containment ask already holds every kernel closure to, rather
+    /// than left to crash the test process. On a refusal, the fallback
+    /// is the encode-level check: the two wire sets' own `PartialEq`
+    /// (`RefinedSet` derives it, `refinement_forms.rs`). Equal spellings
+    /// still agree; unequal spellings with a refused subset ask carry no
+    /// proof either way, so this FAILS naming the set the subset decider
+    /// refused rather than silently reporting disagreement — the row
+    /// gets pinned on the next run instead of the panic hiding it.
     fn same_state(kernel: &RefinedTSKernel, a: &KnownStateWire, b: &KnownStateWire) -> bool {
         if a.top || b.top {
             return a.top && b.top;
         }
-        a.undef == b.undef
-            && a.null == b.null
-            && a.nan == b.nan
-            && (kernel.scalar_subset)(&a.set, &b.set)
-            && (kernel.scalar_subset)(&b.set, &a.set)
+        if a.undef != b.undef || a.null != b.null || a.nan != b.nan {
+            return false;
+        }
+        let a_subset_b = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            (kernel.scalar_subset)(&a.set, &b.set)
+        }));
+        let b_subset_a = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            (kernel.scalar_subset)(&b.set, &a.set)
+        }));
+        match (a_subset_b, b_subset_a) {
+            (Ok(a_in_b), Ok(b_in_a)) => a_in_b && b_in_a,
+            _ if a.set == b.set => true,
+            (refused_a, refused_b) => panic!(
+                "same_state: scalar_subset refused a set shape it does not decide and the two \
+                 wire sets disagree by spelling — a={:?} (subset refused: {}), b={:?} (subset \
+                 refused: {})",
+                a.set,
+                refused_a.is_err(),
+                b.set,
+                refused_b.is_err()
+            ),
+        }
     }
 
     /// The 12 hand-picked scalar rows the Go twin carries, ported

@@ -82,6 +82,7 @@ use std::sync::Arc;
 use refined_domain::abstract_value::known_set;
 use refined_domain::abstract_value::AbstractValue;
 use refined_domain::abstract_value::Kind;
+use refined_domain::abstract_value::PrimitiveKind;
 use refined_domain::abstract_value::SetKindTag;
 use refined_domain::trust_grades::trust_level_of;
 use refined_domain::trust_grades::TrustLevel;
@@ -136,6 +137,13 @@ pub struct RecognizedAccumulation {
     /// answer inherits — a spec-read element set never yields a proved
     /// total.
     pub grade: TrustLevel,
+    /// The total's language-level sort, when the SEED states it: a
+    /// float seed (`total = 0.0`) makes every later `total += _` a
+    /// float — float absorbs each numeric add — so Float is exact. An
+    /// int seed or the seedless generator-sum spelling states nothing:
+    /// the elements' sort could go either way and no correct
+    /// per-element sort survives the repetition-window read.
+    pub total_kind_tag: Option<PrimitiveKind>,
 }
 
 /// Recognizes `for <var> in <name>: <total> += <expr over var>` as a
@@ -164,15 +172,22 @@ pub fn recognize_accumulation(
     // relation starts the total at 0, so an accumulator carrying
     // anything else (a partial sum, an unknown, a set) is a different
     // computation and this reader states nothing about it.
-    if !is_exactly_zero(environment.read(&total_name)?) {
+    let seed = environment.read(&total_name)?;
+    if !is_exactly_zero(seed) {
         return None;
     }
+    // a float seed pins the total's sort; anything else states none
+    let total_kind_tag = match seed.kind_tag {
+        Some(PrimitiveKind::Float) => Some(PrimitiveKind::Float),
+        _ => None,
+    };
     accumulation_program(
         total_name,
         sequence.id.as_str(),
         loop_variable.id.as_str(),
         added,
         environment,
+        total_kind_tag,
     )
 }
 
@@ -248,6 +263,8 @@ pub fn recognize_generator_sum(
         loop_variable.id.as_str(),
         generator.elt.as_ref(),
         environment,
+        // sum() has no seed binding to read a sort off
+        None,
     )
 }
 
@@ -267,6 +284,7 @@ fn accumulation_program(
     loop_variable: &str,
     added: &Expr,
     environment: &Environment,
+    total_kind_tag: Option<PrimitiveKind>,
 ) -> Option<RecognizedAccumulation> {
     if total_name == sequence_name || total_name == loop_variable || sequence_name == loop_variable {
         return None;
@@ -304,6 +322,7 @@ fn accumulation_program(
             ..Default::default()
         }],
         grade: trust_level_of(sequence_value),
+        total_kind_tag,
     })
 }
 
@@ -315,15 +334,18 @@ fn accumulation_program(
 /// see only two unrelated enclosures.
 ///
 /// Recognizes `<total> / len(<sequence>)` for exactly the accumulator
-/// and sequence this accumulation named. `false` — leaving the program
-/// as the accumulation alone — for any other shape: a different name
+/// and sequence this accumulation named — OR a sequence a comprehension
+/// built 1:1 over it with no filter (`AbstractValue::same_length_as`,
+/// `is_len_of`'s own doc). `false` — leaving the program as the
+/// accumulation alone — for any other shape: a different, unlinked name
 /// on either side, a length taken of some other sequence, an operator
 /// that is not true division.
 pub fn fold_division(
     recognized: &mut RecognizedAccumulation,
     expression: &Expr,
+    environment: &Environment,
 ) -> bool {
-    if !is_relational_division(expression, recognized) {
+    if !is_relational_division(expression, recognized, environment) {
         return false;
     }
     recognized.statements.push(division_statement());
@@ -373,10 +395,11 @@ pub fn fold_located_division(recognized: &mut RecognizedAccumulation) {
 pub fn division_range_in(
     expression: &Expr,
     recognized: &RecognizedAccumulation,
+    environment: &Environment,
 ) -> Option<TextRange> {
     let mut found: Option<TextRange> = None;
     let mut count = 0;
-    find_divisions(expression, recognized, &mut found, &mut count);
+    find_divisions(expression, recognized, environment, &mut found, &mut count);
     match count {
         1 => found,
         _ => None,
@@ -395,10 +418,11 @@ pub fn division_range_in(
 fn find_divisions(
     expression: &Expr,
     recognized: &RecognizedAccumulation,
+    environment: &Environment,
     found: &mut Option<TextRange>,
     count: &mut usize,
 ) {
-    if is_relational_division(expression, recognized) {
+    if is_relational_division(expression, recognized, environment) {
         *found = Some(expression.range());
         *count += 1;
         // the operands are a name and a `len` call: neither can hold a
@@ -406,83 +430,83 @@ fn find_divisions(
         return;
     }
     match expression {
-        Expr::Named(named) => find_divisions(named.value.as_ref(), recognized, found, count),
+        Expr::Named(named) => find_divisions(named.value.as_ref(), recognized, environment, found, count),
         Expr::BoolOp(op) => {
             for value in &op.values {
-                find_divisions(value, recognized, found, count);
+                find_divisions(value, recognized, environment, found, count);
             }
         }
         Expr::BinOp(op) => {
-            find_divisions(op.left.as_ref(), recognized, found, count);
-            find_divisions(op.right.as_ref(), recognized, found, count);
+            find_divisions(op.left.as_ref(), recognized, environment, found, count);
+            find_divisions(op.right.as_ref(), recognized, environment, found, count);
         }
-        Expr::UnaryOp(op) => find_divisions(op.operand.as_ref(), recognized, found, count),
+        Expr::UnaryOp(op) => find_divisions(op.operand.as_ref(), recognized, environment, found, count),
         Expr::Lambda(_) => {}
         Expr::If(ternary) => {
-            find_divisions(ternary.test.as_ref(), recognized, found, count);
-            find_divisions(ternary.body.as_ref(), recognized, found, count);
-            find_divisions(ternary.orelse.as_ref(), recognized, found, count);
+            find_divisions(ternary.test.as_ref(), recognized, environment, found, count);
+            find_divisions(ternary.body.as_ref(), recognized, environment, found, count);
+            find_divisions(ternary.orelse.as_ref(), recognized, environment, found, count);
         }
         Expr::Tuple(tuple) => {
             for element in &tuple.elts {
-                find_divisions(element, recognized, found, count);
+                find_divisions(element, recognized, environment, found, count);
             }
         }
         Expr::List(list) => {
             for element in &list.elts {
-                find_divisions(element, recognized, found, count);
+                find_divisions(element, recognized, environment, found, count);
             }
         }
         Expr::Set(set) => {
             for element in &set.elts {
-                find_divisions(element, recognized, found, count);
+                find_divisions(element, recognized, environment, found, count);
             }
         }
         Expr::Dict(dict) => {
             for item in &dict.items {
                 if let Some(key) = item.key.as_ref() {
-                    find_divisions(key, recognized, found, count);
+                    find_divisions(key, recognized, environment, found, count);
                 }
-                find_divisions(&item.value, recognized, found, count);
+                find_divisions(&item.value, recognized, environment, found, count);
             }
         }
         Expr::Call(call) => {
-            find_divisions(call.func.as_ref(), recognized, found, count);
+            find_divisions(call.func.as_ref(), recognized, environment, found, count);
             for argument in &call.arguments.args {
-                find_divisions(argument, recognized, found, count);
+                find_divisions(argument, recognized, environment, found, count);
             }
             for keyword in &call.arguments.keywords {
-                find_divisions(&keyword.value, recognized, found, count);
+                find_divisions(&keyword.value, recognized, environment, found, count);
             }
         }
         Expr::Compare(compare) => {
-            find_divisions(compare.left.as_ref(), recognized, found, count);
+            find_divisions(compare.left.as_ref(), recognized, environment, found, count);
             for comparator in &compare.comparators {
-                find_divisions(comparator, recognized, found, count);
+                find_divisions(comparator, recognized, environment, found, count);
             }
         }
         Expr::Attribute(attribute) => {
-            find_divisions(attribute.value.as_ref(), recognized, found, count)
+            find_divisions(attribute.value.as_ref(), recognized, environment, found, count)
         }
         Expr::Subscript(subscript) => {
-            find_divisions(subscript.value.as_ref(), recognized, found, count);
-            find_divisions(subscript.slice.as_ref(), recognized, found, count);
+            find_divisions(subscript.value.as_ref(), recognized, environment, found, count);
+            find_divisions(subscript.slice.as_ref(), recognized, environment, found, count);
         }
-        Expr::Starred(starred) => find_divisions(starred.value.as_ref(), recognized, found, count),
+        Expr::Starred(starred) => find_divisions(starred.value.as_ref(), recognized, environment, found, count),
         Expr::Slice(slice) => {
             for part in [slice.lower.as_deref(), slice.upper.as_deref(), slice.step.as_deref()] {
                 if let Some(part) = part {
-                    find_divisions(part, recognized, found, count);
+                    find_divisions(part, recognized, environment, found, count);
                 }
             }
         }
-        Expr::Await(inner) => find_divisions(inner.value.as_ref(), recognized, found, count),
+        Expr::Await(inner) => find_divisions(inner.value.as_ref(), recognized, environment, found, count),
         Expr::Yield(inner) => {
             if let Some(value) = inner.value.as_deref() {
-                find_divisions(value, recognized, found, count);
+                find_divisions(value, recognized, environment, found, count);
             }
         }
-        Expr::YieldFrom(inner) => find_divisions(inner.value.as_ref(), recognized, found, count),
+        Expr::YieldFrom(inner) => find_divisions(inner.value.as_ref(), recognized, environment, found, count),
         // Leaves hold no subexpression. A comprehension
         // (ListComp/SetComp/DictComp/Generator) runs its body an
         // unstated number of times, so a division inside one cannot be
@@ -494,8 +518,15 @@ fn find_divisions(
 }
 
 /// Whether an expression is exactly `<total> / len(<sequence>)` for the
-/// accumulator and sequence this accumulation named.
-fn is_relational_division(expression: &Expr, recognized: &RecognizedAccumulation) -> bool {
+/// accumulator and sequence this accumulation named — or `len` of a
+/// DIFFERENT name whose value the environment holds with
+/// `same_length_as` proved equal to the accumulation's own sequence
+/// (`is_len_of`'s own doc).
+fn is_relational_division(
+    expression: &Expr,
+    recognized: &RecognizedAccumulation,
+    environment: &Environment,
+) -> bool {
     let Expr::BinOp(binop) = expression else {
         return false;
     };
@@ -506,14 +537,18 @@ fn is_relational_division(expression: &Expr, recognized: &RecognizedAccumulation
         return false;
     };
     numerator.id.as_str() == recognized.total_name
-        && is_len_of(binop.right.as_ref(), &recognized.sequence_name)
+        && is_len_of(binop.right.as_ref(), &recognized.sequence_name, environment)
 }
 
 /// What the kernel answered: the accumulated total, and the quotient
 /// when a division rode along.
 pub struct AccumulationAnswer {
-    /// The value the accumulator holds after the loop.
-    pub total: AbstractValue,
+    /// The value the accumulator holds after the loop, when the kernel
+    /// answered a bindable set for it. `None` when the total's own
+    /// enclosure is honestly unbounded (a sign-straddling step times an
+    /// unbounded count) while the LEDGER still proved the quotient —
+    /// the two claims are independent in both directions.
+    pub total: Option<AbstractValue>,
     /// The value the divided name holds, when a division was folded in
     /// and the kernel answered a bindable set for it.
     pub quotient: Option<AbstractValue>,
@@ -537,25 +572,60 @@ pub struct AccumulationAnswer {
 /// claims are independent, and dropping the good one with the bad would
 /// state less than the kernel proved.
 pub fn walk_accumulation(recognized: &RecognizedAccumulation) -> Option<AccumulationAnswer> {
-    let states = ask_walk_relational(&recognized.entry_states, &recognized.statements, &[])?;
-    let total = bindable_state(states.get(TOTAL_SLOT as usize)?, recognized.grade)?;
+    let asked = ask_walk_relational(&recognized.entry_states, &recognized.statements, &[]);
+    // Debug instrument (REFINEDPY_DEBUG_RELATIONAL): the raw exit
+    // states as the kernel answered them, or the ask's own refusal —
+    // the split `check.rs`'s instrument cannot see from one layer up.
+    if std::env::var("REFINEDPY_DEBUG_RELATIONAL").is_ok() {
+        match &asked {
+            None => eprintln!("relational_sum: ask_walk_relational answered None (no kernel, or the ask panicked)"),
+            Some(states) => eprintln!("relational_sum: kernel exit states={states:?}"),
+        }
+    }
+    let states = asked?;
+    // The total wears the sort its seed pinned (Float for a `0.0`
+    // seed; nothing otherwise — recognize_accumulation's own rule).
+    let total = states
+        .get(TOTAL_SLOT as usize)
+        .and_then(|state| bindable_state(state, recognized.grade,
+            recognized.total_kind_tag));
     let quotient = match recognized.statements.len() {
         // no division rode along, so the quotient slot was never written
         1 => None,
+        // the folded division is Python's `/`, which yields a float for
+        // every numeric operand pair (expressions.rst, binary arithmetic:
+        // "division of integers yields a float"), so the quotient is
+        // Float-sorted unconditionally — the sort the sqrt/floor call
+        // rows downstream require before they ask the kernel
         _ => states
             .get(QUOTIENT_SLOT as usize)
-            .and_then(|state| bindable_state(state, recognized.grade)),
+            .and_then(|state| bindable_state(state, recognized.grade, Some(PrimitiveKind::Float))),
     };
+    // An answer with NEITHER slot bindable claims nothing; either slot
+    // alone still stands — a top total must not drop a proved quotient
+    // (the ledger ties the quotient to the count even when the total's
+    // own enclosure is unbounded), and the reverse held already.
+    if total.is_none() && quotient.is_none() {
+        return None;
+    }
     Some(AccumulationAnswer { total, quotient })
 }
 
 /// One exit state as a value this checker can bind, or `None` when the
-/// kernel claimed nothing about that slot.
-fn bindable_state(state: &KnownStateWire, grade: TrustLevel) -> Option<AbstractValue> {
+/// kernel claimed nothing about that slot. The sort tag is the caller's
+/// claim about the slot's language-level sort; `None` states no sort.
+fn bindable_state(
+    state: &KnownStateWire,
+    grade: TrustLevel,
+    kind_tag: Option<PrimitiveKind>,
+) -> Option<AbstractValue> {
     if state.top || state.set.forms.is_empty() {
         return None;
     }
-    Some(known_set(state.set.clone(), None, grade, SetKindTag::None))
+    Some(AbstractValue {
+        kind_tag,
+        ..known_set(state.set.clone(), None, grade, SetKindTag::None)
+    })
 }
 
 /// The element set and the count set of a sequence value, read off the
@@ -668,6 +738,23 @@ fn lower_added_expression(expression: &Expr, loop_variable: &str) -> Option<Loop
                 ..Default::default()
             })
         }
+        // `s * s` — both operands the loop variable, the SAME source
+        // variable — is a structural square: the kernel's `Effect.sq`
+        // answers the correlated image `[0, max²]`, which the general
+        // product `Binary(Mul, Var(i), Var(i))` cannot, since the
+        // kernel no longer recognizes x*x by syntax (unsound under
+        // renaming). Read directly off the source AST, before either
+        // side lowers: this is the one place the identifier binding is
+        // honestly known, and a lowered `LoopEffect` has already
+        // thrown that identity away. Gated on the loop variable
+        // specifically (not just "the same name as each other"): a
+        // product of some OTHER shared free name would otherwise
+        // misread as squaring the element it never named.
+        Expr::BinOp(binop) if is_same_name_square(binop, loop_variable) => Some(LoopEffect {
+            kind: LoopEffectKind::Sq,
+            index: ELEMENT_SLOT,
+            ..Default::default()
+        }),
         Expr::BinOp(binop) => {
             let op = match binop.op {
                 Operator::Add => LoopEffectOp::Add,
@@ -693,8 +780,35 @@ fn lower_added_expression(expression: &Expr, loop_variable: &str) -> Option<Loop
     }
 }
 
-/// Whether an expression is `len(<name>)` for exactly this sequence.
-fn is_len_of(expression: &Expr, sequence_name: &str) -> bool {
+/// Whether a `BinOp` is `<loop_variable> * <loop_variable>` — decided
+/// from the source AST's own two `Expr::Name` nodes, never from a
+/// lowered effect, which has already erased which variable a term came
+/// from. Gated on the LOOP variable specifically, not merely "the same
+/// name as each other": some other shared free name would decline
+/// anyway (this module's own invariant — the only `Var` this reader
+/// emits is the element slot), and must keep declining rather than
+/// being misread as squaring the element.
+fn is_same_name_square(binop: &ruff_python_ast::ExprBinOp, loop_variable: &str) -> bool {
+    if !matches!(binop.op, Operator::Mult) {
+        return false;
+    }
+    let (Expr::Name(left), Expr::Name(right)) = (binop.left.as_ref(), binop.right.as_ref()) else {
+        return false;
+    };
+    left.id.as_str() == loop_variable && right.id.as_str() == loop_variable
+}
+
+/// Whether an expression is `len(<name>)` for exactly this sequence —
+/// OR `len(<other name>)` where `<other name>`'s own value carries
+/// `AbstractValue::same_length_as == Some(sequence_name)`: a name a
+/// comprehension built by mapping every position of `sequence_name` 1:1
+/// with no filter, which proves `len(<other name>) == len(sequence_name)`
+/// exactly (`comprehension_star_elements`'s own soundness-line comment,
+/// expressions.rs — the same fact stated there as a window bound, here
+/// read back as a name link). A name with no recorded link, or one
+/// linked to some THIRD sequence, still declines: only an exact proof
+/// of equal length licenses folding the division into this program.
+fn is_len_of(expression: &Expr, sequence_name: &str, environment: &Environment) -> bool {
     let Expr::Call(call) = expression else {
         return false;
     };
@@ -707,7 +821,26 @@ fn is_len_of(expression: &Expr, sequence_name: &str) -> bool {
     let [Expr::Name(argument)] = call.arguments.args.as_ref() else {
         return false;
     };
-    argument.id.as_str() == sequence_name
+    if argument.id.as_str() == sequence_name {
+        return true;
+    }
+    // The link runs in either direction: the len() argument may be a
+    // comprehension over the looped sequence, OR the looped sequence
+    // may be a comprehension over the len() argument — the fixture's
+    // own shape (loop over `clamped`, divide by `len(samples)`, with
+    // `clamped` the 1:1 comprehension over `samples`). Both spell the
+    // same proved equality of the two lengths.
+    if environment
+        .read(argument.id.as_str())
+        .and_then(|value| value.same_length_as.as_deref())
+        == Some(sequence_name)
+    {
+        return true;
+    }
+    environment
+        .read(sequence_name)
+        .and_then(|value| value.same_length_as.as_deref())
+        == Some(argument.id.as_str())
 }
 
 /// Whether a value is the exact number 0 — the only accumulator start
@@ -795,10 +928,11 @@ mod tests {
             entry_states: Vec::new(),
             statements: Vec::new(),
             grade: TrustProved,
+            total_kind_tag: None,
         };
         let expression = division_expression("total", "samples");
         assert!(
-            fold_division(&mut recognized, &expression),
+            fold_division(&mut recognized, &expression, &environment_with_samples()),
             "fold_division declined `total / len(samples)`"
         );
         let [division] = recognized.statements.as_slice() else {
@@ -819,11 +953,84 @@ mod tests {
             entry_states: Vec::new(),
             statements: Vec::new(),
             grade: TrustProved,
+            total_kind_tag: None,
         };
         let expression = division_expression("total", "others");
         assert!(
-            !fold_division(&mut recognized, &expression),
+            !fold_division(&mut recognized, &expression, &environment_with_samples()),
             "fold_division accepted a length taken of a different sequence"
+        );
+        assert!(
+            recognized.statements.is_empty(),
+            "a declined division must leave the program alone"
+        );
+    }
+
+    #[test]
+    fn a_division_by_a_1_to_1_comprehensions_length_is_folded() {
+        // `clamped = [max(-1.0, min(1.0, s)) for s in samples]` proves
+        // `len(clamped) == len(samples)` exactly, so `total / len(clamped)`
+        // ties to the SAME accumulation the loop over `samples` ran.
+        let mut recognized = RecognizedAccumulation {
+            total_name: "total".to_owned(),
+            sequence_name: "samples".to_owned(),
+            entry_states: Vec::new(),
+            statements: Vec::new(),
+            grade: TrustProved,
+            total_kind_tag: None,
+        };
+        let mut environment = environment_with_samples();
+        environment.bind(
+            "clamped",
+            AbstractValue {
+                same_length_as: Some("samples".to_owned()),
+                ..known_set(
+                    make_refined_set(vec![refined_sets::refinement_forms::star(
+                        make_refined_set(vec![at_least(-1.0), at_most(1.0)]),
+                    )]),
+                    None,
+                    TrustProved,
+                    SetKindTag::None,
+                )
+            },
+        );
+        let expression = division_expression("total", "clamped");
+        assert!(
+            fold_division(&mut recognized, &expression, &environment),
+            "fold_division declined a length proved equal via same_length_as"
+        );
+    }
+
+    #[test]
+    fn a_division_by_a_filtered_comprehensions_length_is_not_folded() {
+        // a filtered comprehension's own builder (expressions.rs's
+        // `comprehension_star_elements`) leaves `same_length_as` unset —
+        // this pins the CONSUMING side of that same soundness line: an
+        // unlinked name still declines, exactly as an unrelated name does.
+        let mut recognized = RecognizedAccumulation {
+            total_name: "total".to_owned(),
+            sequence_name: "samples".to_owned(),
+            entry_states: Vec::new(),
+            statements: Vec::new(),
+            grade: TrustProved,
+            total_kind_tag: None,
+        };
+        let mut environment = environment_with_samples();
+        environment.bind(
+            "positives",
+            known_set(
+                make_refined_set(vec![refined_sets::refinement_forms::star(
+                    make_refined_set(vec![at_least(0.0), at_most(1.0)]),
+                )]),
+                None,
+                TrustProved,
+                SetKindTag::None,
+            ),
+        );
+        let expression = division_expression("total", "positives");
+        assert!(
+            !fold_division(&mut recognized, &expression, &environment),
+            "fold_division accepted a length with no proved link"
         );
         assert!(
             recognized.statements.is_empty(),
@@ -838,7 +1045,7 @@ mod tests {
         let source = format!("{numerator} / len({sequence})");
         let parsed = ruff_python_parser::parse_expression(&source)
             .expect("the test's own source parses");
-        parsed.into_syntax()
+        *parsed.into_syntax().body
     }
 
     // A module whose single statement is the assignment under test.
@@ -875,7 +1082,10 @@ mod tests {
 
     #[test]
     fn the_generator_sum_lowers_to_the_same_program_the_explicit_loop_does() {
-        // the fixture's own statement (audio_level.py:19)
+        // the fixture's own statement (audio_level.py:19) — `s * s` is
+        // the SAME source variable on both sides, so this lowers to
+        // the structural `sq` effect, not the general `mul` of two
+        // vars.
         let assign = parsed_assignment("total = sum(s * s for s in samples)\n");
         let recognized = recognize_generator_sum(&assign, &environment_with_samples())
             .expect("the generator sum over a star sequence recognizes");
@@ -885,7 +1095,7 @@ mod tests {
             panic!("want exactly the accumulation, got {}", recognized.statements.len());
         };
         let got = stmt_wire(accumulation);
-        let want = r#"{"loopAccum":{"total":0,"src":1,"len":2,"body":{"op":"binary64.mul","A":{"var":1},"B":{"var":1}}}}"#;
+        let want = r#"{"loopAccum":{"total":0,"src":1,"len":2,"body":{"sq":1}}}"#;
         assert_eq!(got, want, "stmt_wire(generator sum) = {got:?}, want {want:?}");
     }
 
@@ -979,6 +1189,7 @@ mod tests {
             entry_states: Vec::new(),
             statements: Vec::new(),
             grade: TrustProved,
+            total_kind_tag: None,
         }
     }
 
@@ -1002,7 +1213,7 @@ mod tests {
     fn the_division_is_found_nested_inside_a_call_argument() {
         // the fixture's own return (audio_level.py:25)
         let returned = returned_expression("math.sqrt(total / len(samples))");
-        let range = division_range_in(&returned, &recognized_over_samples())
+        let range = division_range_in(&returned, &recognized_over_samples(), &environment_with_samples())
             .expect("the nested division is found");
         // the located node is the inner division, strictly inside the
         // call that wraps it
@@ -1019,7 +1230,7 @@ mod tests {
     #[test]
     fn a_bare_division_in_return_position_is_found() {
         let returned = returned_expression("total / len(samples)");
-        let range = division_range_in(&returned, &recognized_over_samples())
+        let range = division_range_in(&returned, &recognized_over_samples(), &environment_with_samples())
             .expect("a top-level division is found");
         assert_eq!(
             range,
@@ -1033,7 +1244,7 @@ mod tests {
         // one published answer cannot say which node it belongs to
         let returned = returned_expression("total / len(samples) + total / len(samples)");
         assert!(
-            division_range_in(&returned, &recognized_over_samples()).is_none(),
+            division_range_in(&returned, &recognized_over_samples(), &environment_with_samples()).is_none(),
             "two occurrences must decline rather than pick one"
         );
     }
@@ -1042,7 +1253,7 @@ mod tests {
     fn a_return_holding_no_division_is_declined() {
         let returned = returned_expression("math.sqrt(total)");
         assert!(
-            division_range_in(&returned, &recognized_over_samples()).is_none(),
+            division_range_in(&returned, &recognized_over_samples(), &environment_with_samples()).is_none(),
             "there is nothing to fold"
         );
     }
@@ -1051,7 +1262,7 @@ mod tests {
     fn a_division_by_a_different_sequences_length_is_not_found() {
         let returned = returned_expression("math.sqrt(total / len(others))");
         assert!(
-            division_range_in(&returned, &recognized_over_samples()).is_none(),
+            division_range_in(&returned, &recognized_over_samples(), &environment_with_samples()).is_none(),
             "a length taken of another sequence carries no relation"
         );
     }
@@ -1062,7 +1273,7 @@ mod tests {
         // different binding
         let returned = returned_expression("lambda: total / len(samples)");
         assert!(
-            division_range_in(&returned, &recognized_over_samples()).is_none(),
+            division_range_in(&returned, &recognized_over_samples(), &environment_with_samples()).is_none(),
             "a lambda body is a separate scope"
         );
     }

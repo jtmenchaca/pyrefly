@@ -30,7 +30,7 @@ use refined_domain::abstract_value::{known_set, known_values, unknown, AbstractV
 use refined_domain::known_constructors::known_list;
 use refined_domain::trust_grades::{TrustProved, TrustSpec};
 use refined_kernel::kernel_interface::RefinedTSKernel;
-use refined_sets::refinement_forms::{make_refined_set, repeat_of, requires_integer, RefinedSet};
+use refined_sets::refinement_forms::{make_refined_set, on_one_tuple_layer, repeat_of, requires_integer, RefinedSet};
 use ruff_python_ast::{
     Alias, AtomicNodeIndex, CmpOp, ExceptHandler, ExceptHandlerExceptHandler, Expr, ExprAttribute, ExprSubscript,
     ModModule, Parameters, Stmt, StmtAnnAssign, StmtAssign, StmtAugAssign, StmtClassDef, StmtFunctionDef,
@@ -38,7 +38,7 @@ use ruff_python_ast::{
 };
 use ruff_text_size::{Ranged, TextRange};
 
-use crate::refinedpy::assignability::{judge, Verdict};
+use crate::refinedpy::assignability::{judge, states_sequence, Verdict};
 use crate::refinedpy::bytes_models::{self, BytesAnswer};
 use crate::refinedpy::collection_models::{dict_get_result, dict_with_item, dict_without_item, list_literal_value, list_with_item, mutated_receiver, subscript_read};
 use crate::refinedpy::cross_module::{module_surface, ModuleResolver, IMPORT_DEPTH_CAP};
@@ -293,7 +293,7 @@ fn walk_body(
     context: &WalkContext,
     out: &mut Vec<Finding>,
 ) {
-    walk_body_with_self_binding(body, parameters, return_refinement, None, self_model, None, context, out);
+    walk_body_with_self_binding(body, parameters, return_refinement, None, self_model, None, None, context, out);
 }
 
 /// `walk_body`'s full construction, plus one extra optional step:
@@ -305,6 +305,12 @@ fn walk_body(
 /// unbound name. `self` carries no annotation in the corpus's own
 /// convention, so `seed_parameters` never seeds it itself — this bind
 /// is the only writer for that name at body entry.
+///
+/// `returned_values_out`, when `Some`, is filled with every value this
+/// body's `return` statements produced — the SAME values `walk_return`
+/// judges, recorded through `env::collect_returned_values` rather than
+/// re-derived. `fact_export` is the only caller that asks; every walk in
+/// the checker itself passes `None` and behaves exactly as before.
 fn walk_body_with_self_binding(
     body: &[Stmt],
     parameters: Option<&Parameters>,
@@ -312,6 +318,7 @@ fn walk_body_with_self_binding(
     yield_refinement: Option<&DeclaredRefinement>,
     self_model: Option<&ClassModel>,
     self_binding: Option<&AbstractValue>,
+    returned_values_out: Option<&mut Vec<AbstractValue>>,
     context: &WalkContext,
     out: &mut Vec<Finding>,
 ) {
@@ -320,6 +327,9 @@ fn walk_body_with_self_binding(
         collect_parameter_names(parameters, &mut locally_bound);
     }
     let mut environment = Environment::new(locally_bound);
+    if returned_values_out.is_some() {
+        environment.collect_returned_values();
+    }
     environment.set_functions(Arc::new(merged(&local_function_table(body), &context.functions)));
     environment.set_classes(merged_classes_for_body(body, context));
     // Every module-level binding (this module's own top-level constants
@@ -484,6 +494,11 @@ fn walk_body_with_self_binding(
             break;
         }
     }
+    if let Some(returned_values_out) = returned_values_out {
+        *returned_values_out = environment
+            .returned_values()
+            .expect("the recorder was installed above whenever this slot is Some");
+    }
 }
 
 /// BODY-LOCAL CLASSES, merged: `local_class_table`'s own build for
@@ -601,6 +616,7 @@ fn walk_method_def(def: &StmtFunctionDef, class: &ClassModel, context: &WalkCont
         yield_refinement.as_ref(),
         None,
         Some(&self_instance),
+        None,
         context,
         out,
     );
@@ -717,12 +733,30 @@ fn seed_parameters(parameters: &Parameters, context: &WalkContext, environment: 
             if let Some(element) = &declared.element {
                 if !element.set.forms.is_empty() {
                     let (lo, hi) = declared.element_length.unwrap_or((0, None));
-                    let sequence = known_set(
-                        make_refined_set(vec![repeat_of(element.set.clone(), lo, hi)]),
-                        None,
-                        TrustSpec,
-                        SetKindTag::None,
-                    );
+                    // The element's own sort (`requires_integer` reads the
+                    // `Form::Integer` marker `annotated_expression_set`
+                    // pushes for a bare `int`, the same recognizer
+                    // `adapter_alias_verdict` above already uses to tell an
+                    // int-sorted alias from a float-sorted one) rides onto
+                    // the OUTER sequence value's `kind_tag` — `star_numeric_
+                    // hull`/`sum_call_over_star`/`min_max_over_star`
+                    // (builtin_models.rs) all read the sequence value's own
+                    // tag, never the element's, to answer sum/min/max over
+                    // an unknown-length iterable.
+                    let sort = if requires_integer(&element.set) {
+                        PrimitiveKind::Integer
+                    } else {
+                        PrimitiveKind::Float
+                    };
+                    let sequence = AbstractValue {
+                        kind_tag: Some(sort),
+                        ..known_set(
+                            make_refined_set(vec![repeat_of(element.set.clone(), lo, hi)]),
+                            None,
+                            TrustSpec,
+                            SetKindTag::None,
+                        )
+                    };
                     environment.bind(parameter.parameter.name.id.as_str(), sequence);
                     continue;
                 }
@@ -749,7 +783,30 @@ fn seed_parameters(parameters: &Parameters, context: &WalkContext, environment: 
             environment.bind(parameter.parameter.name.id.as_str(), tuple);
             continue;
         }
-        let seeded = known_set(declared.set, None, TrustSpec, SetKindTag::None);
+        // A scalar declared set carries its own numeric sort onto the
+        // seeded value's `kind_tag` — the same tag `min_max_scalar_operand`/
+        // `star_numeric_hull`/`sum_call_over_star` (builtin_models.rs) read
+        // to answer sum/min/max — but ONLY when the declared set is
+        // numeric-ground: `on_one_tuple_layer` alone also reads a
+        // `Literal["A", "B", "C"]` string-tuple union as "on the one-tuple
+        // layer" (the tuple pun `assignability.rs::states_sequence`'s own
+        // doc names), so the gate pairs both checks exactly as every sort
+        // law in that file does. A string/sequence-shaped declared set
+        // (`states_sequence` true, or `on_one_tuple_layer` false) is left
+        // untagged, unchanged from today.
+        let seeded = if on_one_tuple_layer(&declared.set) && !states_sequence(&declared.set) {
+            let sort = if requires_integer(&declared.set) {
+                PrimitiveKind::Integer
+            } else {
+                PrimitiveKind::Float
+            };
+            AbstractValue {
+                kind_tag: Some(sort),
+                ..known_set(declared.set, None, TrustSpec, SetKindTag::None)
+            }
+        } else {
+            known_set(declared.set, None, TrustSpec, SetKindTag::None)
+        };
         environment.bind(parameter.parameter.name.id.as_str(), seeded);
     }
 }
@@ -1103,6 +1160,12 @@ fn walk_return(
         // completion on this path.
         return;
     };
+    // The value this return produces, handed to whoever asked this walk
+    // to collect them (`env::collect_returned_values` — `fact_export`'s
+    // own derivation seam). A no-op for every ordinary walk, and the
+    // value is exactly the one judged below: the export never runs a
+    // second, differently-derived reading of the same return.
+    environment.record_returned_value(value.clone());
     let Some(declared) = return_refinement else {
         return;
     };
@@ -1286,9 +1349,107 @@ fn walk_function_def(def: &StmtFunctionDef, context: &WalkContext, out: &mut Vec
         yield_refinement.as_ref(),
         None,
         None,
+        None,
         context,
         out,
     );
+}
+
+/// Every top-level `def`'s own DERIVED return value, keyed by name: the
+/// join of every value that def's `return` statements produce, from the
+/// SAME walk `findings_for_module_with_resolver` runs over the module —
+/// parameters seeded from their declarations by `seed_parameters`, the
+/// body walked statement by statement, and each return's value taken
+/// from the point `walk_return` already computed it for judging.
+///
+/// `fact_export`'s derivation seam, and its only entry into this file.
+/// The module's shared context (aliases, imports, cross-module surface,
+/// function/class tables — everything a body reads must be built the way
+/// the checker builds it, never a narrower stand-in) is built ONCE here
+/// and every def walks against it, so an N-def module resolves its
+/// imports once rather than N times.
+///
+/// An empty map when the module states no aliases at all (the same early
+/// exit `findings_for_module_with_resolver` takes). A def whose body
+/// produced no `return` value this walk could read is simply absent from
+/// the map — never an entry holding a guessed value. The findings the
+/// walks produce are discarded here: the export judges nothing; it
+/// reports what the walk derived.
+pub fn derived_return_values(
+    module: &ModModule,
+    resolver: ModuleResolver,
+    kernel: &Arc<RefinedTSKernel>,
+) -> HashMap<String, AbstractValue> {
+    let aliases = compile_aliases(module);
+    if aliases.is_empty() {
+        return HashMap::new();
+    }
+    let imports = surface_imports(module);
+    let surface = module_surface(module, resolver, kernel, IMPORT_DEPTH_CAP);
+    let own_functions = function_table(module);
+    let functions = Arc::new(merged(&own_functions, surface.functions.as_ref()));
+    let own_classes = class_table(module, &aliases, &imports, kernel);
+    let mut classes = Arc::try_unwrap(surface.classes)
+        .unwrap_or_else(|_| panic!("module_surface's own Arc<classes> has no other owner yet"));
+    for (class_name, model) in own_classes {
+        classes.insert(class_name, model);
+    }
+    for def in module.body.iter().filter_map(|stmt| match stmt {
+        Stmt::FunctionDef(def) => Some(def),
+        _ => None,
+    }) {
+        for (class_name, model) in local_class_table(&def.body, &aliases, &imports, kernel) {
+            classes.insert(class_name, model);
+        }
+    }
+    let module_callable_returns = Arc::new(module_level_callable_returns(module, &aliases, &imports));
+    let strict_int_aliases = strict_int_alias_names(module);
+    let typed_dicts = Arc::new(instances::typed_dict_table(module, &aliases, &imports));
+    let context = WalkContext {
+        aliases: &aliases,
+        imports: &imports,
+        kernel,
+        functions,
+        classes: Arc::new(classes),
+        module_bindings: surface.bindings,
+        module_callable_returns,
+        strict_int_aliases: &strict_int_aliases,
+        typed_dicts,
+    };
+    let mut derived = HashMap::new();
+    for def in module.body.iter().filter_map(|stmt| match stmt {
+        Stmt::FunctionDef(def) => Some(def),
+        _ => None,
+    }) {
+        let outer_environment = Environment::new(HashSet::new());
+        let return_refinement = def.returns.as_deref().and_then(|annotation| {
+            declared_refinement(annotation, context.aliases, context.imports, &outer_environment)
+                .or_else(|| typed_dict_return_refinement(annotation, &context.typed_dicts))
+        });
+        let (return_refinement, yield_refinement) = generator_body_refinements(def, return_refinement);
+        let mut returned_values: Vec<AbstractValue> = Vec::new();
+        let mut discarded_findings = Vec::new();
+        walk_body_with_self_binding(
+            &def.body,
+            Some(def.parameters.as_ref()),
+            return_refinement.as_ref(),
+            yield_refinement.as_ref(),
+            None,
+            None,
+            Some(&mut returned_values),
+            &context,
+            &mut discarded_findings,
+        );
+        let mut answers = returned_values.into_iter();
+        let Some(first) = answers.next() else {
+            continue;
+        };
+        derived.insert(
+            def.name.id.as_str().to_owned(),
+            answers.fold(first, refined_domain::lattice_operations::join_known),
+        );
+    }
+    derived
 }
 
 /// LOCAL DEFS: this body's own top-level `def`s (not a nested body's —
@@ -1732,7 +1893,7 @@ fn walk_relational_sum(
         Some(Stmt::Assign(assign)) => {
             if let [Expr::Name(target)] = assign.targets.as_slice() {
                 if !rebinds_relational_name(assign.value.as_ref(), &recognized)
-                    && relational_sum::fold_division(&mut recognized, assign.value.as_ref())
+                    && relational_sum::fold_division(&mut recognized, assign.value.as_ref(), environment)
                 {
                     divided_into = Some(target.id.as_str().to_owned());
                 }
@@ -1741,7 +1902,7 @@ fn walk_relational_sum(
         Some(Stmt::Return(ret)) => {
             if let Some(value) = ret.value.as_deref() {
                 if !rebinds_relational_name(value, &recognized) {
-                    if let Some(range) = relational_sum::division_range_in(value, &recognized) {
+                    if let Some(range) = relational_sum::division_range_in(value, &recognized, environment) {
                         relational_sum::fold_located_division(&mut recognized);
                         published_division = Some(range);
                     }
@@ -1750,12 +1911,50 @@ fn walk_relational_sum(
         }
         _ => {}
     }
+    // Plain data dump for the two relational-sum fixtures one exhausted
+    // static trace could not tell apart (the const-effect variant
+    // determines, the var-effect variant does not, and only the live
+    // answer states say why) — gated on REFINEDPY_DEBUG_RELATIONAL so it
+    // never runs unasked. Read once per call, matching the crate's other
+    // inline `std::env::var` checks (`kernel_path.rs`, `kernel_bridge.rs`)
+    // rather than a cached static — this instrument is meant to be
+    // removable later, not a permanent flag. `check.rs` never sees the
+    // per-slot wire send/receive `ask_walk_relational` performs inside
+    // `relational_sum::walk_accumulation` (that call, and the
+    // `catch_unwind` around it, live in a different crate), so a genuine
+    // "ask panicked" vs. "kernel declined" split is not nameable from
+    // here — both collapse to `walk_accumulation` answering `None`. What
+    // IS printed is everything `check.rs` actually holds: the recognized
+    // names, the entry states as this call is ABOUT to send them
+    // (`recognized.entry_states`, `Debug`-formatted — no `Serialize` wire
+    // encoder is public outside `refined_kernel`), and the answer as
+    // received, or the words "declined" when `walk_accumulation` itself
+    // answers `None`.
+    if std::env::var("REFINEDPY_DEBUG_RELATIONAL").is_ok() {
+        eprintln!(
+            "relational_sum: total={} sequence={} entry_states={:?} statements={:?}",
+            recognized.total_name, recognized.sequence_name, recognized.entry_states, recognized.statements
+        );
+    }
     let Some(answer) = relational_sum::walk_accumulation(&recognized) else {
+        if std::env::var("REFINEDPY_DEBUG_RELATIONAL").is_ok() {
+            eprintln!("relational_sum: declined (walk_accumulation answered None)");
+        }
         return RelationalSum::Declined;
     };
-    // The total always binds: it is what the accumulation proved, and it
-    // is what a return statement's own walk reads for the numerator.
-    environment.bind(&recognized.total_name, answer.total);
+    if std::env::var("REFINEDPY_DEBUG_RELATIONAL").is_ok() {
+        eprintln!(
+            "relational_sum: answered total={:?} quotient={:?}",
+            answer.total, answer.quotient
+        );
+    }
+    // The total binds when the kernel answered it; a total whose own
+    // enclosure is unbounded (sign-straddling step, unbounded count) is
+    // forgotten instead — the ledger's quotient below still stands.
+    match answer.total {
+        Some(total) => environment.bind(&recognized.total_name, total),
+        None => environment.forget(&recognized.total_name),
+    }
     // The quotient rides its own slot, so the divided name carries
     // exactly what the kernel proved — or, where the kernel answered the
     // total but not the quotient, nothing at all rather than a guess.
