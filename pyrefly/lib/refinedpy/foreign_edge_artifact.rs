@@ -385,8 +385,7 @@ fn read_and_verify_foreign_ts_artifact(
             return (
                 None,
                 format!(
-                    "the TypeScript target {target_path} states no fact for this edge — there is no \
-                     {artifact_path_words}; write it with `{FOREIGN_EXPORT_COMMAND} {target_path}`"
+                    "there is no {artifact_path_words}; write it with `{FOREIGN_EXPORT_COMMAND} {target_path}`"
                 ),
             );
         }

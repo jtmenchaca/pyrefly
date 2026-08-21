@@ -2715,4 +2715,36 @@ mod tests {
 
         fs::remove_dir_all(&root).ok();
     }
+
+    /// This module's own decline (line ~275, production code, `#[cfg(not(test))]`
+    /// path) wraps whatever the sibling reader answers with "the target …
+    /// states no fact for this edge — {reason}". The sibling's own
+    /// missing-artifact sentence must NOT restate that same claim itself,
+    /// or the composed sentence carries the phrase twice. Composed here
+    /// exactly as the production call site composes it (tests exercise
+    /// the module's fixture stub instead of the sibling reader at
+    /// `foreign_edge_at`'s own call site, so the composition is repeated
+    /// here rather than observed through it) against the REAL sibling
+    /// sentence, so a regression in either side's wording is caught.
+    #[test]
+    fn a_missing_disk_artifact_states_no_fact_exactly_once() {
+        let root = temp_project_root("missing_once");
+        let target = root.join("audio_level.ts");
+        fs::write(&target, b"export function audioLevel(boosted: number[]): number { return 0; }\n")
+            .expect("write target");
+        let target_path = target.to_str().unwrap().to_owned();
+
+        let reason = foreign_edge_artifact::read_foreign_ts_artifact(&target_path)
+            .expect_err("no artifact exists and no producer can write one in this temp root");
+        let message = "the target ".to_owned() + &target_path + " states no fact for this edge — " + &reason;
+
+        assert_eq!(
+            message.matches("states no fact for this edge").count(),
+            1,
+            "the prefix must appear exactly once: {message}"
+        );
+        assert!(message.contains("-export-fact"), "{message}");
+
+        fs::remove_dir_all(&root).ok();
+    }
 }
