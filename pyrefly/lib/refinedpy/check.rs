@@ -710,8 +710,10 @@ fn walk_body_with_self_binding(
         // so it must not be shadowed by a generator-sum match that could
         // never apply to a `subprocess.run` value anyway — the fixed
         // order this mission calls for once two Assign-shaped two-
-        // statement recognizers coexist.
-        if matches!(stmt, Stmt::Assign(_)) {
+        // statement recognizers coexist. A `With` statement also enters:
+        // the temp-file carrier's unit starts at the tempfile with-block
+        // (recognize_temp_file_edge), not at an Assign.
+        if matches!(stmt, Stmt::Assign(_) | Stmt::With(_)) {
             if let Some(outcome) = foreign_edge::foreign_edge_at(
                 body,
                 position,

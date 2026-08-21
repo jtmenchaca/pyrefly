@@ -22,7 +22,8 @@
 //!    "language": "typescript",
 //!    "runtime": {"band": "node-23+"},
 //!    "surface": {"kind": "stdin-json", "stdin": "json", "stdout": "json", "calls": "<fn>"}
-//!      | {"kind": "argv-json", "argIndex": n, "stdout": "json", "calls": "<fn>"},
+//!      | {"kind": "argv-json", "argIndex": n, "stdout": "json", "calls": "<fn>"}
+//!      | {"kind": "file-json", "argIndex": n, "stdout": "json", "calls": "<fn>"},
 //!    "functions": {"<name>": {
 //!      "entry": [{"name", "sequence": {"element": <set>, "lengthAtLeast": n}}
 //!               |{"name", "set": <set>}],
@@ -30,11 +31,15 @@
 //!      "provenance": {"line": n, "said": "..."}}}}
 //!
 //! `surface.kind` names which carrier the JSON transport model rides
-//! on — a pipe (`stdin-json`) or one argv element (`argv-json`,
-//! `argIndex` naming which one: the node convention makes the third
-//! argv element `process.argv[2]`). Both apply the identical transport
-//! model to the payload (JSON text, the same round-trip premise); only
-//! the carrier differs, so `argv-json` carries no `stdin` field at all.
+//! on — a pipe (`stdin-json`), one argv element read directly
+//! (`argv-json`), or one argv element naming a FILE the target reads
+//! (`file-json`) — `argIndex` naming which argv position, either way
+//! (the node convention makes the third argv element `process.argv[2]`).
+//! All three apply the identical transport model to the payload (JSON
+//! text, the same round-trip premise); only the carrier differs, so
+//! `argv-json`/`file-json` carry no `stdin` field at all, and
+//! `file-json`'s own `argIndex` names the argv position holding the
+//! PATH, not the JSON text itself.
 //!
 //! Any other (kind, version, language) triple declines, naming the
 //! triple it saw and the one form this reader accepts.
@@ -134,11 +139,12 @@ pub struct ForeignTsFunctionFact {
     pub provenance_said: String,
 }
 
-/// Which carrier the JSON transport model rides on — the two `surface
-/// .kind` tags this reader admits. Both apply the SAME transport model
-/// (the value crosses as JSON text; `stdoutPure` and the outbound-leg
-/// fit checks apply identically to either): only the carrier differs,
-/// a pipe versus one argv element.
+/// Which carrier the JSON transport model rides on — the three `surface
+/// .kind` tags this reader admits. All three apply the SAME transport
+/// model (the value crosses as JSON text; `stdoutPure` and the
+/// outbound-leg fit checks apply identically to each): only the carrier
+/// differs — a pipe, one argv element read directly, or one argv
+/// element naming a file the target reads its JSON from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForeignSurface {
     /// `{"kind": "stdin-json", "stdin": "json", "stdout": "json"}` — the
@@ -146,9 +152,15 @@ pub enum ForeignSurface {
     StdinJson,
     /// `{"kind": "argv-json", "argIndex": n, "stdout": "json"}` — the
     /// payload is `JSON.parse`'d from `process.argv[argIndex]`; there is
-    /// no `stdin` field at all (the two carriers are mutually exclusive
-    /// by construction, never a joint claim).
+    /// no `stdin` field at all (the carriers are mutually exclusive by
+    /// construction, never a joint claim).
     ArgvJson { arg_index: i64 },
+    /// `{"kind": "file-json", "argIndex": n, "stdout": "json"}` — the
+    /// payload is `JSON.parse`'d from the FILE named at
+    /// `process.argv[argIndex]` (node's own harness reads it with
+    /// `readFileSync(process.argv[argIndex], "utf8")`), not from the
+    /// argv element's own text.
+    FileJson { arg_index: i64 },
 }
 
 /// The artifact as consumed: the runtime band it commits to, which
@@ -510,14 +522,15 @@ fn check_target_integrity(parsed: &Value, target_path: &str, artifact_path_words
     Ok(())
 }
 
-/// Reads the `surface` object: the wire is JSON, carried either on
-/// stdin or on one argv element, and one named function is what the
-/// entry point calls. The edge's whole claim is about THAT function —
-/// a target whose surface reads a different encoding, or calls nothing
-/// this artifact names, transports something the JSON model does not
-/// describe. `surface` carries a tagged `kind`; only `"stdin-json"` and
-/// `"argv-json"` have a transport model here (schema-v2.md: the other
-/// sketched kinds have no reader yet).
+/// Reads the `surface` object: the wire is JSON, carried on stdin, on
+/// one argv element, or in a FILE one argv element names, and one named
+/// function is what the entry point calls. The edge's whole claim is
+/// about THAT function — a target whose surface reads a different
+/// encoding, or calls nothing this artifact names, transports something
+/// the JSON model does not describe. `surface` carries a tagged `kind`;
+/// only `"stdin-json"`, `"argv-json"`, and `"file-json"` have a
+/// transport model here (schema-v2.md: the other sketched kinds have no
+/// reader yet).
 fn harness_surface_of(parsed: &Value, artifact_path_words: &str) -> Result<(ForeignSurface, String), String> {
     let Some(surface) = parsed.get("surface").and_then(Value::as_object) else {
         return Err(format!(
@@ -556,10 +569,26 @@ fn harness_surface_of(parsed: &Value, artifact_path_words: &str) -> Result<(Fore
             };
             ForeignSurface::ArgvJson { arg_index }
         }
+        "file-json" => {
+            if stdout != "json" {
+                return Err(format!(
+                    "{artifact_path_words} states a file-json surface writing {} on stdout, and this edge \
+                     reads only \"json\" on that leg",
+                    quoted_or_none(stdout)
+                ));
+            }
+            let Some(arg_index) = surface.get("argIndex").and_then(Value::as_i64) else {
+                return Err(format!(
+                    "{artifact_path_words} states a file-json surface with no argIndex, so nothing says \
+                     which argv element names the file carrying the JSON payload"
+                ));
+            };
+            ForeignSurface::FileJson { arg_index }
+        }
         other => {
             return Err(format!(
-                "{artifact_path_words} states a surface of kind {}, and this edge reads only \"stdin-json\" \
-                 or \"argv-json\"",
+                "{artifact_path_words} states a surface of kind {}, and this edge reads only \"stdin-json\", \
+                 \"argv-json\", or \"file-json\"",
                 quoted_or_none(other)
             ));
         }
@@ -811,6 +840,72 @@ mod tests {
 
         let read = read_foreign_ts_artifact(target.to_str().unwrap());
         let sentence = read.expect_err("an argv-json surface with no argIndex must decline");
+        assert!(sentence.contains("argIndex"), "sentence = {sentence:?}");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The `file-json` sibling of `well_formed_artifact` — the same
+    /// function fact, the payload carried in a FILE named at the argv
+    /// element rather than on the element's own text.
+    fn well_formed_file_json_artifact(source: &[u8], called: &str, arg_index: i64) -> Value {
+        let scalar = make_refined_set(vec![integer(), at_least(0.0)]);
+        json!({
+            "refined": {"kind": FOREIGN_ARTIFACT_KIND, "version": FOREIGN_ARTIFACT_VERSION},
+            "target": {"file": "target.ts", "contentHash": format!("sha256:{}", sha256_hex(source))},
+            "language": FOREIGN_ARTIFACT_LANGUAGE,
+            "runtime": {"band": FOREIGN_RUNTIME_BAND},
+            "surface": {"kind": "file-json", "argIndex": arg_index, "stdout": "json", "calls": called},
+            "functions": {
+                called: {
+                    "entry": [{"name": "x", "set": refined_kernel::wire_format::wire_set(&scalar)}],
+                    "return": {"set": refined_kernel::wire_format::wire_set(&scalar), "stdoutPure": true},
+                    "provenance": {"line": 3, "said": "given 'x' is a nonnegative integer, this body's returns derive a nonnegative integer"},
+                }
+            }
+        })
+    }
+
+    /// A well-formed `file-json` artifact reads its channel as
+    /// `ForeignSurface::FileJson` with the stated `argIndex` carried
+    /// through — the same transport model as `argv-json`, a different
+    /// carrier (a file the argv element names, not the element's own
+    /// text).
+    #[test]
+    fn a_well_formed_file_json_artifact_reads_its_channel_and_index() {
+        let root = temp_project_root("file_json_well_formed");
+        let target = root.join("target.ts");
+        fs::write(&target, b"export function f(x: number): number { return x; }\n").expect("write target");
+        let source = fs::read(&target).expect("read target back");
+        let artifact_path = cache_artifact_path(target.to_str().unwrap());
+        fs::create_dir_all(artifact_path.parent().unwrap()).expect("create cache dir");
+        fs::write(&artifact_path, well_formed_file_json_artifact(&source, "f", 2).to_string()).expect("write artifact");
+
+        let read = read_foreign_ts_artifact(target.to_str().unwrap());
+        let artifact = read.expect("a well-formed file-json artifact reads as a fact");
+        assert_eq!(artifact.surface, ForeignSurface::FileJson { arg_index: 2 });
+        assert_eq!(artifact.called.name, "f");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A `file-json` surface with no `argIndex` at all declines — the
+    /// carrier is named but the position it reads the file's path from
+    /// is not.
+    #[test]
+    fn a_file_json_surface_with_no_arg_index_declines() {
+        let root = temp_project_root("file_json_missing_index");
+        let target = root.join("target.ts");
+        fs::write(&target, b"export function f(x: number): number { return x; }\n").expect("write target");
+        let source = fs::read(&target).expect("read target back");
+        let mut artifact = well_formed_file_json_artifact(&source, "f", 2);
+        artifact["surface"].as_object_mut().unwrap().remove("argIndex");
+        let artifact_path = cache_artifact_path(target.to_str().unwrap());
+        fs::create_dir_all(artifact_path.parent().unwrap()).expect("create cache dir");
+        fs::write(&artifact_path, artifact.to_string()).expect("write artifact");
+
+        let read = read_foreign_ts_artifact(target.to_str().unwrap());
+        let sentence = read.expect_err("a file-json surface with no argIndex must decline");
         assert!(sentence.contains("argIndex"), "sentence = {sentence:?}");
 
         fs::remove_dir_all(&root).ok();

@@ -187,6 +187,54 @@ pub fn foreign_edge_channel_mismatch_argv_index(called_index: i64, declared_inde
     )
 }
 
+/// The channel-mismatch decline when the call writes a temp file named
+/// at an argv element but the target's own fact serves JSON on stdin —
+/// the file carrier's own mismatch against `stdin-json`, symmetric with
+/// `foreign_edge_channel_mismatch_argv_at_stdin_target`.
+pub fn foreign_edge_channel_mismatch_file_at_stdin_target() -> String {
+    "the call passes the payload through a temp file named as an argv element, but the target's fact serves \
+    JSON on stdin — the channels do not meet"
+        .to_owned()
+}
+
+/// The channel-mismatch decline when the call sends its payload on
+/// stdin but the target's own fact reads its JSON from a FILE named at
+/// an argv element — the reverse of
+/// `foreign_edge_channel_mismatch_file_at_stdin_target`.
+pub fn foreign_edge_channel_mismatch_stdin_at_file_target() -> String {
+    "the call passes the payload on stdin, but the target's fact reads its JSON from a file named as an \
+    argv element — the channels do not meet"
+        .to_owned()
+}
+
+/// The channel-mismatch decline when the call writes a temp file named
+/// at an argv element but the target's own fact reads its argv element
+/// AS the JSON text directly (`argv-json`), never as a file path.
+pub fn foreign_edge_channel_mismatch_file_at_argv_target() -> String {
+    "the call passes the payload through a temp file named as an argv element, but the target's fact reads \
+    that argv element as the JSON text itself — the channels do not meet"
+        .to_owned()
+}
+
+/// The channel-mismatch decline when the call passes its payload
+/// directly as an argv element (`argv-json`), but the target's own fact
+/// reads that argv element as a FILE PATH (`file-json`) rather than the
+/// JSON text itself.
+pub fn foreign_edge_channel_mismatch_argv_at_file_target() -> String {
+    "the call passes the payload directly as an argv element, but the target's fact reads that argv element \
+    as a file path holding the JSON — the channels do not meet"
+        .to_owned()
+}
+
+/// The channel-mismatch decline when both sides name a file-carried argv
+/// element but at different indices.
+pub fn foreign_edge_channel_mismatch_file_index(called_index: i64, declared_index: i64) -> String {
+    format!(
+        "the call names the temp file at argv[{called_index}], but the target's fact reads the file's path \
+        from argv[{declared_index}] — the channels do not meet"
+    )
+}
+
 /// The double-channel decline when a call names BOTH an argv-json
 /// payload and an `input=` keyword — a real ambiguity, not a recognition
 /// gap: two crossing values are stated and this checker names one
@@ -415,6 +463,55 @@ mod tests {
     #[test]
     fn the_argv_index_mismatch_names_both_positions() {
         let message = foreign_edge_channel_mismatch_argv_index(1, 2);
+        assert!(message.contains("argv[1]"), "{message}");
+        assert!(message.contains("argv[2]"), "{message}");
+    }
+
+    /// The file-carrier-at-stdin-target mismatch names the temp-file
+    /// carrier and states it does not meet stdin.
+    #[test]
+    fn the_file_at_stdin_target_mismatch_names_both_carriers() {
+        let message = foreign_edge_channel_mismatch_file_at_stdin_target();
+        assert!(message.contains("temp file"), "{message}");
+        assert!(message.contains("stdin"), "{message}");
+        assert!(message.contains("do not meet"), "{message}");
+    }
+
+    /// The stdin-at-file-target mismatch names both carriers,
+    /// symmetrically.
+    #[test]
+    fn the_stdin_at_file_target_mismatch_names_both_carriers() {
+        let message = foreign_edge_channel_mismatch_stdin_at_file_target();
+        assert!(message.contains("stdin"), "{message}");
+        assert!(message.contains("file"), "{message}");
+        assert!(message.contains("do not meet"), "{message}");
+    }
+
+    /// The file-carrier-at-argv-target mismatch names the file carrier
+    /// and states the target reads the argv element as JSON text
+    /// directly.
+    #[test]
+    fn the_file_at_argv_target_mismatch_names_both_carriers() {
+        let message = foreign_edge_channel_mismatch_file_at_argv_target();
+        assert!(message.contains("temp file"), "{message}");
+        assert!(message.contains("JSON text itself"), "{message}");
+        assert!(message.contains("do not meet"), "{message}");
+    }
+
+    /// The argv-carrier-at-file-target mismatch names both carriers,
+    /// symmetrically.
+    #[test]
+    fn the_argv_at_file_target_mismatch_names_both_carriers() {
+        let message = foreign_edge_channel_mismatch_argv_at_file_target();
+        assert!(message.contains("directly as an argv element"), "{message}");
+        assert!(message.contains("file path"), "{message}");
+        assert!(message.contains("do not meet"), "{message}");
+    }
+
+    /// A mismatched file-carrier index names both positions.
+    #[test]
+    fn the_file_index_mismatch_names_both_positions() {
+        let message = foreign_edge_channel_mismatch_file_index(1, 2);
         assert!(message.contains("argv[1]"), "{message}");
         assert!(message.contains("argv[2]"), "{message}");
     }

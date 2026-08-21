@@ -661,7 +661,7 @@ fn is_pure_builtin(name: &str) -> bool {
 
 // --- THE HARNESS -----------------------------------------------------
 
-/// The two harness shapes this reader recognizes in a module's
+/// The four harness shapes this reader recognizes in a module's
 /// `if __name__ == "__main__":` block. Every other shape is not a
 /// harness fact at all — `harness_shape` answers `None` for it, and the
 /// artifact omits the `surface` key entirely.
@@ -673,10 +673,25 @@ enum HarnessShape {
     /// possibly bound through one intermediate assignment first — the
     /// inbound channel is one argv string, parsed as a float.
     ArgvScalar { called: String, arg_index: i64 },
+    /// `print(json.dumps(<f>(json.load(sys.stdin), <argv-read>)))` —
+    /// TWO inbound channels, stdin's JSON payload handed to the callee's
+    /// parameter 0 and the argv float handed to parameter 1
+    /// (`level_gain_argv.py`'s own anatomy). The invariant a consumer
+    /// relies on: `<f>`'s exported `entry` carries exactly two rows in
+    /// this same order (entry[0] = the stdin parameter, entry[1] = the
+    /// argv parameter), because this shape is recognized only when the
+    /// call's two positional arguments match that order.
+    StdinJsonArgvScalar { called: String, arg_index: i64 },
+    /// `with open(sys.argv[<n>]) as <handle>: <payload> =
+    /// json.load(<handle>)` followed by
+    /// `print(json.dumps(<f>(<payload>)))` — the inbound channel is the
+    /// JSON file named at that argv position, not stdin.
+    FileJson { called: String, arg_index: i64 },
 }
 
 /// `harness_shape_json`'s JSON for one recognized shape — schema v2's
-/// tagged union, §11's `stdin-json` row and this leg's `argv-scalar` row.
+/// tagged union, the `stdin-json` and `argv-scalar` rows plus this
+/// batch's `stdin-json-argv-scalar` and `file-json` rows.
 fn harness_shape_json(shape: &HarnessShape) -> Value {
     match shape {
         HarnessShape::StdinJson { called } => {
@@ -685,11 +700,17 @@ fn harness_shape_json(shape: &HarnessShape) -> Value {
         HarnessShape::ArgvScalar { called, arg_index } => {
             json!({"kind": "argv-scalar", "argIndex": arg_index, "parse": "float", "stdout": "json", "calls": called})
         }
+        HarnessShape::StdinJsonArgvScalar { called, arg_index } => {
+            json!({"kind": "stdin-json-argv-scalar", "stdin": "json", "argIndex": arg_index, "parse": "float", "stdout": "json", "calls": called})
+        }
+        HarnessShape::FileJson { called, arg_index } => {
+            json!({"kind": "file-json", "argIndex": arg_index, "stdout": "json", "calls": called})
+        }
     }
 }
 
 /// The module's `if __name__ == "__main__":` block read for one of the
-/// two recognized harness shapes. `None` for a module with no main
+/// four recognized harness shapes. `None` for a module with no main
 /// block, or with a block of any other shape — the artifact omits the
 /// harness key entirely then, and the consumer reads that absence as "no
 /// harness fact".
@@ -701,7 +722,10 @@ fn harness_shape(module: &ModModule) -> Option<HarnessShape> {
         if !is_main_guard(if_stmt.test.as_ref()) {
             continue;
         }
-        return argv_scalar_harness(&if_stmt.body).or_else(|| stdin_json_harness(&if_stmt.body));
+        return stdin_json_argv_scalar_harness(&if_stmt.body)
+            .or_else(|| argv_scalar_harness(&if_stmt.body))
+            .or_else(|| stdin_json_harness(&if_stmt.body))
+            .or_else(|| file_json_harness(&if_stmt.body));
     }
     None
 }
@@ -765,6 +789,129 @@ fn argv_scalar_harness(body: &[Stmt]) -> Option<HarnessShape> {
     None
 }
 
+/// The mixed shape: some statement in the block is
+/// `print(json.dumps(<f>(json.load(sys.stdin), <argv-read>)))` — a call
+/// of exactly TWO positional arguments, the first `json.load(sys.stdin)`
+/// and the second an argv float read (inline, or bound one statement
+/// earlier by a plain assignment, the same intermediate-assignment leg
+/// `argv_scalar_harness` reads) — `level_gain_argv.py`'s own anatomy.
+/// Position is what carries the meaning: stdin's parse goes to the
+/// callee's parameter 0, the argv float to parameter 1, which is why
+/// this reader checks the arguments in that exact order rather than
+/// accepting either order. Any other shape — one argument, a third
+/// argument, the two arguments swapped, an `int(...)`/`str(...)` parse
+/// — answers `None`.
+fn stdin_json_argv_scalar_harness(body: &[Stmt]) -> Option<HarnessShape> {
+    for (index, inner) in body.iter().enumerate() {
+        let Stmt::Expr(expr_stmt) = inner else {
+            continue;
+        };
+        let Some((called, first_argument, second_argument)) = harness_two_argument_call(expr_stmt.value.as_ref())
+        else {
+            continue;
+        };
+        if !is_stdin_json_load(first_argument) {
+            continue;
+        }
+        if let Some(arg_index) = argv_float_read(second_argument) {
+            return Some(HarnessShape::StdinJsonArgvScalar { called, arg_index });
+        }
+        // The one intermediate assignment the brief allows, read exactly
+        // as `argv_scalar_harness` reads it for its own single argument.
+        let Expr::Name(referenced) = second_argument else {
+            continue;
+        };
+        let Some(Stmt::Assign(assign)) = index.checked_sub(1).and_then(|previous| body.get(previous)) else {
+            continue;
+        };
+        let [target] = assign.targets.as_slice() else {
+            continue;
+        };
+        let Expr::Name(bound) = target else {
+            continue;
+        };
+        if bound.id.as_str() != referenced.id.as_str() {
+            continue;
+        }
+        if let Some(arg_index) = argv_float_read(assign.value.as_ref()) {
+            return Some(HarnessShape::StdinJsonArgvScalar { called, arg_index });
+        }
+    }
+    None
+}
+
+/// The file-JSON shape: a `with open(sys.argv[<n>]) as <handle>:` block
+/// whose body is exactly one assignment binding a bare name to
+/// `json.load(<handle>)`, followed (with or without an intermediate
+/// statement gap the scan does not require to be adjacent — the search
+/// below just looks at every remaining statement) by
+/// `print(json.dumps(<f>(<payload>)))` where `<payload>` is that same
+/// bound name — `level_from_file.py`'s own anatomy. Any other shape (a
+/// `with` body with more than the one assignment, a `json.load` receiver
+/// other than the `with` target, a call whose sole argument is not the
+/// loaded payload) answers `None`.
+fn file_json_harness(body: &[Stmt]) -> Option<HarnessShape> {
+    for (index, inner) in body.iter().enumerate() {
+        let Stmt::With(with_stmt) = inner else {
+            continue;
+        };
+        let [item] = with_stmt.items.as_slice() else {
+            continue;
+        };
+        let Some(handle) = item.optional_vars.as_deref() else {
+            continue;
+        };
+        let Expr::Name(handle_name) = handle else {
+            continue;
+        };
+        let Some(opened) = single_argument_of(&item.context_expr, &CalleeSpelling::BareName("open")) else {
+            continue;
+        };
+        let Some(arg_index) = argv_subscript_index(opened) else {
+            continue;
+        };
+        let [Stmt::Assign(payload_assign)] = with_stmt.body.as_slice() else {
+            continue;
+        };
+        let [payload_target] = payload_assign.targets.as_slice() else {
+            continue;
+        };
+        let Expr::Name(payload_name) = payload_target else {
+            continue;
+        };
+        let Some(loaded) = single_argument_of(payload_assign.value.as_ref(), &CalleeSpelling::Attribute("json", "load"))
+        else {
+            continue;
+        };
+        let Expr::Name(loaded_receiver) = loaded else {
+            continue;
+        };
+        if loaded_receiver.id.as_str() != handle_name.id.as_str() {
+            continue;
+        }
+        // The payload is read from every remaining statement after this
+        // `with` block, not only the very next one — the brief's own
+        // fixture places the `print` immediately after, and this reader
+        // does not require that adjacency to hold for the shape to
+        // count.
+        for later in &body[index + 1..] {
+            let Stmt::Expr(expr_stmt) = later else {
+                continue;
+            };
+            let Some((called, argument)) = harness_sole_argument_call(expr_stmt.value.as_ref()) else {
+                continue;
+            };
+            let Expr::Name(referenced) = argument else {
+                continue;
+            };
+            if referenced.id.as_str() == payload_name.id.as_str() {
+                return Some(HarnessShape::FileJson { called, arg_index });
+            }
+        }
+    }
+    None
+}
+
 /// `print(json.dumps(<f>(<argument>)))` read for `<f>` and its sole
 /// argument — the same print/dumps wrapping `harness_shape_call` reads,
 /// stopping short of reading what the innermost argument itself is
@@ -787,13 +934,45 @@ fn harness_sole_argument_call<'a>(expr: &'a Expr) -> Option<(String, &'a Expr)> 
     Some((called.id.as_str().to_owned(), argument))
 }
 
-/// Whether `expr` is exactly `float(sys.argv[<literal int>])`, read for
-/// that literal index. `int(...)`/`str(...)` in the parse position, a
-/// non-literal or negative subscript, or any other spelling answers
-/// `None` — this reader states only the one parse this unit recognizes.
-fn argv_float_read(expr: &Expr) -> Option<i64> {
-    let argument = single_argument_of(expr, &CalleeSpelling::BareName("float"))?;
-    let Expr::Subscript(subscript) = argument else {
+/// `print(json.dumps(<f>(<first>, <second>)))` read for `<f>` and its
+/// exactly-two positional arguments, in order — the two-argument
+/// counterpart of `harness_sole_argument_call`, for the mixed
+/// stdin+argv shape where argument POSITION is the fact (parameter 0 is
+/// the stdin parse, parameter 1 is the argv parse).
+fn harness_two_argument_call<'a>(expr: &'a Expr) -> Option<(String, &'a Expr, &'a Expr)> {
+    let printed = single_argument_of(expr, &CalleeSpelling::BareName("print"))?;
+    let dumped = single_argument_of(printed, &CalleeSpelling::Attribute("json", "dumps"))?;
+    let Expr::Call(inner) = dumped else {
+        return None;
+    };
+    let Expr::Name(called) = inner.func.as_ref() else {
+        return None;
+    };
+    if !inner.arguments.keywords.is_empty() {
+        return None;
+    }
+    let [first, second] = inner.arguments.args.as_ref() else {
+        return None;
+    };
+    Some((called.id.as_str().to_owned(), first, second))
+}
+
+/// Whether `expr` is exactly `json.load(sys.stdin)` — the mixed shape's
+/// first argument, read without the print/dumps wrapping
+/// `harness_shape_call` reads it under.
+fn is_stdin_json_load(expr: &Expr) -> bool {
+    let Some(stdin) = single_argument_of(expr, &CalleeSpelling::Attribute("json", "load")) else {
+        return false;
+    };
+    is_sys_stdin(stdin)
+}
+
+/// Whether `expr` is exactly `sys.argv[<literal int>]`, read for that
+/// literal index — the bare subscript `argv_float_read` reads underneath
+/// its `float(...)` wrapping, and what the file shape's `with
+/// open(sys.argv[<n>])` reads directly (no `float(...)` wrapping there).
+fn argv_subscript_index(expr: &Expr) -> Option<i64> {
+    let Expr::Subscript(subscript) = expr else {
         return None;
     };
     if !is_sys_argv(subscript.value.as_ref()) {
@@ -806,6 +985,15 @@ fn argv_float_read(expr: &Expr) -> Option<i64> {
         Number::Int(value) => value.as_i64(),
         Number::Float(_) | Number::Complex { .. } => None,
     }
+}
+
+/// Whether `expr` is exactly `float(sys.argv[<literal int>])`, read for
+/// that literal index. `int(...)`/`str(...)` in the parse position, a
+/// non-literal or negative subscript, or any other spelling answers
+/// `None` — this reader states only the one parse this unit recognizes.
+fn argv_float_read(expr: &Expr) -> Option<i64> {
+    let argument = single_argument_of(expr, &CalleeSpelling::BareName("float"))?;
+    argv_subscript_index(argument)
 }
 
 /// Whether `expr` is `sys.argv` (or a bare `argv` a `from sys import
@@ -1429,6 +1617,212 @@ mod tests {
         .expect("test module parses")
         .into_syntax();
         assert!(harness_shape(&inline).is_none());
+    }
+
+    /// The main-block reader recognizes the mixed shape spelled exactly
+    /// as `level_gain_argv.py`'s own main block spells it: `gain =
+    /// float(sys.argv[1])` bound one statement before a call whose first
+    /// argument is `json.load(sys.stdin)` and whose second is `gain`.
+    #[test]
+    fn the_harness_reader_recognizes_the_stdin_json_argv_scalar_shape() {
+        let module = ruff_python_parser::parse_module(
+            "import json\nimport sys\n\n\ndef f(samples, gain: float) -> float: return gain\n\n\nif __name__ == \"__main__\":\n    gain = float(sys.argv[1])\n    print(json.dumps(f(json.load(sys.stdin), gain)))\n",
+        )
+        .expect("test module parses")
+        .into_syntax();
+        let Some(HarnessShape::StdinJsonArgvScalar { called, arg_index }) = harness_shape(&module) else {
+            panic!("expected the stdin-json-argv-scalar shape");
+        };
+        assert_eq!(called, "f");
+        assert_eq!(arg_index, 1);
+    }
+
+    /// The same mixed shape read with the argv read written inline as
+    /// the call's second argument, no intermediate assignment at all.
+    #[test]
+    fn the_harness_reader_recognizes_the_stdin_json_argv_scalar_shape_written_inline() {
+        let module = ruff_python_parser::parse_module(
+            "import json\nimport sys\n\n\ndef f(samples, gain: float) -> float: return gain\n\n\nif __name__ == \"__main__\":\n    print(json.dumps(f(json.load(sys.stdin), float(sys.argv[2]))))\n",
+        )
+        .expect("test module parses")
+        .into_syntax();
+        let Some(HarnessShape::StdinJsonArgvScalar { called, arg_index }) = harness_shape(&module) else {
+            panic!("expected the stdin-json-argv-scalar shape");
+        };
+        assert_eq!(called, "f");
+        assert_eq!(arg_index, 2);
+    }
+
+    /// The arguments in the OTHER order — the argv read first, stdin's
+    /// JSON second — is not the recognized shape: position carries the
+    /// meaning (parameter 0 is stdin, parameter 1 is argv), so the
+    /// swapped order states no harness at all.
+    #[test]
+    fn the_stdin_json_argv_scalar_shape_requires_stdin_first() {
+        let module = ruff_python_parser::parse_module(
+            "import json\nimport sys\n\n\ndef f(gain: float, samples) -> float: return gain\n\n\nif __name__ == \"__main__\":\n    print(json.dumps(f(float(sys.argv[1]), json.load(sys.stdin))))\n",
+        )
+        .expect("test module parses")
+        .into_syntax();
+        assert!(harness_shape(&module).is_none());
+    }
+
+    /// An `int(...)` parse in the mixed shape's argv position declines
+    /// as an omission — no shape recognized — exactly as the pure
+    /// argv-scalar leg declines it.
+    #[test]
+    fn an_int_parsing_mixed_harness_declines_with_no_shape_recognized() {
+        let module = ruff_python_parser::parse_module(
+            "import json\nimport sys\n\n\ndef f(samples, n: int) -> int: return n\n\n\nif __name__ == \"__main__\":\n    n = int(sys.argv[1])\n    print(json.dumps(f(json.load(sys.stdin), n)))\n",
+        )
+        .expect("test module parses")
+        .into_syntax();
+        assert!(harness_shape(&module).is_none());
+
+        let inline = ruff_python_parser::parse_module(
+            "import json\nimport sys\n\n\ndef f(samples, n: int) -> int: return n\n\n\nif __name__ == \"__main__\":\n    print(json.dumps(f(json.load(sys.stdin), int(sys.argv[1]))))\n",
+        )
+        .expect("test module parses")
+        .into_syntax();
+        assert!(harness_shape(&inline).is_none());
+    }
+
+    /// A module whose `__main__` block IS the recognized mixed shape
+    /// exports schema v2's `surface` object exactly — the same
+    /// two-parameter harness anatomy `level_gain_argv.py` states
+    /// (`json.load(sys.stdin)` first, `float(sys.argv[1])` second), with
+    /// a body the walk DOES derive a value for (unlike the real
+    /// fixture's own body — see
+    /// `the_real_mixed_fixture_bodys_return_is_still_undetermined`
+    /// below), so this test pins the surface recognition and the entry
+    /// ordering independent of that separate, ledgered gap. The called
+    /// function's `entry` carries the two rows in the order the
+    /// consumer relies on (entry[0] = stdin's parameter, entry[1] =
+    /// argv's).
+    #[test]
+    fn the_mixed_shape_fixture_exports_the_v2_surface_object() {
+        let Some(kernel) = loaded_kernel() else {
+            return;
+        };
+        let source = b"import sys\nfrom typing import Annotated\n\nfrom pydantic import Field\n\nSample = Annotated[float, Field(ge=-2.0, le=2.0)]\n\n\ndef level_gain_argv(samples: Annotated[list[Sample], Field(min_length=1)], gain: float) -> float:\n    return max(0.0, min(1.0, gain))\n\n\nif __name__ == \"__main__\":\n    import json\n\n    gain = float(sys.argv[1])\n    print(json.dumps(level_gain_argv(json.load(sys.stdin), gain)))\n";
+        let text = String::from_utf8(source.to_vec()).expect("the fixture is UTF-8");
+        let module = ruff_python_parser::parse_module(&text)
+            .expect("the fixture parses")
+            .into_syntax();
+        let no_imports: ModuleResolver = &|_: &str| None;
+        let export = export_module(&module, source, "level_gain_argv.py", no_imports, &kernel);
+        for omission in &export.omissions {
+            eprintln!("omission: '{}' — {}", omission.function, omission.reason);
+        }
+        let artifact = export.artifact.as_object().expect("the artifact is an object");
+        assert_eq!(
+            artifact["surface"],
+            json!({
+                "kind": "stdin-json-argv-scalar",
+                "stdin": "json",
+                "argIndex": 1,
+                "parse": "float",
+                "stdout": "json",
+                "calls": "level_gain_argv",
+            })
+        );
+        let entry = artifact["functions"]["level_gain_argv"]["entry"].as_array().unwrap_or_else(|| {
+            let reason = export
+                .omissions
+                .iter()
+                .find(|omission| omission.function == "level_gain_argv")
+                .map(|omission| omission.reason.as_str())
+                .unwrap_or("not found in either functions or omissions");
+            panic!("level_gain_argv exports no entry — omission reason: {reason}");
+        });
+        assert_eq!(entry.len(), 2, "the mixed shape's callee states exactly two rows");
+        assert_eq!(entry[0]["name"], "samples");
+        assert_eq!(entry[1]["name"], "gain");
+    }
+
+    /// `level_gain_argv.py`'s OWN body — the real fixture, not a
+    /// determinable stand-in — currently derives no return value: the
+    /// comprehension `clamped = [max(-1.0, min(1.0, s * gain)) for s in
+    /// samples]` reads a second free scalar name (`gain`) alongside the
+    /// loop variable, a shape the single-language walk does not yet
+    /// carry through to `math.sqrt(total / len(samples))`. This is a
+    /// determination gap ledgered in ISSUES.md, not this recognizer's
+    /// defect — the harness-shape reader recognizes the module's
+    /// `surface` correctly regardless (see the test above); it is the
+    /// CALLEE's own return that stays underived. Pinned here so the
+    /// ledgered fix flips this test's own assertion the moment it
+    /// lands, at which point `level_gain_argv` should be asserted
+    /// present in `functions` instead.
+    #[test]
+    fn the_real_mixed_fixture_bodys_return_is_still_undetermined() {
+        let Some(kernel) = loaded_kernel() else {
+            return;
+        };
+        let source = b"import math\nimport sys\nfrom typing import Annotated\n\nfrom pydantic import Field\n\nSample = Annotated[float, Field(ge=-2.0, le=2.0)]\nLevel = Annotated[float, Field(ge=0.0, le=1.0)]\n\n\ndef level_gain_argv(samples: Annotated[list[Sample], Field(min_length=1)], gain: float) -> Level:\n    clamped = [max(-1.0, min(1.0, s * gain)) for s in samples]\n    total = sum(s * s for s in clamped)\n    return math.sqrt(total / len(samples))\n\n\nif __name__ == \"__main__\":\n    import json\n\n    gain = float(sys.argv[1])\n    print(json.dumps(level_gain_argv(json.load(sys.stdin), gain)))\n";
+        let text = String::from_utf8(source.to_vec()).expect("the fixture is UTF-8");
+        let module = ruff_python_parser::parse_module(&text)
+            .expect("the fixture parses")
+            .into_syntax();
+        let no_imports: ModuleResolver = &|_: &str| None;
+        let export = export_module(&module, source, "level_gain_argv.py", no_imports, &kernel);
+        for omission in &export.omissions {
+            eprintln!("omission: '{}' — {}", omission.function, omission.reason);
+        }
+        let omission = export
+            .omissions
+            .iter()
+            .find(|omission| omission.function == "level_gain_argv")
+            .unwrap_or_else(|| panic!("expected 'level_gain_argv' to be omitted (see ISSUES.md) — instead it exported"));
+        assert_eq!(
+            omission.reason,
+            "the derived return is a value this walk never determined, which has no faithful set reading"
+        );
+    }
+
+    /// The main-block reader recognizes the file shape spelled exactly
+    /// as `level_from_file.py`'s own main block spells it: `with
+    /// open(sys.argv[1]) as payload_file:` binding `payload =
+    /// json.load(payload_file)`, then `print(json.dumps(f(payload)))`.
+    #[test]
+    fn the_harness_reader_recognizes_the_file_json_shape() {
+        let module = ruff_python_parser::parse_module(
+            "import json\nimport sys\n\n\ndef f(x): return x\n\n\nif __name__ == \"__main__\":\n    with open(sys.argv[1]) as payload_file:\n        payload = json.load(payload_file)\n    print(json.dumps(f(payload)))\n",
+        )
+        .expect("test module parses")
+        .into_syntax();
+        let Some(HarnessShape::FileJson { called, arg_index }) = harness_shape(&module) else {
+            panic!("expected the file-json shape");
+        };
+        assert_eq!(called, "f");
+        assert_eq!(arg_index, 1);
+    }
+
+    /// A module whose `__main__` block IS the recognized file shape
+    /// exports schema v2's `surface` object exactly —
+    /// `level_from_file.py`'s own anatomy end to end through
+    /// `export_module`.
+    #[test]
+    fn the_file_shape_fixture_exports_the_v2_surface_object() {
+        let Some(kernel) = loaded_kernel() else {
+            return;
+        };
+        let source = b"import json\nimport math\nimport sys\nfrom typing import Annotated\n\nfrom pydantic import Field\n\nSample = Annotated[float, Field(ge=-2.0, le=2.0)]\nLevel = Annotated[float, Field(ge=0.0, le=1.0)]\n\n\ndef level_from_file(samples: Annotated[list[Sample], Field(min_length=1)]) -> Level:\n    clamped = [max(-1.0, min(1.0, s)) for s in samples]\n    total = sum(s * s for s in clamped)\n    return math.sqrt(total / len(samples))\n\n\nif __name__ == \"__main__\":\n    with open(sys.argv[1]) as payload_file:\n        payload = json.load(payload_file)\n    print(json.dumps(level_from_file(payload)))\n";
+        let text = String::from_utf8(source.to_vec()).expect("the fixture is UTF-8");
+        let module = ruff_python_parser::parse_module(&text)
+            .expect("the fixture parses")
+            .into_syntax();
+        let no_imports: ModuleResolver = &|_: &str| None;
+        let export = export_module(&module, source, "level_from_file.py", no_imports, &kernel);
+        let artifact = export.artifact.as_object().expect("the artifact is an object");
+        assert_eq!(
+            artifact["surface"],
+            json!({
+                "kind": "file-json",
+                "argIndex": 1,
+                "stdout": "json",
+                "calls": "level_from_file",
+            })
+        );
     }
 
     /// A `print` anywhere in the body — or in a same-module def the body
