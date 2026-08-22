@@ -1135,7 +1135,14 @@ fn sorted_numeric_items(items: &[AbstractValue]) -> Option<Vec<AbstractValue>> {
         }
         pairs.push((element.values[0], element.clone()));
     }
-    pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).expect("known numeric values are never NaN"));
+    // A NaN element makes every comparison false, so CPython's sort
+    // produces an order no law states — a NaN-admitting list yields no
+    // order claim, and this reader declines rather than fabricate one
+    // (float("nan") is a value builtin_models::float_call constructs).
+    if pairs.iter().any(|(value, _)| value.is_nan()) {
+        return None;
+    }
+    pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).expect("NaN elements declined above"));
     Some(pairs.into_iter().map(|(_, value)| value).collect())
 }
 

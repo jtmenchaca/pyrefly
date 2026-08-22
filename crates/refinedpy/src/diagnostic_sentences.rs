@@ -358,6 +358,21 @@ pub fn division_by_a_set_that_admits_zero() -> String {
         .to_owned()
 }
 
+/// A `for` loop's own abstract pass names, per iteration, a written name
+/// whose value never reached a fixed point across the two judged passes
+/// (`loops.rs::stabilized_join`'s own doc) — the loop reaches a real
+/// stopping point, but that name's true accumulated value past it is
+/// unreadable. Names the written name so the reader knows which
+/// accumulation to widen or bound explicitly, mirroring the plain,
+/// per-position wording every other decline in this module already
+/// takes.
+pub fn loop_accumulation_did_not_stabilize(name: &str) -> String {
+    format!(
+        "the for loop's own value for '{name}' does not settle to a fixed point across its own two \
+        judged passes, so its value past the loop is not yet readable"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use refined_sets::codepoint_sets::string_tuple;
@@ -605,5 +620,15 @@ mod tests {
         assert!(message.contains("ZeroDivisionError"), "{message}");
         assert!(message.contains("expressions.rst"), "{message}");
         assert!(message.contains("if divisor != 0:"), "{message}");
+    }
+
+    /// The loop-stabilization sentence names the written name that never
+    /// settled and says its post-loop value is not yet readable.
+    #[test]
+    fn the_loop_accumulation_sentence_names_the_written_name() {
+        let message = loop_accumulation_did_not_stabilize("total");
+        assert!(message.contains("'total'"), "{message}");
+        assert!(message.contains("fixed point"), "{message}");
+        assert!(message.contains("not yet readable"), "{message}");
     }
 }

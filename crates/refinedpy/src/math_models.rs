@@ -9,12 +9,19 @@
 //! module (`floor`, `ceil`, `trunc`, `isqrt`, `fabs`, `copysign`, and
 //! `sqrt` on a known perfect square), the exact `int`-theory slice the
 //! kernel serves (`factorial`, `gcd`, `lcm`, `comb`, `perm`, and
-//! `isqrt` over a set — `int_theory_call`), PLUS the sort-only approximated
-//! family (`sqrt` on any other operand, every trig/hyperbolic function,
-//! `cbrt`, `exp`, `expm1`, `log`, `log1p`, `log2`, `log10`, `hypot`),
-//! which answers `float_sorted_unknown()` — a Float-tagged all-numbers
-//! SET, never a specific value — once every argument is known, so
-//! assignability's sort-fire law can still refuse an int-sorted sink.
+//! `isqrt` over a set — `int_theory_call`), the KERNEL-BACKED
+//! transcendental family (`exp`, `expm1`, `log`, `log1p`, `log2`,
+//! `log10`, every trig/hyperbolic function, and `atan2` —
+//! `kernel_backed_unary_family_call`/`kernel_backed_atan2_call` —
+//! python-pins.md's explog.1–6 and trig.1–13 rows, each posed to the
+//! SAME `boundary/javascript.lean` transfer arm the JS adapter asks,
+//! answering a certified window rather than a bare sort), PLUS the
+//! sort-only approximated family that remains (`cbrt`, `hypot`, and
+//! `sqrt` on a non-perfect-square operand — pow.6/pow.8/pow.4's own
+//! pins rows name why each stays local), which answers
+//! `float_sorted_unknown()` — a Float-tagged all-numbers SET, never a
+//! specific value — once every argument is known, so assignability's
+//! sort-fire law can still refuse an int-sorted sink.
 //! `math` is CPython's thin libm wrapper (library/math.html,
 //! implementation detail note: "the current implementation... will
 //! raise ValueError for invalid operations... and OverflowError for
@@ -48,8 +55,11 @@ use refined_kernel::transfer_questions::PowOperandWire;
 use refined_kernel::transfer_questions::TransferAnswerKind;
 use refined_kernel::transfer_questions::TransferQuestion;
 use refined_kernel::transfer_questions::TransferQuestionOp;
+use refined_sets::refinement_forms::above;
 use refined_sets::refinement_forms::at_least;
+use refined_sets::refinement_forms::at_most;
 use refined_sets::refinement_forms::below;
+use refined_sets::refinement_forms::union;
 use refined_sets::refinement_forms::Form;
 use refined_sets::refinement_forms::make_refined_set;
 use refined_sets::refinement_forms::one_of;
@@ -672,16 +682,435 @@ fn sqrt_call_over_set(value: &AbstractValue, kernel: &Arc<RefinedTSKernel>) -> O
     }
 }
 
-/// The approximated float family this wave promotes from `None` (plain
-/// unknown) to `float_sorted_unknown()` (a Float-tagged, all-numbers
-/// SET) once every argument is known: `sqrt`, `sin`, `cos`, `tan`,
-/// `asin`, `acos`, `atan`, `atan2`, `sinh`, `cosh`, `tanh`, `asinh`,
-/// `acosh`, `atanh`, `cbrt`, `exp`, `expm1`, `log`, `log1p`, `log2`,
-/// `log10`, `hypot` — `log2(x)`/`log10(x)` ("Return the base-2/base-10
-/// logarithm of x," library/math.rst) are the same float-returning,
-/// no-pinned-exact-value shape `log`/`log1p` already carry.
-/// None of these carries a pinned exact-value clause (library/math.html's
-/// module intro: "the current implementation... Behavior in exceptional
+/// The operand a one-argument float transcendental question can be
+/// posed over: a known single numeric value reads as the one-element
+/// set `{v}` (the same "known value → singleton set" reading
+/// `int_transferable_operand` performs for the `int` theory, widened
+/// to every numeric sort since these questions are not integer-only),
+/// and an already-numeric-sorted `Kind::Set` reads as its own set —
+/// the same operand shape `sqrt_call_over_set`/`floor_call_over_set`
+/// pose, generalized to accept a known SINGLE value too (`transferExp`
+/// and its siblings answer a bracketing window even for a singleton
+/// operand, since none of this family is exactly computable at an
+/// arbitrary interior point — the pins table's own "implementation-
+/// approximated interior" note). A boolean-sorted or non-numeric
+/// operand declines.
+fn float_transferable_operand(value: &AbstractValue) -> Option<RefinedSet> {
+    if let Some((number, _)) = single_numeric_operand(value) {
+        return Some(make_refined_set(vec![one_of(&[number])]));
+    }
+    if value.kind == Kind::Set
+        && matches!(
+            value.kind_tag,
+            Some(PrimitiveKind::Integer)
+                | Some(PrimitiveKind::Float)
+                | Some(PrimitiveKind::Boolean)
+                | Some(PrimitiveKind::Number)
+        )
+    {
+        return Some(value.set.clone());
+    }
+    None
+}
+
+/// The DOMAIN-LIMITED members of the kernel-backed family and the exact
+/// window each one raises `ValueError` over in CPython — verified
+/// against `tmp/cpython/Modules/mathmodule.c`, not against the kernel's
+/// own JavaScript-facing `.nan` corner, because the two do NOT always
+/// agree at the boundary:
+///
+/// - `log`/`log2`/`log10`: `loghelper` routes a float argument through
+///   `math_1(arg, func, 0)` (`can_overflow = 0`). `m_log`/`m_log2`/
+///   `m_log10` (mathmodule.c) return `-HUGE_VAL` (an INFINITE result)
+///   at `x == 0.0` — a finite input — and `math_1`'s own rule ("an
+///   infinite result from finite inputs causes... ValueError if
+///   can_overflow is 0") fires there, so `math.log(0.0)` RAISES rather
+///   than returning `-inf`. The kernel's `logCorners` answers the
+///   value `-inf` at that same point (JavaScript's `Math.log(0) ===
+///   -Infinity`) — a real JS/Python divergence at exactly one point.
+///   The raise domain is therefore `x <= 0` (CLOSED at zero), one wider
+///   than the kernel's own open `x < 0` NaN corner. Cited by
+///   specifications/python/Doc/library/math.rst:696-698, whose own
+///   worked example is `log(0.0)`.
+/// - `log1p`: `FUNC1(log1p, m_log1p, 0, ...)` — same `can_overflow = 0`
+///   rule. The platform `log1p(-1.0)` returns `-inf` (an infinite
+///   result from a finite input), so `math.log1p(-1.0)` RAISES —
+///   diverging from the kernel's `jsLog1p`, which serves the exact
+///   value `-inf` there (`Eqv d ⟨-1,0⟩`). The raise domain is `x <=
+///   -1` (closed), one wider than the kernel's own open `x < -1` NaN
+///   corner.
+/// - `asin`/`acos`: `FUNC1(asin, asin, 0, ...)` / `FUNC1(acos, acos, 0,
+///   ...)`, the platform libm functions directly. `|x| = 1` is finite
+///   (`asin(1) = pi/2`, `acos(-1) = pi`) — no infinite-result rule
+///   fires there, so the raise domain is `|x| > 1` (OPEN), matching the
+///   kernel's own boundary exactly: no divergence.
+/// - `atanh`: `FUNC1(atanh, atanh, 0, ...)`. The platform `atanh(±1.0)`
+///   returns `±inf` (an infinite result from a finite input), so
+///   `math.atanh(±1.0)` RAISES — diverging from the kernel's
+///   `jsAtanh`, which serves `±inf` there. The raise domain is `|x| >=
+///   1` (closed), matching `atanh_sound.lean`'s own "`1 ± x <= 0`"
+///   domain-error comment, one wider than a naive open reading.
+/// - `acosh`: `FUNC1(acosh, acosh, 0, ...)`. `x = 1` is finite
+///   (`acosh(1) = 0`) — the raise domain is `x < 1` (OPEN), matching
+///   the kernel's own boundary exactly: no divergence.
+///
+/// Each row's SERVED half — the window's complement against the raise
+/// domain — is what `served_half_window` intersects the operand
+/// against for the straddling case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DomainLimitedFamily {
+    Log,
+    Log2,
+    Log10,
+    Log1p,
+    Asin,
+    Acos,
+    Atanh,
+    Acosh,
+}
+
+impl DomainLimitedFamily {
+    /// The `math.*` attribute name this family answers, or `None` for
+    /// every other function — the one place a name string is read into
+    /// this enum, so every caller (the value dispatch, `expressions.rs`'s
+    /// fire arms) shares one recognition.
+    pub fn of_function(function: &str) -> Option<DomainLimitedFamily> {
+        match function {
+            "log" => Some(DomainLimitedFamily::Log),
+            "log2" => Some(DomainLimitedFamily::Log2),
+            "log10" => Some(DomainLimitedFamily::Log10),
+            "log1p" => Some(DomainLimitedFamily::Log1p),
+            "asin" => Some(DomainLimitedFamily::Asin),
+            "acos" => Some(DomainLimitedFamily::Acos),
+            "atanh" => Some(DomainLimitedFamily::Atanh),
+            "acosh" => Some(DomainLimitedFamily::Acosh),
+            _ => None,
+        }
+    }
+
+    fn transfer_op(self) -> TransferQuestionOp {
+        match self {
+            DomainLimitedFamily::Log => TransferQuestionOp::Log,
+            DomainLimitedFamily::Log2 => TransferQuestionOp::Log2,
+            DomainLimitedFamily::Log10 => TransferQuestionOp::Log10,
+            DomainLimitedFamily::Log1p => TransferQuestionOp::Log1p,
+            DomainLimitedFamily::Asin => TransferQuestionOp::Asin,
+            DomainLimitedFamily::Acos => TransferQuestionOp::Acos,
+            DomainLimitedFamily::Atanh => TransferQuestionOp::Atanh,
+            DomainLimitedFamily::Acosh => TransferQuestionOp::Acosh,
+        }
+    }
+
+    /// The window CPython raises `ValueError` over — this enum's own
+    /// doc names the exact `mathmodule.c` clause behind each row.
+    fn raise_domain(self) -> RefinedSet {
+        match self {
+            DomainLimitedFamily::Log | DomainLimitedFamily::Log2 | DomainLimitedFamily::Log10 => {
+                make_refined_set(vec![at_most(0.0)])
+            }
+            DomainLimitedFamily::Log1p => make_refined_set(vec![at_most(-1.0)]),
+            DomainLimitedFamily::Asin | DomainLimitedFamily::Acos => {
+                make_refined_set(vec![union(make_refined_set(vec![below(-1.0)]), make_refined_set(vec![above(1.0)]))])
+            }
+            DomainLimitedFamily::Atanh => make_refined_set(vec![union(
+                make_refined_set(vec![at_most(-1.0)]),
+                make_refined_set(vec![at_least(1.0)]),
+            )]),
+            DomainLimitedFamily::Acosh => make_refined_set(vec![below(1.0)]),
+        }
+    }
+
+    /// The window's COMPLEMENT — the served half — spelled directly
+    /// rather than through a generic set-difference form, the same way
+    /// `split_divisor_transfer`'s own negative/positive halves are
+    /// spelled directly rather than built from a `Difference` node.
+    fn served_domain(self) -> RefinedSet {
+        match self {
+            DomainLimitedFamily::Log | DomainLimitedFamily::Log2 | DomainLimitedFamily::Log10 => {
+                make_refined_set(vec![above(0.0)])
+            }
+            DomainLimitedFamily::Log1p => make_refined_set(vec![above(-1.0)]),
+            DomainLimitedFamily::Asin | DomainLimitedFamily::Acos => {
+                make_refined_set(vec![at_least(-1.0), at_most(1.0)])
+            }
+            DomainLimitedFamily::Atanh => make_refined_set(vec![above(-1.0), below(1.0)]),
+            DomainLimitedFamily::Acosh => make_refined_set(vec![at_least(1.0)]),
+        }
+    }
+
+    /// CPython's own runtime message for every row in this family —
+    /// `is_error` (mathmodule.c): `if (errno == EDOM) PyErr_SetString
+    /// (PyExc_ValueError, "math domain error")` — one shared string
+    /// across the whole module, not a per-function wording, matching
+    /// `expressions.rs`'s existing `math.sqrt` raise arm.
+    pub fn raise_message(self) -> &'static str {
+        "this expression provably raises ValueError: math domain error"
+    }
+}
+
+/// Whether a KNOWN operand's window is ENTIRELY inside a family's raise
+/// domain, STRADDLES the boundary (admits both raising and non-raising
+/// values), or is ENTIRELY inside the served domain — the three-way
+/// read `expressions.rs`'s `call_provable_raise` (entirely-raises) and
+/// `possible_raise` (straddles) both ask, mirroring
+/// `divisor_is_provably_always_zero`/`divisor_provably_excludes_zero`'s
+/// own `scalar_subset`/`scalar_disjoint` pair exactly — the same two
+/// kernel questions, posed against this family's own `raise_domain()`
+/// rather than the fixed `{0.0}` divisor does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DomainRaiseClassification {
+    EntirelyRaises,
+    Straddles,
+    EntirelyServed,
+}
+
+/// Classifies a KNOWN operand (a single value or a bounded set) against
+/// `family`'s raise domain. `None` when the operand cannot be read as a
+/// transferable window at all (an unknown argument, a non-numeric
+/// sort) — the caller declines exactly as every other unread shape in
+/// this file does.
+pub fn domain_raise_classification(
+    family: DomainLimitedFamily,
+    argument: &AbstractValue,
+    kernel: &Arc<RefinedTSKernel>,
+) -> Option<DomainRaiseClassification> {
+    let operand = float_transferable_operand(argument)?;
+    let raise_domain = family.raise_domain();
+    let empty = crate::kernel_ask::ask_kernel(|| (kernel.scalar_empty)(&operand));
+    if matches!(empty, Ok(true)) || empty.is_err() {
+        return None;
+    }
+    let entirely_raises = crate::kernel_ask::ask_kernel(|| (kernel.scalar_subset)(&operand, &raise_domain));
+    if matches!(entirely_raises, Ok(true)) {
+        return Some(DomainRaiseClassification::EntirelyRaises);
+    }
+    let entirely_served = crate::kernel_ask::ask_kernel(|| (kernel.scalar_disjoint)(&operand, &raise_domain));
+    if matches!(entirely_served, Ok(true)) {
+        return Some(DomainRaiseClassification::EntirelyServed);
+    }
+    Some(DomainRaiseClassification::Straddles)
+}
+
+/// The served half's kernel window for a STRADDLING operand — the exact
+/// mirror of `split_divisor_transfer`'s own split-and-re-ask pattern,
+/// narrowed to one half (this family's `served_domain()`) rather than
+/// two, since a domain-limited unary function has one raise-side ray
+/// and one served-side ray/interval, not two symmetric halves around a
+/// point. Poses the operand's window INTERSECTED with the served
+/// domain — never the raw operand window, which would ask
+/// `js.log`/`js.asin`/… a question a raising sub-window makes unsound
+/// for Python. `None` on a kernel refusal, an empty intersection (the
+/// operand does not actually straddle — the caller's own
+/// `domain_raise_classification` should have already ruled this out),
+/// or a `NaN`/`Unknown` answer on the served half (a decline, never a
+/// mis-answer — the same discipline `kernel_backed_unary_family_call`
+/// keeps for the non-straddling case).
+pub fn domain_raise_served_half_value(
+    family: DomainLimitedFamily,
+    argument: &AbstractValue,
+    kernel: &Arc<RefinedTSKernel>,
+) -> Option<AbstractValue> {
+    let operand = float_transferable_operand(argument)?;
+    let served_half = make_refined_set({
+        let mut forms = operand.forms.clone();
+        forms.extend(family.served_domain().forms.clone());
+        forms
+    });
+    let empty = crate::kernel_ask::ask_kernel(|| (kernel.scalar_empty)(&served_half));
+    if matches!(empty, Ok(true)) || empty.is_err() {
+        return None;
+    }
+    let nan_operand = PowOperandWire { kind: PowOperandKind::NaN, set: make_refined_set(vec![]) };
+    let asked = crate::kernel_ask::ask_kernel(|| {
+        (kernel.transfer)(&TransferQuestion {
+            op: family.transfer_op(),
+            a: served_half,
+            b: make_refined_set(vec![]),
+            c: 0.0,
+            base: nan_operand.clone(),
+            exp: nan_operand,
+        })
+    })
+    .ok()?;
+    let grade = derived_trust_level(TrustSpec, std::slice::from_ref(argument));
+    match asked.kind {
+        TransferAnswerKind::Values => Some(known_values(asked.values, PrimitiveKind::Float, grade)),
+        TransferAnswerKind::Set => Some(AbstractValue {
+            kind_tag: Some(PrimitiveKind::Float),
+            ..known_set(asked.set, None, grade, SetKindTag::None)
+        }),
+        TransferAnswerKind::NaN | TransferAnswerKind::Unknown => None,
+    }
+}
+
+/// Poses one KERNEL-BACKED question for the explog/trig family's
+/// one-argument members (`Exp`, `Expm1`, `Log`, `Log1p`, `Log2`,
+/// `Log10`, `Sin`, `Cos`, `Tan`, `Sinh`, `Cosh`, `Tanh`, `Asin`,
+/// `Acos`, `Atan`, `Asinh`, `Acosh`, `Atanh`) and reads the answer back
+/// Float-sorted — the exact mirror of `sqrt_call_over_set`'s own
+/// construction and refusal discipline, generalized to any unary
+/// `TransferQuestionOp` and to a known-single-value operand via
+/// `float_transferable_operand`.
+///
+/// A `TransferAnswerKind::NaN` answer declines to `None` rather than
+/// answering a value — the same reasoning `sqrt_argument_is_known_negative`
+/// already keeps for `sqrt`, generalized to the rest of the family
+/// rather than restated per function.
+///
+/// For the six DOMAIN-LIMITED members (`DomainLimitedFamily::of_function`),
+/// this function additionally gates the VALUE side against CPython's
+/// own raise domain — `DomainLimitedFamily::raise_domain`'s own doc —
+/// which is WIDER than the kernel's `.nan` corner for `log`/`log2`/
+/// `log10`/`log1p`/`atanh` at exactly one boundary point each (the
+/// JS-vs-Python divergence that enum documents). Without this gate,
+/// `math.log(0.0)` would read the kernel's served `-inf` value as a
+/// Python return, when the real call raises there instead. A window
+/// that STRADDLES the raise domain (some served values, some raising)
+/// still declines HERE — `expressions.rs`'s `possible_raise` sibling
+/// asks `domain_raise_served_half_value` directly for that case, since
+/// this function's own "one call, one answer" shape has no room to
+/// speak the served HALF only.
+fn kernel_backed_unary_family_call(
+    function: &str,
+    op: TransferQuestionOp,
+    value: &AbstractValue,
+    kernel: &Arc<RefinedTSKernel>,
+) -> Option<AbstractValue> {
+    if let Some(family) = DomainLimitedFamily::of_function(function) {
+        match domain_raise_classification(family, value, kernel) {
+            Some(DomainRaiseClassification::EntirelyServed) => {}
+            // EntirelyRaises: the real call never returns a value here —
+            // `call_provable_raise`'s own row, not this function's to
+            // answer. Straddles: only the served half determines, and
+            // this function answers no partial value —
+            // `possible_raise`'s own row reads `domain_raise_served_
+            // half_value` directly. A classification refusal (`None`)
+            // is the same unread-operand-shape decline every other row
+            // in this file already gives.
+            _ => return None,
+        }
+    }
+    let operand = float_transferable_operand(value)?;
+    let nan_operand = PowOperandWire { kind: PowOperandKind::NaN, set: make_refined_set(vec![]) };
+    let asked = crate::kernel_ask::ask_kernel(|| {
+        (kernel.transfer)(&TransferQuestion {
+            op,
+            a: operand,
+            b: make_refined_set(vec![]),
+            c: 0.0,
+            base: nan_operand.clone(),
+            exp: nan_operand,
+        })
+    })
+    .ok()?;
+    let grade = derived_trust_level(TrustSpec, std::slice::from_ref(value));
+    match asked.kind {
+        TransferAnswerKind::Values => Some(known_values(asked.values, PrimitiveKind::Float, grade)),
+        TransferAnswerKind::Set => Some(AbstractValue {
+            kind_tag: Some(PrimitiveKind::Float),
+            ..known_set(asked.set, None, grade, SetKindTag::None)
+        }),
+        // NaN: the real Python call raises rather than returning a
+        // value — this function's own doc. Unknown: the kernel arm
+        // itself declines this operand shape (e.g. `jsAtan2`'s
+        // non-`x>0` quadrants — see `kernel_backed_atan2_call`).
+        TransferAnswerKind::NaN | TransferAnswerKind::Unknown => None,
+    }
+}
+
+/// `math.atan2(y, x)` — the one two-argument member of this family
+/// (pins row trig.10). Poses `TransferQuestionOp::Atan2` over both
+/// known operands; the exact two-operand mirror of
+/// `kernel_backed_unary_family_call` above.
+///
+/// `jsAtan2` (`languages/javascript/trig/atan2.lean`) only serves the
+/// `x > 0, y ≠ 0` quadrant today ("the axis and left-half-plane
+/// corners wait on π pins," the file's own comment) and answers
+/// `Unknown` — never `NaN` — everywhere else, so there is no raise-vs-
+/// NaN divergence to gate here the way the log/asin/acos/atanh/acosh
+/// family needs: `atan2` is total over the reals in Python
+/// (library/math.rst's own clause states no domain restriction), and
+/// an `Unknown` kernel answer is this arm's own current serving gap,
+/// not a Python raise — it declines the same as every other unread
+/// shape in this file.
+fn kernel_backed_atan2_call(
+    y: &AbstractValue,
+    x: &AbstractValue,
+    kernel: &Arc<RefinedTSKernel>,
+) -> Option<AbstractValue> {
+    let y_operand = float_transferable_operand(y)?;
+    let x_operand = float_transferable_operand(x)?;
+    let nan_operand = PowOperandWire { kind: PowOperandKind::NaN, set: make_refined_set(vec![]) };
+    let asked = crate::kernel_ask::ask_kernel(|| {
+        (kernel.transfer)(&TransferQuestion {
+            op: TransferQuestionOp::Atan2,
+            a: y_operand,
+            b: x_operand,
+            c: 0.0,
+            base: nan_operand.clone(),
+            exp: nan_operand,
+        })
+    })
+    .ok()?;
+    let grade = derived_trust_level(TrustSpec, &[y.clone(), x.clone()]);
+    match asked.kind {
+        TransferAnswerKind::Values => Some(known_values(asked.values, PrimitiveKind::Float, grade)),
+        TransferAnswerKind::Set => Some(AbstractValue {
+            kind_tag: Some(PrimitiveKind::Float),
+            ..known_set(asked.set, None, grade, SetKindTag::None)
+        }),
+        TransferAnswerKind::NaN | TransferAnswerKind::Unknown => None,
+    }
+}
+
+/// The explog/trig pins rows' own `TransferQuestionOp` election, one
+/// per one-argument function name — the kernel operation column each
+/// pins row (`explog.1`–`explog.6`, `trig.1`–`trig.9`, `trig.11`–
+/// `trig.13`) now reads through `boundary/javascript.lean`'s shared
+/// name-keyed transfer table (`"js.exp"`, `"js.sin"`, …), the same
+/// table Python's own `int.*` arms register into
+/// (`boundary/python.lean`'s own header: "Registered into the SAME
+/// name-keyed transfer table... every wire op name is a flat string
+/// key"). `atan2` (trig.10) is excluded — its own
+/// `kernel_backed_atan2_call` above poses the two-operand question
+/// directly. `hypot` (pow.8) and `cbrt` (pow.6) are excluded: `hypot`'s
+/// own pins row states plainly "no wire arm registered for the N-ary
+/// form" (Python's variadic `math.hypot(*coordinates)` has no kernel
+/// election, only JS's landed two-argument `js.hypot`), and `cbrt` is
+/// outside this wave's named remainder (its own pins row, pow.6, calls
+/// `js.cbrt` "the adjacent election but... not directly reusable" —
+/// a separate ledger line from the explog+trig block this function
+/// answers).
+fn kernel_backed_unary_family_op(function: &str) -> Option<TransferQuestionOp> {
+    match function {
+        "exp" => Some(TransferQuestionOp::Exp),
+        "expm1" => Some(TransferQuestionOp::Expm1),
+        "log" => Some(TransferQuestionOp::Log),
+        "log1p" => Some(TransferQuestionOp::Log1p),
+        "log2" => Some(TransferQuestionOp::Log2),
+        "log10" => Some(TransferQuestionOp::Log10),
+        "sin" => Some(TransferQuestionOp::Sin),
+        "cos" => Some(TransferQuestionOp::Cos),
+        "tan" => Some(TransferQuestionOp::Tan),
+        "sinh" => Some(TransferQuestionOp::Sinh),
+        "cosh" => Some(TransferQuestionOp::Cosh),
+        "tanh" => Some(TransferQuestionOp::Tanh),
+        "asin" => Some(TransferQuestionOp::Asin),
+        "acos" => Some(TransferQuestionOp::Acos),
+        "atan" => Some(TransferQuestionOp::Atan),
+        "asinh" => Some(TransferQuestionOp::Asinh),
+        "acosh" => Some(TransferQuestionOp::Acosh),
+        "atanh" => Some(TransferQuestionOp::Atanh),
+        _ => None,
+    }
+}
+
+/// The approximated float family still riding sort-only precision:
+/// `sqrt` on a non-perfect-square operand, `cbrt`, `hypot` —
+/// `float_sorted_unknown()` (a Float-tagged, all-numbers SET) once
+/// every argument is known, never a specific value. None of these
+/// carries a pinned exact-value clause (library/math.html's module
+/// intro: "the current implementation... Behavior in exceptional
 /// cases follows Annex F... will raise ValueError for invalid
 /// operations... and OverflowError for results that overflow" — an
 /// IMPLEMENTATION-graded accuracy promise, not an exact bit pattern),
@@ -692,11 +1121,21 @@ fn sqrt_call_over_set(value: &AbstractValue, kernel: &Arc<RefinedTSKernel>) -> O
 /// still be a known single numeric value (an unknown argument answers
 /// plain `unknown()` instead — see the dispatcher below), matching
 /// every other row in this file's "known operands only" discipline.
+///
+/// The 18 kernel-backed unary names plus `atan2` are DELIBERATELY
+/// ABSENT from `APPROXIMATED_NAMES` below, even though
+/// `kernel_backed_unary_family_call`/`kernel_backed_atan2_call` can
+/// themselves decline: `math_call_result` does NOT fall through from
+/// those functions into this one. A decline from the kernel-backed row
+/// means either a provable Python raise (the kernel answered `NaN`) or
+/// the kernel arm's own served-shape gap (`Unknown`) — in both cases
+/// `float_sorted_unknown()` would be a FALSE claim ("some float value
+/// exists") layered on top of a call that provably does not return
+/// one, or a claim stronger than the kernel itself was willing to
+/// make. Answering nothing is the correct decline there; this function
+/// is never consulted for those 19 names.
 fn approximated_family_result(function: &str, arguments: &[AbstractValue]) -> Option<AbstractValue> {
-    const APPROXIMATED_NAMES: &[&str] = &[
-        "sqrt", "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "sinh", "cosh", "tanh", "asinh", "acosh",
-        "atanh", "cbrt", "exp", "expm1", "log", "log1p", "log2", "log10", "hypot",
-    ];
+    const APPROXIMATED_NAMES: &[&str] = &["sqrt", "cbrt", "hypot"];
     if !APPROXIMATED_NAMES.contains(&function) {
         return None;
     }
@@ -778,15 +1217,34 @@ pub fn random_call_result(function: &str, arguments: &[AbstractValue]) -> Option
 /// cannot read. These ask `boundary/python.lean`'s own `int.*` arms and
 /// answer Integer-sorted exact values, never the float image.
 ///
+/// Modeled through the KERNEL-BACKED transcendental family
+/// (`kernel_backed_unary_family_call`/`kernel_backed_atan2_call`'s own
+/// doc, each row's pins clause named there): `exp`, `expm1`, `log`,
+/// `log1p`, `log2`, `log10`, `sin`, `cos`, `tan`, `sinh`, `cosh`,
+/// `tanh`, `asin`, `acos`, `atan`, `atan2`, `asinh`, `acosh`, `atanh` —
+/// python-pins.md's explog.1–6 and trig.1–13 rows. Each poses the
+/// operand's window to the same `boundary/javascript.lean` transfer
+/// arm the JS adapter asks and answers a certified enclosure, never a
+/// bare sort; a domain-violating known operand (where CPython raises
+/// `ValueError` rather than returning a value) answers `None` here
+/// instead of the kernel's own `NaN` reading — see
+/// `kernel_backed_unary_family_call`'s own doc. A decline from ANY of
+/// these 19 names — an unread operand shape, a provable Python raise,
+/// or the kernel arm's own served-shape gap — is FINAL: it does NOT
+/// fall through to the sort-only row below, because that row's
+/// `float_sorted_unknown()` claim ("some float value exists") would be
+/// exactly as false on a raise, or stronger than the kernel itself was
+/// willing to claim.
+///
 /// Modeled at SORT-ONLY precision (`approximated_family_result`'s own
-/// doc): `sqrt` on a non-perfect-square operand, `sin`, `cos`, `tan`,
-/// `asin`, `acos`, `atan`, `atan2`, `sinh`, `cosh`, `tanh`, `asinh`,
-/// `acosh`, `atanh`, `cbrt`, `exp`, `expm1`, `log`, `log1p`, `log2`,
-/// `log10`, `hypot` — every argument known answers
-/// `float_sorted_unknown()` (a Float-tagged all-numbers set), never a
-/// specific value; `math.sqrt` on a known negative argument answers
-/// `None` here because it provably RAISES instead (see
-/// `sqrt_argument_is_known_negative`, read by `provable_raise`).
+/// doc) still: `sqrt` on a non-perfect-square operand, `cbrt`, `hypot`
+/// — every argument known answers `float_sorted_unknown()` (a
+/// Float-tagged all-numbers set), never a specific value;
+/// `math.sqrt` on a known negative argument answers `None` here
+/// because it provably RAISES instead (see
+/// `sqrt_argument_is_known_negative`, read by `provable_raise`). None
+/// of the 19 kernel-backed names above reach this row — see
+/// `approximated_family_result`'s own doc for why.
 ///
 /// Still declined (no cited row this wave, and not sort-only-graded
 /// either): `pow`, `fsum`, `remainder`, `fmod`, `degrees`, `radians`,
@@ -857,11 +1315,40 @@ pub fn math_call_result(
                 None => sqrt_call_over_set(only, kernel).or_else(|| approximated_family_result(function, arguments)),
             }
         }
-        // the sort-only approximated family (trig, log, exp, hypot,
-        // and sqrt on a non-perfect-square): float_sorted_unknown()
-        // once every argument is known, per
-        // approximated_family_result's own doc
-        _ => approximated_family_result(function, arguments),
+        // trig.10 — the one two-argument member of the kernel-backed
+        // family. A decline here (an unread operand shape, a provable
+        // Python raise the kernel answered NaN for, or the kernel arm's
+        // own served-quadrant gap answering Unknown —
+        // `kernel_backed_atan2_call`'s own doc) is FINAL: it does NOT
+        // fall through to `approximated_family_result`'s sort-only
+        // `float_sorted_unknown()`, because that claim ("some float
+        // value exists") is equally false on a raise, and no weaker
+        // than the kernel's own Unknown on its serving gap — falling
+        // through there would answer a value-bearing claim the kernel
+        // itself just declined to make.
+        "atan2" => {
+            let [y, x] = arguments else { return None };
+            kernel_backed_atan2_call(y, x, kernel)
+        }
+        // explog.1–explog.6, trig.1–trig.9, trig.11–trig.13: the
+        // kernel's own transfer answers the window, or declines FINALLY
+        // — same no-fallback reasoning as `atan2` above, and the same
+        // reason these 18 names are no longer in
+        // `approximated_family_result`'s own `APPROXIMATED_NAMES` list.
+        // The sort-only approximated family still rides local Rust for
+        // the names that stay there: `cbrt` (pow.6) and `hypot`
+        // (pow.8) — `kernel_backed_unary_family_op`'s own doc names why
+        // both are excluded here — plus `sqrt` on a non-perfect-square
+        // falls through from its own arm: float_sorted_unknown() once
+        // every argument is known, per approximated_family_result's own
+        // doc.
+        _ => match kernel_backed_unary_family_op(function) {
+            Some(op) => {
+                let [only] = arguments else { return None };
+                kernel_backed_unary_family_call(function, op, only, kernel)
+            }
+            None => approximated_family_result(function, arguments),
+        },
     }
 }
 
@@ -1058,10 +1545,39 @@ mod tests {
         assert!(!sqrt_argument_is_known_negative(&[float_operand(4.0)]));
     }
 
+    /// `math.sin(0.0)` is one of `jsSin`'s pinned corners (`trigSingleton`'s
+    /// own `zero` case): the KERNEL-BACKED row now answers the exact
+    /// value `0.0`, not the sort-only unconstrained set — `sin` is one
+    /// of the trig.1-13 rows this wave wires.
     #[test]
-    fn test_sin_known_argument_answers_sort_only() {
+    fn test_sin_known_argument_answers_the_kernel_backed_exact_zero() {
         let Some(result) = math_call("sin", &[float_operand(0.0)]) else { return };
-        assert_eq!(result.kind, Kind::Set);
+        assert_eq!(result.kind, Kind::Values);
+        assert_eq!(result.values, vec![0.0]);
+        assert_eq!(result.kind_tag, Some(PrimitiveKind::Float));
+    }
+
+    /// `math.sin(1.0)` is NOT one of `jsSin`'s pinned corners — the
+    /// kernel answers a certified bracketing WINDOW around the true
+    /// value (sin(1) ≈ 0.8414709848), never a bare sort-only set: the
+    /// window must be narrow enough to exclude 0.9 and 0.8 while
+    /// containing the true value's own neighborhood.
+    #[test]
+    fn test_sin_of_one_answers_a_narrow_kernel_window() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let result = math_call_result("sin", &[float_operand(1.0)], &kernel).expect("sin(1.0) should answer");
+        assert_eq!(result.kind, Kind::Set, "sin(1.0) is not a pinned corner — expect a window: {result:?}");
+        assert_eq!(result.kind_tag, Some(PrimitiveKind::Float));
+        assert!(
+            (kernel.member)(&result.set, &[0.841_470_984_807_896_5]),
+            "the true value must be inside the window: {:?}",
+            result.set
+        );
+        assert!(
+            !(kernel.member)(&result.set, &[0.9]),
+            "0.9 is outside sin(1.0)'s true window: {:?}",
+            result.set
+        );
     }
 
     #[test]
@@ -1089,12 +1605,25 @@ mod tests {
         assert_eq!(result, None);
     }
 
+    /// `math.log2(1024.0)`/`math.log10(1000.0)` are interior points, not
+    /// `jsLog2`/`jsLog10`'s pinned corners (`0`, `1`, `posInf`) — the
+    /// KERNEL-BACKED row answers a certified window containing the
+    /// exact value (10.0 / 3.0 respectively), never the sort-only
+    /// unconstrained set.
     #[test]
-    fn test_log2_and_log10_answer_sort_only() {
-        let Some(log2) = math_call("log2", &[float_operand(1024.0)]) else { return };
+    fn test_log2_and_log10_answer_kernel_windows_containing_their_exact_values() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let log2 = math_call_result("log2", &[float_operand(1024.0)], &kernel).expect("log2(1024.0) should answer");
         assert_eq!(log2.kind, Kind::Set);
-        let Some(log10) = math_call("log10", &[float_operand(1000.0)]) else { return };
+        assert_eq!(log2.kind_tag, Some(PrimitiveKind::Float));
+        assert!((kernel.member)(&log2.set, &[10.0]), "log2(1024) = 10 exactly, must be inside the window");
+        assert!(!(kernel.member)(&log2.set, &[11.0]), "11 is outside log2(1024)'s true window");
+
+        let log10 = math_call_result("log10", &[float_operand(1000.0)], &kernel).expect("log10(1000.0) should answer");
         assert_eq!(log10.kind, Kind::Set);
+        assert_eq!(log10.kind_tag, Some(PrimitiveKind::Float));
+        assert!((kernel.member)(&log10.set, &[3.0]), "log10(1000) = 3 exactly, must be inside the window");
+        assert!(!(kernel.member)(&log10.set, &[4.0]), "4 is outside log10(1000)'s true window");
     }
 
     /// `math.floor(random.random() * 121)` — the kernel's own `Mult`
@@ -1123,6 +1652,116 @@ mod tests {
         assert!(!(kernel.member)(&result.set, &[121.0]), "121 must not be a member of floor([0, 121))");
         assert!((kernel.member)(&result.set, &[120.0]), "120 must be a member of floor([0, 121))");
         assert!((kernel.member)(&result.set, &[0.0]), "0 must be a member of floor([0, 121))");
+    }
+
+    /// `math.exp(x)` over a KNOWN INTERVAL operand `[0.0, 1.0]` (not a
+    /// single known value): `float_transferable_operand`'s `Kind::Set`
+    /// branch poses the interval directly to the kernel's `js.exp`
+    /// transfer, which answers a window enclosing `[exp(0), exp(1)] =
+    /// [1, e]` — exp is monotone increasing, so the true image of a
+    /// closed interval is exactly that bracketing window.
+    #[test]
+    fn test_exp_over_a_known_interval_answers_a_window_containing_one_to_e() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let interval = AbstractValue {
+            kind_tag: Some(PrimitiveKind::Float),
+            ..known_set(make_refined_set(vec![at_least(0.0), at_most(1.0)]), None, TrustSpec, SetKindTag::None)
+        };
+        let result =
+            math_call_result("exp", std::slice::from_ref(&interval), &kernel).expect("exp([0,1]) should answer");
+        assert_eq!(result.kind, Kind::Set);
+        assert_eq!(result.kind_tag, Some(PrimitiveKind::Float));
+        assert!((kernel.member)(&result.set, &[1.0]), "exp(0) = 1 must be inside the window");
+        assert!(
+            (kernel.member)(&result.set, &[std::f64::consts::E]),
+            "exp(1) = e must be inside the window"
+        );
+        assert!(!(kernel.member)(&result.set, &[3.0]), "e < 3, so 3 must be outside exp([0,1])'s window");
+        assert!(!(kernel.member)(&result.set, &[-0.5]), "exp is always positive — -0.5 must be outside");
+    }
+
+    /// `math.exp(1.0)` on a KNOWN SINGLE VALUE: the kernel still answers
+    /// a bracketing WINDOW (exp is implementation-approximated at an
+    /// interior point, per the pins table's own note), containing e but
+    /// not a bare sort-only unconstrained set.
+    #[test]
+    fn test_exp_of_one_answers_a_narrow_kernel_window_containing_e() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let result = math_call_result("exp", &[float_operand(1.0)], &kernel).expect("exp(1.0) should answer");
+        assert_eq!(result.kind, Kind::Set);
+        assert!((kernel.member)(&result.set, &[std::f64::consts::E]), "e must be inside the window");
+        assert!(!(kernel.member)(&result.set, &[3.0]), "3 is outside exp(1)'s true window");
+        assert!(!(kernel.member)(&result.set, &[2.5]), "2.5 is outside exp(1)'s true window");
+    }
+
+    /// `math.log(x)` on a KNOWN NEGATIVE operand: the kernel's own
+    /// `logCorners` answers `NaN` for that operand (JavaScript's
+    /// `Math.log(-1)` returns `NaN`), but CPython's `math.log(-1)`
+    /// RAISES `ValueError` instead of returning a value —
+    /// `kernel_backed_unary_family_call`'s own doc. This row must
+    /// decline rather than answer a value the real call never
+    /// produces.
+    #[test]
+    fn test_log_of_a_known_negative_declines_rather_than_answer_nan() {
+        if loaded_kernel().is_none() {
+            return;
+        }
+        let result = math_call("log", &[float_operand(-1.0)]);
+        assert_eq!(result, None, "math.log(-1) raises in CPython — must answer no value");
+    }
+
+    /// `math.asin(x)` outside `[-1, 1]`: the same NaN-vs-raise gate as
+    /// `log`'s negative row, for the inverse-trig domain instead of the
+    /// logarithm's sign domain.
+    #[test]
+    fn test_asin_outside_domain_declines_rather_than_answer_nan() {
+        if loaded_kernel().is_none() {
+            return;
+        }
+        let result = math_call("asin", &[float_operand(2.0)]);
+        assert_eq!(result, None, "math.asin(2.0) raises in CPython — must answer no value");
+    }
+
+    /// `math.log(1.0)` is one of `logCorners`' pinned corners — the
+    /// exact value `0.0`, not a window.
+    #[test]
+    fn test_log_of_one_answers_the_kernel_backed_exact_zero() {
+        let Some(result) = math_call("log", &[float_operand(1.0)]) else { return };
+        assert_eq!(result.kind, Kind::Values);
+        assert_eq!(result.values, vec![0.0]);
+        assert_eq!(result.kind_tag, Some(PrimitiveKind::Float));
+    }
+
+    /// `math.atan2(1.0, 1.0)` (trig.10): `y = x = 1.0` lands in
+    /// `jsAtan2`'s served quadrant (`x > 0, y != 0`) — the true value
+    /// is `pi/4 ≈ 0.7853981634`, and the kernel answers a bracketing
+    /// window around it.
+    #[test]
+    fn test_atan2_of_one_one_answers_a_window_containing_pi_over_four() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let result = math_call_result("atan2", &[float_operand(1.0), float_operand(1.0)], &kernel)
+            .expect("atan2(1.0, 1.0) should answer");
+        assert_eq!(result.kind, Kind::Set);
+        assert_eq!(result.kind_tag, Some(PrimitiveKind::Float));
+        assert!(
+            (kernel.member)(&result.set, &[std::f64::consts::FRAC_PI_4]),
+            "pi/4 must be inside atan2(1,1)'s window"
+        );
+        assert!(!(kernel.member)(&result.set, &[1.0]), "1.0 > pi/4 by enough to be outside the window");
+    }
+
+    /// `math.atan2(1.0, -1.0)`: `x < 0` is outside `jsAtan2`'s served
+    /// quadrant ("the axis and left-half-plane corners wait on π
+    /// pins") — the kernel answers `Unknown`, which is this arm's own
+    /// serving gap (not a Python raise), so the call declines and
+    /// falls through rather than mis-answering.
+    #[test]
+    fn test_atan2_outside_served_quadrant_declines() {
+        if loaded_kernel().is_none() {
+            return;
+        }
+        let result = math_call("atan2", &[float_operand(1.0), float_operand(-1.0)]);
+        assert_eq!(result, None, "atan2's kernel arm does not yet serve x <= 0 — must decline, not guess");
     }
 
     /// `math.pi` is a sort-only Float set — never an exact digit

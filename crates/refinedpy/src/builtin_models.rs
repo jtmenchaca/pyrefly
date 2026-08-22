@@ -8,15 +8,15 @@
 //! Calls to Python builtins with determinable results, answered exactly.
 //! Two dispatchers: `builtin_call_result` (pure Rust, no kernel) and
 //! `builtin_call_result_with_kernel` (the caller's actual entry point —
-//! tries the pure dispatcher first, then the one row family that needs
-//! a kernel ask, `min`/`max` over a Set operand). Both take the callee
-//! name and the already-evaluated argument values; `None` means "not
-//! modeled here" (the caller declines honestly), `Some` is an exact
-//! answer. Every modeled row cites its clause of
-//! docs.python.org/3.12/library/functions.html or library/stdtypes.html
-//! (the container constructors `list`/`set`/`dict` live in
-//! stdtypes.html's own class entries); a row with no citation is not
-//! written.
+//! tries the pure dispatcher first, then the row families that need a
+//! kernel ask: `min`/`max` over a Set operand, and `abs` over a Set
+//! operand). Both take the callee name and the already-evaluated
+//! argument values; `None` means "not modeled here" (the caller
+//! declines honestly), `Some` is an exact answer. Every modeled row
+//! cites its clause of docs.python.org/3.12/library/functions.html or
+//! library/stdtypes.html (the container constructors `list`/`set`/
+//! `dict` live in stdtypes.html's own class entries); a row with no
+//! citation is not written.
 
 use std::sync::Arc;
 
@@ -55,6 +55,51 @@ fn abs_call(arguments: &[AbstractValue]) -> Option<AbstractValue> {
     let (value, sort) = single_known_numeric(only)?;
     let grade = derived_trust_level(TrustSpec, arguments);
     Some(known_values(vec![value.abs()], sort, grade))
+}
+
+/// `abs(x)` on a KNOWN NUMERIC SET (a seeded range, or a bounded set
+/// another transfer already produced): the kernel's own `Abs` transfer
+/// (`javascript-pins.md` arith.7 — "Math.abs: −0→+0, −∞→+∞, otherwise
+/// negates negatives," `theories/binary64/abs.lean`'s `transferAbs` —
+/// a range straddling zero folds its lower bound to 0, e.g. `[-2, 1]`
+/// answers `[0, 2]`) answers the absolute-valued enclosure directly, the
+/// exact mirror of `floor_call_over_set` (`math_models.rs`) — same
+/// `TransferQuestion` construction, same `catch_unwind` refusal
+/// discipline, same `TransferAnswerKind` match. Sort is preserved (the
+/// same rule `abs_call`'s single-value row keeps): the answer keeps the
+/// operand's own Integer/Float tag, never fixed at one sort the way
+/// `floor_call_over_set`'s Integer-only result is. A non-numeric-sorted
+/// set, or a kernel refusal on this set shape, declines to `None`.
+fn abs_call_over_set(value: &AbstractValue, kernel: &Arc<RefinedTSKernel>) -> Option<AbstractValue> {
+    if value.kind != Kind::Set {
+        return None;
+    }
+    let sort = match value.kind_tag {
+        Some(PrimitiveKind::Integer) => PrimitiveKind::Integer,
+        Some(PrimitiveKind::Float) => PrimitiveKind::Float,
+        _ => return None,
+    };
+    let nan_operand = PowOperandWire { kind: PowOperandKind::NaN, set: make_refined_set(vec![]) };
+    let asked = crate::kernel_ask::ask_kernel(|| {
+        (kernel.transfer)(&TransferQuestion {
+            op: TransferQuestionOp::Abs,
+            a: value.set.clone(),
+            b: make_refined_set(vec![]),
+            c: 0.0,
+            base: nan_operand.clone(),
+            exp: nan_operand,
+        })
+    })
+    .ok()?;
+    let grade = derived_trust_level(TrustSpec, std::slice::from_ref(value));
+    match asked.kind {
+        TransferAnswerKind::Values => Some(known_values(asked.values, sort, grade)),
+        TransferAnswerKind::Set => Some(AbstractValue {
+            kind_tag: Some(sort),
+            ..known_set(asked.set, None, grade, SetKindTag::None)
+        }),
+        TransferAnswerKind::NaN | TransferAnswerKind::Unknown => None,
+    }
 }
 
 /// `round(x)`, single-argument — library/functions.html#round: "If
@@ -304,7 +349,15 @@ fn sorted_call(arguments: &[AbstractValue]) -> Option<AbstractValue> {
     for element in &iterable.items {
         pairs.push(single_known_numeric_element(element)?);
     }
-    pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).expect("known numeric values are never NaN"));
+    // A NaN element makes every comparison false (expressions.rst's
+    // ordering rules), so CPython's sort produces an order no law
+    // states — a NaN-admitting list yields no order claim, and this
+    // arm declines rather than fabricate one (float("nan") is a value
+    // float_call now constructs).
+    if pairs.iter().any(|(value, _)| value.is_nan()) {
+        return None;
+    }
+    pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).expect("NaN elements declined above"));
     let grade = derived_trust_level(TrustSpec, &[iterable.clone()]);
     let sorted_items: Vec<AbstractValue> = pairs.into_iter().map(|(value, sort)| known_values(vec![value], sort, grade)).collect();
     Some(known_list(sorted_items, grade))
@@ -682,30 +735,114 @@ fn parse_base_ten_int_string(text: &str) -> Option<f64> {
     Some(if negative { -magnitude } else { magnitude })
 }
 
-/// `float(x)` on a single known numeric — library/functions.html#float:
-/// "Return a floating-point number constructed from a number or a
-/// string." A STRING-sorted argument (`is_string_sorted_argument`'s own
-/// doc — a plain str ground with no exact text this file can parse, e.g.
-/// a captured subprocess `.stdout` read: `expressions.rs`'s own
+/// `float(x)` on a single known numeric or known exact string —
+/// library/functions.html#float: "Return a floating-point number
+/// constructed from a number or a string." A NUMERIC argument answers
+/// its exact value, Float-sorted. A known EXACT string is parsed by
+/// `parse_float_literal_string` — that function's own doc cites the
+/// grammar (functions.rst's `productionlist:: float`): the `inf`/
+/// `Infinity`/`nan` spellings (case-insensitive, optional leading sign)
+/// answer the exact infinite/NaN value, and any other text that parses
+/// as the grammar's `floatnumber` production answers that exact decimal
+/// value. A STRING-sorted argument with no exact text this file can
+/// parse (`is_string_sorted_argument`'s own doc — e.g. a captured
+/// subprocess `.stdout` read: `expressions.rs`'s own
 /// `subprocess_run_construction_value`) still determines a SORT: the
 /// same clause states `float`'s return is always a `float` regardless of
 /// which of the two argument forms produced it, so `float(<any string>)`
 /// answers `float_sorted_unknown()` — sort-known, value-unknown, the
 /// same posture every other sort-only row in this file takes rather than
-/// decline outright. An EXACT string's own numeric text is not parsed
-/// here (this row answers the sort every string takes, never attempts
-/// CPython's float-literal grammar) — only a NUMERIC argument answers an
-/// exact value, unchanged from before this row grew the string case.
+/// decline outright. An EXACT string that fails to parse under the
+/// grammar keeps that same sort-only posture rather than decline
+/// outright (`is_string_sorted_argument` already reads a
+/// `Kind::Values`/`String` argument as string-sorted) — CPython raises
+/// `ValueError` for it, which this file has no exception channel for,
+/// so the sort-only answer is the honest fallback, not a fabricated
+/// value.
 fn float_call(arguments: &[AbstractValue]) -> Option<AbstractValue> {
     let [only] = arguments else { return None };
     if let Some((value, _sort)) = single_known_numeric(only) {
         let grade = derived_trust_level(TrustSpec, arguments);
         return Some(known_values(vec![value], PrimitiveKind::Float, grade));
     }
+    if only.kind == Kind::Values && only.kind_tag == Some(PrimitiveKind::String) {
+        let text: String = only.values.iter().filter_map(|point| char::from_u32(*point as i64 as u32)).collect();
+        if let Some(value) = parse_float_literal_string(&text) {
+            let grade = derived_trust_level(TrustSpec, arguments);
+            return Some(known_values(vec![value], PrimitiveKind::Float, grade));
+        }
+        return Some(float_sorted_unknown());
+    }
     if is_string_sorted_argument(only) {
         return Some(float_sorted_unknown());
     }
     None
+}
+
+/// `float(string)`'s exact parsed value, for the grammar
+/// library/functions.rst's `productionlist:: float` states (read
+/// before writing this function): after leading/trailing whitespace is
+/// removed, an optional `sign` (`+`/`-`, `+` has no effect), then either
+/// `infinity` (`"Infinity"` or `"inf"`, case-insensitive per that
+/// section's own "Case is not significant... 'inf', 'Inf', 'INFINITY',
+/// and 'iNfINity' are all acceptable spellings"), `nan` (`"nan"`, same
+/// case-insensitivity), or a `floatnumber` (`digitpart ["." digitpart]`
+/// or `["." digitpart]`, with an optional `(e|E) [sign] digitpart`
+/// exponent — underscores between digits allowed, the same grouping
+/// `parse_base_ten_int_string` already reads for `int`). Returns `None`
+/// or panics on no legitimate value: `None` when the text does not
+/// conform to the grammar (`float_call`'s own caller falls back to the
+/// sort-only answer for this row, never a fabricated value) or the
+/// parse is not itself the exact spelled decimal (never here, since the
+/// spellings this function recognizes route straight to `f64::INFINITY`/
+/// `f64::NEG_INFINITY`/`f64::NAN`/Rust's own `str::parse::<f64>`, which
+/// implements the same decimal grammar).
+fn parse_float_literal_string(text: &str) -> Option<f64> {
+    let trimmed = text.trim();
+    let (negative, unsigned) = match trimmed.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, trimmed.strip_prefix('+').unwrap_or(trimmed)),
+    };
+    if unsigned.is_empty() {
+        return None;
+    }
+    let lowered = unsigned.to_ascii_lowercase();
+    if lowered == "inf" || lowered == "infinity" {
+        return Some(if negative { f64::NEG_INFINITY } else { f64::INFINITY });
+    }
+    if lowered == "nan" {
+        return Some(f64::NAN);
+    }
+    // the `floatnumber` production: digits (with single underscores
+    // between them, the same grouping rule int()'s own parse allows),
+    // an optional decimal point, an optional e/E exponent — Rust's
+    // `str::parse::<f64>` reads this same grammar once underscores are
+    // stripped, so digit-and-underscore validity is checked by hand
+    // first (a stray underscore, e.g. "1__0" or "_1", is invalid Python
+    // syntax that `str::parse` would otherwise silently reject anyway,
+    // but the explicit check keeps this row's acceptance exactly the
+    // documented grammar rather than piggybacking on Rust's own parser
+    // leniency).
+    let mut digits_only = String::with_capacity(unsigned.len());
+    let mut previous_was_underscore = false;
+    let mut previous_was_digit = false;
+    for c in unsigned.chars() {
+        if c == '_' {
+            if !previous_was_digit || previous_was_underscore {
+                return None;
+            }
+            previous_was_underscore = true;
+            continue;
+        }
+        digits_only.push(c);
+        previous_was_underscore = false;
+        previous_was_digit = c.is_ascii_digit();
+    }
+    if previous_was_underscore {
+        return None;
+    }
+    let value: f64 = digits_only.parse().ok()?;
+    Some(if negative { -value } else { value })
 }
 
 /// Whether `argument` is a STRING-sorted value: an exact `Kind::Values`
@@ -903,13 +1040,14 @@ pub fn builtin_call_result(function: &str, arguments: &[AbstractValue]) -> Optio
 }
 
 /// The caller's actual entry point (`expressions.rs::evaluate_call`): a
-/// call to Python builtin `function`, `kernel` in hand for the one row
-/// family that needs it — `min`/`max`'s two-or-more-argument form when
+/// call to Python builtin `function`, `kernel` in hand for the row
+/// families that need it — `min`/`max`'s two-or-more-argument form when
 /// at least one argument is a `Kind::Set` (`min_max_call_over_sets`'s
-/// own doc, including the NaN-discharge citation). Every other builtin
-/// routes straight through the pure-Rust `builtin_call_result` above,
-/// tried FIRST so a known-scalar `min`/`max` call never pays a kernel
-/// round trip it does not need.
+/// own doc, including the NaN-discharge citation), and `abs`'s single
+/// Set-seeded operand (`abs_call_over_set`'s own doc). Every other
+/// builtin routes straight through the pure-Rust `builtin_call_result`
+/// above, tried FIRST so a known-scalar call never pays a kernel round
+/// trip it does not need.
 pub fn builtin_call_result_with_kernel(
     function: &str,
     arguments: &[AbstractValue],
@@ -918,6 +1056,10 @@ pub fn builtin_call_result_with_kernel(
     builtin_call_result(function, arguments).or_else(|| match function {
         "min" => min_max_call_over_sets(arguments, TransferQuestionOp::Min, kernel),
         "max" => min_max_call_over_sets(arguments, TransferQuestionOp::Max, kernel),
+        "abs" => {
+            let [only] = arguments else { return None };
+            abs_call_over_set(only, kernel)
+        }
         _ => None,
     })
 }
@@ -985,6 +1127,31 @@ mod tests {
         assert_eq!(got.kind_tag, Some(PrimitiveKind::Integer));
     }
 
+    /// `abs()` over a Set-seeded operand asks the kernel's `Abs` transfer
+    /// (`abs_call_over_set`'s own doc, `javascript-pins.md` arith.7): a
+    /// window straddling zero folds its lower bound to 0 — `abs([-2, 1])`
+    /// answers `[0, 2]`, `transferAbs`'s own `straddles` branch
+    /// (`theories/binary64/abs.lean`: `lo := if straddles then 0 else
+    /// min(abs(A.lo), abs(A.hi))`, `hi := max(abs(A.lo), abs(A.hi))` —
+    /// here `A.lo = -2, A.hi = 1`, both admitted, so `lo = 0` and
+    /// `hi = max(2, 1) = 2`). Asserts the exact enclosure, not merely the
+    /// shape, since the window is narrow enough to pin by hand.
+    #[test]
+    fn abs_over_a_set_operand_asks_the_kernel() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let window = make_refined_set(vec![at_least(-2.0), at_most(1.0)]);
+        let operand = AbstractValue {
+            kind_tag: Some(PrimitiveKind::Integer),
+            ..known_set(window, None, TrustSpec, SetKindTag::None)
+        };
+        let got = builtin_call_result_with_kernel("abs", &[operand], &kernel)
+            .expect("abs([-2, 1]) over a Set operand models through the kernel");
+        assert_eq!(got.kind, Kind::Set);
+        assert_eq!(got.kind_tag, Some(PrimitiveKind::Integer));
+        let want = make_refined_set(vec![at_least(0.0), at_most(2.0)]);
+        assert_eq!(got.set, want, "abs([-2, 1]) should answer [0, 2]: got {:?}", got.set);
+    }
+
     #[test]
     fn int_truncates_toward_zero_on_positive_fraction() {
         let got = builtin_call_result("int", &[float(7.9)]).expect("int(7.9) models");
@@ -1023,6 +1190,57 @@ mod tests {
         let string_argument = string_value("-7");
         let got = builtin_call_result("int", &[string_argument]).expect("int(\"-7\") models");
         assert_eq!(got.values, vec![-7.0]);
+    }
+
+    #[test]
+    fn float_of_inf_string_is_positive_infinity() {
+        // functions.rst's float() grammar: "inf"/"Infinity" (case-
+        // insensitive) spell positive infinity.
+        let string_argument = string_value("inf");
+        let got = builtin_call_result("float", &[string_argument]).expect("float(\"inf\") models");
+        assert_eq!(got.values, vec![f64::INFINITY]);
+        assert_eq!(got.kind_tag, Some(PrimitiveKind::Float));
+    }
+
+    #[test]
+    fn float_of_negative_inf_string_is_negative_infinity() {
+        let string_argument = string_value("-inf");
+        let got = builtin_call_result("float", &[string_argument]).expect("float(\"-inf\") models");
+        assert_eq!(got.values, vec![f64::NEG_INFINITY]);
+    }
+
+    #[test]
+    fn float_of_nan_string_is_the_nan_admitting_value() {
+        let string_argument = string_value("nan");
+        let got = builtin_call_result("float", &[string_argument]).expect("float(\"nan\") models");
+        assert_eq!(got.values.len(), 1);
+        assert!(got.values[0].is_nan(), "float(\"nan\") should answer NaN: {:?}", got.values);
+        assert_eq!(got.kind_tag, Some(PrimitiveKind::Float));
+    }
+
+    #[test]
+    fn float_of_a_decimal_digit_string_parses_the_exact_value() {
+        let string_argument = string_value("1.5");
+        let got = builtin_call_result("float", &[string_argument]).expect("float(\"1.5\") models");
+        assert_eq!(got.values, vec![1.5]);
+        assert_eq!(got.kind_tag, Some(PrimitiveKind::Float));
+    }
+
+    #[test]
+    fn float_of_infinity_spelling_case_insensitive() {
+        // "Case is not significant... 'INFINITY' and 'iNfINity' are all
+        // acceptable spellings for positive infinity."
+        let string_argument = string_value("Infinity");
+        let got = builtin_call_result("float", &[string_argument]).expect("float(\"Infinity\") models");
+        assert_eq!(got.values, vec![f64::INFINITY]);
+    }
+
+    #[test]
+    fn float_of_an_unparseable_string_keeps_the_sort_only_answer() {
+        let string_argument = string_value("not a number");
+        let got = builtin_call_result("float", &[string_argument]).expect("float(<any string>) models sort-only");
+        assert_eq!(got.kind, Kind::Set);
+        assert_eq!(got.kind_tag, Some(PrimitiveKind::Float));
     }
 
     #[test]

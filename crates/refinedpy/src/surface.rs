@@ -983,8 +983,12 @@ pub fn surface_imports(module: &ModModule) -> SurfaceImports {
 }
 
 /// A numeric literal, with unary minus — the readable-RHS gate for
-/// this slice. None anywhere else (an unread value declines, it never
-/// guesses).
+/// this slice; a constant integer expression over literals
+/// (`2**53 + 2`, `2**31 - 1`) folds through `literal_integer_fold`
+/// and is accepted only when the folded value converts to f64 without
+/// rounding, so the computed spelling of a bound reads exactly as its
+/// literal spelling would. None anywhere else (an unread value
+/// declines, it never guesses).
 pub fn literal_number(expr: &Expr) -> Option<f64> {
     match expr {
         Expr::NumberLiteral(literal) => match &literal.value {
@@ -994,6 +998,42 @@ pub fn literal_number(expr: &Expr) -> Option<f64> {
         },
         Expr::UnaryOp(unary) if unary.op == UnaryOp::USub => {
             Some(-literal_number(unary.operand.as_ref())?)
+        }
+        Expr::BinOp(_) => {
+            let folded = literal_integer_fold(expr)?;
+            let as_float = folded as f64;
+            if as_float as i64 != folded {
+                return None;
+            }
+            Some(as_float)
+        }
+        _ => None,
+    }
+}
+
+/// Constant integer arithmetic over literals, folded exactly in i64:
+/// `2**53`, `2**31 - 1`, `60 * 60`. Overflow, a float operand, a
+/// division, or any non-literal leaf declines — the fold never
+/// approximates.
+fn literal_integer_fold(expr: &Expr) -> Option<i64> {
+    match expr {
+        Expr::NumberLiteral(literal) => match &literal.value {
+            Number::Int(i) => i.as_i64(),
+            Number::Float(_) | Number::Complex { .. } => None,
+        },
+        Expr::UnaryOp(unary) if unary.op == UnaryOp::USub => {
+            literal_integer_fold(unary.operand.as_ref())?.checked_neg()
+        }
+        Expr::BinOp(bin) => {
+            let left = literal_integer_fold(bin.left.as_ref())?;
+            let right = literal_integer_fold(bin.right.as_ref())?;
+            match bin.op {
+                Operator::Add => left.checked_add(right),
+                Operator::Sub => left.checked_sub(right),
+                Operator::Mult => left.checked_mul(right),
+                Operator::Pow => left.checked_pow(u32::try_from(right).ok()?),
+                _ => None,
+            }
         }
         _ => None,
     }
@@ -1082,6 +1122,49 @@ mod tests {
         );
         let out = compile_aliases(&module);
         assert!(!out.contains_key("Age"));
+    }
+
+    fn parsed_expression(source: &str) -> Expr {
+        ruff_python_parser::parse_expression(source)
+            .expect("test source parses")
+            .into_expr()
+    }
+
+    /// `2**53 + 2` folds to the same value its literal spelling
+    /// 9007199254740994 reads — the computed spelling of a bound is not
+    /// a different construct.
+    #[test]
+    fn literal_number_folds_constant_integer_arithmetic() {
+        assert_eq!(literal_number(&parsed_expression("2**53 + 2")), Some(9007199254740994.0));
+        assert_eq!(literal_number(&parsed_expression("2**31 - 1")), Some(2147483647.0));
+        assert_eq!(literal_number(&parsed_expression("60 * 60")), Some(3600.0));
+    }
+
+    /// `2**53 + 1` has no exact f64 spelling, an i64-overflowing fold
+    /// has no exact value at all, and a division is not an operator the
+    /// fold reads — each declines rather than approximating.
+    #[test]
+    fn literal_number_declines_inexact_and_unread_folds() {
+        assert_eq!(literal_number(&parsed_expression("2**53 + 1")), None);
+        assert_eq!(literal_number(&parsed_expression("2**63")), None);
+        assert_eq!(literal_number(&parsed_expression("10 / 2")), None);
+    }
+
+    /// The construct the ledger named: `Field(le=2**53 + 2)` compiles
+    /// where the identical literal spelling already did, and the
+    /// inexact `2**53 + 1` spelling declines the whole row rather than
+    /// rounding the bound.
+    #[test]
+    fn field_bound_from_constant_arithmetic_compiles() {
+        let module = parsed(
+            "from pydantic import Field\n\
+             from typing import Annotated\n\
+             type Big = Annotated[int, Field(le=2**53 + 2)]\n\
+             type Odd = Annotated[int, Field(le=2**53 + 1)]\n",
+        );
+        let out = compile_aliases(&module);
+        assert!(out.contains_key("Big"));
+        assert!(!out.contains_key("Odd"));
     }
 
     /// `Annotated` used bare, with no import naming it, is never

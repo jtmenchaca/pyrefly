@@ -47,7 +47,7 @@ use crate::assignability::{judge, states_sequence, Verdict};
 use crate::bytes_models::{self, BytesAnswer};
 use crate::collection_models::{dict_get_result, dict_with_item, dict_without_item, list_literal_value, list_with_item, mutated_receiver, subscript_read};
 use crate::cross_module::{module_surface, ModuleResolver, IMPORT_DEPTH_CAP};
-use crate::diagnostic_sentences::{empty_set, unhonorable_annotation};
+use crate::diagnostic_sentences::{empty_set, loop_accumulation_did_not_stabilize, unhonorable_annotation};
 use crate::env::Environment;
 use crate::expressions::{binary_arithmetic_value, evaluate_expression, fieldless_exception_value, possible_raise, provable_raise, register_retained_callables};
 use crate::foreign_edge;
@@ -3091,6 +3091,17 @@ fn rebinds_relational_name(
 /// checked position anywhere still records one blocker (first-blocker-
 /// wins, same as every other construct this walk cannot yet handle),
 /// never a second one.
+///
+/// A `Some` answer is not always blocker-free: a `for` loop's own
+/// abstract pass (`loops.rs`'s `stabilized_join`) may reach a real
+/// stopping point while still havocing one or more written names to
+/// `unknown()`, because their value never settled to a fixed point
+/// across its two judged passes — `LoopAnswer.widened_names`, sorted for
+/// a reproducible first name. This function records THAT as the body's
+/// blocker before ever looking at `return_refinement`, so a bare
+/// `-> float`/`-> int`/`-> str` return (unreadable to `declared_
+/// refinement`, `typereading.rs`'s own doc) never leaves this loop's own
+/// genuine undetermined value unnamed.
 fn walk_loop(
     stmt: &Stmt,
     return_refinement: Option<&DeclaredRefinement>,
@@ -3110,8 +3121,24 @@ fn walk_loop(
             message,
         });
     }
-    if let Some(LoopAnswer { environment: final_env, else_runs, returned }) = result {
+    if let Some(LoopAnswer { environment: final_env, else_runs, returned, widened_names }) = result {
         *environment = final_env;
+        // A `for` loop's own abstract pass reached a real stopping
+        // point, but one or more of its OWN written names never settled
+        // to a fixed point across its two judged passes
+        // (`loops.rs::stabilized_join`'s own doc) and reads as
+        // `unknown()` from here on — a genuine blocker this loop itself
+        // is the first construct to name, independent of whether the
+        // enclosing function's own `-> Annotation` is readable (a bare
+        // `-> float` leaves `return_refinement` `None`, which is
+        // `walk_return`'s own signal to skip JUDGING a value — it must
+        // not also silence THIS body's own record of why that value is
+        // unreadable in the first place). `widened_names` is sorted
+        // (`stabilized_join`'s own doc), so the first entry is a stable,
+        // reproducible choice across runs.
+        if let Some(first_widened) = widened_names.first() {
+            record_blocker(blocked, stmt.range(), loop_accumulation_did_not_stabilize(first_widened), out);
+        }
         // RETURN-THROUGH-LOOP CHANNEL: a value SOME concrete iteration
         // returned judges against the enclosing function's own
         // `-> Annotation`, exactly as `walk_return` judges a
@@ -11313,6 +11340,95 @@ mod tests {
             fires.len(),
             1,
             "the joined set (>= -2 && <= 2, or 0.0) is wider than Level (>= 0 && <= 1) and must fire: {:?}",
+            findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// Ledger: "Py: loop blockers unnamed when return annotation
+    /// unreadable — bare `-> float` never judged; undetermined bodies
+    /// must name their blocker regardless." `samples` is a repetition-
+    /// window parameter (`repetition_window_element_pass`'s own shape),
+    /// so the loop runs through `stabilized_join`'s two-pass abstract
+    /// walk rather than a concrete per-element run.
+    ///
+    /// The accumulation is spelled `total = total + s` — a plain
+    /// `Stmt::Assign`, not `total += s`. This matters: `loops.rs`'s
+    /// `AugAssign` arm calls the LOOP-LOCAL `binary_arithmetic_value`
+    /// directly (declines outright unless BOTH operands reduce to one
+    /// exact `Kind::Values` number), while `Stmt::Assign`'s RHS runs
+    /// through the ordinary `evaluate_expression` → `evaluate_binop` →
+    /// exact-arithmetic path: `total = total * 2.0` reads two exact
+    /// `Kind::Values` operands every iteration, so each judged pass
+    /// COMPLETES (`run_assign_once` accepts a `Kind::Values` result) and
+    /// the two passes bind DIFFERENT exact values ([2.0] then [4.0]) —
+    /// a write that provably never settles to a fixed point, reaching
+    /// `stabilized_join`'s havoc branch rather than declining the whole
+    /// loop before getting there (an element-consuming spelling like
+    /// `total + s` evaluates Values + Set to unknown inside the loop
+    /// module and declines the pass outright, landing on the older
+    /// "is not yet walked" blocker instead). A doubling rebind is
+    /// neither a `relational_sum` accumulation (`total += element`) nor
+    /// a count spelling (`count = count + 1`), so no more precise
+    /// recognizer intercepts it and the walk reaches
+    /// `walk_loop`/`stabilized_join` as an ordinary unrecognized rebind.
+    ///
+    /// The return annotation is a BARE `float`, which `typereading::
+    /// declared_refinement` never reads (it only resolves a bare Name
+    /// through the module's own alias table), so `return_refinement` is
+    /// `None` and `walk_return` judges nothing on its own — before this
+    /// fix, that left the body with zero findings despite `total`'s
+    /// value never having been determined. The loop itself must still
+    /// name that blocker.
+    #[test]
+    fn a_for_loop_whose_accumulation_does_not_stabilize_names_its_blocker_even_under_a_bare_return_sort() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "Sample = Annotated[float, Field(ge=-2.0, le=2.0)]\n",
+            "def f(samples: Annotated[list[Sample], Field(min_length=1)]) -> float:\n",
+            "    total = 1.0\n",
+            "    for s in samples:\n",
+            "        total = total * 2.0\n",
+            "        pass\n",
+            "    return total\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        let blockers: Vec<&Finding> = findings.iter().filter(|f| f.code == "RTS7002").collect();
+        assert_eq!(
+            blockers.len(),
+            1,
+            "the loop's own non-stabilizing accumulation must be this body's named blocker, even though \
+            the bare `-> float` return gives walk_return nothing to judge: {:?}",
+            findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+        );
+        assert!(blockers[0].message.contains("'total'"), "{}", blockers[0].message);
+        assert!(
+            blockers[0].message.contains("fixed point"),
+            "the sentence must name WHY total is unreadable, not just that it is: {}",
+            blockers[0].message
+        );
+    }
+
+    /// The determined twin of the test above: a `for` loop over a
+    /// LITERAL list runs through the concrete per-element path
+    /// (`iterable_values`), never through `stabilized_join` at all, so
+    /// `widened_names` stays empty and the body — bare `-> float` return
+    /// included — records no blocker and no fire.
+    #[test]
+    fn a_for_loop_over_a_literal_list_stays_sentence_free_under_a_bare_return_sort() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "def f() -> float:\n",
+            "    total = 0.0\n",
+            "    for s in [1.0, 2.0, 3.0]:\n",
+            "        total += s\n",
+            "    return total\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        assert!(
+            findings.is_empty(),
+            "a concretely-executable for loop over a literal list must stay determined and sentence-free: {:?}",
             findings.iter().map(|f| &f.message).collect::<Vec<_>>()
         );
     }

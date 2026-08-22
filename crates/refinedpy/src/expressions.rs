@@ -2157,6 +2157,423 @@ fn datetime_field(instance: &AbstractValue, name: &str) -> Option<f64> {
     Some(value)
 }
 
+/// Whether `attribute` is exactly the two-level attribute chain
+/// `datetime.date` with `datetime` NOT locally shadowed — `date.1`'s own
+/// receiver shape, mirroring `is_datetime_datetime_attribute` for the
+/// sibling `date` class (datetime.rst, `class:: date(year, month,
+/// day)`). Gates both the `datetime.date(...)` CONSTRUCTION call and the
+/// `datetime.date.fromisoformat(...)` CLASSMETHOD call.
+fn is_datetime_date_attribute(attribute: &ruff_python_ast::ExprAttribute, environment: &Environment) -> bool {
+    if attribute.attr.as_str() != "date" {
+        return false;
+    }
+    let Expr::Name(module_name) = attribute.value.as_ref() else {
+        return false;
+    };
+    module_name.id.as_str() == "datetime" && environment.read("datetime").is_none()
+}
+
+/// Whether `attribute` is exactly the two-level attribute chain
+/// `datetime.timedelta` with `datetime` NOT locally shadowed — date.5's
+/// own receiver shape, mirroring `is_datetime_datetime_attribute` for
+/// the `timedelta` class (datetime.rst, `class:: timedelta(days=0, ...)`).
+fn is_datetime_timedelta_attribute(attribute: &ruff_python_ast::ExprAttribute, environment: &Environment) -> bool {
+    if attribute.attr.as_str() != "timedelta" {
+        return false;
+    }
+    let Expr::Name(module_name) = attribute.value.as_ref() else {
+        return false;
+    };
+    module_name.id.as_str() == "datetime" && environment.read("datetime").is_none()
+}
+
+/// datetime.rst:88,94 — `MINYEAR` is 1, `MAXYEAR` is 9999 (date.2's own
+/// row): "every `date`/`datetime` year satisfies `MINYEAR <= year <=
+/// MAXYEAR`." The kernel's OWN range check (`epochDaysWithinLimits`,
+/// Temporal's PlainDate window, roughly ±271821 years) is far WIDER
+/// than Python's — date.2's row states this directly ("narrower than
+/// Temporal's PlainDate day-range limit the JS kernel elects"), and the
+/// kernel's `validDate`/`isoDate` ops enforce ONLY their own wider bound
+/// (or, for `validDate`, no year bound at all — `isValidISODate` checks
+/// month/day-of-month only). Every `datetime_date` construction path in
+/// this file therefore asks the kernel's OWN `pyYearInRange` op
+/// (`exports_calendar.lean`'s `"pyYearInRange"` arm, `Refinements.
+/// pyYearInRange`, `languages/python/dates_durations/year_range.lean`)
+/// — one wrapper, three call sites (`date_construction_value`,
+/// `date_fromisoformat_value`, `date_shifted_by_timedelta`) unchanged.
+/// `None` on a refused ask, matching every other kernel ask in this
+/// crate.
+fn python_year_in_range(year: i64, kernel: &Arc<RefinedTSKernel>) -> Option<bool> {
+    let asked = crate::kernel_ask::ask_kernel(|| {
+        (kernel.calendar)(&CalendarQuestion {
+            op: CalendarQuestionOp::PyYearInRange,
+            year,
+            month: 0,
+            day: 0,
+            days: 0,
+            fields: Vec::new(),
+            a: Vec::new(),
+            b: Vec::new(),
+        })
+    })
+    .ok()?;
+    asked.get("valid")?.as_bool()
+}
+
+/// `datetime.date(year, month, day)` — a tagged `Kind::Object` (`source =
+/// "datetime_date"`) carrying `year`/`month`/`day` Integer `ObjectKey`s.
+/// datetime.rst, `class:: date(year, month, day)`: all three arguments
+/// are REQUIRED, positional-or-keyword, no defaults — unlike
+/// `datetime_construction_value`'s `hour`/`minute`/`second`, a missing
+/// field here declines the whole construction rather than defaulting.
+/// Validated through TWO kernel asks: `calendar.validDate` (date.1's own
+/// seam) for calendar correctness (month/day-of-month), and
+/// `python_year_in_range`'s own `pyYearInRange` ask for date.2's
+/// `MINYEAR`/`MAXYEAR` window (see that function's own doc for why
+/// `validDate` alone does not cover it) — a year/month/day combination
+/// either ask refuses answers `None`.
+fn date_construction_value(
+    call: &ruff_python_ast::ExprCall,
+    environment: &Environment,
+    kernel: &Arc<RefinedTSKernel>,
+) -> Option<AbstractValue> {
+    let field_names = ["year", "month", "day"];
+    let mut fields: Vec<Option<i64>> = vec![None; field_names.len()];
+    for (index, arg) in call.arguments.args.iter().enumerate() {
+        let slot = fields.get_mut(index)?;
+        *slot = Some(datetime_field_argument(arg, environment, kernel)?);
+    }
+    for keyword in &call.arguments.keywords {
+        let Some(arg_name) = keyword.arg.as_ref() else {
+            return None;
+        };
+        let position = field_names.iter().position(|name| *name == arg_name.as_str())?;
+        let slot = fields.get_mut(position)?;
+        *slot = Some(datetime_field_argument(&keyword.value, environment, kernel)?);
+    }
+    let year = fields[0]?;
+    let month = fields[1]?;
+    let day = fields[2]?;
+    if !python_year_in_range(year, kernel)? {
+        return None;
+    }
+    if !valid_civil_date(year, month, day, kernel)? {
+        return None;
+    }
+    let keys = field_names.iter().zip([year, month, day]).map(|(name, value)| integer_object_key(name, value)).collect();
+    let mut instance = known_object(keys, None, true, TrustProved, false);
+    instance.source = "datetime_date".to_owned();
+    Some(instance)
+}
+
+/// `calendar.validDate` — date.1's own kernel seam, asked directly
+/// (rather than through `epoch_days_of_civil_date`'s `epochDays` op)
+/// because construction only needs the `valid` verdict, not a day
+/// count. `None` on a refused ask (the kernel panics on no answer;
+/// `ask_kernel` catches that the same way `epoch_days_of_civil_date`
+/// does), matching every other refused kernel ask in this crate.
+fn valid_civil_date(year: i64, month: i64, day: i64, kernel: &Arc<RefinedTSKernel>) -> Option<bool> {
+    let asked = crate::kernel_ask::ask_kernel(|| {
+        (kernel.calendar)(&CalendarQuestion {
+            op: CalendarQuestionOp::ValidDate,
+            year,
+            month,
+            day,
+            days: 0,
+            fields: Vec::new(),
+            a: Vec::new(),
+            b: Vec::new(),
+        })
+    })
+    .ok()?;
+    asked.get("valid")?.as_bool()
+}
+
+/// `datetime.timedelta(days=n)` — a tagged `Kind::Object` (`source =
+/// "datetime_timedelta"`) carrying one `days` Integer `ObjectKey`.
+/// datetime.rst, `class:: timedelta(days=0, seconds=0, microseconds=0,
+/// milliseconds=0, minutes=0, hours=0, weeks=0)`: only the `days`
+/// keyword is modeled — a positional argument or any OTHER keyword
+/// (`seconds=`, `weeks=`, …) declines the whole construction, matching
+/// this crate's `datetime_construction_value` convention of declining
+/// rather than guessing at an argument shape it does not read. Validated
+/// through the kernel's `calendar.validDuration` ask (date.5's own
+/// seam): the ten-field vector is `(years, months, weeks, days, hours,
+/// minutes, seconds, milliseconds, microseconds, nanoseconds)`
+/// (`theories/calendar/duration.lean`'s own comment) — every field
+/// besides `days` is `0` here, so the magnitude/sign guards the kernel
+/// checks only ever bind on the one field this file constructs.
+fn timedelta_construction_value(
+    call: &ruff_python_ast::ExprCall,
+    environment: &Environment,
+    kernel: &Arc<RefinedTSKernel>,
+) -> Option<AbstractValue> {
+    if !call.arguments.args.is_empty() {
+        return None;
+    }
+    let [keyword] = call.arguments.keywords.as_slice() else {
+        return None;
+    };
+    if keyword.arg.as_ref().map(|name| name.as_str()) != Some("days") {
+        return None;
+    }
+    let days = datetime_field_argument(&keyword.value, environment, kernel)?;
+    if !valid_duration_days(days, kernel)? {
+        return None;
+    }
+    let instance_keys = vec![integer_object_key("days", days)];
+    let mut instance = known_object(instance_keys, None, true, TrustProved, false);
+    instance.source = "datetime_timedelta".to_owned();
+    Some(instance)
+}
+
+/// `calendar.validDuration` asked over a days-only ten-field vector —
+/// `timedelta_construction_value`'s own validity gate (date.5's kernel
+/// seam), spelled as its own function so the field-order comment lives
+/// beside the one call site that builds the vector.
+fn valid_duration_days(days: i64, kernel: &Arc<RefinedTSKernel>) -> Option<bool> {
+    let fields = vec![0.0, 0.0, 0.0, days as f64, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+    let asked = crate::kernel_ask::ask_kernel(|| {
+        (kernel.calendar)(&CalendarQuestion {
+            op: CalendarQuestionOp::ValidDuration,
+            year: 0,
+            month: 0,
+            day: 0,
+            days: 0,
+            fields,
+            a: Vec::new(),
+            b: Vec::new(),
+        })
+    })
+    .ok()?;
+    asked.get("valid")?.as_bool()
+}
+
+/// `date.fromisoformat("YYYY-MM-DD")` — datetime.rst, `classmethod::
+/// date.fromisoformat(date_string)`. Modeled ONLY for the strict
+/// `YYYY-MM-DD` shape date.3's own row states as the committed
+/// (non-reduced-precision, non-extended, non-ordinal) grammar — a known
+/// exact string this file can split by its two ASCII hyphens into three
+/// all-digit runs. The parsed year/month/day is then validated through
+/// the SAME two kernel asks `date_construction_value` uses —
+/// `python_year_in_range`'s `pyYearInRange` for date.2's window, then
+/// `calendar.validDate` for calendar correctness — so a syntactically
+/// well-shaped but calendrically invalid string (`"2023-02-30"`)
+/// declines the same way a bad `datetime.date(...)` construction does.
+/// Any other shape (a non-string argument, an unparseable string, a
+/// string with the wrong hyphen count or non-digit runs) answers
+/// `None`.
+fn date_fromisoformat_value(text: &str, kernel: &Arc<RefinedTSKernel>) -> Option<AbstractValue> {
+    let mut parts = text.split('-');
+    let year_text = parts.next()?;
+    let month_text = parts.next()?;
+    let day_text = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    if year_text.len() != 4 || month_text.len() != 2 || day_text.len() != 2 {
+        return None;
+    }
+    if !year_text.bytes().all(|b| b.is_ascii_digit())
+        || !month_text.bytes().all(|b| b.is_ascii_digit())
+        || !day_text.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let year: i64 = year_text.parse().ok()?;
+    let month: i64 = month_text.parse().ok()?;
+    let day: i64 = day_text.parse().ok()?;
+    if !python_year_in_range(year, kernel)? {
+        return None;
+    }
+    if !valid_civil_date(year, month, day, kernel)? {
+        return None;
+    }
+    let keys = vec![integer_object_key("year", year), integer_object_key("month", month), integer_object_key("day", day)];
+    let mut instance = known_object(keys, None, true, TrustProved, false);
+    instance.source = "datetime_date".to_owned();
+    Some(instance)
+}
+
+/// The kernel's `epochDays` answer for a tagged `datetime_date`
+/// instance's own `year`/`month`/`day` fields — `.weekday()` and
+/// `.toordinal()`'s shared first step, both riding the SAME kernel ask
+/// `epoch_days_of_civil_date` already makes for `datetime_datetime`
+/// (this function reads its own `dayOfWeek` field too, which that
+/// function's caller never needed). `None` on a refused ask (an
+/// out-of-range or invalid date, though a tagged `datetime_date`
+/// instance was already validated at construction).
+fn epoch_days_and_day_of_week(instance: &AbstractValue, kernel: &Arc<RefinedTSKernel>) -> Option<(i64, i64)> {
+    let year = datetime_field(instance, "year")? as i64;
+    let month = datetime_field(instance, "month")? as i64;
+    let day = datetime_field(instance, "day")? as i64;
+    let asked = crate::kernel_ask::ask_kernel(|| {
+        (kernel.calendar)(&CalendarQuestion {
+            op: CalendarQuestionOp::EpochDays,
+            year,
+            month,
+            day,
+            days: 0,
+            fields: Vec::new(),
+            a: Vec::new(),
+            b: Vec::new(),
+        })
+    })
+    .ok()?;
+    let days = asked.get("days")?.as_i64()?;
+    let day_of_week = asked.get("dayOfWeek")?.as_i64()?;
+    Some((days, day_of_week))
+}
+
+/// `date.weekday()` — datetime.rst:687, "Monday is 0 and Sunday is 6."
+/// Asks the kernel's `"weekday"` op directly (`exports_calendar.lean`'s
+/// `"weekday"` arm, `Refinements.pyWeekday`, `languages/python/
+/// dates_durations/weekday.lean`) over the instance's own `year`/
+/// `month`/`day` fields — the kernel answers Python's Monday-0 form
+/// itself, so this function poses one ask and reads its `weekday` field
+/// unchanged, no local arithmetic.
+fn date_weekday_value(instance: &AbstractValue, kernel: &Arc<RefinedTSKernel>) -> Option<AbstractValue> {
+    let year = datetime_field(instance, "year")? as i64;
+    let month = datetime_field(instance, "month")? as i64;
+    let day = datetime_field(instance, "day")? as i64;
+    let asked = crate::kernel_ask::ask_kernel(|| {
+        (kernel.calendar)(&CalendarQuestion {
+            op: CalendarQuestionOp::Weekday,
+            year,
+            month,
+            day,
+            days: 0,
+            fields: Vec::new(),
+            a: Vec::new(),
+            b: Vec::new(),
+        })
+    })
+    .ok()?;
+    let weekday = asked.get("weekday")?.as_i64()?;
+    Some(known_values(vec![weekday as f64], PrimitiveKind::Integer, TrustProved))
+}
+
+/// `date.isoweekday()` — datetime.rst:694-695, "Monday is 1 and Sunday
+/// is 7," ONE more than `.weekday()`'s Monday-0 form (both elections
+/// walk the same seven days in the same order — the kernel's `"weekday"`
+/// arm already IS the Monday-0 answer this method shifts by one).
+/// Reuses `date_weekday_value`'s own ask rather than posing a second
+/// one: the ISO-1 form has no dedicated kernel arm of its own, and
+/// deriving it from the already-asked Monday-0 answer needs no further
+/// kernel round trip.
+fn date_isoweekday_value(instance: &AbstractValue, kernel: &Arc<RefinedTSKernel>) -> Option<AbstractValue> {
+    let weekday = date_weekday_value(instance, kernel)?;
+    let (monday_zero, _) = single_numeric_value(&weekday)?;
+    Some(known_values(vec![monday_zero + 1.0], PrimitiveKind::Integer, TrustProved))
+}
+
+/// `date.toordinal()` — datetime.rst:525-526, "January 1 of year 1 has
+/// ordinal 1." Asks the kernel's `"toordinal"` op directly
+/// (`exports_calendar.lean`'s `"toordinal"` arm, `Refinements.
+/// pyToOrdinal`, `languages/python/dates_durations/ordinal.lean`) over
+/// the instance's own `year`/`month`/`day` fields — the kernel applies
+/// the proved `719163` anchor shift itself, so this function poses one
+/// ask and reads its `ordinal` field unchanged, no local arithmetic.
+fn date_toordinal_value(instance: &AbstractValue, kernel: &Arc<RefinedTSKernel>) -> Option<AbstractValue> {
+    let year = datetime_field(instance, "year")? as i64;
+    let month = datetime_field(instance, "month")? as i64;
+    let day = datetime_field(instance, "day")? as i64;
+    let asked = crate::kernel_ask::ask_kernel(|| {
+        (kernel.calendar)(&CalendarQuestion {
+            op: CalendarQuestionOp::ToOrdinal,
+            year,
+            month,
+            day,
+            days: 0,
+            fields: Vec::new(),
+            a: Vec::new(),
+            b: Vec::new(),
+        })
+    })
+    .ok()?;
+    let ordinal = asked.get("ordinal")?.as_i64()?;
+    Some(known_values(vec![ordinal as f64], PrimitiveKind::Integer, TrustProved))
+}
+
+/// `date.isocalendar()` — datetime.rst:699-721, the (ISO year, ISO
+/// week, ISO weekday) triple. Asks the kernel's `"isoCalendar"` op
+/// directly (`exports_calendar.lean`'s `"isoCalendar"` arm,
+/// `Refinements.pyIsoCalendar`, `languages/python/dates_durations/
+/// iso_week_date.lean`) over the instance's own `year`/`month`/`day`
+/// fields, then binds the three answered ints (`isoYear`, `week`,
+/// `weekday`) as a known 3-element tuple through
+/// `collection_models::tuple_literal_value` — the same constructor
+/// `evaluate_tuple` uses for a literal `(a, b, c)` display, so the
+/// answer type-checks identically to a real tuple.
+fn date_isocalendar_value(instance: &AbstractValue, kernel: &Arc<RefinedTSKernel>) -> Option<AbstractValue> {
+    let year = datetime_field(instance, "year")? as i64;
+    let month = datetime_field(instance, "month")? as i64;
+    let day = datetime_field(instance, "day")? as i64;
+    let asked = crate::kernel_ask::ask_kernel(|| {
+        (kernel.calendar)(&CalendarQuestion {
+            op: CalendarQuestionOp::IsoCalendar,
+            year,
+            month,
+            day,
+            days: 0,
+            fields: Vec::new(),
+            a: Vec::new(),
+            b: Vec::new(),
+        })
+    })
+    .ok()?;
+    let iso_year = asked.get("isoYear")?.as_i64()?;
+    let week = asked.get("week")?.as_i64()?;
+    let weekday = asked.get("weekday")?.as_i64()?;
+    let elements = [iso_year, week, weekday].map(|value| known_values(vec![value as f64], PrimitiveKind::Integer, TrustProved));
+    Some(collection_models::tuple_literal_value(&elements))
+}
+
+/// `date1 ± timedelta` — datetime.rst's operation table (date.7's own
+/// row): shifts by `timedelta.days` (the only field
+/// `timedelta_construction_value` ever populates) and answers a NEW
+/// tagged `datetime_date` instance, or declines (`None`) exactly where
+/// CPython raises `OverflowError`. The kernel's `epochDays`/`isoDate`
+/// pair (date.1's seam) computes the shifted day count and certifies it
+/// lands back on a calendrically valid date (`isoDate`'s own
+/// "self-certification" — `exports_calendar.lean`'s comment), but that
+/// certification alone is NOT date.7's `OverflowError` bound: the
+/// kernel's own PlainDate window is far wider than Python's
+/// `[MINYEAR, MAXYEAR]`, so this function additionally poses the
+/// `pyYearInRange` ask (`python_year_in_range`) on the shifted result —
+/// a shift the kernel's `isoDate` arm would happily answer but Python
+/// would reject (`date(9999, 12, 31) + timedelta(days=1)`, landing on
+/// year 10000) still declines here. `negate` flips the shift for
+/// `date - timedelta` (`date + timedelta` passes `false`).
+fn date_shifted_by_timedelta(date: &AbstractValue, timedelta: &AbstractValue, negate: bool, kernel: &Arc<RefinedTSKernel>) -> Option<AbstractValue> {
+    let (days, _) = epoch_days_and_day_of_week(date, kernel)?;
+    let shift = datetime_field(timedelta, "days")? as i64;
+    let shifted_days = if negate { days - shift } else { days + shift };
+    let asked = crate::kernel_ask::ask_kernel(|| {
+        (kernel.calendar)(&CalendarQuestion {
+            op: CalendarQuestionOp::IsoDate,
+            year: 0,
+            month: 0,
+            day: 0,
+            days: shifted_days,
+            fields: Vec::new(),
+            a: Vec::new(),
+            b: Vec::new(),
+        })
+    })
+    .ok()?;
+    let year = asked.get("year")?.as_i64()?;
+    let month = asked.get("month")?.as_i64()?;
+    let day = asked.get("day")?.as_i64()?;
+    if !python_year_in_range(year, kernel)? {
+        return None;
+    }
+    let keys = vec![integer_object_key("year", year), integer_object_key("month", month), integer_object_key("day", day)];
+    let mut instance = known_object(keys, None, true, TrustProved, false);
+    instance.source = "datetime_date".to_owned();
+    Some(instance)
+}
+
 /// A retained-callable call's own positional arguments, given `def`'s
 /// synthetic parameter list — tries `positional_arguments_for_def`'s
 /// existing exact mapping FIRST (the ordinary, no-splat call shape
@@ -2682,6 +3099,52 @@ fn evaluate_call(call: &ruff_python_ast::ExprCall, environment: &Environment, ke
             }
             return unknown();
         }
+        // `datetime.date(year, month, day)` — date.1's own construction,
+        // recognized the same way `datetime.datetime(...)` is (BEFORE the
+        // keyword gate below, though this construction reads no keyword
+        // this file's corpus does not already handle positionally). See
+        // `date_construction_value`'s own doc for the exact fields read
+        // and the `calendar.validDate` kernel validation.
+        if is_datetime_date_attribute(attribute, environment) {
+            if let Some(value) = date_construction_value(call, environment, kernel) {
+                return value;
+            }
+            return unknown();
+        }
+        // `datetime.timedelta(days=n)` — date.5's own construction,
+        // recognized here (BEFORE the keyword gate below) because
+        // `days=` always arrives as a keyword argument. See
+        // `timedelta_construction_value`'s own doc for the one field
+        // read and the `calendar.validDuration` kernel validation.
+        if is_datetime_timedelta_attribute(attribute, environment) {
+            if let Some(value) = timedelta_construction_value(call, environment, kernel) {
+                return value;
+            }
+            return unknown();
+        }
+        // `datetime.date.fromisoformat("YYYY-MM-DD")` — a TWO-level
+        // attribute chain the same way `datetime.datetime.now()` is
+        // (`attribute` here is one level further out than
+        // `is_datetime_date_attribute`'s own single-level check). See
+        // `date_fromisoformat_value`'s own doc for the exact grammar
+        // read.
+        if let Expr::Attribute(inner) = attribute.value.as_ref() {
+            if is_datetime_date_attribute(inner, environment) && attribute.attr.as_str() == "fromisoformat" {
+                if let [text] = &*call.arguments.args {
+                    if call.arguments.keywords.is_empty() {
+                        let argument = evaluate_expression(text, environment, kernel);
+                        if let Some(code_points) = exact_string_values(&argument) {
+                            if let Some(spelling) = code_points_to_string(code_points) {
+                                if let Some(value) = date_fromisoformat_value(&spelling, kernel) {
+                                    return value;
+                                }
+                            }
+                        }
+                    }
+                }
+                return unknown();
+            }
+        }
         // `array.array(typecode, initializer)` — the Float64Array twin,
         // p-typed-array.py's `array_double_from_iterable`/`array_double_
         // write_and_read_back`. Recognized here (an Attribute call,
@@ -3172,10 +3635,26 @@ fn evaluate_attribute_call(
 ) -> AbstractValue {
     if let Expr::Name(module_name) = attribute.value.as_ref() {
         if module_name.id.as_str() == "math" && environment.read("math").is_none() {
-            return match math_models::math_call_result(attribute.attr.as_str(), arguments, kernel) {
-                Some(value) => value,
-                None => unknown(),
-            };
+            if let Some(value) = math_models::math_call_result(attribute.attr.as_str(), arguments, kernel) {
+                return value;
+            }
+            // `math_call_result` declined — for the eight domain-limited
+            // names (`log`/`log2`/`log10`/`log1p`/`asin`/`acos`/`atanh`/
+            // `acosh`), a STRADDLING operand still determines a value
+            // over its served half, alongside the fire `possible_raise`
+            // (`domain_limited_family_possible_raise`) pushes at the
+            // sink — the same "the finding and the value both stand"
+            // split `split_divisor_transfer` keeps for a sometimes-zero
+            // divisor. An entirely-raising or unreadable operand still
+            // answers `unknown()` here, unchanged.
+            if let Some(family) = math_models::DomainLimitedFamily::of_function(attribute.attr.as_str()) {
+                if let [only] = arguments {
+                    if let Some(value) = math_models::domain_raise_served_half_value(family, only, kernel) {
+                        return value;
+                    }
+                }
+            }
+            return unknown();
         }
         // `random.random()` — the sound `[0.0, 1.0)` range
         // (`math_models::random_call_result`'s own doc, citing
@@ -3426,6 +3905,38 @@ fn evaluate_attribute_call(
         }
         if attribute.attr.as_str() == "isoformat" {
             return opaque_value("an ISO 8601 datetime string");
+        }
+    }
+    // A tagged `datetime_date` instance's own METHODS — `.weekday()`
+    // (date.8, Monday 0), `.isoweekday()` (date.8, Monday 1),
+    // `.toordinal()` (date.9), `.isocalendar()` (date.10) — each exact,
+    // each posing its own dedicated kernel ask directly (see
+    // `date_weekday_value`/`date_toordinal_value`/
+    // `date_isocalendar_value`'s own docs for the exact op).
+    if receiver.kind == Kind::Object && receiver.source == "datetime_date" {
+        if attribute.attr.as_str() == "weekday" && arguments.is_empty() {
+            return match date_weekday_value(&receiver, kernel) {
+                Some(value) => value,
+                None => unknown(),
+            };
+        }
+        if attribute.attr.as_str() == "isoweekday" && arguments.is_empty() {
+            return match date_isoweekday_value(&receiver, kernel) {
+                Some(value) => value,
+                None => unknown(),
+            };
+        }
+        if attribute.attr.as_str() == "toordinal" && arguments.is_empty() {
+            return match date_toordinal_value(&receiver, kernel) {
+                Some(value) => value,
+                None => unknown(),
+            };
+        }
+        if attribute.attr.as_str() == "isocalendar" && arguments.is_empty() {
+            return match date_isocalendar_value(&receiver, kernel) {
+                Some(value) => value,
+                None => unknown(),
+            };
         }
     }
     if exact_string_values(&receiver).is_some() {
@@ -4369,11 +4880,16 @@ fn single_numeric_value(value: &AbstractValue) -> Option<(f64, PrimitiveKind)> {
     }
 }
 
-/// Binary arithmetic over two known single numeric values, for exactly
-/// the operators PYREFLY-NUMERIC-B3-B4.md cites a CPython row for:
-/// `+ - * / // % **`. Every row below follows the cited clause exactly;
-/// an operator this file does not recognize, or operands this file
-/// cannot prove numeric, declines to the sequence row below (a
+/// Binary arithmetic over two known numeric operands, for exactly the
+/// operators PYREFLY-NUMERIC-B3-B4.md cites a CPython row for: `+ - *
+/// / // % **`. Two known SINGLE values answer through
+/// `binary_arithmetic_pair` directly; a MULTI-valued `Kind::Values`
+/// operand on either side (an ordinary join of admitted literals, e.g.
+/// a loop's second judged pass) answers through
+/// `multi_value_binary_arithmetic`'s own pointwise cross product
+/// instead, before ever falling through to the sequence row. An
+/// operator this file does not recognize, or operands this file cannot
+/// prove numeric AT ALL, declines to the sequence row below (a
 /// non-numeric `+`/`*` — string/list concatenation or repetition,
 /// `sequence_binop_value`'s own doc) — the same decline order
 /// `evaluate_binop` already reads: numeric first, then sequence.
@@ -4388,11 +4904,31 @@ fn single_numeric_value(value: &AbstractValue) -> Option<(f64, PrimitiveKind)> {
 /// diverging from what the equivalent BinOp answers.
 pub fn binary_arithmetic_value(op: Operator, left: &AbstractValue, right: &AbstractValue) -> AbstractValue {
     let Some((left_value, left_sort)) = single_numeric_value(left) else {
-        return sequence_binop_value(op, left, right);
+        return multi_value_binary_arithmetic(op, left, right).unwrap_or_else(|| sequence_binop_value(op, left, right));
     };
     let Some((right_value, right_sort)) = single_numeric_value(right) else {
-        return sequence_binop_value(op, left, right);
+        return multi_value_binary_arithmetic(op, left, right).unwrap_or_else(|| sequence_binop_value(op, left, right));
     };
+    binary_arithmetic_pair(op, left_value, left_sort, right_value, right_sort)
+}
+
+/// Binary arithmetic over two known SINGLE numeric values — the exact
+/// per-pair rule every operator in PYREFLY-NUMERIC-B3-B4.md's cited
+/// CPython row follows: `+ - * / // % ** << >> & | ^`. Factored out of
+/// `binary_arithmetic_value` so `multi_value_binary_arithmetic`'s own
+/// cross-product can call the identical per-pair arithmetic CPython
+/// itself runs at each admitted combination, rather than re-deriving
+/// it. An operator this file does not recognize, or a pair this file
+/// cannot prove exact for (a zero divisor, an out-of-2^53-range
+/// result, a non-integer bitwise operand, …), answers `unknown()` — the
+/// caller's own decline discipline, unchanged from before this split.
+fn binary_arithmetic_pair(
+    op: Operator,
+    left_value: f64,
+    left_sort: PrimitiveKind,
+    right_value: f64,
+    right_sort: PrimitiveKind,
+) -> AbstractValue {
     // int op int -> int (PYREFLY-NUMERIC-B3-B4.md's own kernel-transfer
     // rows); either operand float -> the result widens to float per
     // stdtypes' mixed-arithmetic rule. `/` overrides this below — true
@@ -4501,6 +5037,118 @@ pub fn binary_arithmetic_value(op: Operator, left: &AbstractValue, right: &Abstr
         }
         Operator::BitOr | Operator::BitXor | Operator::BitAnd => unknown(),
     }
+}
+
+/// The multi-value cap: two operands whose CROSS PRODUCT exceeds this
+/// many combined pairs fall through to the existing set/transfer path
+/// unchanged, rather than enumerate an unbounded join as `Kind::Values`
+/// — mirrors the boundaryFuelCeiling-style hang guard other kernel-
+/// adjacent code in this workspace states explicitly rather than
+/// deriving from an existing convention (none was found for THIS
+/// carrier: no prior `Kind::Values` cross product exists in this file).
+const MULTI_VALUE_CROSS_PRODUCT_CAP: usize = 16;
+
+/// `{a1, a2, ...} op {b1, b2, ...}` — a binary operation over TWO
+/// operands where at least one is a MULTI-valued `Kind::Values` binding
+/// (an ordinary join of admitted literals, e.g. a loop's second judged
+/// pass over `total` after the first pass's own join produced `{0,
+/// age}`): the exact pointwise answer, one CPython actually computes at
+/// EVERY admitted concrete pair — `{1.0, 2.0} * 2.0` answers `{2.0,
+/// 4.0}`, not `unknown()`, because CPython evaluates `1.0 * 2.0` and
+/// `2.0 * 2.0` independently at each concrete run and both are exact.
+///
+/// Every pair goes through the SAME `binary_arithmetic_pair` the
+/// single-value path already trusts — this function is a cross product
+/// over that function's own answers, never a second arithmetic
+/// implementation. A single-valued operand reads as its own one-element
+/// list (`single_numeric_value`), so a `{Values} op {single}` pair and
+/// a `{Values} op {Values}` pair are the SAME shape here — the
+/// single-value CALLER (`binary_arithmetic_value`) never reaches this
+/// function at all (it already answers through `binary_arithmetic_pair`
+/// directly when BOTH operands are singletons), so this function only
+/// ever runs with at least one genuinely multi-valued side.
+///
+/// A pair `binary_arithmetic_pair` cannot determine (a zero divisor, an
+/// out-of-2^53-range result, a non-integer bitwise operand, …) makes
+/// the WHOLE cross product decline (`None`) rather than silently drop
+/// that one admitted combination from the answer — dropping a value
+/// CPython can actually produce would be UNSOUND, the same reason
+/// `split_divisor_transfer` never drops its own raise arm silently; it
+/// routes that arm to `possible_raise` instead, a channel this function
+/// does not own. `Div`/`FloorDiv`/`Mod`'s zero-divisor row therefore
+/// still declines the WHOLE combined answer whenever the cross product
+/// admits a zero divisor pairing, exactly as `binary_arithmetic_pair`'s
+/// own existing single-pair behavior already declines for one. A cross
+/// product past `MULTI_VALUE_CROSS_PRODUCT_CAP` also declines here (the
+/// caller falls through to the set/transfer path unchanged) rather than
+/// enumerate an unbounded join. `None` for every non-multi-valued
+/// operand pair (the caller's own single-value path owns those) and
+/// for a non-numeric multi-valued operand (a String/Boolean-sorted
+/// `Kind::Values` — `single_numeric_value`'s own per-element read
+/// already excludes those the same way the single-value path does).
+fn multi_value_binary_arithmetic(op: Operator, left: &AbstractValue, right: &AbstractValue) -> Option<AbstractValue> {
+    let left_pairs = numeric_values_with_sort(left)?;
+    let right_pairs = numeric_values_with_sort(right)?;
+    if left_pairs.len() <= 1 && right_pairs.len() <= 1 {
+        // both sides are already single values — the caller's own
+        // `binary_arithmetic_value` path answers this directly through
+        // `binary_arithmetic_pair`, never reaching this function
+        return None;
+    }
+    if left_pairs.len().saturating_mul(right_pairs.len()) > MULTI_VALUE_CROSS_PRODUCT_CAP {
+        return None;
+    }
+    let mut combined: Vec<f64> = Vec::with_capacity(left_pairs.len() * right_pairs.len());
+    for &(left_value, left_sort) in &left_pairs {
+        for &(right_value, right_sort) in &right_pairs {
+            let pair_result = binary_arithmetic_pair(op, left_value, left_sort, right_value, right_sort);
+            let Some((result_value, _)) = single_numeric_value(&pair_result) else {
+                // one admitted combination could not be determined
+                // exactly (a zero divisor, an out-of-range result, …) —
+                // the whole cross product declines rather than silently
+                // omit a value CPython can actually produce
+                return None;
+            };
+            if !combined.contains(&result_value) {
+                combined.push(result_value);
+            }
+        }
+    }
+    // the RESULT sort follows the same both-int rule
+    // `binary_arithmetic_pair` already applies per pair: every pointwise
+    // result came back through `arithmetic_result`/`known_values`,
+    // which already normalized Integer vs Float per pair — reading the
+    // FIRST pair's own kind_tag is sound because every pair shares the
+    // same left/right SORTS (not values), so `both_int` (and therefore
+    // the result sort) is identical across the whole cross product.
+    let result_sort = binary_arithmetic_pair(op, left_pairs[0].0, left_pairs[0].1, right_pairs[0].0, right_pairs[0].1)
+        .kind_tag
+        .unwrap_or(PrimitiveKind::Float);
+    Some(known_values(combined, result_sort, TrustProved))
+}
+
+/// Every numeric value a `Kind::Values` binding admits, each paired
+/// with the PYTHON ARITHMETIC SORT `single_numeric_value` reads a
+/// single value under — the multi-valued generalization of
+/// `single_numeric_value` itself (a one-element binding reads
+/// identically through either function). `None` for a non-`Kind::Values`
+/// operand, an EMPTY `Kind::Values` (nothing to enumerate — should not
+/// occur for a real join, but this function makes no assumption), or a
+/// non-numeric sort (String/Boolean/anything `single_numeric_value`
+/// itself declines) — the same "known operands only" discipline every
+/// reader in this file keeps.
+fn numeric_values_with_sort(value: &AbstractValue) -> Option<Vec<(f64, PrimitiveKind)>> {
+    if value.kind != Kind::Values || value.values.is_empty() {
+        return None;
+    }
+    let sort = match value.kind_tag {
+        Some(PrimitiveKind::Integer) => PrimitiveKind::Integer,
+        Some(PrimitiveKind::Float) => PrimitiveKind::Float,
+        Some(PrimitiveKind::Boolean) => PrimitiveKind::Integer,
+        Some(PrimitiveKind::Number) => PrimitiveKind::Float,
+        _ => return None,
+    };
+    Some(value.values.iter().map(|&v| (v, sort)).collect())
 }
 
 /// The set operand a kernel arithmetic transfer can pose: a numeric-
@@ -5141,7 +5789,49 @@ fn evaluate_binop(
 ) -> AbstractValue {
     let left = evaluate_expression(&binop.left, environment, kernel);
     let right = evaluate_expression(&binop.right, environment, kernel);
+    if let Some(value) = date_timedelta_binop_value(binop.op, &left, &right, kernel) {
+        return value;
+    }
     binary_arithmetic_value_with_kernel(binop.op, &left, &right, kernel)
+}
+
+/// `date ± timedelta` (date.7's own operation-table row) — tried BEFORE
+/// the ordinary numeric/sequence dispatch, since neither operand is a
+/// single numeric value or a string/list (`binary_arithmetic_value`'s
+/// own fallthrough would otherwise reach `sequence_binop_value` and
+/// answer `unknown()` for a tagged-Object pair). `date + timedelta` and
+/// `timedelta + date` both shift forward (`Operator::Add`, either
+/// operand order — datetime.rst states the operation both ways);
+/// `date - timedelta` shifts backward (`Operator::Sub`, `date` on the
+/// LEFT only — `timedelta - date` is not a datetime.rst operation).
+/// `date - date` (the OTHER `date.7` row, an exact `timedelta` result)
+/// is NOT built here: no row in this file's construct list asks for it,
+/// and `timedelta_construction_value`'s own single `days` field gives no
+/// two-instance subtraction a shape to land in without inventing one.
+/// `None` for every operand pair that is not exactly one tagged
+/// `datetime_date` and one tagged `datetime_timedelta` — the caller
+/// falls through to the ordinary dispatch unchanged.
+fn date_timedelta_binop_value(op: Operator, left: &AbstractValue, right: &AbstractValue, kernel: &Arc<RefinedTSKernel>) -> Option<AbstractValue> {
+    let is_date = |value: &AbstractValue| value.kind == Kind::Object && value.source == "datetime_date";
+    let is_timedelta = |value: &AbstractValue| value.kind == Kind::Object && value.source == "datetime_timedelta";
+    match op {
+        Operator::Add => {
+            if is_date(left) && is_timedelta(right) {
+                return date_shifted_by_timedelta(left, right, false, kernel);
+            }
+            if is_timedelta(left) && is_date(right) {
+                return date_shifted_by_timedelta(right, left, false, kernel);
+            }
+            None
+        }
+        Operator::Sub => {
+            if is_date(left) && is_timedelta(right) {
+                return date_shifted_by_timedelta(left, right, true, kernel);
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 /// `binary_arithmetic_value` WITH the kernel available: tries the SET
@@ -5490,8 +6180,47 @@ pub fn possible_raise(
 ) -> Option<(TextRange, String)> {
     match expression {
         Expr::BinOp(binop) => binop_possible_raise(binop, environment, kernel),
+        Expr::Call(call) => domain_limited_family_possible_raise(call, environment, kernel),
         _ => None,
     }
+}
+
+/// `math.log(x)`/`log2`/`log10`/`log1p`/`asin`/`acos`/`atanh`/`acosh`
+/// where `x`'s window STRADDLES CPython's own raise domain (some
+/// admitted values raise, the rest still return a value) —
+/// `math_models::DomainRaiseClassification::Straddles`'s own row, the
+/// sibling this `call_provable_raise`'s all-or-nothing arm explicitly
+/// defers to. The window's ENTIRELY-raising case is `call_provable_
+/// raise`'s own row (an unconditional fire, no value question at all);
+/// the ENTIRELY-served case fires nothing here and answers its value
+/// through `math_models::math_call_result`'s ordinary kernel-backed
+/// path, unaffected by this function.
+fn domain_limited_family_possible_raise(
+    call: &ruff_python_ast::ExprCall,
+    environment: &Environment,
+    kernel: &Arc<RefinedTSKernel>,
+) -> Option<(TextRange, String)> {
+    let Expr::Attribute(attribute) = call.func.as_ref() else {
+        return None;
+    };
+    let family = math_models::DomainLimitedFamily::of_function(attribute.attr.as_str())?;
+    let Expr::Name(module_name) = attribute.value.as_ref() else {
+        return None;
+    };
+    if module_name.id.as_str() != "math" || environment.read("math").is_some() {
+        return None;
+    }
+    let [only_arg] = &*call.arguments.args else {
+        return None;
+    };
+    let argument = evaluate_expression(only_arg, environment, kernel);
+    if !matches!(
+        math_models::domain_raise_classification(family, &argument, kernel),
+        Some(math_models::DomainRaiseClassification::Straddles)
+    ) {
+        return None;
+    }
+    Some((call.range(), family.raise_message().to_owned()))
 }
 
 /// `x / d`, `x // d`, `x % d` where `d`'s set ADMITS zero without being
@@ -5788,6 +6517,36 @@ fn call_provable_raise(
                             call.range(),
                             "this expression provably raises ValueError: math domain error".to_owned(),
                         ));
+                    }
+                }
+            }
+        }
+        // `math.log`/`log2`/`log10`/`log1p`/`asin`/`acos`/`atanh`/`acosh`
+        // of a KNOWN operand whose window is ENTIRELY inside CPython's
+        // own raise domain provably raises `ValueError: math domain
+        // error` — `math_models::DomainLimitedFamily::raise_domain`'s
+        // own doc cites the exact `mathmodule.c` clause per family
+        // (verified against the vendored source, not against the
+        // kernel's own JavaScript-facing `.nan` corner, which disagrees
+        // with CPython at one boundary point for `log`/`log2`/`log10`/
+        // `log1p`/`atanh`). specifications/python/Doc/library/
+        // math.rst:696-698 is the module's own impl-detail note citing
+        // `log(0.0)` as its worked example of exactly this row. A
+        // window that only STRADDLES the raise domain is `possible_
+        // raise`'s own row (`domain_limited_family_possible_raise`
+        // below), not this one's — this function's contract is
+        // all-or-nothing, so only `EntirelyRaises` fires here.
+        if let Some(family) = math_models::DomainLimitedFamily::of_function(attribute.attr.as_str()) {
+            if let Expr::Name(module_name) = attribute.value.as_ref() {
+                if module_name.id.as_str() == "math" && environment.read("math").is_none() {
+                    if let [only_arg] = &*call.arguments.args {
+                        let argument = evaluate_expression(only_arg, environment, kernel);
+                        if matches!(
+                            math_models::domain_raise_classification(family, &argument, kernel),
+                            Some(math_models::DomainRaiseClassification::EntirelyRaises)
+                        ) {
+                            return Some((call.range(), family.raise_message().to_owned()));
+                        }
                     }
                 }
             }
@@ -6285,6 +7044,59 @@ mod tests {
         let result = binary_arithmetic_value(Operator::Add, &ten_int, &half_float);
         assert_eq!(result.values, vec![10.5]);
         assert_eq!(result.kind_tag, Some(PrimitiveKind::Float));
+    }
+
+    /// `{1.0, 2.0} * 2.0` — a MULTI-valued `Kind::Values` operand
+    /// against a single-valued one: the exact pointwise answer `{2.0,
+    /// 4.0}`, not `unknown()`. This is the row a loop's second judged
+    /// pass needs: a first-pass join can leave `total` bound to exactly
+    /// this two-element shape, and a decline here is what collapses a
+    /// stabilizing accumulation onto the coarse "not yet walked"
+    /// blocker instead of the fixed-point one.
+    #[test]
+    fn test_binary_arithmetic_value_multi_valued_operand_answers_the_pointwise_cross_product() {
+        let one_and_two = known_values(vec![1.0, 2.0], PrimitiveKind::Float, TrustProved);
+        let two = known_values(vec![2.0], PrimitiveKind::Float, TrustProved);
+        let result = binary_arithmetic_value(Operator::Mult, &one_and_two, &two);
+        assert_eq!(result.kind, Kind::Values, "{result:?}");
+        assert_eq!(result.kind_tag, Some(PrimitiveKind::Float));
+        let mut values = result.values.clone();
+        values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(values, vec![2.0, 4.0]);
+    }
+
+    /// `{1.0, 2.0} + {10.0, 20.0}` — BOTH operands multi-valued: the
+    /// full cross product, four pointwise sums, deduped (none collide
+    /// here) — `1+10, 1+20, 2+10, 2+20`.
+    #[test]
+    fn test_binary_arithmetic_value_both_operands_multi_valued_answers_the_full_cross_product() {
+        let one_and_two = known_values(vec![1.0, 2.0], PrimitiveKind::Float, TrustProved);
+        let ten_and_twenty = known_values(vec![10.0, 20.0], PrimitiveKind::Float, TrustProved);
+        let result = binary_arithmetic_value(Operator::Add, &one_and_two, &ten_and_twenty);
+        assert_eq!(result.kind, Kind::Values, "{result:?}");
+        let mut values = result.values.clone();
+        values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(values, vec![11.0, 12.0, 21.0, 22.0]);
+    }
+
+    /// A cross product past `MULTI_VALUE_CROSS_PRODUCT_CAP` falls
+    /// through to whatever the existing set/transfer path answers today
+    /// — pinned as NOT `Kind::Values` (this function's own multi-value
+    /// row must not fire), rather than pinning a specific set shape the
+    /// set/transfer path's own tests already own.
+    #[test]
+    fn test_binary_arithmetic_value_cross_product_past_the_cap_falls_through() {
+        let left_values: Vec<f64> = (0..5).map(|n| n as f64).collect();
+        let right_values: Vec<f64> = (0..5).map(|n| 100.0 + n as f64).collect();
+        let left = known_values(left_values, PrimitiveKind::Float, TrustProved);
+        let right = known_values(right_values, PrimitiveKind::Float, TrustProved);
+        // 5 * 5 = 25 pairs, past the 16-pair cap
+        let result = binary_arithmetic_value(Operator::Add, &left, &right);
+        assert_ne!(
+            result.kind,
+            Kind::Values,
+            "a cross product past the cap must fall through, not answer Kind::Values: {result:?}"
+        );
     }
 
     /// `binary_arithmetic_value` on two known STRINGS falls through to
@@ -7716,6 +8528,122 @@ mod tests {
         assert!(provable_raise_of("math.sqrt(4)").is_none());
     }
 
+    /// `math.log(-2)`/`math.log2(-2)`/`math.log10(-2)`: a KNOWN operand
+    /// entirely inside CPython's raise domain (`x <= 0`) fires the
+    /// determined "math domain error" finding, one shared row per
+    /// `DomainLimitedFamily::of_function`.
+    #[test]
+    fn test_provable_raise_math_log_family_of_a_known_nonpositive() {
+        for source in ["math.log(-2)", "math.log2(-2)", "math.log10(-2)"] {
+            let Some(found) = provable_raise_of(source) else {
+                if loaded_kernel().is_none() {
+                    return;
+                }
+                panic!("{source} must provably raise");
+            };
+            assert!(found.1.contains("ValueError"), "{source}: {}", found.1);
+            assert!(found.1.contains("math domain error"), "{source}: {}", found.1);
+        }
+    }
+
+    /// `math.log(0.0)` provably raises — the module's own worked
+    /// example (specifications/python/Doc/library/math.rst:696-698) and
+    /// the exact JS/Python divergence point: the kernel's own `js.log`
+    /// arm serves `-inf` there (JavaScript's `Math.log(0) ===
+    /// -Infinity`), but CPython's `loghelper`/`math_1` (mathmodule.c)
+    /// raises `ValueError` for an infinite result from a finite input.
+    #[test]
+    fn test_provable_raise_math_log_of_exact_zero_the_python_javascript_divergence_point() {
+        let Some(found) = provable_raise_of("math.log(0.0)") else {
+            if loaded_kernel().is_none() {
+                return;
+            }
+            panic!("math.log(0.0) must provably raise — the module's own worked ValueError example");
+        };
+        assert!(found.1.contains("ValueError"), "{}", found.1);
+        assert!(found.1.contains("math domain error"), "{}", found.1);
+    }
+
+    /// `math.log1p(-2.0)` (entirely `x <= -1`) provably raises; the
+    /// exact boundary point `math.log1p(-1.0)` ALSO raises (the closed
+    /// `x <= -1` domain, not the kernel's open `x < -1` NaN corner) —
+    /// `jsLog1p` serves `-inf` there, another JS/Python divergence.
+    #[test]
+    fn test_provable_raise_math_log1p_of_nonpositive_and_its_exact_boundary() {
+        for source in ["math.log1p(-2.0)", "math.log1p(-1.0)"] {
+            let Some(found) = provable_raise_of(source) else {
+                if loaded_kernel().is_none() {
+                    return;
+                }
+                panic!("{source} must provably raise");
+            };
+            assert!(found.1.contains("ValueError"), "{source}: {}", found.1);
+            assert!(found.1.contains("math domain error"), "{source}: {}", found.1);
+        }
+    }
+
+    /// `math.asin(2.0)`/`math.acos(-2.0)`: entirely outside `[-1, 1]`
+    /// fires the determined finding; `math.asin(1.0)` (the CLOSED
+    /// boundary) does NOT raise — `asin`/`acos`'s raise domain is the
+    /// OPEN ray `|x| > 1`, matching the kernel's own boundary exactly
+    /// (no JS/Python divergence for this family).
+    #[test]
+    fn test_provable_raise_math_asin_acos_outside_domain_and_boundary_declines() {
+        let Some(found) = provable_raise_of("math.asin(2.0)") else {
+            if loaded_kernel().is_none() {
+                return;
+            }
+            panic!("math.asin(2.0) must provably raise");
+        };
+        assert!(found.1.contains("math domain error"), "{}", found.1);
+
+        let Some(found) = provable_raise_of("math.acos(-2.0)") else {
+            if loaded_kernel().is_none() {
+                return;
+            }
+            panic!("math.acos(-2.0) must provably raise");
+        };
+        assert!(found.1.contains("math domain error"), "{}", found.1);
+
+        assert!(provable_raise_of("math.asin(1.0)").is_none(), "asin(1.0) = pi/2 exactly — must not raise");
+        assert!(provable_raise_of("math.acos(-1.0)").is_none(), "acos(-1.0) = pi exactly — must not raise");
+    }
+
+    /// `math.atanh(2.0)` (entirely `|x| >= 1`) provably raises; the
+    /// exact boundary points `math.atanh(1.0)`/`math.atanh(-1.0)` ALSO
+    /// raise (the closed `|x| >= 1` domain) — `jsAtanh` serves `±inf`
+    /// there, another JS/Python divergence this family's own raise
+    /// domain must be one ray WIDER than the kernel's boundary to catch.
+    #[test]
+    fn test_provable_raise_math_atanh_outside_domain_and_its_exact_boundary() {
+        for source in ["math.atanh(2.0)", "math.atanh(1.0)", "math.atanh(-1.0)"] {
+            let Some(found) = provable_raise_of(source) else {
+                if loaded_kernel().is_none() {
+                    return;
+                }
+                panic!("{source} must provably raise");
+            };
+            assert!(found.1.contains("ValueError"), "{source}: {}", found.1);
+            assert!(found.1.contains("math domain error"), "{source}: {}", found.1);
+        }
+    }
+
+    /// `math.acosh(0.5)`: entirely `x < 1` fires; `math.acosh(1.0)` (the
+    /// CLOSED boundary, `acosh(1) = 0` exactly) does NOT raise —
+    /// `acosh`'s raise domain is the OPEN ray `x < 1`, matching the
+    /// kernel's own boundary exactly (no JS/Python divergence).
+    #[test]
+    fn test_provable_raise_math_acosh_below_one_and_boundary_declines() {
+        let Some(found) = provable_raise_of("math.acosh(0.5)") else {
+            if loaded_kernel().is_none() {
+                return;
+            }
+            panic!("math.acosh(0.5) must provably raise");
+        };
+        assert!(found.1.contains("math domain error"), "{}", found.1);
+        assert!(provable_raise_of("math.acosh(1.0)").is_none(), "acosh(1.0) = 0 exactly — must not raise");
+    }
+
     // --- set display and set operators/methods ---
 
     #[test]
@@ -8069,6 +8997,220 @@ mod tests {
         let Some(value) = eval("datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc).isoformat()") else { return };
         assert_eq!(value.kind, Kind::Object);
         assert!(value.kind_word.is_some());
+    }
+
+    // --- j-stdlib-surfaces.py: date/timedelta family ---
+    // Every pin below routes its calendar arithmetic through the
+    // kernel's `calendar` ask — `validDate`/`epochDays`/`isoDate`/
+    // `validDuration` (construction and `date ± timedelta`) and
+    // `weekday`/`toordinal`/`pyYearInRange`/`isoCalendar` (`.weekday()`/
+    // `.isoweekday()`/`.toordinal()`/`.isocalendar()` and the year-range
+    // guard) — same as the `datetime_datetime` family above; `eval`
+    // loads the real kernel dylib, so a wrong or refused kernel answer
+    // fails these pins directly. PIN VALUE PROVENANCE: `date(2024, 3,
+    // 1).weekday() == 4` and `.toordinal() == 738946` are the exact
+    // values this task's own brief states; every other constant below
+    // is derived by `/tmp/date_pin_values.py` (a CPython `datetime`
+    // probe) and MUST be cross-checked against that script's printed
+    // output before this batch gates — flagged individually below.
+
+    /// `datetime.date(2024, 3, 1)` constructs — a plain valid civil
+    /// date, tagged and carrying its own year/month/day fields.
+    #[test]
+    fn test_date_construction_carries_its_own_fields() {
+        let Some(value) = eval("datetime.date(2024, 3, 1)") else { return };
+        assert_eq!(value.kind, Kind::Object);
+        assert_eq!(datetime_field(&value, "year"), Some(2024.0));
+        assert_eq!(datetime_field(&value, "month"), Some(3.0));
+        assert_eq!(datetime_field(&value, "day"), Some(1.0));
+    }
+
+    /// `datetime.date(2023, 2, 30)` — February has 28 days in 2023 (not
+    /// a leap year); the kernel's own `validDate` refuses this, so
+    /// construction declines rather than building an invalid instance.
+    #[test]
+    fn test_date_construction_of_an_invalid_calendar_date_declines() {
+        let Some(value) = eval("datetime.date(2023, 2, 30)") else { return };
+        assert_eq!(value.kind, Kind::Unknown);
+    }
+
+    /// `datetime.date(2024, 3, 1).weekday()` — PIN VALUE FROM THE
+    /// TASK BRIEF ITSELF: 4 (Friday), Monday-0 through Sunday-6.
+    #[test]
+    fn test_date_weekday_of_a_known_friday() {
+        let Some(value) = eval("datetime.date(2024, 3, 1).weekday()") else { return };
+        assert_eq!(value.values, vec![4.0]);
+        assert_eq!(value.kind_tag, Some(PrimitiveKind::Integer));
+    }
+
+    /// `datetime.date(2024, 3, 1).isoweekday()` — PIN VALUE DERIVED BY
+    /// THE PROBE (`/tmp/date_pin_values.py`'s `isoweekday()` row):
+    /// Monday-1 through Sunday-7, one more than `.weekday()`'s Friday-4.
+    #[test]
+    fn test_date_isoweekday_of_a_known_friday() {
+        let Some(value) = eval("datetime.date(2024, 3, 1).isoweekday()") else { return };
+        assert_eq!(value.values, vec![5.0]);
+        assert_eq!(value.kind_tag, Some(PrimitiveKind::Integer));
+    }
+
+    /// `datetime.date(1970, 1, 1).weekday()` — the epoch anchor date,
+    /// PIN VALUE DERIVED BY THE PROBE: CPython's own epoch is a
+    /// Thursday (`isoDayOfWeek_epoch_thursday`'s proved fact, weekday()
+    /// Monday-0 form: Thursday is 3).
+    #[test]
+    fn test_date_weekday_at_the_epoch_anchor() {
+        let Some(value) = eval("datetime.date(1970, 1, 1).weekday()") else { return };
+        assert_eq!(value.values, vec![3.0]);
+    }
+
+    /// `datetime.date(2024, 3, 1).toordinal()` — PIN VALUE FROM THE
+    /// TASK BRIEF ITSELF: 738946.
+    #[test]
+    fn test_date_toordinal_of_a_known_date() {
+        let Some(value) = eval("datetime.date(2024, 3, 1).toordinal()") else { return };
+        assert_eq!(value.values, vec![738946.0]);
+        assert_eq!(value.kind_tag, Some(PrimitiveKind::Integer));
+    }
+
+    /// `datetime.date(1, 1, 1).toordinal()` — PIN VALUE FROM THE KERNEL'S
+    /// OWN PROVED THEOREM (`ordinal.lean`'s `pyToOrdinal_anchor_is_one`,
+    /// closed by `decide`): exactly 1, "January 1 of year 1 has ordinal
+    /// 1" (datetime.rst:525-526).
+    #[test]
+    fn test_date_toordinal_anchor_is_exactly_one() {
+        let Some(value) = eval("datetime.date(1, 1, 1).toordinal()") else { return };
+        assert_eq!(value.values, vec![1.0]);
+    }
+
+    /// `datetime.timedelta(days=5)` constructs — a plain valid duration,
+    /// tagged and carrying its own `days` field.
+    #[test]
+    fn test_timedelta_construction_carries_its_days_field() {
+        let Some(value) = eval("datetime.timedelta(days=5)") else { return };
+        assert_eq!(value.kind, Kind::Object);
+        assert_eq!(datetime_field(&value, "days"), Some(5.0));
+    }
+
+    /// `datetime.timedelta(hours=5)` — a keyword this file does not
+    /// read (only `days=` is modeled); the whole construction declines
+    /// rather than silently dropping the field.
+    #[test]
+    fn test_timedelta_construction_with_an_unmodeled_keyword_declines() {
+        let Some(value) = eval("datetime.timedelta(hours=5)") else { return };
+        assert_eq!(value.kind, Kind::Unknown);
+    }
+
+    /// `datetime.date(2024, 3, 1) + datetime.timedelta(days=31)` — PIN
+    /// VALUE DERIVED BY THE PROBE: 2024-03-01 plus 31 days crosses into
+    /// April, landing on 2024-04-01.
+    #[test]
+    fn test_date_plus_timedelta_crosses_a_month_boundary() {
+        let Some(value) = eval("datetime.date(2024, 3, 1) + datetime.timedelta(days=31)") else { return };
+        assert_eq!(value.kind, Kind::Object);
+        assert_eq!(datetime_field(&value, "year"), Some(2024.0));
+        assert_eq!(datetime_field(&value, "month"), Some(4.0));
+        assert_eq!(datetime_field(&value, "day"), Some(1.0));
+    }
+
+    /// `datetime.timedelta(days=31) + datetime.date(2024, 3, 1)` — the
+    /// REVERSED operand order (datetime.rst states the operation both
+    /// ways); must answer the identical date the forward order gives.
+    #[test]
+    fn test_timedelta_plus_date_reversed_operand_order_agrees() {
+        let Some(value) = eval("datetime.timedelta(days=31) + datetime.date(2024, 3, 1)") else { return };
+        assert_eq!(datetime_field(&value, "year"), Some(2024.0));
+        assert_eq!(datetime_field(&value, "month"), Some(4.0));
+        assert_eq!(datetime_field(&value, "day"), Some(1.0));
+    }
+
+    /// `datetime.date(2024, 3, 1) - datetime.timedelta(days=1)` — PIN
+    /// VALUE DERIVED BY THE PROBE: one day before March 1st on a leap
+    /// year is February 29th (2024 IS a leap year).
+    #[test]
+    fn test_date_minus_timedelta_crosses_back_into_a_leap_february() {
+        let Some(value) = eval("datetime.date(2024, 3, 1) - datetime.timedelta(days=1)") else { return };
+        assert_eq!(datetime_field(&value, "year"), Some(2024.0));
+        assert_eq!(datetime_field(&value, "month"), Some(2.0));
+        assert_eq!(datetime_field(&value, "day"), Some(29.0));
+    }
+
+    /// `datetime.date(9999, 12, 31) + datetime.timedelta(days=1)` —
+    /// datetime.rst's own `OverflowError` row (date.7): MAXYEAR is 9999,
+    /// so this shift leaves the representable range and declines
+    /// through the `pyYearInRange` kernel ask (`python_year_in_range`)
+    /// on the shifted result's year (10000) — the kernel's `isoDate` arm
+    /// alone would answer this shift (its own PlainDate window is far
+    /// wider than Python's), so the decline is `pyYearInRange`'s doing.
+    #[test]
+    fn test_date_plus_timedelta_past_maxyear_declines() {
+        let Some(value) = eval("datetime.date(9999, 12, 31) + datetime.timedelta(days=1)") else { return };
+        assert_eq!(value.kind, Kind::Unknown);
+    }
+
+    /// `datetime.date.fromisoformat("2024-03-01")` — the strict
+    /// `YYYY-MM-DD` grammar (date.3's own committed shape), landing on
+    /// the exact same tagged instance `datetime.date(2024, 3, 1)`
+    /// constructs directly.
+    #[test]
+    fn test_date_fromisoformat_parses_the_strict_grammar() {
+        let Some(value) = eval("datetime.date.fromisoformat(\"2024-03-01\")") else { return };
+        assert_eq!(value.kind, Kind::Object);
+        assert_eq!(datetime_field(&value, "year"), Some(2024.0));
+        assert_eq!(datetime_field(&value, "month"), Some(3.0));
+        assert_eq!(datetime_field(&value, "day"), Some(1.0));
+    }
+
+    /// `datetime.date.fromisoformat("2023-02-30")` — syntactically the
+    /// right shape (three hyphen-separated all-digit runs of the right
+    /// width) but calendrically invalid; declines through the SAME
+    /// `calendar.validDate` kernel ask `date_construction_value` uses.
+    #[test]
+    fn test_date_fromisoformat_of_a_calendrically_invalid_string_declines() {
+        let Some(value) = eval("datetime.date.fromisoformat(\"2023-02-30\")") else { return };
+        assert_eq!(value.kind, Kind::Unknown);
+    }
+
+    /// `datetime.date.fromisoformat("2024-3-1")` — the reduced-width
+    /// (non-zero-padded) spelling; date.3's own committed grammar is
+    /// exactly `YYYY-MM-DD` (fixed widths), so this shape declines
+    /// rather than guess a looser parse.
+    #[test]
+    fn test_date_fromisoformat_of_a_non_zero_padded_string_declines() {
+        let Some(value) = eval("datetime.date.fromisoformat(\"2024-3-1\")") else { return };
+        assert_eq!(value.kind, Kind::Unknown);
+    }
+
+    /// `datetime.date(2024, 3, 1).isocalendar()` — PIN VALUE FROM THE
+    /// COORDINATOR'S OWN BRIEF (backed by the kernel's `isoCalendar` arm
+    /// AND the Lean witness landing alongside it): `(2024, 9, 5)` — ISO
+    /// year 2024, ISO week 9, ISO weekday 5 (Friday, the same Friday
+    /// `.weekday() == 4`/`.isoweekday() == 5` already pin above). Binds
+    /// as a known 3-element tuple, the same `Kind::List` shape a literal
+    /// `(a, b, c)` display builds.
+    #[test]
+    fn test_date_isocalendar_of_a_known_date() {
+        let Some(value) = eval("datetime.date(2024, 3, 1).isocalendar()") else { return };
+        assert_eq!(value.kind, Kind::List);
+        assert_eq!(
+            value.items,
+            vec![
+                known_values(vec![2024.0], PrimitiveKind::Integer, TrustProved),
+                known_values(vec![9.0], PrimitiveKind::Integer, TrustProved),
+                known_values(vec![5.0], PrimitiveKind::Integer, TrustProved),
+            ]
+        );
+    }
+
+    /// `datetime.date(9999, 12, 31) + datetime.timedelta(days=1)` posed
+    /// a SECOND way: this is the same construct
+    /// `test_date_plus_timedelta_past_maxyear_declines` above already
+    /// pins, restated here to name explicitly that the decline is now
+    /// the `pyYearInRange` kernel ask's own `valid: false` answer (year
+    /// 10000), not an adapter-local bound check.
+    #[test]
+    fn test_date_plus_timedelta_past_maxyear_declines_via_the_kernel_year_range_ask() {
+        let Some(value) = eval("datetime.date(9999, 12, 31) + datetime.timedelta(days=1)") else { return };
+        assert_eq!(value.kind, Kind::Unknown);
     }
 
     // --- j-stdlib-surfaces.py: re family ---
@@ -8900,6 +10042,121 @@ mod tests {
                 "{source}: the value question must keep declining outright — no split runs for `//`/`%`: {value:?}"
             );
         }
+    }
+
+    // --- `possible_raise` for the domain-limited math family (straddling) ---
+
+    /// `math.log(x)` where `x`'s window is `[-1.0, 1.0]` — STRADDLES the
+    /// raise domain (`x <= 0`): the negative-through-zero half raises,
+    /// the positive half `(0.0, 1.0]` still returns a value. Fires the
+    /// SAME "math domain error" sentence `call_provable_raise`'s
+    /// all-or-nothing row speaks, but through `possible_raise` — the
+    /// window is not ENTIRELY inside the raise domain, so `call_
+    /// provable_raise`'s own row (checked directly below) must stay
+    /// silent, exactly the disjointness `test_possible_raise_stays_
+    /// silent_for_a_divisor_that_is_always_zero` pins for the division
+    /// row. The served half's value stands alongside the fire, read
+    /// through `evaluate_attribute_call`'s own wiring (the value side of
+    /// `math_call_result`'s decline, not `possible_raise` itself).
+    #[test]
+    fn test_possible_raise_fires_for_a_log_window_that_straddles_the_raise_domain() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let mut environment = empty_environment();
+        let straddling = AbstractValue {
+            kind_tag: Some(PrimitiveKind::Float),
+            ..known_set(
+                make_refined_set(vec![at_least(-1.0), refined_sets::refinement_forms::at_most(1.0)]),
+                None,
+                TrustProved,
+                SetKindTag::None,
+            )
+        };
+        environment.bind("x", straddling);
+        let parsed = parse_expression("math.log(x)").expect("test source must parse");
+        let expr = parsed.into_expr();
+
+        let found = possible_raise(&expr, &environment, &kernel);
+        let Some((_, message)) = found else {
+            panic!("a straddling log window must fire the possible-raise sentence, not stay silent");
+        };
+        assert!(message.contains("ValueError"), "{message}");
+        assert!(message.contains("math domain error"), "{message}");
+
+        // the ALL-OR-NOTHING row must stay silent for the same window —
+        // the two claims are disjoint, keyed by
+        // DomainRaiseClassification::EntirelyRaises vs ::Straddles
+        assert!(
+            provable_raise(&expr, &environment, &kernel).is_none(),
+            "a straddling window is possible_raise's own claim, not provable_raise's"
+        );
+
+        // the served half still determines a value, read through the
+        // ordinary evaluate_expression path (evaluate_attribute_call's
+        // own decline-then-served-half wiring, math_models.rs)
+        let value = evaluate_expression(&expr, &environment, &kernel);
+        assert_eq!(
+            value.kind,
+            Kind::Set,
+            "the served half (0.0, 1.0] must still determine a window, alongside the fire: {value:?}"
+        );
+        assert_eq!(value.kind_tag, Some(PrimitiveKind::Float));
+    }
+
+    /// An ENTIRELY-served log window (`[1.0, 2.0]`, wholly `x > 0`) must
+    /// NOT fire `possible_raise` — the disjointness twin of the fire
+    /// test above, mirroring `test_possible_raise_stays_silent_for_a_
+    /// divisor_narrowed_away_from_zero`'s own shape for division.
+    #[test]
+    fn test_possible_raise_stays_silent_for_a_log_window_entirely_served() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let mut environment = empty_environment();
+        let served = AbstractValue {
+            kind_tag: Some(PrimitiveKind::Float),
+            ..known_set(
+                make_refined_set(vec![at_least(1.0), refined_sets::refinement_forms::at_most(2.0)]),
+                None,
+                TrustProved,
+                SetKindTag::None,
+            )
+        };
+        environment.bind("x", served);
+        let parsed = parse_expression("math.log(x)").expect("test source must parse");
+        let expr = parsed.into_expr();
+        assert!(
+            possible_raise(&expr, &environment, &kernel).is_none(),
+            "an entirely-served window must not fire the straddling row"
+        );
+    }
+
+    /// An ENTIRELY-raising log window (`[-2.0, -1.0]`, wholly `x <= 0`)
+    /// must NOT fire `possible_raise` either — that claim belongs to
+    /// `provable_raise`'s own all-or-nothing row alone, the same
+    /// disjointness `test_possible_raise_stays_silent_for_a_divisor_
+    /// that_is_always_zero` pins for the always-zero divisor.
+    #[test]
+    fn test_possible_raise_stays_silent_for_a_log_window_entirely_raising() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let mut environment = empty_environment();
+        let raising = AbstractValue {
+            kind_tag: Some(PrimitiveKind::Float),
+            ..known_set(
+                make_refined_set(vec![at_least(-2.0), refined_sets::refinement_forms::at_most(-1.0)]),
+                None,
+                TrustProved,
+                SetKindTag::None,
+            )
+        };
+        environment.bind("x", raising);
+        let parsed = parse_expression("math.log(x)").expect("test source must parse");
+        let expr = parsed.into_expr();
+        assert!(
+            possible_raise(&expr, &environment, &kernel).is_none(),
+            "an entirely-raising window is provable_raise's own claim, not this row's"
+        );
+        assert!(
+            provable_raise(&expr, &environment, &kernel).is_some(),
+            "an entirely-raising window must fire provable_raise's own all-or-nothing row"
+        );
     }
 
     // --- string_set_concatenation / string_shaped_set ---

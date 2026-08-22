@@ -159,11 +159,16 @@ mod tests {
     /// a `top` state narrows to a `Difference(Intersection [], ...)`
     /// (`scalarB`, `set_functions/emptiness.lean:46`, requires a
     /// NON-EMPTY refinements list, so the kernel refuses it), and a
-    /// multi-value `Kind::Values` word becomes a `Concatenation`
-    /// (`set_of_known`'s tuple layer) — a sequence shape, not a scalar
-    /// one. Both are legitimate shapes the scalar decider does not
-    /// speak to, so this tries `scalar_empty` first and, on a kernel
-    /// refusal (caught, never a crash — the established
+    /// STRING-sorted multi-value `Kind::Values` word becomes a
+    /// `Concatenation` (`set_of_known`'s tuple layer, the codepoint
+    /// sequence a string IS) — a sequence shape, not a scalar one. A
+    /// NUMERIC-sorted multi-value word is scalar-shaped instead — a
+    /// `Union` of the members' own singletons, matching `join_known`'s
+    /// own union spelling — so `scalar_empty` decides it directly. The
+    /// top-state and string-sorted shapes are the legitimate cases the
+    /// scalar decider does not speak to, so this tries `scalar_empty`
+    /// first and, on a kernel refusal (caught, never a crash — the
+    /// established
     /// `catch_unwind`/`AssertUnwindSafe` idiom `assignability.rs`'s
     /// containment ask and `narrowing.rs`'s narrow ask already hold
     /// every kernel closure to), tries `seq_empty`. `None` means
@@ -436,13 +441,14 @@ mod tests {
         }
     }
 
-    /// LEDGER ROW T5, the vocabulary bound: a MULTI-value
-    /// `Kind::Values` state answers `(false, false)` on the adapter, and
-    /// `set_of_known` reads it as a `Concatenation` of the members'
-    /// singletons (the tuple layer) — a sequence shape `seq_empty`
-    /// decides, not a scalar one `scalar_empty` speaks to. So this is a
+    /// LEDGER ROW T5, the vocabulary bound: a NUMERIC-sorted MULTI-value
+    /// `Kind::Values` state answers `(false, false)` on the adapter — it
+    /// decides only the `len() == 1` arm of `Kind::Values` — while
+    /// `set_of_known` reads the same state as a scalar `Union` of the
+    /// members' own singletons (matching `join_known`'s own union
+    /// spelling), which `scalar_empty` decides directly. So this is a
     /// gap of the same family as T1, arising from the adapter's own arm
-    /// rather than from the wire.
+    /// rather than from the wire or the set's shape.
     #[test]
     fn test_determination_gap_multi_value_states_are_undecided_adapter_side() {
         let Some(kernel) = loaded_kernel() else { return };

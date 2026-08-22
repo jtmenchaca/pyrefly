@@ -166,10 +166,21 @@ struct JudgeContext<'a> {
 /// replacement for it. A return that never fires across every
 /// concretely-run iteration reports `returned: None`, unchanged from
 /// before this law.
+///
+/// `widened_names` names every bare name `stabilized_join` had to rebind
+/// to `unknown()` because its two-pass join never reached a fixed point
+/// (`stabilized_join`'s own doc) — empty for every OTHER answer shape
+/// (a concrete per-element run over a known iterable has nothing to
+/// widen; `while_loop_final_environment`'s own widening is already a
+/// judged fire, not a silent one). `check.rs`'s `walk_loop` records the
+/// FIRST name here as this body's own blocker: the loop reached a real
+/// stopping point, but that one name's true accumulated value is
+/// unreadable past it, and nothing downstream would otherwise say so.
 pub struct LoopAnswer {
     pub environment: Environment,
     pub else_runs: bool,
     pub returned: Option<(Option<AbstractValue>, TextRange)>,
+    pub widened_names: Vec<String>,
 }
 
 /// The post-loop answer for a `for`/`while` statement matching one of
@@ -297,11 +308,16 @@ fn for_loop_final_environment(
                     break;
                 }
                 BodyOutcome::Returned(value, range) => {
-                    return Some(LoopAnswer { environment: current, else_runs: false, returned: Some((value, range)) });
+                    return Some(LoopAnswer {
+                        environment: current,
+                        else_runs: false,
+                        returned: Some((value, range)),
+                        widened_names: Vec::new(),
+                    });
                 }
             }
         }
-        return Some(LoopAnswer { environment: current, else_runs: !broke, returned: None });
+        return Some(LoopAnswer { environment: current, else_runs: !broke, returned: None, widened_names: Vec::new() });
     }
     abstract_element_sort_pass(for_stmt, environment, kernel, judge_context)
         .or_else(|| custom_iterator_element_pass(for_stmt, environment, kernel, judge_context))
@@ -368,10 +384,15 @@ fn custom_iterator_element_pass(
     match run_body_once(&for_stmt.body, &mut one_pass, kernel, judge_context)? {
         BodyOutcome::Fell | BodyOutcome::Continued | BodyOutcome::Broke => {}
         BodyOutcome::Returned(value, range) => {
-            return Some(LoopAnswer { environment: one_pass, else_runs: false, returned: Some((value, range)) });
+            return Some(LoopAnswer {
+                environment: one_pass,
+                else_runs: false,
+                returned: Some((value, range)),
+                widened_names: Vec::new(),
+            });
         }
     }
-    let joined = stabilized_join(
+    let (joined, widened_names) = stabilized_join(
         environment,
         &one_pass,
         &for_stmt.body,
@@ -380,7 +401,7 @@ fn custom_iterator_element_pass(
         kernel,
         judge_context,
     )?;
-    Some(LoopAnswer { environment: joined, else_runs: true, returned: None })
+    Some(LoopAnswer { environment: joined, else_runs: true, returned: None, widened_names })
 }
 
 /// `for`/`async for` over a KNOWN-LENGTH-UNKNOWN, known-element-set
@@ -433,10 +454,15 @@ fn repetition_window_element_pass(
     match run_body_once(&for_stmt.body, &mut one_pass, kernel, judge_context)? {
         BodyOutcome::Fell | BodyOutcome::Continued | BodyOutcome::Broke => {}
         BodyOutcome::Returned(value, range) => {
-            return Some(LoopAnswer { environment: one_pass, else_runs: false, returned: Some((value, range)) });
+            return Some(LoopAnswer {
+                environment: one_pass,
+                else_runs: false,
+                returned: Some((value, range)),
+                widened_names: Vec::new(),
+            });
         }
     }
-    let joined = stabilized_join(
+    let (joined, widened_names) = stabilized_join(
         environment,
         &one_pass,
         &for_stmt.body,
@@ -445,7 +471,7 @@ fn repetition_window_element_pass(
         kernel,
         judge_context,
     )?;
-    Some(LoopAnswer { environment: joined, else_runs: true, returned: None })
+    Some(LoopAnswer { environment: joined, else_runs: true, returned: None, widened_names })
 }
 
 /// ABSTRACT SORT-ELEMENT PASS: `for`/`async for` over a same-module
@@ -513,10 +539,15 @@ fn abstract_element_sort_pass(
     match run_body_once(&for_stmt.body, &mut one_pass, kernel, judge_context)? {
         BodyOutcome::Fell | BodyOutcome::Continued | BodyOutcome::Broke => {}
         BodyOutcome::Returned(value, range) => {
-            return Some(LoopAnswer { environment: one_pass, else_runs: false, returned: Some((value, range)) });
+            return Some(LoopAnswer {
+                environment: one_pass,
+                else_runs: false,
+                returned: Some((value, range)),
+                widened_names: Vec::new(),
+            });
         }
     }
-    let joined = stabilized_join(
+    let (joined, widened_names) = stabilized_join(
         environment,
         &one_pass,
         &for_stmt.body,
@@ -525,7 +556,7 @@ fn abstract_element_sort_pass(
         kernel,
         judge_context,
     )?;
-    Some(LoopAnswer { environment: joined, else_runs: true, returned: None })
+    Some(LoopAnswer { environment: joined, else_runs: true, returned: None, widened_names })
 }
 
 /// The loop target's own bare-name spelling, if the target is one — a
@@ -726,6 +757,16 @@ fn stable_by_containment(narrower: &RefinedSet, wider: &RefinedSet, kernel: &Arc
 /// as this success/failure signal; its `Returned` value is not itself
 /// used to build the answer since the second pass's whole purpose here
 /// is the stability comparison, not a fresh answer to return through.
+///
+/// `Some((environment, widened))` — `widened` names every bare name this
+/// pass rebound to `unknown()` because it never reached a fixed point,
+/// SORTED (`HashSet` iteration order is not stable, and a body writing
+/// more than one such name still needs a single, reproducible FIRST name
+/// for the caller's own blocker) — empty when every written name
+/// stabilized. This function itself records no finding: `check.rs`'s
+/// `walk_loop` owns turning a non-empty `widened` into this body's own
+/// blocker, the same way it already owns every other loop-shaped
+/// blocker.
 fn stabilized_join(
     environment: &Environment,
     one_pass: &Environment,
@@ -734,7 +775,7 @@ fn stabilized_join(
     element: &AbstractValue,
     kernel: &Arc<RefinedTSKernel>,
     judge_context: &mut JudgeContext,
-) -> Option<Environment> {
+) -> Option<(Environment, Vec<String>)> {
     let joined = Environment::join(environment.fork(), one_pass);
 
     let mut second_pass = joined.fork();
@@ -749,6 +790,7 @@ fn stabilized_join(
     written_names(body, &mut candidates);
 
     let mut result = joined.fork();
+    let mut widened: Vec<String> = Vec::new();
     for name in candidates {
         if excluded.contains(&name) {
             continue;
@@ -784,9 +826,11 @@ fn stabilized_join(
         }
         if !stable {
             result.bind(&name, unknown());
+            widened.push(name);
         }
     }
-    Some(result)
+    widened.sort();
+    Some((result, widened))
 }
 
 /// `while <name> <op> <literal>: <body> [else: <body>]`, where `<op>`
@@ -840,7 +884,7 @@ fn while_loop_final_environment(
     judge_context: &mut JudgeContext,
 ) -> Option<LoopAnswer> {
     if let Some(kernel_result) = kernel_bounded_counter_environment(while_stmt, environment, kernel) {
-        return Some(LoopAnswer { environment: kernel_result, else_runs: true, returned: None });
+        return Some(LoopAnswer { environment: kernel_result, else_runs: true, returned: None, widened_names: Vec::new() });
     }
     let mut current = environment.fork();
     let mut ran_an_iteration = false;
@@ -850,26 +894,39 @@ fn while_loop_final_environment(
                 match run_body_once(&while_stmt.body, &mut current, kernel, judge_context)? {
                     BodyOutcome::Fell | BodyOutcome::Continued => {}
                     BodyOutcome::Broke => {
-                        return Some(LoopAnswer { environment: current, else_runs: false, returned: None });
+                        return Some(LoopAnswer {
+                            environment: current,
+                            else_runs: false,
+                            returned: None,
+                            widened_names: Vec::new(),
+                        });
                     }
                     BodyOutcome::Returned(value, range) => {
                         return Some(LoopAnswer {
                             environment: current,
                             else_runs: false,
                             returned: Some((value, range)),
+                            widened_names: Vec::new(),
                         });
                     }
                 }
                 ran_an_iteration = true;
             }
-            Some(false) => return Some(LoopAnswer { environment: current, else_runs: true, returned: None }),
+            Some(false) => {
+                return Some(LoopAnswer { environment: current, else_runs: true, returned: None, widened_names: Vec::new() });
+            }
             // an UNREADABLE condition after at least one judged iteration
             // is the counter's own honest widening (see this function's
             // doc); an unreadable condition on the very FIRST check is a
             // shape this module never recognized at all and must decline,
             // same as before.
             None if ran_an_iteration => {
-                return Some(LoopAnswer { environment: current, else_runs: false, returned: None });
+                return Some(LoopAnswer {
+                    environment: current,
+                    else_runs: false,
+                    returned: None,
+                    widened_names: Vec::new(),
+                });
             }
             None => return None,
         }
@@ -2106,6 +2163,71 @@ mod tests {
         let table = Arc::new(crate::function_table::function_table(&module));
         let loop_stmt = module.body.into_iter().last().expect("at least one top-level statement");
         (loop_stmt, table)
+    }
+
+    /// `run_body_once` over the simplest self-referencing rebind —
+    /// `total = total * 2.0` against an exact binding — completes and
+    /// binds the doubled exact value: two known operands are the most
+    /// determinable arithmetic this module reads, and a decline here is
+    /// what turns a non-stabilizing accumulation body into the coarser
+    /// "not yet walked" blocker instead of the fixed-point one.
+    #[test]
+    fn run_body_once_completes_an_exact_self_referencing_rebind() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let stmt = parsed_loop("total = total * 2.0\n");
+        let mut environment = environment_with(&[("total", 1.0)]);
+        let declared = no_declared();
+        let mut judge_context = JudgeContext {
+            declared: &declared,
+            newly_declared: HashMap::new(),
+            already_fired: std::collections::HashSet::new(),
+            fires: Vec::new(),
+        };
+        let body = [stmt];
+        let outcome = run_body_once(&body, &mut environment, &kernel, &mut judge_context);
+        assert!(outcome.is_some(), "an exact rebind of two known operands is walkable");
+        let total = environment.read("total").expect("total stays bound");
+        assert_eq!(total.values, vec![2.0], "1.0 * 2.0 binds exactly 2.0: {total:?}");
+    }
+
+    /// `stabilized_join`'s widening, pinned at its own layer: a second
+    /// pass that binds a DIFFERENT exact value than the first proves the
+    /// name never reached a fixed point, so the join rebinds it to
+    /// unknown and names it in `widened` — the list `check.rs`'s
+    /// `walk_loop` turns into the body's fixed-point blocker.
+    #[test]
+    fn stabilized_join_names_the_name_that_never_reaches_a_fixed_point() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let for_stmt = parsed_loop("for s in samples:\n    total = total * 2.0\n");
+        let Stmt::For(for_stmt) = for_stmt else {
+            panic!("fixture is a for statement");
+        };
+        let environment = environment_with(&[("total", 1.0)]);
+        let one_pass = environment_with(&[("total", 1.0)]);
+        let declared = no_declared();
+        let mut judge_context = JudgeContext {
+            declared: &declared,
+            newly_declared: HashMap::new(),
+            already_fired: std::collections::HashSet::new(),
+            fires: Vec::new(),
+        };
+        let element = known_number(0.0);
+        let (result, widened) = stabilized_join(
+            &environment,
+            &one_pass,
+            &for_stmt.body,
+            for_stmt.target.as_ref(),
+            &element,
+            &kernel,
+            &mut judge_context,
+        )
+        .expect("both judged passes complete for an exact rebind");
+        assert_eq!(widened, vec!["total".to_owned()], "the non-stabilizing name is named");
+        assert_eq!(
+            result.read("total").map(|v| v.kind),
+            Some(Kind::Unknown),
+            "the unstable name holds no claim past the loop"
+        );
     }
 
     #[test]
