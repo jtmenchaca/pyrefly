@@ -36,6 +36,7 @@ use refined_sets::codepoint_sets::strings;
 use refined_sets::refinement_forms::at_least;
 use refined_sets::refinement_forms::integer;
 use refined_sets::refinement_forms::make_refined_set;
+use refined_sets::refinement_forms::Form;
 use refined_sets::refinement_forms::one_of;
 use refined_sets::refinement_forms::repeat_of;
 use refined_sets::refinement_forms::requires_integer;
@@ -53,6 +54,7 @@ use ruff_python_ast::UnaryOp;
 use ruff_text_size::Ranged;
 use ruff_text_size::TextRange;
 
+use crate::refinedpy::assignability;
 use crate::refinedpy::builtin_models;
 use crate::refinedpy::bytes_models;
 use crate::refinedpy::bytes_models::BytesAnswer;
@@ -61,6 +63,7 @@ use crate::refinedpy::env;
 use crate::refinedpy::env::Environment;
 use crate::refinedpy::instances;
 use crate::refinedpy::math_models;
+use crate::refinedpy::narrowing;
 use crate::refinedpy::string_models;
 use crate::refinedpy::summaries;
 
@@ -451,8 +454,17 @@ fn evaluate_subscript(subscript: &ruff_python_ast::ExprSubscript, environment: &
 /// built-in sequence, so this is the SAME bound-computation this
 /// function already carries, only reading `items` instead of `values`)
 /// answers a SLICED LIST (`c-reads-and-values.py`'s `list_slice`:
-/// `overs[0:1][0]`, a slice immediately re-subscripted). Any other
-/// receiver shape, or a non-Integer bound, declines.
+/// `overs[0:1][0]`, a slice immediately re-subscripted). A THIRD
+/// receiver shape answers a narrower claim: a string-shaped SET (a
+/// concatenation/repeat window, never an exact literal — those are
+/// `Kind::Values` and already answered above) sliced exactly `[:n]`
+/// (`lower` absent or the exact literal `0`, `upper` an exact
+/// non-negative Integer, no `step`) asks the kernel's `seq_prefix` —
+/// `prefixReadOf`'s proved over-approximation of `take n` on every
+/// member (boundary/exports_sets.lean's `kernelSeqPrefix`). Any other
+/// slice shape over a non-exact receiver — a `step`, a nonzero `lower`,
+/// or an `upper` that is not an exact Integer — declines, naming the
+/// construct it cannot read rather than guessing.
 fn evaluate_slice(
     container: &AbstractValue,
     slice: &ruff_python_ast::ExprSlice,
@@ -461,6 +473,9 @@ fn evaluate_slice(
 ) -> AbstractValue {
     if slice.step.is_some() {
         return unknown();
+    }
+    if let Some(result) = sequence_prefix_slice(container, slice, environment, kernel) {
+        return result;
     }
     let length = match container.kind {
         Kind::Values if container.kind_tag == Some(PrimitiveKind::String) => container.values.len() as i64,
@@ -500,6 +515,81 @@ fn evaluate_slice(
         }
         _ => unreachable!("container.kind checked above in the length match"),
     }
+}
+
+/// The `[:n]` prefix-read arm of `evaluate_slice`: fires only when the
+/// receiver is a string-shaped SET (`string_shaped_set` — a concatenation
+/// or repeat window; an exact literal is `Kind::Values` and already
+/// answered by `evaluate_slice`'s own Values arm, so this never
+/// double-answers that case) AND the slice is exactly `[:n]` — `lower`
+/// absent or the exact known value `0`, `upper` an exact known
+/// non-negative Integer, no `step` (checked by the caller before this
+/// runs). Any other slice shape over a set-shaped receiver — a nonzero
+/// or unknown `lower`, or an `upper` that is not an exact non-negative
+/// Integer — answers `None` immediately, so the caller's own decline
+/// stands rather than this function guessing. The kernel itself can
+/// ALSO decline once the shape is asked (`kernel.seq_prefix`'s own
+/// `None` — the receiver is not `seqOf`-recognized, e.g. a leading
+/// concatenation operand that is not a fixed scalar): that decline is an
+/// ORDINARY answer, not a fault, and this function answers `None` for it
+/// exactly the same way, so the caller falls through to the
+/// length-based fallback precisely as if this arm had never matched.
+fn sequence_prefix_slice(
+    container: &AbstractValue,
+    slice: &ruff_python_ast::ExprSlice,
+    environment: &Environment,
+    kernel: &Arc<RefinedTSKernel>,
+) -> Option<AbstractValue> {
+    let receiver_set = string_shaped_set(container)?;
+    if let Some(expr) = &slice.lower {
+        if slice_bound_index(expr, environment, kernel) != Some(0) {
+            return None;
+        }
+    }
+    let upper_expr = slice.upper.as_ref()?;
+    let n = slice_bound_index(upper_expr, environment, kernel)?;
+    if n < 0 {
+        return None;
+    }
+    let prefix_set = (kernel.seq_prefix)(&unbounded_repeats(&receiver_set), n)?;
+    Some(known_set(prefix_set, None, TrustProved, SetKindTag::None))
+}
+
+/// Relaxes every `Repeat`/`RepeatWord` form reachable through the set's
+/// own concatenation/union/difference/star operands to its UNBOUNDED
+/// twin (`hi: None`) — sound because a bounded window's every member is
+/// trivially a member of the same window with its ceiling dropped
+/// (widening a claim only ever admits more), and `seqOf`
+/// (set_functions/subset_seq_shape.lean) recognizes a `Repeat` position
+/// only when `hi` is `none`. `seq_prefix`'s own soundness
+/// (`prefixReadOf_sound`) never reads the receiver's ceiling — its
+/// premise is `SeqDen`, which states membership per position and the
+/// open tail's `Star`, neither of which mentions `hi` — so asking the
+/// kernel about this relaxed receiver instead of the tighter original
+/// still proves the same `take n` fact for both. A parameter's own
+/// `Field(min_length=…, max_length=…)` window is exactly the shape this
+/// exists for (`check.rs::seed_parameters`'s own doc): the LENGTH bound
+/// still narrows what `evaluate_slice`'s caller reads through `len()`
+/// elsewhere; only the prefix READ over-approximates.
+fn unbounded_repeats(set: &RefinedSet) -> RefinedSet {
+    let forms = set
+        .forms
+        .iter()
+        .map(|form| {
+            let mut relaxed = form.clone();
+            if matches!(form.form, Form::Repeat | Form::RepeatWord) {
+                relaxed.hi = None;
+            }
+            if let Some(a) = &form.a_ {
+                relaxed.a_ = Some(Box::new(unbounded_repeats(a)));
+            }
+            if let Some(b) = &form.b {
+                relaxed.b = Some(Box::new(unbounded_repeats(b)));
+            }
+            relaxed
+        })
+        .collect();
+    make_refined_set(forms)
 }
 
 /// One slice bound's known Integer value, or `None` if it is not a
@@ -581,12 +671,24 @@ fn compare_pair(op: CmpOp, left: &AbstractValue, right: &AbstractValue) -> Optio
     // file can prove identity for without a shared-object model. Either
     // side being the exactly-null state (`Kind::Null`) settles it: None
     // is None (True/False split by op), and a known non-None value is
-    // never identical to None.
+    // never identical to None. A `Kind::PossiblyUndefined` side (an
+    // `Optional[X]`/`X | None`-declared parameter's own seed,
+    // `check.rs::seed_parameters`) is NOT a known non-None value the way
+    // an ordinary present-only Kind settles as — its own absent side may
+    // genuinely BE None at runtime, so its identity against None stays
+    // undecided here exactly like Unknown's, leaving `narrowing.rs`'s
+    // `narrow_is_none` (the maybe carrier's own unwrap) to state what
+    // each fork actually proves instead of this law guessing one arm
+    // dead outright.
     if op == CmpOp::Is || op == CmpOp::IsNot {
         let identical = match (left.kind == Kind::Null, right.kind == Kind::Null) {
             (true, true) => true,
             (true, false) | (false, true) => {
-                if right.kind == Kind::Unknown || left.kind == Kind::Unknown {
+                if right.kind == Kind::Unknown
+                    || left.kind == Kind::Unknown
+                    || right.kind == Kind::PossiblyUndefined
+                    || left.kind == Kind::PossiblyUndefined
+                {
                     return None;
                 }
                 false
@@ -638,6 +740,25 @@ fn compare_pair(op: CmpOp, left: &AbstractValue, right: &AbstractValue) -> Optio
         };
         return Some(if result { 1.0 } else { 0.0 });
     }
+    // one side a single known numeric value, the OTHER a bounded
+    // Integer-sorted window (`integer_set_bounds` — `len()`'s own answer
+    // over a `Repeat`-shaped receiver, `collection_models::len_result`'s
+    // doc: `[window.lo, window.hi]`, never one exact count): the
+    // comparison decides only when the WHOLE window agrees, since the
+    // window states every value it admits, never which one a given run
+    // actually holds. `==`/`!=` decide only on a DEGENERATE window
+    // (`lo == hi`, the len-of-a-fixed-length-slice case) — a wider
+    // window can never prove `==` true (some other admitted length
+    // would disagree) or `!=` true (the target might be the one held
+    // length), so both stay undecided there. The four orderings decide
+    // whenever the window sits entirely on one side of the target
+    // (`hi <op> target` uniform down to `lo`, or the mirror), which a
+    // degenerate window trivially satisfies too.
+    if let Some(result) = numeric_value_vs_window_compare(op, left, right, false)
+        .or_else(|| numeric_value_vs_window_compare(op, right, left, true))
+    {
+        return Some(if result { 1.0 } else { 0.0 });
+    }
     // both known exact strings: == and != read the code-point vectors
     // directly; <, <=, >, >= read them lexicographically — CPython
     // orders strings "lexicographically using the numeric equivalents
@@ -656,6 +777,105 @@ fn compare_pair(op: CmpOp, left: &AbstractValue, right: &AbstractValue) -> Optio
         return Some(if result { 1.0 } else { 0.0 });
     }
     None
+}
+
+/// One comparison operator between a single known numeric value and a
+/// bounded Integer-sorted window (`integer_set_bounds`'s own `[lo, hi]`
+/// reading), decided only when EVERY value the window admits agrees —
+/// the window is a claim over an unstated member, never a promise about
+/// which one, so a partial overlap must stay `None` rather than guess.
+/// `numeric_side`/`window_side` name which of `compare_pair`'s two
+/// operands is being read here; `swapped` is `true` when `window_side`
+/// is actually `compare_pair`'s LEFT operand (`op` is then read as if
+/// its operands had traded places — `window >= 3` reverses to `3 <=
+/// window`, the ordering a caller swaps by trying both operand
+/// orientations rather than this function inverting `op` itself).
+fn numeric_value_vs_window_compare(
+    op: CmpOp,
+    numeric_side: &AbstractValue,
+    window_side: &AbstractValue,
+    swapped: bool,
+) -> Option<bool> {
+    let (target, _) = single_numeric_value(numeric_side)?;
+    let (lo, hi) = integer_set_bounds(window_side)?;
+    let (lo, hi) = (lo as f64, hi as f64);
+    // `op` as read named `numeric_side <op> window_side`; `swapped`
+    // means the true operands were `window_side <op> numeric_side`, so
+    // the ordering direction is mirrored before the window/target
+    // arithmetic below (`x < y` read as `y > x`).
+    let effective_op = if swapped {
+        match op {
+            CmpOp::Lt => CmpOp::Gt,
+            CmpOp::LtE => CmpOp::GtE,
+            CmpOp::Gt => CmpOp::Lt,
+            CmpOp::GtE => CmpOp::LtE,
+            other => other,
+        }
+    } else {
+        op
+    };
+    match effective_op {
+        // every admitted value equals target only when the window is
+        // degenerate AND that one value IS target; a wider window can
+        // never prove equality (some other admitted length disagrees)
+        CmpOp::Eq => {
+            if lo == hi {
+                Some(lo == target)
+            } else {
+                None
+            }
+        }
+        // != is decided the same way `==` is (its exact negation, once
+        // decidable), plus the case the window misses target ENTIRELY
+        // (every admitted value differs, whether or not the window is
+        // degenerate)
+        CmpOp::NotEq => {
+            if hi < target || target < lo {
+                Some(true)
+            } else if lo == hi {
+                Some(lo != target)
+            } else {
+                None
+            }
+        }
+        CmpOp::Lt => {
+            if hi < target {
+                Some(true)
+            } else if lo >= target {
+                Some(false)
+            } else {
+                None
+            }
+        }
+        CmpOp::LtE => {
+            if hi <= target {
+                Some(true)
+            } else if lo > target {
+                Some(false)
+            } else {
+                None
+            }
+        }
+        CmpOp::Gt => {
+            if lo > target {
+                Some(true)
+            } else if hi <= target {
+                Some(false)
+            } else {
+                None
+            }
+        }
+        CmpOp::GtE => {
+            if lo >= target {
+                Some(true)
+            } else if hi < target {
+                Some(false)
+            } else {
+                None
+            }
+        }
+        CmpOp::Is | CmpOp::IsNot | CmpOp::In | CmpOp::NotIn => unreachable!("handled above compare_pair's own call site"),
+    }
 }
 
 /// Whether two already-evaluated values are `==`, for the `in`/`not in`
@@ -772,8 +992,18 @@ fn evaluate_fstring(fstring: &ruff_python_ast::ExprFString, environment: &Enviro
                 }
             }
             InterpolatedStringElement::Interpolation(interpolation) => {
-                if interpolation.conversion != ConversionFlag::None || interpolation.format_spec.is_some() {
+                if interpolation.conversion != ConversionFlag::None {
                     return unknown();
+                }
+                if let Some(format_spec) = &interpolation.format_spec {
+                    let value = evaluate_expression(&interpolation.expression, environment, kernel);
+                    let Some(part) = zero_padded_decimal_spelling(format_spec, &value) else {
+                        return unknown();
+                    };
+                    has_exact = false;
+                    grade = refined_domain::trust_grades::min_trust_level(grade, TrustSpec);
+                    parts.push(part);
+                    continue;
                 }
                 let value = evaluate_expression(&interpolation.expression, environment, kernel);
                 if let Some(text) = exact_string_values(&value) {
@@ -819,6 +1049,116 @@ fn evaluate_fstring(fstring: &ruff_python_ast::ExprFString, environment: &Enviro
         folded = make_refined_set(vec![refined_sets::refinement_forms::concatenation(part, folded)]);
     }
     known_set(folded, None, grade, SetKindTag::None)
+}
+
+/// `f"{year:04d}"` — an interpolation carrying a ZERO-PADDED DECIMAL
+/// format spec (`format_spec.rst`, "Format Specification Mini-Language":
+/// `[[fill]align][sign][z][#][0][width][grouping_option][.precision][type]`
+/// — this reader recognizes only the plain `0{width}d` spelling: no
+/// fill/align/sign/`#`/grouping/precision, `type` exactly `d`). `value`
+/// need not be a single known integer — this is the row that fires for
+/// a BOUNDED Integer-sorted set (`year: Annotated[int, Field(ge=1970,
+/// le=9999)]` seeds `Kind::Set`, never `Kind::Values` —
+/// `check.rs::seed_parameters`'s scalar-declared-set arm), which
+/// `single_numeric_value`'s exact-value row above never reaches. Exact
+/// only when EVERY integer in the set's own closed range needs no
+/// padding at all: `min_digit_count`/`max_digit_count` (the decimal
+/// digit count of the range's two ends — the monotone extremes, since a
+/// wider magnitude never has FEWER digits) both equal `width` exactly,
+/// so the zero-fill never actually adds a digit and the plain decimal
+/// alphabet is the exact spelling set either way. A range that would
+/// need real padding for some members but not others (`ge=8, le=12`
+/// against `02d`: "08".."12", where padding does fire) declines rather
+/// than approximate — this row states only the sub-case where padding
+/// is provably a no-op. `RefinedSet` is a `Repeat` over the plain digit
+/// alphabet at EXACTLY `width` positions — a stronger claim than
+/// `int_spelling_set`'s own unbounded-length superset, and exact for
+/// this admitted case since every member has exactly `width` digits and
+/// carries no sign (the range's own `lo` is checked non-negative below).
+fn zero_padded_decimal_spelling(
+    format_spec: &ruff_python_ast::InterpolatedStringFormatSpec,
+    value: &AbstractValue,
+) -> Option<RefinedSet> {
+    let width = zero_padded_decimal_width(format_spec)?;
+    let (lo, hi) = integer_set_bounds(value)?;
+    if lo < 0 {
+        return None;
+    }
+    if decimal_digit_count(lo) != width || decimal_digit_count(hi) != width {
+        return None;
+    }
+    Some(make_refined_set(vec![repeat_of(one_char_of("0123456789"), width as i64, Some(width as i64))]))
+}
+
+/// The `width` a format spec states, when the spec is EXACTLY the plain
+/// `0{width}d` spelling this reader recognizes — a single literal
+/// element (no nested interpolation inside the spec itself, which
+/// `format_spec.rst` allows but this reader does not model) whose text
+/// is `0` followed by one or more digits followed by `d`. Any other
+/// spelling (a fill/align/sign/`#`/grouping/precision character, a
+/// different `type`, a spec with its own interpolation) answers `None`.
+fn zero_padded_decimal_width(format_spec: &ruff_python_ast::InterpolatedStringFormatSpec) -> Option<u32> {
+    let [InterpolatedStringElement::Literal(literal)] = &*format_spec.elements else {
+        return None;
+    };
+    let digits = literal.value.strip_prefix('0')?.strip_suffix('d')?;
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// The closed integer bound `[lo, hi]` a value states, when the value is
+/// a BOUNDED Integer-sorted `Kind::Set` (`seed_parameters`'s scalar
+/// arm — never `Kind::Values`, which `single_numeric_value` already
+/// reads exactly). Reads the set's own top-level `AtLeast`/`Above`/
+/// `AtMost`/`Below` forms, the same syntactic hull
+/// `collection_models::integer_range_bounds` reads for its own bounded-
+/// index subscript read — duplicated here rather than exported, since
+/// the two files' own AGENT-BRIEF scope (`collection_models.rs`'s
+/// container reads; this file's expression evaluation) keeps neither
+/// reaching into the other's private helpers, the same convention
+/// `string_models.rs`'s own `exact_string_text` doc states for this
+/// exact situation.
+fn integer_set_bounds(value: &AbstractValue) -> Option<(i64, i64)> {
+    if value.kind != Kind::Set || value.kind_tag != Some(PrimitiveKind::Integer) {
+        return None;
+    }
+    let mut lo: Option<f64> = None;
+    let mut hi: Option<f64> = None;
+    for form in &value.set.forms {
+        match form.form {
+            refined_sets::refinement_forms::Form::AtLeast => {
+                lo = Some(lo.map_or(form.a, |current: f64| current.max(form.a)))
+            }
+            refined_sets::refinement_forms::Form::Above => {
+                lo = Some(lo.map_or(form.a.floor() + 1.0, |current: f64| current.max(form.a.floor() + 1.0)))
+            }
+            refined_sets::refinement_forms::Form::AtMost => {
+                hi = Some(hi.map_or(form.a, |current: f64| current.min(form.a)))
+            }
+            refined_sets::refinement_forms::Form::Below => {
+                hi = Some(hi.map_or(form.a.ceil() - 1.0, |current: f64| current.min(form.a.ceil() - 1.0)))
+            }
+            refined_sets::refinement_forms::Form::Integer => {}
+            _ => return None,
+        }
+    }
+    let (lo, hi) = (lo?, hi?);
+    if !lo.is_finite() || !hi.is_finite() {
+        return None;
+    }
+    Some((lo as i64, hi as i64))
+}
+
+/// The number of decimal digits a NONNEGATIVE integer's plain `str()`
+/// spelling carries — `0` itself spells one digit ("0"), matching
+/// `format_integer_spelling`'s own no-leading-zero convention.
+fn decimal_digit_count(value: i64) -> u32 {
+    if value == 0 {
+        return 1;
+    }
+    value.unsigned_abs().to_string().len() as u32
 }
 
 /// One codepoint drawn from the given ASCII characters — the digit and
@@ -949,18 +1289,34 @@ fn format_integer_spelling(value: f64) -> String {
 /// both arms (neither is skipped when it is not known which one runs)
 /// and joins their values, the loosest sound answer once both cannot be
 /// ruled out.
+///
+/// Each arm is evaluated under its OWN forked, narrowed environment —
+/// exactly the fork/`narrowing::assume` pattern `walk_if` runs for an
+/// `if`/`else` STATEMENT (check.rs's own `walk_if`), applied here to the
+/// expression form instead of duplicating it. `sample if sample is not
+/// None else 0.0` forks on `sample is not None`: the true fork narrows
+/// `sample` (its possibly-absent tag drops) before `ternary.body` reads
+/// it, and the false fork narrows it the other way before
+/// `ternary.orelse` reads it. A decided test still narrows before
+/// picking the one arm it evaluates, since a name the taken arm reads
+/// may depend on that same narrowing (an `isinstance`-proved sort, a
+/// walrus-bound comparison, …).
 fn evaluate_ternary(ternary: &ruff_python_ast::ExprIf, environment: &Environment, kernel: &Arc<RefinedTSKernel>) -> AbstractValue {
     let test = evaluate_expression(&ternary.test, environment, kernel);
     let (value, known) = truthiness(&test);
     if known {
         return if value {
-            evaluate_expression(&ternary.body, environment, kernel)
+            let body_environment = narrowing::assume(&ternary.test, environment.fork(), kernel, true);
+            evaluate_expression(&ternary.body, &body_environment, kernel)
         } else {
-            evaluate_expression(&ternary.orelse, environment, kernel)
+            let orelse_environment = narrowing::assume(&ternary.test, environment.fork(), kernel, false);
+            evaluate_expression(&ternary.orelse, &orelse_environment, kernel)
         };
     }
-    let body = evaluate_expression(&ternary.body, environment, kernel);
-    let orelse = evaluate_expression(&ternary.orelse, environment, kernel);
+    let body_environment = narrowing::assume(&ternary.test, environment.fork(), kernel, true);
+    let orelse_environment = narrowing::assume(&ternary.test, environment.fork(), kernel, false);
+    let body = evaluate_expression(&ternary.body, &body_environment, kernel);
+    let orelse = evaluate_expression(&ternary.orelse, &orelse_environment, kernel);
     join_known(body, orelse)
 }
 
@@ -4604,6 +4960,9 @@ fn sequence_binop_value(op: Operator, left: &AbstractValue, right: &AbstractValu
                 joined.extend(right.items.iter().cloned());
                 return collection_models::list_literal_value(&joined);
             }
+            if let Some(result) = string_set_concatenation(left, right) {
+                return result;
+            }
             unknown()
         }
         Operator::BitOr => set_operator_value("union", left, right),
@@ -4666,6 +5025,47 @@ fn sequence_repetition(sequence: &AbstractValue, count: &AbstractValue) -> Optio
             repeated.extend(sequence.items.iter().cloned());
         }
         return Some(collection_models::list_literal_value(&repeated));
+    }
+    None
+}
+
+/// `left + right` where at least one side is a STRING-SHAPED SET rather
+/// than an exact literal — `seed + "xxxxxxxx"` where `seed` is a
+/// parameter carrying a length window (`Annotated[str, Field(min_length=…,
+/// max_length=…)]` seeds `Kind::Set` over a `Repeat`/`Star` form,
+/// `check.rs::seed_parameters`'s own doc), never `Kind::Values`. The
+/// exact-exact row above already answers when BOTH operands are literal
+/// strings; this row is what fires the moment either one is not. Composes
+/// the same `refinement_forms::concatenation` form `string_tuple`
+/// concatenation and the f-string pattern tier already build — pure set
+/// composition, no kernel round trip, since concatenation is a GRAMMAR
+/// constructor, not a decided question. `None` when either side is not
+/// string-shaped at all (a numeric set, an object, an unknown), so the
+/// caller's own `unknown()` fallback stays honest for it.
+fn string_set_concatenation(left: &AbstractValue, right: &AbstractValue) -> Option<AbstractValue> {
+    let left_set = string_shaped_set(left)?;
+    let right_set = string_shaped_set(right)?;
+    let joined = make_refined_set(vec![refined_sets::refinement_forms::concatenation(left_set, right_set)]);
+    let grade = refined_domain::trust_grades::derived_trust_level(TrustProved, &[left.clone(), right.clone()]);
+    Some(known_set(joined, None, grade, SetKindTag::None))
+}
+
+/// The `RefinedSet` a value states, read ONLY when the value is
+/// string-shaped: a known exact string (`Kind::Values` tagged
+/// `PrimitiveKind::String` — read through `set_of_known`, which answers
+/// the code points' own concatenation form for a multi-character
+/// literal), or an untagged `Kind::Set` whose own forms demonstrably
+/// carry a sequence shape (`assignability::states_sequence` — the same
+/// gate `scalar_case_of`/`seed_parameters` use to tell a string window
+/// from a numeric range, since a bare `Kind::Set` carries no sort tag of
+/// its own to read instead). A numeric set, an object, or any other
+/// shape answers `None` — never guessed at.
+fn string_shaped_set(value: &AbstractValue) -> Option<RefinedSet> {
+    if value.kind == Kind::Values && value.kind_tag == Some(PrimitiveKind::String) {
+        return refined_domain::lattice_operations::set_of_known(value);
+    }
+    if value.kind == Kind::Set && value.set_kind_tag == SetKindTag::None && assignability::states_sequence(&value.set) {
+        return Some(value.set.clone());
     }
     None
 }
@@ -7995,5 +8395,439 @@ mod tests {
             binop_provable_raise(&binop, &environment, &kernel).is_none(),
             "a sometimes-zero divisor window must not fire an unconditional raise"
         );
+    }
+
+    // --- string_set_concatenation / string_shaped_set ---
+
+    /// A length-windowed string parameter (`seed`, `Repeat(codepoints,
+    /// 1, 8)` — the shape `check.rs::seed_parameters` seeds for
+    /// `Annotated[str, Field(min_length=1, max_length=8)]`) concatenated
+    /// with a literal: `Add` must compose a `Concatenation` set rather
+    /// than falling through to `unknown()`, since neither operand is an
+    /// exact string (the literal side is exact; the parameter side is
+    /// not, which is what used to make `exact_string_values` refuse the
+    /// whole row).
+    #[test]
+    fn test_add_concatenates_a_string_window_with_a_literal() {
+        let seed = AbstractValue {
+            kind_tag: None,
+            ..known_set(
+                make_refined_set(vec![repeat_of(refined_sets::codepoint_sets::codepoints(), 1, Some(8))]),
+                None,
+                TrustSpec,
+                SetKindTag::None,
+            )
+        };
+        let literal = string_models::string_literal_value("xxxxxxxx");
+        let result = sequence_binop_value(Operator::Add, &seed, &literal);
+        assert_eq!(result.kind, Kind::Set);
+        assert_eq!(result.set_kind_tag, SetKindTag::None);
+        assert!(
+            assignability::states_sequence(&result.set),
+            "the concatenation must itself carry a sequence form: {:?}",
+            result.set
+        );
+    }
+
+    /// Two known EXACT strings still take the exact-value row above
+    /// `string_set_concatenation`'s own fallback (`sequence_binop_value`'s
+    /// first check) — this pins that the new fallback never fires for
+    /// the case the exact row already answers, so the two rows do not
+    /// double-handle the same input.
+    #[test]
+    fn test_add_two_exact_strings_stays_exact() {
+        let a = string_models::string_literal_value("ab");
+        let b = string_models::string_literal_value("c");
+        let result = sequence_binop_value(Operator::Add, &a, &b);
+        assert_eq!(result.kind, Kind::Values);
+        assert_eq!(result.kind_tag, Some(PrimitiveKind::String));
+    }
+
+    /// A NUMERIC set (never string-shaped) plus a string literal must
+    /// stay `unknown()` — `string_shaped_set` refuses the numeric side,
+    /// so the concatenation row never fires for a cross-sort operand
+    /// pair.
+    #[test]
+    fn test_add_numeric_set_and_string_literal_stays_unknown() {
+        let number_set = AbstractValue {
+            kind_tag: Some(PrimitiveKind::Integer),
+            ..known_set(
+                make_refined_set(vec![at_least(0.0), refined_sets::refinement_forms::at_most(2.0)]),
+                None,
+                TrustSpec,
+                SetKindTag::None,
+            )
+        };
+        let literal = string_models::string_literal_value("x");
+        let result = sequence_binop_value(Operator::Add, &number_set, &literal);
+        assert_eq!(result.kind, Kind::Unknown);
+    }
+
+    // --- kernel.seq_prefix / evaluate_slice's [:n] arm ---
+
+    /// The kernel ask itself: `seq_prefix` over an UNBOUNDED repetition
+    /// window (`Repeat(codepoints, 1, None)` — the shape
+    /// set_functions/subset_seq_shape.lean's `seqOf` recognizes directly
+    /// via its `.Repeat A lo none` arm) answers a set that itself states
+    /// a sequence shape, per `prefixReadOf`'s own over-approximation
+    /// (boundary/exports_sets.lean's `kernelSeqPrefix`).
+    #[test]
+    fn test_kernel_seq_prefix_answers_a_sequence_shaped_set() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let unbounded_window = make_refined_set(vec![repeat_of(
+            refined_sets::codepoint_sets::codepoints(),
+            1,
+            None,
+        )]);
+        let Some(answered) = (kernel.seq_prefix)(&unbounded_window, 3) else {
+            panic!("seqOf-recognized receiver must not decline");
+        };
+        assert!(
+            assignability::states_sequence(&answered),
+            "seq_prefix's answer must itself carry a sequence form: {answered:?}"
+        );
+    }
+
+    /// The SAME receiver shape `evaluate_slice`'s regression test
+    /// exercises end to end, pinned here at the bare ask level: a
+    /// `Concatenation` whose leading operand is a `Repeat` window (the
+    /// shape `text_label.py`'s own `seed + "xxxxxxxx"` builds).
+    ///
+    /// Pre-extension, the kernel's `seqOf` recognized a `Concatenation
+    /// A B` only when `A.scalarB` — a single fixed scalar, never a
+    /// `Repeat`/`Star` window — so this shape declined regardless of
+    /// the window's own bound; that was this test's original premise
+    /// (`test_kernel_seq_prefix_declines_a_concatenation_with_a_leading_
+    /// window`, now renamed). The kernel extension
+    /// (`seqWindowOf`/`prefix_read.lean`) now reads a `Concatenation`
+    /// with a leading `Repeat` window in either operand order, so this
+    /// now ANSWERS the proved window instead of declining.
+    #[test]
+    fn test_kernel_seq_prefix_admits_a_concatenation_with_a_leading_window() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let seed_window = make_refined_set(vec![repeat_of(
+            refined_sets::codepoint_sets::codepoints(),
+            1,
+            Some(8),
+        )]);
+        let literal = refined_sets::codepoint_sets::string_tuple("xxxxxxxx");
+        let joined = make_refined_set(vec![refined_sets::refinement_forms::concatenation(
+            seed_window,
+            literal,
+        )]);
+        let Some(answered) = (kernel.seq_prefix)(&joined, 3) else {
+            panic!("a leading-window concatenation must now be seqOf-recognized, not decline");
+        };
+        assert!(
+            assignability::states_sequence(&answered),
+            "seq_prefix's answer must itself carry a sequence form: {answered:?}"
+        );
+    }
+
+    /// `evaluate_slice`'s `[:n]` admit case: a receiver `Kind::Set` whose
+    /// own form is the UNBOUNDED repetition window `seqOf` recognizes,
+    /// sliced `[:3]`, asks `seq_prefix` and binds the answered set —
+    /// never `unknown()`.
+    #[test]
+    fn test_slice_prefix_admits_over_a_seq_of_recognized_window() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let receiver = AbstractValue {
+            kind_tag: None,
+            ..known_set(
+                make_refined_set(vec![repeat_of(refined_sets::codepoint_sets::codepoints(), 1, None)]),
+                None,
+                TrustSpec,
+                SetKindTag::None,
+            )
+        };
+        let mut environment = empty_environment();
+        environment.bind("padded", receiver);
+        let parsed = parse_expression("padded[:3]").expect("test source must parse");
+        let Expr::Subscript(subscript) = parsed.into_expr() else { panic!("expected a Subscript") };
+        let result = evaluate_subscript(&subscript, &environment, &kernel);
+        assert_eq!(result.kind, Kind::Set, "expected a bound prefix set, got {result:?}");
+        assert!(
+            assignability::states_sequence(&result.set),
+            "the bound prefix must itself carry a sequence form: {:?}",
+            result.set
+        );
+    }
+
+    /// A `step` slice over the same set-shaped receiver keeps declining —
+    /// `evaluate_slice`'s own `slice.step.is_some()` gate fires before
+    /// `sequence_prefix_slice` ever runs, per the mission's own
+    /// unmodeled-step scope.
+    #[test]
+    fn test_slice_prefix_declines_a_step_slice() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let receiver = AbstractValue {
+            kind_tag: None,
+            ..known_set(
+                make_refined_set(vec![repeat_of(refined_sets::codepoint_sets::codepoints(), 1, None)]),
+                None,
+                TrustSpec,
+                SetKindTag::None,
+            )
+        };
+        let mut environment = empty_environment();
+        environment.bind("padded", receiver);
+        let parsed = parse_expression("padded[:3:2]").expect("test source must parse");
+        let Expr::Subscript(subscript) = parsed.into_expr() else { panic!("expected a Subscript") };
+        let result = evaluate_subscript(&subscript, &environment, &kernel);
+        assert_eq!(result.kind, Kind::Unknown, "a step slice must still decline: {result:?}");
+    }
+
+    /// A NEGATIVE `upper` bound over the same set-shaped receiver
+    /// declines: `sequence_prefix_slice` refuses `n < 0` rather than
+    /// asking the kernel a nonsensical prefix length, and the length-based
+    /// fallback below it has no known length for a `Kind::Set` receiver
+    /// either, so the whole slice stays `unknown()`.
+    #[test]
+    fn test_slice_prefix_declines_a_negative_upper_bound() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let receiver = AbstractValue {
+            kind_tag: None,
+            ..known_set(
+                make_refined_set(vec![repeat_of(refined_sets::codepoint_sets::codepoints(), 1, None)]),
+                None,
+                TrustSpec,
+                SetKindTag::None,
+            )
+        };
+        let mut environment = empty_environment();
+        environment.bind("padded", receiver);
+        let parsed = parse_expression("padded[:-1]").expect("test source must parse");
+        let Expr::Subscript(subscript) = parsed.into_expr() else { panic!("expected a Subscript") };
+        let result = evaluate_subscript(&subscript, &environment, &kernel);
+        assert_eq!(result.kind, Kind::Unknown, "a negative upper bound must decline: {result:?}");
+    }
+
+    /// The KERNEL's own decline — not a shape `sequence_prefix_slice`'s
+    /// own gate rejects up front, but a receiver that reaches
+    /// `kernel.seq_prefix` and gets `None` back from IT — completes
+    /// without panicking and keeps the length-based fallback exactly as
+    /// if the `[:n]` arm had never matched.
+    ///
+    /// The kernel extension (`seqWindowOf`, set_functions/prefix_read.lean)
+    /// now folds a `Concatenation` whose operand is itself a nested
+    /// sequence shape (the `text_label.py` shape this arm was built
+    /// for), but its own doc names the one operand it still refuses: a
+    /// `Union`. The receiver here is a `Concatenation` whose right
+    /// operand is a `Union` of two scalar sets — the top-level form is
+    /// still `Concatenation` (so `string_shaped_set`'s own
+    /// `states_sequence` gate admits it, same as `text_label.py`'s
+    /// receiver does), but `seqWindowOf`'s `Concatenation` arm recurses
+    /// into that operand and gets `none` back, so the whole ask still
+    /// declines — pinning that the non-panic path stays exercised now
+    /// that the ORIGINAL concatenation-with-a-leading-window shape has
+    /// moved to the admit test above.
+    #[test]
+    fn test_slice_prefix_completes_without_panic_when_the_kernel_itself_declines() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let unrecognized_union_operand = make_refined_set(vec![refined_sets::refinement_forms::union(
+            refined_sets::codepoint_sets::string_tuple("a"),
+            refined_sets::codepoint_sets::string_tuple("b"),
+        )]);
+        let literal = refined_sets::codepoint_sets::string_tuple("xxxxxxxx");
+        let concatenation_with_a_union_operand = make_refined_set(vec![
+            refined_sets::refinement_forms::concatenation(unrecognized_union_operand, literal),
+        ]);
+        // pin the ask-level premise directly: seqWindowOf must still
+        // decline this shape, or the rest of the test would be testing
+        // nothing
+        assert_eq!(
+            (kernel.seq_prefix)(&concatenation_with_a_union_operand, 3),
+            None,
+            "a Concatenation over a Union operand must still decline (seqWindowOf's own named edge)"
+        );
+        let receiver = AbstractValue {
+            kind_tag: None,
+            ..known_set(concatenation_with_a_union_operand, None, TrustProved, SetKindTag::None)
+        };
+        let mut environment = empty_environment();
+        environment.bind("padded", receiver);
+        let parsed = parse_expression("padded[:3]").expect("test source must parse");
+        let Expr::Subscript(subscript) = parsed.into_expr() else { panic!("expected a Subscript") };
+        // the assertion itself is the regression: a prior version of this
+        // arm panicked reaching this call ("kernel: the set is not a
+        // recognized sequence shape") instead of returning a value
+        let result = evaluate_subscript(&subscript, &environment, &kernel);
+        assert_eq!(
+            result.kind,
+            Kind::Unknown,
+            "a kernel-declined prefix must fall through to unknown(), not panic: {result:?}"
+        );
+    }
+
+    // --- numeric_value_vs_window_compare ---
+
+    /// `len(padded) >= 3` where `padded` is a `[:3]` prefix window — the
+    /// exact construct `text_label.py`'s `return padded if len(padded)
+    /// >= 3 else "xxx"` compares. `len()` over a `Repeat(alphabet, 3, 3)`
+    /// window (`collection_models::len_result`'s own reading of a
+    /// DEGENERATE bound) answers a bounded Integer `Kind::Set`, `{AtLeast
+    /// 3, AtMost 3}` — never a single known value — so this decides only
+    /// through `numeric_value_vs_window_compare`'s own window arm, not
+    /// `compare_pair`'s exact-numeric row. Every admitted length (all of
+    /// them, since the window is degenerate) satisfies `>= 3`, so the
+    /// comparison decides `True`.
+    #[test]
+    fn test_compare_decides_over_a_degenerate_length_window() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let seed_window = make_refined_set(vec![repeat_of(
+            refined_sets::codepoint_sets::codepoints(),
+            1,
+            Some(8),
+        )]);
+        let literal = refined_sets::codepoint_sets::string_tuple("xxxxxxxx");
+        let concatenation_with_a_leading_window = make_refined_set(vec![
+            refined_sets::refinement_forms::concatenation(seed_window, literal),
+        ]);
+        let receiver = AbstractValue {
+            kind_tag: None,
+            ..known_set(concatenation_with_a_leading_window, None, TrustProved, SetKindTag::None)
+        };
+        let mut environment = empty_environment();
+        environment.bind("padded", receiver);
+        let sliced_parsed = parse_expression("padded[:3]").expect("test source must parse");
+        let Expr::Subscript(subscript) = sliced_parsed.into_expr() else { panic!("expected a Subscript") };
+        let sliced = evaluate_subscript(&subscript, &environment, &kernel);
+        assert_eq!(sliced.kind, Kind::Set, "the [:3] slice must admit now that the kernel recognizes the shape");
+        environment.bind("sliced", sliced);
+
+        let compare_parsed = parse_expression("len(sliced) >= 3").expect("test source must parse");
+        let compare_value = evaluate_expression(&compare_parsed.into_expr(), &environment, &kernel);
+        assert_eq!(compare_value.kind, Kind::Values, "the comparison must decide, not stay unknown: {compare_value:?}");
+        assert_eq!(
+            compare_value.values,
+            vec![1.0],
+            "len(a 3-length window) >= 3 must decide True: {compare_value:?}"
+        );
+    }
+
+    /// A window that only SOMETIMES satisfies the comparison (`[0, 5]`
+    /// against `>= 3`) must stay undecided — some admitted lengths (0,
+    /// 1, 2) fail the bound while others (3, 4, 5) pass it, and this
+    /// function never guesses across a partial overlap.
+    #[test]
+    fn test_compare_stays_undecided_over_a_window_straddling_the_bound() {
+        let straddling_window = AbstractValue {
+            kind_tag: Some(PrimitiveKind::Integer),
+            ..known_set(
+                make_refined_set(vec![at_least(0.0), refined_sets::refinement_forms::at_most(5.0)]),
+                None,
+                TrustSpec,
+                SetKindTag::None,
+            )
+        };
+        let three = known_values(vec![3.0], PrimitiveKind::Integer, TrustProved);
+        assert_eq!(
+            compare_pair(CmpOp::GtE, &straddling_window, &three),
+            None,
+            "a window straddling the bound must not decide >="
+        );
+        assert_eq!(
+            compare_pair(CmpOp::GtE, &three, &straddling_window),
+            None,
+            "the swapped operand order must not decide either"
+        );
+    }
+
+    /// A window entirely BELOW the target decides `<`/`<=` true and
+    /// `>`/`>=` false — the mirror of the degenerate-window admit case,
+    /// pinning the non-degenerate ordering rows and the swapped operand
+    /// order together.
+    #[test]
+    fn test_compare_decides_over_a_window_entirely_below_the_target() {
+        let low_window = AbstractValue {
+            kind_tag: Some(PrimitiveKind::Integer),
+            ..known_set(
+                make_refined_set(vec![at_least(0.0), refined_sets::refinement_forms::at_most(2.0)]),
+                None,
+                TrustSpec,
+                SetKindTag::None,
+            )
+        };
+        let three = known_values(vec![3.0], PrimitiveKind::Integer, TrustProved);
+        assert_eq!(compare_pair(CmpOp::Lt, &low_window, &three), Some(1.0), "[0,2] < 3 must decide True");
+        assert_eq!(compare_pair(CmpOp::GtE, &low_window, &three), Some(0.0), "[0,2] >= 3 must decide False");
+        // swapped: `3 > window` is the same claim as `window < 3`
+        assert_eq!(compare_pair(CmpOp::Gt, &three, &low_window), Some(1.0), "3 > [0,2] must decide True");
+    }
+
+    // --- zero_padded_decimal_spelling / zero_padded_decimal_width ---
+
+    /// `year: [1970, 9999]` formatted `:04d` — every member already
+    /// spells exactly 4 decimal digits, so the zero-fill is a no-op and
+    /// the exact digit-window `Repeat(digits, 4, 4)` is sound.
+    #[test]
+    fn test_zero_padded_decimal_spelling_exact_when_padding_is_a_no_op() {
+        let year = AbstractValue {
+            kind_tag: Some(PrimitiveKind::Integer),
+            ..known_set(
+                make_refined_set(vec![at_least(1970.0), refined_sets::refinement_forms::at_most(9999.0)]),
+                None,
+                TrustSpec,
+                SetKindTag::None,
+            )
+        };
+        let Some(kernel) = loaded_kernel() else { return };
+        let source = "f\"{year:04d}\"";
+        let parsed = parse_expression(source).expect("test source must parse");
+        let Expr::FString(fstring) = parsed.into_expr() else { panic!("expected an FString") };
+        let mut environment = empty_environment();
+        environment.bind("year", year);
+        let result = evaluate_fstring(&fstring, &environment, &kernel);
+        assert_eq!(result.kind, Kind::Set);
+        assert!(
+            assignability::states_sequence(&result.set),
+            "a zero-padded bounded-range interpolation must answer a sequence-shaped set: {:?}",
+            result.set
+        );
+    }
+
+    /// A range that WOULD need real padding for some members but not
+    /// others (`8..12` against `02d`: "08".."12") declines rather than
+    /// approximate — `decimal_digit_count(8) == 1` while
+    /// `decimal_digit_count(12) == 2`, so the two ends disagree with the
+    /// stated width and the whole interpolation must answer `unknown()`.
+    #[test]
+    fn test_zero_padded_decimal_spelling_declines_when_padding_would_actually_fire() {
+        let count = AbstractValue {
+            kind_tag: Some(PrimitiveKind::Integer),
+            ..known_set(
+                make_refined_set(vec![at_least(8.0), refined_sets::refinement_forms::at_most(12.0)]),
+                None,
+                TrustSpec,
+                SetKindTag::None,
+            )
+        };
+        let Some(kernel) = loaded_kernel() else { return };
+        let source = "f\"{count:02d}\"";
+        let parsed = parse_expression(source).expect("test source must parse");
+        let Expr::FString(fstring) = parsed.into_expr() else { panic!("expected an FString") };
+        let mut environment = empty_environment();
+        environment.bind("count", count);
+        let result = evaluate_fstring(&fstring, &environment, &kernel);
+        assert_eq!(result.kind, Kind::Unknown);
+    }
+
+    /// A format spec that is not the recognized `0{width}d` spelling
+    /// (here, `.2f`) declines the whole f-string, same as before this
+    /// wave's own format-spec gate ever recognized any spec at all.
+    #[test]
+    fn test_unrecognized_format_spec_declines() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let value = AbstractValue {
+            kind_tag: Some(PrimitiveKind::Float),
+            ..known_set(make_refined_set(vec![at_least(0.0)]), None, TrustSpec, SetKindTag::None)
+        };
+        let source = "f\"{value:.2f}\"";
+        let parsed = parse_expression(source).expect("test source must parse");
+        let Expr::FString(fstring) = parsed.into_expr() else { panic!("expected an FString") };
+        let mut environment = empty_environment();
+        environment.bind("value", value);
+        let result = evaluate_fstring(&fstring, &environment, &kernel);
+        assert_eq!(result.kind, Kind::Unknown);
     }
 }

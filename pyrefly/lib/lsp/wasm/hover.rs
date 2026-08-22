@@ -53,7 +53,6 @@ use vec1::Vec1;
 use crate::alt::answers_solver::AnswersSolver;
 use crate::binding::binding::Key;
 use crate::error::error::Error;
-use crate::lsp::module_helpers::collect_symbol_def_paths;
 use crate::lsp::module_helpers::to_real_path;
 use crate::lsp::wasm::signature_help::CallInfo;
 use crate::lsp::wasm::signature_help::is_constructor_call;
@@ -102,35 +101,6 @@ pub struct HoverOptions {
 }
 
 impl HoverValue {
-    #[cfg(not(target_arch = "wasm32"))]
-    fn format_symbol_def_locations(t: &Type) -> Option<String> {
-        let symbol_paths = collect_symbol_def_paths(t);
-        let linked_names = symbol_paths
-            .into_iter()
-            .filter_map(|(qname, file_path)| {
-                if let Ok(mut url) = Url::from_file_path(&file_path) {
-                    let start_pos = qname.module().display_range(qname.range()).start;
-                    set_display_pos_fragment(&mut url, start_pos);
-                    Some(format!("[{}]({})", qname.id(), url))
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(" | ");
-
-        if linked_names.is_empty() {
-            None
-        } else {
-            Some(format!("\n\nGo to {linked_names}"))
-        }
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    fn format_symbol_def_locations(t: &Type) -> Option<String> {
-        None
-    }
-
     fn resolve_symbol_kind(&self) -> Option<SymbolKind> {
         match self.kind {
             Some(SymbolKind::Attribute) => Some(attribute_symbol_kind_from_type(&self.type_)),
@@ -271,22 +241,12 @@ impl HoverValue {
             .as_ref()
             .map(|s| format!("{s}: "))
             .unwrap_or_default();
-        let symbol_def_formatted = if self.show_go_to_links {
-            HoverValue::format_symbol_def_locations(&self.type_).unwrap_or_default()
-        } else {
-            String::new()
-        };
-        let type_source_formatted = if self.type_sources.is_empty() {
-            String::new()
-        } else {
-            let mut section = String::from("\n---\n**Type source**\n");
-            for source in &self.type_sources {
-                section.push_str("- ");
-                section.push_str(source);
-                section.push('\n');
-            }
-            section
-        };
+        // RefinedPy serves the host type as one line and nothing past it:
+        // no "Go to X" definition-location link (`format_symbol_def_locations`)
+        // and no "Type source" / "Inferred from first use" block
+        // (`self.type_sources`). `splice_refinedpy_hover`
+        // (lib/lsp/non_wasm/refinedpy.rs) appends the refined-set line
+        // after this fenced type line once the walk determines one.
         let type_display = self.display.clone().unwrap_or_else(|| {
             self.type_
                 .as_lsp_string_with_fallback_name(self.name.as_deref(), LspDisplayMode::Hover)
@@ -296,14 +256,8 @@ impl HoverValue {
             contents: HoverContents::Markup(MarkupContent {
                 kind: MarkupKind::Markdown,
                 value: format!(
-                    "```python\n{}{}{}\n```{}{}{}{}",
-                    kind_formatted,
-                    name_formatted,
-                    type_display,
-                    type_source_formatted,
-                    docstring_formatted,
-                    parameter_doc_formatted,
-                    symbol_def_formatted
+                    "```python\n{}{}{}\n```{}{}",
+                    kind_formatted, name_formatted, type_display, docstring_formatted, parameter_doc_formatted
                 ),
             }),
             range: self.range,

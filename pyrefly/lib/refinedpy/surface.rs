@@ -71,6 +71,15 @@ pub struct AliasEntry {
     pub head: Option<&'static str>,
     pub element: Option<Box<(RefinedSet, String)>>,
     pub length_window: Option<(i64, Option<i64>)>,
+    /// true when the alias's OWN right-hand side admits None alongside
+    /// the set (`type X = Optional[Age]`, `type X = Age | None`) —
+    /// mirrors `DeclaredRefinement::admits_none` (typereading.rs), read
+    /// by `declared_refinement`'s bare-alias-name arm the same way an
+    /// inline `Optional[X]`/`X | None` annotation sets it, so `sample:
+    /// OptionalSample` narrows and judges identically whether the
+    /// `Optional[...]` wrapper is spelled inline at the parameter or
+    /// hoisted into a module-level alias name.
+    pub admits_none: bool,
 }
 
 /// Every `type X = Annotated[int|float, Field(…)]` alias at the
@@ -124,6 +133,16 @@ pub fn compile_aliases(module: &ModModule) -> HashMap<String, AliasEntry> {
         };
         let sets_by_name: HashMap<String, RefinedSet> =
             out.iter().map(|(name, entry)| (name.clone(), entry.set.clone())).collect();
+        // `Optional[X]` / `X | None` (exactly one side a bare `None`
+        // literal): peel to the inner `X` and lower THAT through the
+        // ordinary chain below — the same peel
+        // `typereading::declared_refinement`'s own `Optional`/`BinOp`
+        // arms apply to an inline annotation, applied here so a
+        // module-level alias spelled `type OptionalAge = Optional[Age]`
+        // reads identically to a parameter spelled `age: Optional[Age]`
+        // inline. `admits_none` rides onto the compiled `AliasEntry`
+        // afterward, never into the RHS this chain lowers.
+        let (value, admits_none) = peel_alias_optional(value);
         // A container base's length window rides `annotated_expression_set`'s
         // OWN second tuple slot now — the table's value carries it
         // (`AliasEntry::length_window`) instead of dropping it, and the
@@ -149,6 +168,7 @@ pub fn compile_aliases(module: &ModModule) -> HashMap<String, AliasEntry> {
                     head,
                     element: element.map(Box::new),
                     length_window,
+                    admits_none: false,
                 })
             })
             .or_else(|| {
@@ -157,6 +177,7 @@ pub fn compile_aliases(module: &ModModule) -> HashMap<String, AliasEntry> {
                     head: None,
                     element: None,
                     length_window: None,
+                    admits_none: false,
                 })
             })
             .or_else(|| {
@@ -165,6 +186,7 @@ pub fn compile_aliases(module: &ModModule) -> HashMap<String, AliasEntry> {
                     head: None,
                     element: None,
                     length_window: None,
+                    admits_none: false,
                 })
             })
             .or_else(|| {
@@ -174,12 +196,39 @@ pub fn compile_aliases(module: &ModModule) -> HashMap<String, AliasEntry> {
                     return None;
                 };
                 out.get(rhs.id.as_str()).cloned()
-            });
+            })
+            .map(|entry| AliasEntry { admits_none: admits_none || entry.admits_none, ..entry });
         if let Some(entry) = entry {
             out.insert(name.to_owned(), entry);
         }
     }
     out
+}
+
+/// Peels a bare `Optional[X]` (recognized by bare-Name head, the same
+/// no-import-identity convention `typereading::declared_refinement`'s
+/// own `Optional` arm takes) or `X | None`/`None | X` (exactly one side
+/// a bare `None` literal) down to `(X, true)`. Every other shape is
+/// `(value, false)` unchanged — an alias RHS that is neither of these
+/// two forms lowers through the ordinary chain exactly as before this
+/// peel existed.
+fn peel_alias_optional(value: &Expr) -> (&Expr, bool) {
+    if let Expr::Subscript(subscript) = value {
+        if matches!(subscript.value.as_ref(), Expr::Name(head) if head.id.as_str() == "Optional") {
+            return (subscript.slice.as_ref(), true);
+        }
+    }
+    if let Expr::BinOp(binop) = value {
+        if binop.op == Operator::BitOr {
+            let left_is_none = matches!(binop.left.as_ref(), Expr::NoneLiteral(_));
+            let right_is_none = matches!(binop.right.as_ref(), Expr::NoneLiteral(_));
+            if left_is_none != right_is_none {
+                let other = if right_is_none { binop.left.as_ref() } else { binop.right.as_ref() };
+                return (other, true);
+            }
+        }
+    }
+    (value, false)
 }
 
 /// A container alias's own element expression resolved to `(the
@@ -764,6 +813,7 @@ pub struct SurfaceImports {
     field_names: HashSet<String>,
     pydantic_modules: HashSet<String>,
     pub(crate) annotated_names: HashSet<String>,
+    pub(crate) literal_names: HashSet<String>,
     strict_int_names: HashSet<String>,
     annotated_types_ge: HashSet<String>,
     annotated_types_gt: HashSet<String>,
@@ -788,6 +838,7 @@ pub fn surface_imports(module: &ModModule) -> SurfaceImports {
     let mut field_names = HashSet::new();
     let mut pydantic_modules = HashSet::new();
     let mut annotated_names = HashSet::new();
+    let mut literal_names = HashSet::new();
     let mut strict_int_names = HashSet::new();
     let mut annotated_types_ge = HashSet::new();
     let mut annotated_types_gt = HashSet::new();
@@ -825,6 +876,15 @@ pub fn surface_imports(module: &ModModule) -> SurfaceImports {
                     {
                         annotated_names.insert(local.id.as_str().to_owned());
                     }
+                    if (source.id.as_str() == "typing" || source.id.as_str() == "typing_extensions")
+                        && alias.name.id.as_str() == "Literal"
+                    {
+                        // A `Literal[...]` annotation states an exact value
+                        // set with no alias and no `Annotated` wrapper, so
+                        // this import alone means the module can carry
+                        // refinement vocabulary the checker reads.
+                        literal_names.insert(local.id.as_str().to_owned());
+                    }
                     if source.id.as_str() == "annotated_types" {
                         match alias.name.id.as_str() {
                             "Ge" => {
@@ -860,6 +920,7 @@ pub fn surface_imports(module: &ModModule) -> SurfaceImports {
         field_names,
         pydantic_modules,
         annotated_names,
+        literal_names,
         strict_int_names,
         annotated_types_ge,
         annotated_types_gt,

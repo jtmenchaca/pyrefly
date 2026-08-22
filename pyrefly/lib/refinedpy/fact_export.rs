@@ -45,14 +45,17 @@ use std::sync::Arc;
 
 use refined_domain::abstract_value::AbstractValue;
 use refined_domain::abstract_value::Kind;
+use refined_domain::abstract_value::PrimitiveKind;
 use refined_domain::lattice_operations::set_of_known;
 use refined_kernel::kernel_interface::RefinedTSKernel;
 use refined_kernel::wire_format::wire_set;
 use refined_sets::format_for_diagnostics::format_for_diagnostics;
 use refined_sets::refinement_forms::RefinedSet;
+use ruff_python_ast::Arguments;
 use ruff_python_ast::CmpOp;
 use ruff_python_ast::ExceptHandler;
 use ruff_python_ast::Expr;
+use ruff_python_ast::ExprCall;
 use ruff_python_ast::ModModule;
 use ruff_python_ast::Number;
 use ruff_python_ast::Stmt;
@@ -61,7 +64,9 @@ use serde_json::Map;
 use serde_json::Value;
 use serde_json::json;
 
-use crate::refinedpy::check::derived_return_values;
+use crate::refinedpy::assignability::sequence_shaped;
+use crate::refinedpy::assignability::states_sequence;
+use crate::refinedpy::check::derived_return_values_at;
 use crate::refinedpy::cross_module::ModuleResolver;
 use crate::refinedpy::env::Environment;
 use crate::refinedpy::surface::AliasEntry;
@@ -72,14 +77,202 @@ use crate::refinedpy::typereading::DeclaredRefinement;
 use crate::refinedpy::typereading::base_sort_return_refinement;
 use crate::refinedpy::typereading::declared_refinement;
 
-/// The artifact's own kind tag and version — the Go consumer matches on
-/// both before reading a single fact. Schema v2
-/// (docs/one-checker/schema-v2.md): one (kind, version) pair shared by
-/// every producer language; `language` (below) is what tells the
+/// One admitted return/entry shape, the RULED cases schema's own unit
+/// (CROSS-LANGUAGE-EDGE.md's fact-artifact cases design, JT-approved
+/// 2026-08-21): a scalar position's whole meaning is a LIST of these,
+/// never a bare set — the wire's `Case := {"sort":"number","set":<wire>}
+/// | {"sort":"string","set":<wire>} | {"sort":"boolean"} | {"sort":"null"}
+/// | {"sort":"object","members":{...},"closed":bool}`. A single case
+/// still spells as a one-element list — one shape, no special casing for
+/// "just one."
+enum Case {
+    /// A numeric set, encoded through the SAME kernel wire codec every
+    /// other set in this artifact goes through — never a private
+    /// artifact subset, which is what lets the full grammar (unions,
+    /// oneOf literal sets, multipleOf steps, …) cross for free.
+    Number(RefinedSet),
+    /// A string set — the identical wire codec, read by the consumer as
+    /// the string sort rather than guessed from the set's own shape.
+    String(RefinedSet),
+    /// The whole boolean sort — a floor case for now (a named future
+    /// extension narrows this to an admitted member subset); no `set`
+    /// field at all, since there is nothing narrower stated yet.
+    Boolean,
+    /// Absence — the wire-honest reading of a possibly-undefined value:
+    /// what actually crosses the JSON transport for "no value here" is
+    /// the bare token `null`, so this case names exactly that rather
+    /// than omitting the position or approximating it as a set.
+    Null,
+    /// An object-shaped value with known member structure — the RULED
+    /// object case (CROSS-LANGUAGE-EDGE.md §17, JT-prioritized
+    /// 2026-08-21): each declared/known key maps to ITS OWN cases list,
+    /// fully recursive (a member can itself be an object case). `closed`
+    /// is `true` when the producer states the exact key set (every key
+    /// listed, no others possible — a dict literal's own `complete: true`,
+    /// or a TypedDict's declared member table); `false` when keys beyond
+    /// those listed may exist. A Result-style union (two differently-
+    /// shaped branches) is never ONE object case with a `variants` field
+    /// of its own — it is TWO object cases riding in the same cases list,
+    /// which is what `object_cases_of` builds for a `Kind::Object` value
+    /// carrying `variants`.
+    Object {
+        members: Vec<(String, Vec<Case>)>,
+        closed: bool,
+    },
+}
+
+impl Case {
+    fn to_json(&self) -> Value {
+        match self {
+            Case::Number(set) => json!({"sort": "number", "set": wire_set(set)}),
+            Case::String(set) => json!({"sort": "string", "set": wire_set(set)}),
+            Case::Boolean => json!({"sort": "boolean"}),
+            Case::Null => json!({"sort": "null"}),
+            Case::Object { members, closed } => {
+                let mut members_json = Map::new();
+                for (name, cases) in members {
+                    members_json.insert(name.clone(), cases_json(cases));
+                }
+                json!({"sort": "object", "members": Value::Object(members_json), "closed": closed})
+            }
+        }
+    }
+}
+
+/// Whether `set` states a string rather than a number — `states_sequence`
+/// (a set/`str` DECLARATION always carries its own sequence form at the
+/// TOP level) alone misses a DERIVED string whose top form is a `Union`
+/// of sequence-shaped branches (`["ok", "warn", "error"][code]`'s own
+/// join over a bounded index — three known strings joined pairwise
+/// through `join_known`'s string-union path build `Union(Concatenation,
+/// Concatenation)` at the top, never a bare `Concatenation` itself), so
+/// `sequence_shaped`'s own recursive reading (EVERY top form is itself a
+/// sequence form, or a `Union`/`Difference` of two sequence-shaped
+/// operands) is checked too. Either test firing is enough — `states_
+/// sequence` stays the fast, non-recursive first check for the common
+/// case, and `sequence_shaped` catches the union/difference join this
+/// export's own new joined-index reads produce.
+fn is_string_shaped(set: &RefinedSet) -> bool {
+    states_sequence(set) || sequence_shaped(set)
+}
+
+/// A `RefinedSet` this checker already read as a boundary-narrowed,
+/// string-or-numeric scalar, spelled as its one case — `is_string_shaped`
+/// tells string from number the same way `foreign_edge.rs`'s own sort
+/// laws already do: a scalar position's set can carry a sequence form
+/// (`Star`/`Concatenation`/`Repeat`/`RepeatWord`/`EmptyTuple`, possibly
+/// under a `Union`/`Difference` join) only when it is a `str`
+/// declaration or derivation, since every container spelling
+/// (`list[X]`/`set[X]`/`Sequence[X]`) routes to the SEQUENCE entry shape
+/// before this function ever sees the set.
+fn scalar_case_of(set: &RefinedSet) -> Case {
+    if is_string_shaped(set) {
+        Case::String(set.clone())
+    } else {
+        Case::Number(set.clone())
+    }
+}
+
+/// The cases list one derived return value spells — the writer's own
+/// half of the RULED schema: a plain numeric/string set is one case; a
+/// possibly-absent return (`Kind::PossiblyUndefined`) is the INNER
+/// value's own case(s) PLUS a null case, since "a possibly-absent value
+/// has no faithful set reading" is exactly the omission this schema
+/// retires. An OBJECT-shaped return (`Kind::Object`) reads through
+/// `object_cases_of` — one case when the value states a single shape, two
+/// (or more, up to the join's own four-arm ceiling) when the value carries
+/// `variants` (a Result-style union of differently-shaped branches).
+/// Every other unreadable shape (an unknown, an object whose members this
+/// table cannot itself read) keeps its named omission exactly as before —
+/// this function answers `Err` for those, unchanged from
+/// `faithful_return_set`'s own refusal.
+fn return_cases(returned: &AbstractValue) -> Result<Vec<Case>, String> {
+    if returned.kind == Kind::PossiblyUndefined {
+        let inner = returned
+            .inner
+            .as_ref()
+            .expect("Kind::PossiblyUndefined always carries an inner value");
+        let mut cases = return_cases(inner)?;
+        cases.push(Case::Null);
+        return Ok(cases);
+    }
+    if returned.kind == Kind::Null || returned.kind == Kind::Undef {
+        return Ok(vec![Case::Null]);
+    }
+    if returned.kind == Kind::Values && returned.kind_tag == Some(PrimitiveKind::Boolean) {
+        return Ok(vec![Case::Boolean]);
+    }
+    if returned.kind == Kind::Object {
+        return object_cases_of(returned);
+    }
+    let set = faithful_return_set(returned)?;
+    let is_string = returned.kind_tag == Some(PrimitiveKind::String) || is_string_shaped(&set);
+    Ok(vec![if is_string { Case::String(set) } else { Case::Number(set) }])
+}
+
+/// One object-shaped value's own cases list — ONE case for a value
+/// stating a single shape, or ONE PER VARIANT (`AbstractValue::variants`,
+/// `known_with_variants`'s own field) when the value's derivation joined
+/// two or more differently-shaped branches (a Result-style union:
+/// `{"ok": true, "value": …}` or `{"ok": false, "error": …}` is exactly
+/// TWO object cases riding in the one cases list this function answers,
+/// never one case with a nested variants field). The `variants` list
+/// always holds full stand-alone `Kind::Object` values (`sides_of`'s own
+/// convention in `lattice_operations.rs`), so each is read through
+/// `object_case_of` exactly as the un-joined value would be.
+fn object_cases_of(returned: &AbstractValue) -> Result<Vec<Case>, String> {
+    if returned.variants.is_empty() {
+        return Ok(vec![object_case_of(returned)?]);
+    }
+    returned.variants.iter().map(object_case_of).collect()
+}
+
+/// One `Kind::Object` value's own single case: each of its known keys
+/// mapped to that key's OWN cases list (recursing through `return_cases`
+/// so a member that is itself object-shaped becomes a nested object case,
+/// and a possibly-absent member reads its inner case(s) plus null exactly
+/// as a possibly-absent RETURN does — the two positions share one rule),
+/// and `closed` read directly off the value's own `complete` bit — the
+/// domain's own completeness fact (`known_object`'s doc: a dict literal
+/// always builds `complete: true`, since a literal states every key it
+/// has; a join of two differing key sets drops to `complete: false`,
+/// since a key present on only one arm may or may not exist on the
+/// runtime value). A key whose own value has no cases list this table can
+/// read (an unknown, a nested unreadable shape) stops the WHOLE object
+/// case — this function answers `Err` naming that key, and the caller's
+/// own omission carries the sentence forward exactly as an unreadable
+/// scalar return already does. Never guesses at a member it cannot state.
+fn object_case_of(returned: &AbstractValue) -> Result<Case, String> {
+    let mut members = Vec::with_capacity(returned.keys.len());
+    for key in &returned.keys {
+        let cases = return_cases(&key.value).map_err(|reason| {
+            format!("its member '{}' is {reason}, which has no faithful cases reading", key.name)
+        })?;
+        members.push((key.name.clone(), cases));
+    }
+    Ok(Case::Object {
+        members,
+        closed: returned.complete,
+    })
+}
+
+/// The cases list as the artifact spells it — a JSON array, never a
+/// bare set, so a single case still reads as the one-element list the
+/// schema requires.
+fn cases_json(cases: &[Case]) -> Value {
+    Value::Array(cases.iter().map(Case::to_json).collect())
+}
+
+/// The artifact's own kind tag — the Go consumer matches on it before
+/// reading a single fact. NO version field: the RULED cases schema
+/// (JT, 2026-08-21) carries no version ceremony at all — a reader
+/// strict-parses the CURRENT shape, and any other shape (a version
+/// field, a bare "set", the old sequence spelling) is NO-FACT, read by
+/// the same "no fact this reader recognizes" sentence every other
+/// unreadable artifact earns. `language` (below) is what tells the
 /// consumer which pins to check the runtime band against, so adding a
 /// language never adds a new artifact kind.
 const ARTIFACT_KIND: &str = "fact-artifact";
-const ARTIFACT_VERSION: i64 = 2;
 
 /// The language this producer states — schema v2's own field, read
 /// beside `runtime.band` so a consumer checks the band against the
@@ -111,20 +304,27 @@ pub struct Export {
 /// commits to, and the bytes `module` was parsed from); `basename` is
 /// what `target.file` states. `resolver` is the same import resolver the
 /// checker's own CLI passes, so a def reading an imported name derives
-/// exactly what the checker derives for it.
+/// exactly what the checker derives for it. `entry_directory` is the
+/// checked file's own directory — threaded into
+/// `derived_return_values_at` so a relative foreign-edge target (a
+/// `subprocess.run(["node", "./audio_level.ts"], ...)` call) joins
+/// against it before the artifact read, exactly as an ordinary check
+/// already joins it (`findings_for_module_at`). `None` leaves a relative
+/// target unjoined, the same as `derived_return_values`'s own default.
 pub fn export_module(
     module: &ModModule,
     source_bytes: &[u8],
     basename: &str,
     resolver: ModuleResolver,
     kernel: &Arc<RefinedTSKernel>,
+    entry_directory: Option<&Path>,
 ) -> Export {
     let aliases = compile_aliases(module);
     let imports = surface_imports(module);
     // ONE walk of the whole module answers every def's derived return:
     // the shared context (imports resolved, function/class tables built)
     // costs the same whether one def asks or all of them do.
-    let derived_returns = derived_return_values(module, resolver, kernel);
+    let derived_returns = derived_return_values_at(module, resolver, kernel, entry_directory);
     let mut functions = Map::new();
     let mut omissions = Vec::new();
     let module_line_starts = line_starts_of(source_bytes);
@@ -140,10 +340,9 @@ pub fn export_module(
     }
 
     let mut artifact = Map::new();
-    artifact.insert(
-        "refined".to_owned(),
-        json!({"kind": ARTIFACT_KIND, "version": ARTIFACT_VERSION}),
-    );
+    // NO version field, ever — the identity marker names the kind only
+    // (see ARTIFACT_KIND's own doc).
+    artifact.insert("refined".to_owned(), json!({"kind": ARTIFACT_KIND}));
     artifact.insert(
         "target".to_owned(),
         json!({"file": basename, "contentHash": format!("sha256:{}", sha256_hex(source_bytes))}),
@@ -285,19 +484,19 @@ fn export_function(
             .cloned()
             .unwrap_or_else(|| "the body's returns derived no value the walk could read".to_owned())
     })?;
-    let return_set = faithful_return_set(returned)?;
+    let return_cases = return_cases(returned)?;
     let stdout_pure = writes_nothing_to_stdout(def, module);
     // The def's own NAME identifier, not the statement range: a
     // decorated def's statement range starts at the decorator, and the
     // line a reader means by "the def line" is the one `def <name>` sits
     // on. The name identifier is always on that line.
     let line = line_of(line_starts, def.name.range.start().to_usize());
-    let said = provenance_sentence(&entry, &return_set);
+    let said = provenance_sentence(&entry, &return_cases);
 
     let entry_json: Vec<Value> = entry.iter().map(entry_row_json).collect();
     Ok(json!({
         "entry": entry_json,
-        "return": {"set": wire_set(&return_set), "stdoutPure": stdout_pure},
+        "return": {"cases": cases_json(&return_cases), "stdoutPure": stdout_pure},
         "provenance": {"line": line, "said": said},
     }))
 }
@@ -311,16 +510,20 @@ struct EntryRow {
 }
 
 enum EntryShape {
-    /// `list[X]`/`set[X]`/`Sequence[X]` — the element's own set, and the
-    /// declaration's own length floor (`element_length`'s `lo`, 0 when
-    /// the declaration states no bound, exactly the default
+    /// `list[X]`/`set[X]`/`Sequence[X]` — the element's own cases, and
+    /// the declaration's own length floor (`element_length`'s `lo`, 0
+    /// when the declaration states no bound, exactly the default
     /// `check::seed_parameters` seeds the repetition window with).
     Sequence {
-        element: RefinedSet,
+        element: Vec<Case>,
         length_at_least: i64,
     },
-    /// Every other readable declaration: the set itself.
-    Scalar(RefinedSet),
+    /// Every other readable declaration: its own cases — a plain
+    /// declaration is one case; an `admits_none` declaration (`X |
+    /// None`, `Optional[X]`) carries the inner case(s) PLUS the null
+    /// case, the same "the flag stops being dropped" fix the writer
+    /// applies to a derived possibly-absent RETURN.
+    Scalar(Vec<Case>),
 }
 
 /// `def`'s parameters read into exported entry rows, or the reason the
@@ -380,6 +583,10 @@ fn entry_rows(
 /// SEQUENCE/SCALAR split `check::seed_parameters` makes when it seeds
 /// the parameter (a container spelling with a non-empty element set
 /// seeds a repetition window; everything else seeds the set itself).
+/// `admits_none` (`X | None`, `Optional[X]`) appends the null case to a
+/// SCALAR declaration's own cases — the container arm has no `None`
+/// reading of its own to extend (a `dict[str, X] | None` still routes
+/// through `element`, unaffected by this function's scalar branch).
 fn entry_shape(declared: &DeclaredRefinement) -> Result<EntryShape, String> {
     let is_sequence_container = declared.spelling.starts_with("list[")
         || declared.spelling.starts_with("set[")
@@ -399,7 +606,7 @@ fn entry_shape(declared: &DeclaredRefinement) -> Result<EntryShape, String> {
         }
         let (lo, _hi) = declared.element_length.unwrap_or((0, None));
         return Ok(EntryShape::Sequence {
-            element: element.set.clone(),
+            element: vec![scalar_case_of(&element.set)],
             length_at_least: lo,
         });
     }
@@ -409,7 +616,11 @@ fn entry_shape(declared: &DeclaredRefinement) -> Result<EntryShape, String> {
             declared.spelling
         ));
     }
-    Ok(EntryShape::Scalar(declared.set.clone()))
+    let mut cases = vec![scalar_case_of(&declared.set)];
+    if declared.admits_none {
+        cases.push(Case::Null);
+    }
+    Ok(EntryShape::Scalar(cases))
 }
 
 /// One entry row as the artifact spells it.
@@ -420,9 +631,9 @@ fn entry_row_json(row: &EntryRow) -> Value {
             length_at_least,
         } => json!({
             "name": row.name,
-            "sequence": {"element": wire_set(element), "lengthAtLeast": length_at_least},
+            "sequence": {"element": {"cases": cases_json(element)}, "lengthAtLeast": length_at_least},
         }),
-        EntryShape::Scalar(set) => json!({"name": row.name, "set": wire_set(set)}),
+        EntryShape::Scalar(cases) => json!({"name": row.name, "cases": cases_json(cases)}),
     }
 }
 
@@ -474,13 +685,41 @@ fn return_kind_words(returned: &AbstractValue) -> &'static str {
     }
 }
 
+/// One case's own words, for a provenance sentence — `format_for_
+/// diagnostics` for the two set-carrying cases, plain words for the two
+/// that carry none, and each member's own words (recursively) for an
+/// object case.
+fn case_words(case: &Case) -> String {
+    match case {
+        Case::Number(set) | Case::String(set) => format_for_diagnostics(set),
+        Case::Boolean => "a boolean".to_owned(),
+        Case::Null => "absent".to_owned(),
+        Case::Object { members, closed } => {
+            let member_words: Vec<String> = members
+                .iter()
+                .map(|(name, cases)| format!("'{name}' is {}", cases_words(cases)))
+                .collect();
+            let openness = if *closed { "no other keys" } else { "possibly other keys" };
+            format!("an object whose {} ({openness})", member_words.join(" and "))
+        }
+    }
+}
+
+/// A cases list's own words — one case reads as its own words; more than
+/// one joins with "or", the plain reading of "this position is one of
+/// these cases."
+fn cases_words(cases: &[Case]) -> String {
+    cases.iter().map(case_words).collect::<Vec<_>>().join(" or ")
+}
+
 /// The one sentence `provenance.said` states, assembled from the facts
 /// the artifact already carries — each entry bound and the derived
-/// return, spelled through `format_for_diagnostics`, the same formatter
-/// every refinement sentence in this checker is spelled through.
+/// return, spelled through `format_for_diagnostics` (the same formatter
+/// every refinement sentence in this checker is spelled through) for a
+/// set-carrying case, and plain words for a boolean/null case.
 fn provenance_sentence(
     entry: &[EntryRow],
-    return_set: &RefinedSet,
+    return_cases: &[Case],
 ) -> String {
     let entry_words: Vec<String> = entry
         .iter()
@@ -491,18 +730,18 @@ fn provenance_sentence(
             } => format!(
                 "'{}' whose every element is {} and whose length is at least {}",
                 row.name,
-                format_for_diagnostics(element),
+                cases_words(element),
                 length_at_least
             ),
-            EntryShape::Scalar(set) => {
-                format!("'{}' is {}", row.name, format_for_diagnostics(set))
+            EntryShape::Scalar(cases) => {
+                format!("'{}' is {}", row.name, cases_words(cases))
             }
         })
         .collect();
     format!(
         "given {}, this body's returns derive {}",
         entry_words.join(" and "),
-        format_for_diagnostics(return_set)
+        cases_words(return_cases)
     )
 }
 
@@ -552,8 +791,36 @@ fn body_is_stdout_pure(
             let Expr::Call(call) = expr else {
                 return;
             };
+            // A captured-stdout spawn call (`subprocess.run(...,
+            // capture_output=True)`, `subprocess.Popen(...,
+            // stdout=subprocess.PIPE)`, `subprocess.check_output(...)`, the
+            // awaited `asyncio.create_subprocess_exec(...,
+            // stdout=asyncio.subprocess.PIPE)`) pipes the CHILD's stdout
+            // into this call's own return value; it writes nothing to the
+            // PARENT's stdout on its own account, so it is checked BEFORE
+            // the opaque-attribute-call fallback below — a shape this
+            // table does not admit still falls through to that fallback
+            // and refuses, exactly as before.
+            if is_captured_stdout_spawn_call(call) {
+                return;
+            }
             match call.func.as_ref() {
                 Expr::Name(callee) => called_names.push(callee.id.as_str().to_owned()),
+                // `<process>.communicate(...)` is the ONLY way either
+                // admitted PIPE row (`subprocess.Popen`, the awaited
+                // `asyncio.create_subprocess_exec`) ever reads its
+                // captured stdout back — `library/subprocess.rst`,
+                // `Popen.communicate`: "the data will be … strings if
+                // streams were opened in text mode", read from the pipe
+                // this call's own captured-spawn row already admitted;
+                // it writes nothing to the PARENT's stdout on its own
+                // account either, so it is admitted here BY METHOD NAME
+                // alone (this scan carries no alias table tying the
+                // receiver name back to its own `Popen`/
+                // `create_subprocess_exec` call site) — the same
+                // by-name-only posture the Go twin's own banner accepts
+                // for its three synchronous spawn names.
+                Expr::Attribute(attribute) if attribute.attr.as_str() == "communicate" => {}
                 // an attribute call (`obj.method(...)`, `math.sqrt(...)`)
                 // reaches no same-module def this scan can follow; the
                 // stdout-writing attribute shapes are already caught by
@@ -608,19 +875,42 @@ fn expression_writes_stdout(expr: &Expr) -> bool {
             _ => false,
         },
         // A bare `sys.stdout` reference (handed to a writer this scan
-        // cannot follow) is itself enough to refuse the claim.
-        Expr::Attribute(_) => attribute_path_reaches_stdout(expr),
+        // cannot follow) is itself enough to refuse the claim. This is
+        // the actual STREAM object — `is_sys_stdout_path` reads the
+        // receiver chain back to `sys` (or a `from sys import stdout`
+        // bare name) rather than matching any identifier merely NAMED
+        // `.stdout` (a captured subprocess result's own `result.stdout`
+        // — the field `subprocess.run(..., capture_output=True)` pipes
+        // the child's captured bytes into — is a plain read of THAT
+        // field, never a reference to the parent's own stream, and must
+        // not trip this rule).
+        Expr::Attribute(_) => is_sys_stdout_path(expr),
         _ => false,
     }
 }
 
-/// Whether an attribute path's own spelling names stdout — `sys.stdout`,
-/// or a bare `stdout` a `from sys import stdout` would bind.
+/// Whether `expr` is itself a write to stdout (called with `expr` as the
+/// receiver of `.write(...)`, `.flush()`, etc — see the call above) —
+/// resolves the SAME `sys.stdout` stream object `attribute_path_reaches_
+/// stdout`'s callers already assume, kept as its own name since a
+/// receiver check and a bare-reference check read the identical path.
 fn attribute_path_reaches_stdout(expr: &Expr) -> bool {
+    is_sys_stdout_path(expr)
+}
+
+/// Whether `expr` is exactly `sys.stdout`, or a bare `stdout` a `from sys
+/// import stdout` would bind — the parent's own stream object, never any
+/// OTHER attribute merely spelled `.stdout` (a captured subprocess
+/// result's `result.stdout`, a `Popen` object's `.stdout` pipe handle).
+/// The root of the attribute chain must be the name `sys`; a chain
+/// rooted in any other name (a local variable, a captured result) does
+/// not match here regardless of how many `.stdout`-named links follow.
+fn is_sys_stdout_path(expr: &Expr) -> bool {
     match expr {
         Expr::Name(name) => name.id.as_str() == "stdout",
         Expr::Attribute(attribute) => {
-            attribute.attr.as_str() == "stdout" || attribute_path_reaches_stdout(attribute.value.as_ref())
+            attribute.attr.as_str() == "stdout"
+                && matches!(attribute.value.as_ref(), Expr::Name(receiver) if receiver.id.as_str() == "sys")
         }
         _ => false,
     }
@@ -639,6 +929,130 @@ fn is_opaque_receiver_call(func: &Expr) -> bool {
         return true;
     };
     !matches!(receiver.id.as_str(), "math" | "json")
+}
+
+/// Whether `call` spawns a child process through a form whose stdout is
+/// CAPTURED rather than written to the parent's own stdout — the twin of
+/// the Go scan's `isCapturedStdoutSpawnCall`
+/// (fact_export_purity.go:309-362), admitted per the SAME documented
+/// `subprocess`/`asyncio.subprocess` capture semantics, cited per row:
+///
+/// - `subprocess.run(..., capture_output=True)`: `capture_output=True` is
+///   shorthand for `stdout=PIPE, stderr=PIPE` (`library/subprocess.rst`,
+///   `subprocess.run`), which pipes the child's stdout into the returned
+///   `CompletedProcess.stdout` rather than writing it to the parent's own
+///   stdout. WITHOUT `capture_output=True` (or an equivalent explicit
+///   `stdout=PIPE`), the default is `stdout=None`, which means the child
+///   INHERITS the parent's stdout — the call is then a real write, and
+///   this table refuses it.
+/// - `subprocess.check_output(...)`: captures by definition —
+///   `library/subprocess.rst`, `subprocess.check_output`: "the return
+///   value ... is the stdout." Admitted UNCONDITIONALLY: the call has no
+///   `stdout` keyword to override at all, so no shape defeats the
+///   capture.
+/// - `subprocess.Popen(..., stdout=subprocess.PIPE)`: the same PIPE
+///   sentinel as `run`'s shorthand expands to, read directly here since
+///   `Popen` has no `capture_output` convenience of its own — the child's
+///   stdout is a pipe this call's own returned `Popen` object reads back
+///   from (`.communicate()`/`.stdout`), never the parent's channel.
+///   WITHOUT `stdout=subprocess.PIPE`, the default is `stdout=None`
+///   (inherited), refused the same as `run`'s uncaptured default.
+/// - the awaited `asyncio.create_subprocess_exec(...,
+///   stdout=asyncio.subprocess.PIPE)`: `library/asyncio-subprocess.rst`
+///   states the identical PIPE-sentinel contract as the synchronous
+///   `Popen`, re-exported under the `asyncio.subprocess` namespace — the
+///   child's stdout is captured into the process object's own
+///   `.communicate()`/`.stdout`, never the parent's stdout.
+///
+/// A call this table does not recognize as one of these four exact
+/// shapes (a different receiver, a different attribute name, a `stdio`
+/// keyword this reader cannot read as one of the two admitted literal
+/// forms) answers `false` — the caller's own opaque-call fallback then
+/// refuses the purity claim, the same conservative-only-admits posture
+/// the rest of this scan takes.
+fn is_captured_stdout_spawn_call(call: &ExprCall) -> bool {
+    let Expr::Attribute(attribute) = call.func.as_ref() else {
+        return false;
+    };
+    let Expr::Name(receiver) = attribute.value.as_ref() else {
+        return false;
+    };
+    match (receiver.id.as_str(), attribute.attr.as_str()) {
+        ("subprocess", "run") => keyword_bool(&call.arguments, "capture_output") == Some(true),
+        // check_output always captures: no keyword of its own could
+        // defeat it, so every call shape reaches this row
+        ("subprocess", "check_output") => true,
+        ("subprocess", "Popen") => {
+            keyword_matches(&call.arguments, "stdout", is_subprocess_pipe_sentinel)
+        }
+        ("asyncio", "create_subprocess_exec") => {
+            keyword_matches(&call.arguments, "stdout", is_asyncio_subprocess_pipe_sentinel)
+        }
+        _ => false,
+    }
+}
+
+/// `arguments`'s own `name=` keyword read as a boolean literal (`True`/
+/// `False`) — `Some(value)` when the keyword is present and its value is
+/// a plain `BooleanLiteral`; `None` when the keyword is absent OR its
+/// value is not a literal this reader can pin down (a computed
+/// expression, a name), which this table's callers always treat the same
+/// as "the keyword is absent" — a shape this scan cannot read never
+/// registers as the safe case on invented grounds.
+fn keyword_bool(arguments: &Arguments, name: &str) -> Option<bool> {
+    arguments.keywords.iter().find_map(|keyword| {
+        if keyword.arg.as_ref()?.as_str() != name {
+            return None;
+        }
+        match &keyword.value {
+            Expr::BooleanLiteral(literal) => Some(literal.value),
+            _ => None,
+        }
+    })
+}
+
+/// Whether `arguments` carries a `name=` keyword whose value satisfies
+/// `predicate` — the read `is_captured_stdout_spawn_call` uses for the
+/// `stdout=subprocess.PIPE` / `stdout=asyncio.subprocess.PIPE` rows,
+/// where absence of the keyword (the inherited-stdout default) and a
+/// present-but-different value both answer `false` alike.
+fn keyword_matches(arguments: &Arguments, name: &str, predicate: fn(&Expr) -> bool) -> bool {
+    arguments
+        .keywords
+        .iter()
+        .any(|keyword| keyword.arg.as_ref().is_some_and(|arg| arg.as_str() == name) && predicate(&keyword.value))
+}
+
+/// Whether `expr` is exactly `subprocess.PIPE`.
+fn is_subprocess_pipe_sentinel(expr: &Expr) -> bool {
+    let Expr::Attribute(attribute) = expr else {
+        return false;
+    };
+    let Expr::Name(module_name) = attribute.value.as_ref() else {
+        return false;
+    };
+    module_name.id.as_str() == "subprocess" && attribute.attr.as_str() == "PIPE"
+}
+
+/// Whether `expr` is exactly `asyncio.subprocess.PIPE` — the awaited
+/// shape's own two-level spelling of the same PIPE sentinel
+/// (`library/asyncio-subprocess.rst`: re-exported under the
+/// `asyncio.subprocess` namespace), unlike the sync shape's one-level
+/// `subprocess.PIPE`.
+fn is_asyncio_subprocess_pipe_sentinel(expr: &Expr) -> bool {
+    let Expr::Attribute(pipe_attribute) = expr else {
+        return false;
+    };
+    if pipe_attribute.attr.as_str() != "PIPE" {
+        return false;
+    }
+    let Expr::Attribute(subprocess_attribute) = pipe_attribute.value.as_ref() else {
+        return false;
+    };
+    let Expr::Name(module_name) = subprocess_attribute.value.as_ref() else {
+        return false;
+    };
+    module_name.id.as_str() == "asyncio" && subprocess_attribute.attr.as_str() == "subprocess"
 }
 
 /// The builtins this scan knows write nothing to stdout. A name outside
@@ -1531,7 +1945,7 @@ mod tests {
             .expect("the fixture parses")
             .into_syntax();
         let no_imports: ModuleResolver = &|_: &str| None;
-        let export = export_module(&module, source, "f.py", no_imports, &kernel);
+        let export = export_module(&module, source, "f.py", no_imports, &kernel, None);
         let artifact = export.artifact.as_object().expect("the artifact is an object");
         assert_eq!(
             artifact["surface"],
@@ -1554,7 +1968,7 @@ mod tests {
             .expect("the fixture parses")
             .into_syntax();
         let no_imports: ModuleResolver = &|_: &str| None;
-        let export = export_module(&module, source, "f.py", no_imports, &kernel);
+        let export = export_module(&module, source, "f.py", no_imports, &kernel, None);
         let artifact = export.artifact.as_object().expect("the artifact is an object");
         assert_eq!(
             artifact["surface"],
@@ -1722,7 +2136,7 @@ mod tests {
             .expect("the fixture parses")
             .into_syntax();
         let no_imports: ModuleResolver = &|_: &str| None;
-        let export = export_module(&module, source, "level_gain_argv.py", no_imports, &kernel);
+        let export = export_module(&module, source, "level_gain_argv.py", no_imports, &kernel, None);
         for omission in &export.omissions {
             eprintln!("omission: '{}' — {}", omission.function, omission.reason);
         }
@@ -1781,7 +2195,7 @@ mod tests {
             .expect("the fixture parses")
             .into_syntax();
         let no_imports: ModuleResolver = &|_: &str| None;
-        let export = export_module(&module, source, "level_gain_argv.py", no_imports, &kernel);
+        let export = export_module(&module, source, "level_gain_argv.py", no_imports, &kernel, None);
         for omission in &export.omissions {
             eprintln!("omission: '{}' — {}", omission.function, omission.reason);
         }
@@ -1791,9 +2205,10 @@ mod tests {
             !function.is_null(),
             "level_gain_argv must export (its body derives through the sort-only transfer answer)"
         );
-        let return_forms = function["return"]["set"]["forms"]
-            .as_array()
-            .expect("the derived return states its forms");
+        let cases = function["return"]["cases"].as_array().expect("the return states its cases");
+        assert_eq!(cases.len(), 1, "a plain numeric return states one case");
+        assert_eq!(cases[0]["sort"], "number");
+        let return_forms = cases[0]["set"]["forms"].as_array().expect("the number case states its forms");
         assert_eq!(return_forms.len(), 2, "the derived return is the two-sided [0, 1] window");
     }
 
@@ -1830,7 +2245,7 @@ mod tests {
             .expect("the fixture parses")
             .into_syntax();
         let no_imports: ModuleResolver = &|_: &str| None;
-        let export = export_module(&module, source.as_bytes(), "loop_blocker.py", no_imports, &kernel);
+        let export = export_module(&module, source.as_bytes(), "loop_blocker.py", no_imports, &kernel, None);
         let reason_for = |name: &str| {
             export
                 .omissions
@@ -1885,7 +2300,7 @@ mod tests {
             .expect("the fixture parses")
             .into_syntax();
         let no_imports: ModuleResolver = &|_: &str| None;
-        let export = export_module(&module, source, "level_from_file.py", no_imports, &kernel);
+        let export = export_module(&module, source, "level_from_file.py", no_imports, &kernel, None);
         let artifact = export.artifact.as_object().expect("the artifact is an object");
         assert_eq!(
             artifact["surface"],
@@ -1932,6 +2347,311 @@ mod tests {
         assert!(!writes_nothing_to_stdout(def, &module));
     }
 
+    /// `subprocess.run(..., capture_output=True)` pipes the child's
+    /// stdout into `result.stdout`, never the parent's own stdout —
+    /// `chain_relay.py`'s own anatomy (the fixture named in
+    /// j-chains-and-diamonds.py's own header): the purity claim
+    /// discharges even though the body spawns a child.
+    #[test]
+    fn a_captured_subprocess_run_discharges_the_purity_claim() {
+        let module = ruff_python_parser::parse_module(
+            "import json\nimport subprocess\n\n\ndef relay(x):\n    result = subprocess.run(\n        [\"node\", \"./targets/chain_meter.ts\"],\n        input=json.dumps(x),\n        capture_output=True,\n        text=True,\n    )\n    return json.loads(result.stdout)\n",
+        )
+        .expect("test module parses")
+        .into_syntax();
+        let def = top_level_defs(&module).next().expect("one def");
+        assert!(writes_nothing_to_stdout(def, &module));
+    }
+
+    /// `subprocess.run(...)` WITHOUT `capture_output=True` inherits the
+    /// parent's own stdout (`library/subprocess.rst`'s documented
+    /// default, `stdout=None`) — the purity claim still refuses, exactly
+    /// as an uncaptured spawn should.
+    #[test]
+    fn subprocess_run_without_capture_output_still_refuses() {
+        let module = ruff_python_parser::parse_module(
+            "import json\nimport subprocess\n\n\ndef relay(x):\n    result = subprocess.run(\n        [\"node\", \"./targets/chain_meter.ts\"],\n        input=json.dumps(x),\n        text=True,\n    )\n    return json.loads(result.stdout)\n",
+        )
+        .expect("test module parses")
+        .into_syntax();
+        let def = top_level_defs(&module).next().expect("one def");
+        assert!(!writes_nothing_to_stdout(def, &module));
+    }
+
+    /// `subprocess.Popen(..., stdout=subprocess.PIPE)` admits — the same
+    /// PIPE sentinel `run`'s `capture_output=True` shorthand expands to,
+    /// read directly since `Popen` carries no such shorthand of its own.
+    #[test]
+    fn popen_with_stdout_pipe_admits() {
+        let module = ruff_python_parser::parse_module(
+            "import json\nimport subprocess\n\n\ndef relay(x):\n    process = subprocess.Popen(\n        [\"node\", \"./targets/chain_meter.ts\"],\n        stdin=subprocess.PIPE,\n        stdout=subprocess.PIPE,\n        text=True,\n    )\n    stdout, _stderr = process.communicate(json.dumps(x))\n    return json.loads(stdout)\n",
+        )
+        .expect("test module parses")
+        .into_syntax();
+        let def = top_level_defs(&module).next().expect("one def");
+        assert!(writes_nothing_to_stdout(def, &module));
+    }
+
+    /// A `print(...)` body still refuses — the captured-spawn admission
+    /// table added nothing to a body whose own impurity is a genuine
+    /// stdout write (regression against the pre-existing scan).
+    #[test]
+    fn a_print_body_still_refuses() {
+        let module = ruff_python_parser::parse_module("def loud(x):\n    print(x)\n    return x\n")
+            .expect("test module parses")
+            .into_syntax();
+        let def = top_level_defs(&module).next().expect("one def");
+        assert!(!writes_nothing_to_stdout(def, &module));
+    }
+
+    /// The awaited `asyncio.create_subprocess_exec(...,
+    /// stdout=asyncio.subprocess.PIPE)` shape admits — the same PIPE
+    /// contract as the synchronous `Popen`, re-exported under the
+    /// `asyncio.subprocess` namespace (k-async-invocation.py's own
+    /// `level_via_async_subprocess` anatomy).
+    #[test]
+    fn the_asyncio_captured_shape_admits() {
+        let module = ruff_python_parser::parse_module(
+            "import asyncio\nimport json\n\n\nasync def relay(x):\n    proc = await asyncio.create_subprocess_exec(\n        \"node\",\n        \"./targets/chain_meter.ts\",\n        stdin=asyncio.subprocess.PIPE,\n        stdout=asyncio.subprocess.PIPE,\n    )\n    stdout_bytes, _ = await proc.communicate(json.dumps(x))\n    return json.loads(stdout_bytes)\n",
+        )
+        .expect("test module parses")
+        .into_syntax();
+        let def = top_level_defs(&module).next().expect("one def");
+        assert!(writes_nothing_to_stdout(def, &module));
+    }
+
+    /// A plain numeric return exports the RULED cases schema exactly: a
+    /// one-element `cases` array, its sort "number", carrying the full
+    /// kernel wire set. `Age`'s own `Annotated[...]` alias is what makes
+    /// this module eligible for the walk at all (`derived_return_values`'s
+    /// own early exit: a module with no `type` alias and no recognized
+    /// `Annotated` import derives nothing).
+    #[test]
+    fn a_numeric_return_exports_one_number_case() {
+        let Some(kernel) = loaded_kernel() else {
+            return;
+        };
+        let source = concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Age = Annotated[int, Field(ge=0, le=120)]\n",
+            "def f(x: Age) -> Age:\n",
+            "    return x\n",
+        );
+        let module = ruff_python_parser::parse_module(source).expect("the fixture parses").into_syntax();
+        let no_imports: ModuleResolver = &|_: &str| None;
+        let export = export_module(&module, source.as_bytes(), "f.py", no_imports, &kernel, None);
+        for omission in &export.omissions {
+            eprintln!("omission: '{}' — {}", omission.function, omission.reason);
+        }
+        let artifact = export.artifact.as_object().expect("the artifact is an object");
+        assert!(!artifact["refined"].as_object().unwrap().contains_key("version"), "no version field, ever");
+        let cases = artifact["functions"]["f"]["return"]["cases"].as_array().expect("return states cases");
+        assert_eq!(cases.len(), 1, "a plain numeric return states exactly one case");
+        assert_eq!(cases[0]["sort"], "number");
+        assert!(cases[0].get("set").is_some(), "a number case carries the full kernel wire set");
+    }
+
+    /// An `Optional[...]`-declared RETURN whose body's own join derives
+    /// `Kind::PossiblyUndefined` exports the INNER case(s) PLUS the null
+    /// case — the omission "a possibly-absent value has no faithful set
+    /// reading" is retired by the cases schema: absence now crosses as
+    /// wire-honest `{"sort": "null"}` alongside the value's own case,
+    /// rather than dropping the whole def from the artifact.
+    #[test]
+    fn an_optional_return_exports_the_inner_case_plus_null() {
+        let Some(kernel) = loaded_kernel() else {
+            return;
+        };
+        let source = concat!(
+            "from typing import Annotated, Optional\n",
+            "from pydantic import Field\n",
+            "type Age = Annotated[int, Field(ge=0, le=120)]\n",
+            "def maybe_level(x: Age) -> Optional[Age]:\n",
+            "    if x > 0:\n",
+            "        return x\n",
+            "    return None\n",
+        );
+        let module = ruff_python_parser::parse_module(source).expect("the fixture parses").into_syntax();
+        let no_imports: ModuleResolver = &|_: &str| None;
+        let export = export_module(&module, source.as_bytes(), "maybe_level.py", no_imports, &kernel, None);
+        for omission in &export.omissions {
+            eprintln!("omission: '{}' — {}", omission.function, omission.reason);
+        }
+        let artifact = export.artifact.as_object().expect("the artifact is an object");
+        let rendered = serde_json::to_string_pretty(&Value::Object(artifact.clone())).expect("the artifact renders");
+        eprintln!("emitted artifact for an Optional[Age] return:\n{rendered}");
+        let cases = artifact["functions"]["maybe_level"]["return"]["cases"]
+            .as_array()
+            .unwrap_or_else(|| panic!("maybe_level must export a return cases list, artifact: {rendered}"));
+        assert!(cases.len() >= 2, "a possibly-absent return states its inner case(s) plus null: {cases:?}");
+        assert!(
+            cases.iter().any(|case| case["sort"] == "null"),
+            "a possibly-absent return must carry a null case: {cases:?}"
+        );
+        assert!(
+            cases.iter().any(|case| case["sort"] == "number"),
+            "a possibly-absent return over an int body must still carry its inner number case: {cases:?}"
+        );
+    }
+
+    /// A `TypedDict`-declared return whose body builds and returns a dict
+    /// literal exports ONE object case: `members` carries the literal's
+    /// own key ('age', its declared `Age` set) and `closed: true` — a
+    /// dict literal always derives `Kind::Object` with `complete: true`
+    /// (`dict_literal_value`'s own construction: a literal states every
+    /// key it has, no others possible). Pinned VERBATIM per the mission's
+    /// own ask: the whole `cases` array this function's return states.
+    #[test]
+    fn a_typed_dict_return_exports_one_object_case_with_its_members_and_closed_true() {
+        let Some(kernel) = loaded_kernel() else {
+            return;
+        };
+        let source = concat!(
+            "from typing import Annotated, TypedDict\n",
+            "from pydantic import Field\n",
+            "type Age = Annotated[int, Field(ge=0, le=120)]\n",
+            "class PersonDict(TypedDict):\n",
+            "    age: Age\n",
+            "def make_person(x: Age) -> PersonDict:\n",
+            "    return {\"age\": x}\n",
+        );
+        let module = ruff_python_parser::parse_module(source).expect("the fixture parses").into_syntax();
+        let no_imports: ModuleResolver = &|_: &str| None;
+        let export = export_module(&module, source.as_bytes(), "make_person.py", no_imports, &kernel, None);
+        for omission in &export.omissions {
+            eprintln!("omission: '{}' — {}", omission.function, omission.reason);
+        }
+        let artifact = export.artifact.as_object().expect("the artifact is an object");
+        let rendered = serde_json::to_string_pretty(&Value::Object(artifact.clone())).expect("the artifact renders");
+        eprintln!("emitted artifact for a TypedDict return:\n{rendered}");
+        let cases = artifact["functions"]["make_person"]["return"]["cases"]
+            .as_array()
+            .unwrap_or_else(|| panic!("make_person must export a return cases list, artifact: {rendered}"));
+        assert_eq!(cases.len(), 1, "a single-shape TypedDict return states exactly one object case: {cases:?}");
+        assert_eq!(cases[0]["sort"], "object");
+        assert_eq!(cases[0]["closed"], true, "a dict literal's own completeness states every key it has");
+        let members = cases[0]["members"].as_object().expect("the object case states its members");
+        assert_eq!(members.len(), 1, "the literal states exactly one key: {members:?}");
+        let age_cases = members["age"].as_array().expect("'age' states its own cases list");
+        assert_eq!(age_cases.len(), 1, "'age' is a plain Age-declared int, one case");
+        assert_eq!(age_cases[0]["sort"], "number");
+        assert!(
+            age_cases[0].get("set").is_some(),
+            "'age' carries the full kernel wire set for its Age declaration"
+        );
+    }
+
+    /// A Result-style two-branch return (`{"ok": true, "value": …}` on one
+    /// arm, `{"ok": false, "error": …}` on the other) exports TWO object
+    /// cases in the one cases list — never one case with a nested
+    /// `variants` field. The join (`lattice_operations.rs::join_known`'s
+    /// `Kind::Object` arm) builds a `Kind::Object` carrying BOTH full
+    /// shapes on its own `variants` field precisely because the two
+    /// branches' key sets differ, and `object_cases_of` reads one case per
+    /// variant.
+    #[test]
+    fn a_result_shaped_two_branch_return_exports_two_object_cases() {
+        let Some(kernel) = loaded_kernel() else {
+            return;
+        };
+        let source = concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Age = Annotated[int, Field(ge=0, le=120)]\n",
+            "def make_result(x: Age) -> dict:\n",
+            "    if x > 0:\n",
+            "        return {\"ok\": True, \"value\": x}\n",
+            "    return {\"ok\": False, \"error\": x}\n",
+        );
+        let module = ruff_python_parser::parse_module(source).expect("the fixture parses").into_syntax();
+        let no_imports: ModuleResolver = &|_: &str| None;
+        let export = export_module(&module, source.as_bytes(), "make_result.py", no_imports, &kernel, None);
+        for omission in &export.omissions {
+            eprintln!("omission: '{}' — {}", omission.function, omission.reason);
+        }
+        let artifact = export.artifact.as_object().expect("the artifact is an object");
+        let rendered = serde_json::to_string_pretty(&Value::Object(artifact.clone())).expect("the artifact renders");
+        eprintln!("emitted artifact for a Result-shaped return:\n{rendered}");
+        let cases = artifact["functions"]["make_result"]["return"]["cases"]
+            .as_array()
+            .unwrap_or_else(|| panic!("make_result must export a return cases list, artifact: {rendered}"));
+        assert_eq!(cases.len(), 2, "a two-branch Result-style return states two object cases: {cases:?}");
+        for case in cases {
+            assert_eq!(case["sort"], "object");
+            let members = case["members"].as_object().expect("each object case states its members");
+            assert!(members.contains_key("ok"), "every branch carries its own 'ok' key: {members:?}");
+        }
+        let has_value_branch = cases.iter().any(|case| case["members"].as_object().unwrap().contains_key("value"));
+        let has_error_branch = cases.iter().any(|case| case["members"].as_object().unwrap().contains_key("error"));
+        assert!(has_value_branch, "one branch must carry 'value': {cases:?}");
+        assert!(has_error_branch, "the other branch must carry 'error': {cases:?}");
+    }
+
+    /// An object the domain genuinely cannot enumerate the members of (an
+    /// opaque/unknown object, never guessed at) stays an OMISSION naming
+    /// the construct — the object case never approximates a shape this
+    /// checker did not derive.
+    #[test]
+    fn an_unenumerable_object_return_stays_an_omission_naming_the_construct() {
+        let Some(kernel) = loaded_kernel() else {
+            return;
+        };
+        let source = concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Age = Annotated[int, Field(ge=0, le=120)]\n",
+            "def f(x: Age) -> dict:\n",
+            "    return globals()\n",
+        );
+        let module = ruff_python_parser::parse_module(source).expect("the fixture parses").into_syntax();
+        let no_imports: ModuleResolver = &|_: &str| None;
+        let export = export_module(&module, source.as_bytes(), "f.py", no_imports, &kernel, None);
+        assert!(
+            !export.artifact["functions"].as_object().unwrap().contains_key("f"),
+            "an unenumerable object return must not export a guessed cases list"
+        );
+        let reason = export
+            .omissions
+            .iter()
+            .find(|omission| omission.function == "f")
+            .unwrap_or_else(|| panic!("'f' must be named in an omission, got: {:?}", export.omissions.iter().map(|o| (&o.function, &o.reason)).collect::<Vec<_>>()));
+        eprintln!("omission for an unenumerable object return: {}", reason.reason);
+    }
+
+    /// A `Literal[...]`-declared entry parameter exports its own cases —
+    /// the OneOf set the literal states, read as a number case (the
+    /// entry's declared set carries no sequence form, so `scalar_case_of`
+    /// reads it numeric).
+    #[test]
+    fn a_literal_set_entry_exports_its_cases() {
+        let Some(kernel) = loaded_kernel() else {
+            return;
+        };
+        let source = concat!(
+            "from typing import Annotated, Literal\n",
+            "from pydantic import Field\n",
+            "type Age = Annotated[int, Field(ge=0, le=120)]\n",
+            "def f(level: Literal[1, 2, 4]) -> Age:\n",
+            "    return level\n",
+        );
+        let module = ruff_python_parser::parse_module(source).expect("the fixture parses").into_syntax();
+        let no_imports: ModuleResolver = &|_: &str| None;
+        let export = export_module(&module, source.as_bytes(), "f.py", no_imports, &kernel, None);
+        for omission in &export.omissions {
+            eprintln!("omission: '{}' — {}", omission.function, omission.reason);
+        }
+        let artifact = export.artifact.as_object().expect("the artifact is an object");
+        let entry = artifact["functions"]["f"]["entry"].as_array().expect("entry is an array");
+        assert_eq!(entry.len(), 1);
+        assert_eq!(entry[0]["name"], "level");
+        let cases = entry[0]["cases"].as_array().expect("the Literal entry states cases");
+        assert_eq!(cases.len(), 1, "a plain Literal[...] entry (no None arm) states one case");
+        assert_eq!(cases[0]["sort"], "number");
+        let forms = cases[0]["set"]["forms"].as_array().expect("the case's set carries forms");
+        assert!(!forms.is_empty(), "the Literal[1, 2, 4] entry states a non-empty OneOf set");
+    }
+
     /// The tutorial fixture exported end to end: every artifact key
     /// present, the hash prefixed and full-width, and the entry row
     /// carrying the sequence shape `samples`' own declaration states.
@@ -1960,11 +2680,15 @@ mod tests {
             "audio_level_python_only.py",
             no_imports,
             &kernel,
+            None,
         );
         let artifact = export.artifact.as_object().expect("the artifact is an object");
 
         assert_eq!(artifact["refined"]["kind"], ARTIFACT_KIND);
-        assert_eq!(artifact["refined"]["version"], ARTIFACT_VERSION);
+        assert!(
+            artifact["refined"].as_object().expect("refined is an object").get("version").is_none(),
+            "the RULED schema carries no version field, ever"
+        );
         assert_eq!(artifact["target"]["file"], "audio_level_python_only.py");
         let hash = artifact["target"]["contentHash"]
             .as_str()
@@ -2003,24 +2727,30 @@ mod tests {
             let row = &rows[0];
             assert_eq!(row["name"], "samples");
             // `Annotated[list[Sample], Field(min_length=1)]` — a
-            // sequence row, its element set present and its length floor
-            // the declaration's own 1.
+            // sequence row, its element cases present and its length
+            // floor the declaration's own 1.
             let sequence = row
                 .get("sequence")
                 .unwrap_or_else(|| panic!("'{name}' states a sequence entry"));
             assert_eq!(sequence["lengthAtLeast"], 1);
+            let element_cases = sequence["element"]["cases"]
+                .as_array()
+                .expect("the element states its cases");
+            assert_eq!(element_cases.len(), 1, "a plain element declaration states one case");
             assert!(
-                !sequence["element"]["forms"]
+                !element_cases[0]["set"]["forms"]
                     .as_array()
-                    .expect("the element set carries forms")
+                    .expect("the element case's set carries forms")
                     .is_empty(),
                 "'{name}' states an empty element set"
             );
             let returned = &entry["return"];
+            let return_cases = returned["cases"].as_array().expect("the return states its cases");
+            assert_eq!(return_cases.len(), 1, "a plain numeric return states one case");
             assert!(
-                !returned["set"]["forms"]
+                !return_cases[0]["set"]["forms"]
                     .as_array()
-                    .expect("the return set carries forms")
+                    .expect("the return case's set carries forms")
                     .is_empty(),
                 "'{name}' states an empty return set"
             );
@@ -2121,5 +2851,96 @@ mod tests {
         assert!(cached_hash_matches(&matching_path, source));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `export_module` WITH an `entry_directory` joins a relative
+    /// foreign-edge target against it before the export walk's own
+    /// artifact read — the export seam's own twin of
+    /// `check.rs`'s `derived_return_values_at_with_a_directory_joins_the_relative_target_before_declining`,
+    /// pinned here at the `export_function` level: the def carries a
+    /// declared entry (`x: Age`), so its own omission is what names the
+    /// JOINED path, proving `export_module` threads `entry_directory`
+    /// into `derived_return_values_at` rather than dropping it on the
+    /// way from the CLI/LSP callers into the shared walk.
+    #[test]
+    fn export_module_with_a_directory_joins_the_relative_target_before_declining() {
+        let Some(kernel) = loaded_kernel() else {
+            return;
+        };
+        let source = concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Age = Annotated[int, Field(ge=0, le=120)]\n",
+            "\n",
+            "def f(x: Age):\n",
+            "    result = subprocess.run(\n",
+            "        [\"node\", \"./audio_level.ts\"],\n",
+            "        input=json.dumps(x),\n",
+            "        capture_output=True,\n",
+            "        text=True,\n",
+            "    )\n",
+            "    parsed = json.loads(result.stdout)\n",
+        );
+        let module = ruff_python_parser::parse_module(source).expect("the fixture parses").into_syntax();
+        let no_imports: ModuleResolver = &|_: &str| None;
+        let directory = std::path::Path::new("/tmp/refinedpy-export-directory-fixture");
+        let export = export_module(&module, source.as_bytes(), "f.py", no_imports, &kernel, Some(directory));
+        let reason = export
+            .omissions
+            .iter()
+            .find(|omission| omission.function == "f")
+            .unwrap_or_else(|| {
+                panic!(
+                    "'f' must be named in an omission (its foreign-edge return is undetermined), got: {:?}",
+                    export.omissions.iter().map(|o| (&o.function, &o.reason)).collect::<Vec<_>>()
+                )
+            });
+        // `Path::join` keeps the source's own leading "./" verbatim
+        // (foreign_edge.rs's own join), so the joined spelling is the
+        // directory plus that exact relative text, not a normalized form.
+        let joined = directory.join("./audio_level.ts");
+        assert!(
+            reason.reason.contains(&joined.to_string_lossy().into_owned()),
+            "with entry_directory given, the export walk must join the target before the read: {}",
+            reason.reason
+        );
+    }
+
+    /// `["ok", "warn", "error"][code]` where `code` is a BOUNDED (not
+    /// exact) integer index — the join over all three positions builds a
+    /// top-level `Union` of `Concatenation` forms, which `states_
+    /// sequence`'s own non-recursive top-layer check alone misreads as
+    /// numeric (its top form IS `Union`, never `Concatenation` itself).
+    /// This pins the export's own return case at `"sort": "string"`,
+    /// never `"number"`, for exactly the shape `text_status.py`'s
+    /// `make_status` derives.
+    #[test]
+    fn export_reads_a_joined_string_list_index_as_a_string_case_not_a_number_case() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let source = "from typing import Annotated\n\
+             from pydantic import Field\n\
+             \n\
+             def make_status(code: Annotated[int, Field(ge=0, le=2)]) -> str:\n\
+             \x20   return [\"ok\", \"warn\", \"error\"][code]\n";
+        let module = ruff_python_parser::parse_module(source).expect("test module parses").into_syntax();
+        let no_imports: ModuleResolver = &|_: &str| None;
+        let export = export_module(&module, source.as_bytes(), "text_status.py", no_imports, &kernel, None);
+        assert!(
+            export.omissions.is_empty(),
+            "make_status must export cleanly, got omissions: {:?}",
+            export.omissions.iter().map(|o| (&o.function, &o.reason)).collect::<Vec<_>>()
+        );
+        let entry = export
+            .artifact
+            .get("functions")
+            .and_then(|functions| functions.get("make_status"))
+            .expect("make_status must be present in the artifact");
+        let sort = entry
+            .get("return")
+            .and_then(|value| value.get("cases"))
+            .and_then(|cases| cases.get(0))
+            .and_then(|case| case.get("sort"))
+            .and_then(Value::as_str);
+        assert_eq!(sort, Some("string"), "artifact: {entry:?}");
     }
 }

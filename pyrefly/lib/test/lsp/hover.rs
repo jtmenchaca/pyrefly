@@ -178,14 +178,12 @@ xyz = [foo.meth]
     let report = get_batched_lsp_operations_report(&[("main", code)], get_test_report);
     assert!(report.contains("(method) meth: def meth(self: Foo) -> None: ..."));
     assert!(report.contains("(variable) xyz: list[(self: Foo) -> None]"));
+    // RefinedPy drops the "Go to X" definition-location link from every
+    // hover it serves (HoverValue::format, lib/lsp/wasm/hover.rs) — the
+    // host type line is the whole story here.
     assert!(
-        report.contains("Go to [list]"),
-        "Expected 'Go to [list]' link, got: {}",
-        report
-    );
-    assert!(
-        report.contains("builtins.pyi"),
-        "Expected link to builtins.pyi, got: {}",
+        !report.contains("Go to ["),
+        "RefinedPy hover must not carry a 'Go to' link, got: {}",
         report
     );
 }
@@ -565,7 +563,11 @@ a: int = "test"  # type: ignore
 }
 
 #[test]
-fn hover_shows_type_sources_for_narrow_and_first_use() {
+fn hover_hides_type_sources_for_narrow_and_first_use() {
+    // RefinedPy drops the "Type source" block (narrowing / first-use
+    // inference) from every hover it serves — the host type line is
+    // the whole story, with the refined-set line (if any) appended by
+    // `splice_refinedpy_hover` after it.
     let code = r#"
 def f(x: int | None) -> None:
     if x is None:
@@ -594,40 +596,29 @@ def f(x: int | None) -> None:
 ```python
 (parameter) x: int
 ```
----
-**Type source**
-- Narrowed by condition at 3:13: `x is not None`
-
 
 9 |     y
         ^
 ```python
 (variable) y: list[int]
 ```
----
-**Type source**
-- Inferred from first use at 6:5: `y.append(1)`
 "#
         .trim(),
         report.trim(),
     );
     let report_with_links = get_batched_lsp_operations_report(&[("main", code)], get_test_report);
     assert!(
-        report_with_links.contains("Go to ["),
-        "Expected hover to include go-to links, got: {report_with_links}"
+        !report_with_links.contains("Go to ["),
+        "RefinedPy hover must not carry a 'Go to' link, got: {report_with_links}"
     );
     assert!(
-        report_with_links.contains("](file://"),
-        "Expected hover links to use file URLs, got: {report_with_links}"
-    );
-    assert!(
-        report_with_links.contains("builtins.pyi"),
-        "Expected hover links to include builtins.pyi, got: {report_with_links}"
+        !report_with_links.contains("builtins.pyi"),
+        "RefinedPy hover must not link to builtins.pyi, got: {report_with_links}"
     );
 }
 
 #[test]
-fn hover_type_source_compound_narrow() {
+fn hover_hides_type_source_for_compound_narrow() {
     let code = r#"
 def f(x: int | str | None) -> None:
     if isinstance(x, int) and x > 0:
@@ -644,17 +635,13 @@ def f(x: int | str | None) -> None:
         }
     });
     assert!(
-        report.contains("**Type source**"),
-        "Expected type source section in hover, got: {report}"
-    );
-    assert!(
-        report.contains("isinstance(x, int)"),
-        "Expected isinstance narrow in hover, got: {report}"
+        !report.contains("**Type source**"),
+        "RefinedPy hover must not carry a Type source section, got: {report}"
     );
 }
 
 #[test]
-fn hover_type_source_match_capture_then_narrow() {
+fn hover_hides_type_source_for_match_capture_then_narrow() {
     let code = r#"
 def f(subject: object) -> None:
     match subject:
@@ -673,12 +660,8 @@ def f(subject: object) -> None:
         }
     });
     assert!(
-        report.contains("**Type source**"),
-        "Expected type source section in hover, got: {report}"
-    );
-    assert!(
-        report.contains("isinstance(y, int)"),
-        "Expected the capture's own narrow attributed to it, got: {report}"
+        !report.contains("**Type source**"),
+        "RefinedPy hover must not carry a Type source section, got: {report}"
     );
 }
 
@@ -710,7 +693,7 @@ def f(x: int | None) -> None:
 }
 
 #[test]
-fn hover_type_source_attribute_narrow() {
+fn hover_hides_type_source_for_attribute_narrow() {
     let code = r#"
 class C:
     x: int | None
@@ -730,12 +713,8 @@ def f(c: C) -> None:
         }
     });
     assert!(
-        report.contains("**Type source**"),
-        "Expected type source section in field hover, got: {report}"
-    );
-    assert!(
-        report.contains("c.x is not None"),
-        "Expected attribute narrow in field hover, got: {report}"
+        !report.contains("**Type source**"),
+        "RefinedPy hover must not carry a Type source section, got: {report}"
     );
 }
 
@@ -1333,25 +1312,17 @@ z: list[int] = []
 #^
 "#;
     let report = get_batched_lsp_operations_report(&[("main", code)], get_test_report);
+    // RefinedPy drops the "Go to X" definition-location link from every
+    // hover it serves — a builtin type's hover is the host type line
+    // alone, with no link to builtins.pyi.
     assert!(
-        report.contains("Go to [str]"),
-        "Expected 'Go to [str]' link for str type, got: {}",
+        !report.contains("Go to ["),
+        "RefinedPy hover must not carry a 'Go to' link, got: {}",
         report
     );
     assert!(
-        report.contains("Go to [int]"),
-        "Expected 'Go to [int]' link for int type, got: {}",
-        report
-    );
-    assert!(
-        report.contains("Go to") && report.contains("[list]"),
-        "Expected 'Go to' link with [list] for list type, got: {}",
-        report
-    );
-
-    assert!(
-        report.contains("builtins.pyi"),
-        "Expected links to builtins.pyi, got: {}",
+        !report.contains("builtins.pyi"),
+        "RefinedPy hover must not link to builtins.pyi, got: {}",
         report
     );
 }

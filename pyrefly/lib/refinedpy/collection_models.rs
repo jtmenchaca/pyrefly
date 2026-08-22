@@ -358,6 +358,86 @@ fn list_index_read(items: &[AbstractValue], index: i64) -> Option<AbstractValue>
     Some(items[adjusted as usize].clone())
 }
 
+/// `container[index]` on a known LIST/TUPLE receiver whose index is a
+/// bounded Integer RANGE rather than one exact value — `["ok", "warn",
+/// "error"][code]` where `code: Annotated[int, Field(ge=0, le=2)]` seeds
+/// `Kind::Set` (`check.rs::seed_parameters`'s scalar-declared-set arm),
+/// never `Kind::Values`, so `known_integer_index` (the exact-value
+/// reader) answers `None` and this is the caller's fallback. Reads the
+/// index's own closed bound (`integer_range_bounds`) and, ONLY when
+/// every integer in `[lo, hi]` lands in range after negative-index
+/// adjustment (never a partial range — a bound that could still fall
+/// outside `items` after adjustment answers `None` rather than guessing
+/// which positions are safe), joins every position `items[lo..=hi]` —
+/// the loosest sound answer once the concrete index is unknown but its
+/// possible positions are all known and all in-bounds. No kernel round
+/// trip: `hi - lo` is always small enough to enumerate directly (a
+/// range wide enough to be impractical to enumerate is also almost
+/// certainly wider than the list itself, which the in-bounds check
+/// already refuses).
+fn list_bounded_range_read(items: &[AbstractValue], index: &AbstractValue) -> Option<AbstractValue> {
+    if index.kind != Kind::Set || index.kind_tag != Some(PrimitiveKind::Integer) {
+        return None;
+    }
+    let (lo, hi) = integer_range_bounds(&index.set)?;
+    let length = items.len() as i64;
+    if lo < 0 || hi < lo {
+        // negative bounds/indices are not modeled here — CPython's own
+        // adjustment (`index + length`) would need to apply PER
+        // CANDIDATE index, which a single [lo, hi] window cannot state
+        // uniformly once negative values are mixed in with nonnegative
+        // ones; a purely negative or purely nonnegative window still
+        // wants an explicit brief before widening this reader
+        return None;
+    }
+    if hi >= length {
+        return None;
+    }
+    let mut joined: Option<AbstractValue> = None;
+    for position in lo..=hi {
+        let candidate = items[position as usize].clone();
+        joined = Some(match joined {
+            None => candidate,
+            Some(so_far) => join_known(so_far, candidate),
+        });
+    }
+    joined
+}
+
+/// The closed integer bound `[lo, hi]` a scalar `RefinedSet` states, read
+/// from its own top-level `AtLeast`/`Above`/`AtMost`/`Below` forms — the
+/// same kind of syntactic hull `foreign_edge.rs::hull_of` reads for its
+/// own uncarriable-corner check, narrowed here to the CLOSED case only
+/// (`None` the moment either side is unbounded, since an unbounded range
+/// can never be enumerated). `Above`/`Below` are the strict-bound forms
+/// (`x > a`/`x < a`) — `.ceil()`/`.floor()` step them to the nearest
+/// INTEGER the strict bound still admits, which is exact for an
+/// Integer-sorted set (a strict bound between two consecutive integers
+/// admits the same integers a non-strict bound at the stepped value
+/// would). A set carrying any OTHER form (`Union`, `MultipleOf`, `OneOf`,
+/// a bare `Integer` marker with no numeric bound) answers `None` — this
+/// reader is the plain closed-window case only, not a general hull.
+fn integer_range_bounds(set: &refined_sets::refinement_forms::RefinedSet) -> Option<(i64, i64)> {
+    use refined_sets::refinement_forms::Form;
+    let mut lo: Option<f64> = None;
+    let mut hi: Option<f64> = None;
+    for form in &set.forms {
+        match form.form {
+            Form::AtLeast => lo = Some(lo.map_or(form.a, |current: f64| current.max(form.a))),
+            Form::Above => lo = Some(lo.map_or(form.a.floor() + 1.0, |current: f64| current.max(form.a.floor() + 1.0))),
+            Form::AtMost => hi = Some(hi.map_or(form.a, |current: f64| current.min(form.a))),
+            Form::Below => hi = Some(hi.map_or(form.a.ceil() - 1.0, |current: f64| current.min(form.a.ceil() - 1.0))),
+            Form::Integer => {}
+            _ => return None,
+        }
+    }
+    let (lo, hi) = (lo?, hi?);
+    if !lo.is_finite() || !hi.is_finite() {
+        return None;
+    }
+    Some((lo as i64, hi as i64))
+}
+
 /// `container[index]` on a known EXACT STRING receiver (`Kind::Values`
 /// tagged `PrimitiveKind::String`) with a known Integer index: the same
 /// negative-index adjustment `list_index_read` applies (expressions.rst,
@@ -651,8 +731,10 @@ fn star_element_read(container: &AbstractValue, index: &AbstractValue) -> Option
 pub fn subscript_read(container: &AbstractValue, index: &AbstractValue) -> Option<AbstractValue> {
     match container.kind {
         Kind::List => {
-            let position = known_integer_index(index)?;
-            list_index_read(&container.items, position)
+            if let Some(position) = known_integer_index(index) {
+                return list_index_read(&container.items, position);
+            }
+            list_bounded_range_read(&container.items, index)
         }
         Kind::Values if container.kind_tag == Some(PrimitiveKind::String) => {
             let position = known_integer_index(index)?;
@@ -2076,5 +2158,81 @@ mod tests {
         let (new_receiver, result) = mutated_receiver("reverse", &list, &[]).expect("reverse must decide");
         assert_eq!(new_receiver.items, vec![integer(3.0), integer(2.0), integer(1.0)]);
         assert_eq!(result.kind, Kind::Null);
+    }
+
+    // --- list_bounded_range_read / integer_range_bounds ---
+
+    /// A bounded Integer-sorted index (`ge=0, le=2` — the seeded shape
+    /// `["ok", "warn", "error"][code]` reads) into a three-element list
+    /// of exact strings: every position is in range, so the read joins
+    /// all three — `["ok", "warn", "error"][code]`'s own shape.
+    fn bounded_index(lo: f64, hi: f64) -> AbstractValue {
+        AbstractValue {
+            kind_tag: Some(PrimitiveKind::Integer),
+            ..known_set(make_refined_set(vec![at_least(lo), at_most(hi)]), None, TrustProved, SetKindTag::None)
+        }
+    }
+
+    #[test]
+    fn subscript_read_bounded_index_into_full_length_list_joins_every_position() {
+        let list = list_literal_value(&[string("ok"), string("warn"), string("error")]);
+        let index = bounded_index(0.0, 2.0);
+        let got = subscript_read(&list, &index).expect("every index in [0, 2] is in range");
+        let want = join_known(join_known(string("ok"), string("warn")), string("error"));
+        assert_eq!(got, want);
+    }
+
+    /// A bounded index narrower than the full list still joins only the
+    /// positions the range actually admits.
+    #[test]
+    fn subscript_read_bounded_index_into_a_sub_range_joins_only_those_positions() {
+        let list = list_literal_value(&[string("ok"), string("warn"), string("error")]);
+        let index = bounded_index(0.0, 1.0);
+        let got = subscript_read(&list, &index).expect("[0, 1] is in range");
+        let want = join_known(string("ok"), string("warn"));
+        assert_eq!(got, want);
+    }
+
+    /// A bounded index whose ceiling reaches past the list's own length
+    /// declines rather than joining only the in-range prefix — a partial
+    /// read would misreport what the OUT-of-range positions could hold.
+    #[test]
+    fn subscript_read_bounded_index_past_list_length_declines() {
+        let list = list_literal_value(&[string("ok"), string("warn"), string("error")]);
+        let index = bounded_index(0.0, 5.0);
+        assert_eq!(subscript_read(&list, &index), None);
+    }
+
+    /// An UNBOUNDED index (no ceiling at all — `integer_range_bounds`
+    /// answers `None` for a set with no `AtMost`/`Below` form) declines:
+    /// there is no enumerable window to join over.
+    #[test]
+    fn subscript_read_unbounded_index_declines() {
+        let list = list_literal_value(&[string("ok"), string("warn"), string("error")]);
+        let index = AbstractValue {
+            kind_tag: Some(PrimitiveKind::Integer),
+            ..known_set(make_refined_set(vec![at_least(0.0)]), None, TrustProved, SetKindTag::None)
+        };
+        assert_eq!(subscript_read(&list, &index), None);
+    }
+
+    /// A NEGATIVE-lo range declines — this reader models only the
+    /// nonnegative window (per its own doc), never CPython's per-index
+    /// negative adjustment applied across a mixed-sign range.
+    #[test]
+    fn subscript_read_negative_lo_index_declines() {
+        let list = list_literal_value(&[string("ok"), string("warn"), string("error")]);
+        let index = bounded_index(-1.0, 1.0);
+        assert_eq!(subscript_read(&list, &index), None);
+    }
+
+    /// A plain EXACT index still takes the exact-value row (`Kind::
+    /// Values`, never reaching `list_bounded_range_read` at all) — pins
+    /// that the new bounded-range fallback never displaces the existing
+    /// exact read.
+    #[test]
+    fn subscript_read_exact_index_still_reads_one_position() {
+        let list = list_literal_value(&[string("ok"), string("warn"), string("error")]);
+        assert_eq!(subscript_read(&list, &integer(1.0)), Some(string("warn")));
     }
 }

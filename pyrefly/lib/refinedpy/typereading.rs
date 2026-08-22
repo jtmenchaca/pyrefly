@@ -164,7 +164,12 @@ pub fn declared_refinement(
             Some(DeclaredRefinement {
                 set: entry.set.clone(),
                 spelling: container_spelling.unwrap_or_else(|| spelling.to_owned()),
-                admits_none: false,
+                // The alias's OWN admission (`type OptionalAge =
+                // Optional[Age]`, `surface::peel_alias_optional`) —
+                // never the element's; a container alias's admits_none
+                // is a fact about the ALIAS NAME itself admitting None,
+                // orthogonal to whether its element slot does.
+                admits_none: entry.admits_none,
                 element,
                 element_length: entry.length_window,
                 generator: None,
@@ -905,7 +910,13 @@ mod tests {
         let mut aliases = HashMap::new();
         aliases.insert(
             "PositiveInt".to_owned(),
-            AliasEntry { set: make_refined_set(vec![at_least(1.0)]), head: None, element: None, length_window: None },
+            AliasEntry {
+                set: make_refined_set(vec![at_least(1.0)]),
+                head: None,
+                element: None,
+                length_window: None,
+                admits_none: false,
+            },
         );
         let imports = no_imports();
         let environment = no_locals();
@@ -1050,7 +1061,13 @@ mod tests {
         let mut aliases = HashMap::new();
         aliases.insert(
             "Age".to_owned(),
-            AliasEntry { set: make_refined_set(vec![at_least(0.0)]), head: None, element: None, length_window: None },
+            AliasEntry {
+                set: make_refined_set(vec![at_least(0.0)]),
+                head: None,
+                element: None,
+                length_window: None,
+                admits_none: false,
+            },
         );
         let imports = no_imports();
         let environment = no_locals();
@@ -1208,7 +1225,13 @@ mod tests {
         let mut aliases = HashMap::new();
         aliases.insert(
             "PositiveInt".to_owned(),
-            AliasEntry { set: make_refined_set(vec![at_least(1.0)]), head: None, element: None, length_window: None },
+            AliasEntry {
+                set: make_refined_set(vec![at_least(1.0)]),
+                head: None,
+                element: None,
+                length_window: None,
+                admits_none: false,
+            },
         );
         let imports = no_imports();
         let mut locally_bound = HashSet::new();
@@ -1224,7 +1247,13 @@ mod tests {
         let mut aliases = HashMap::new();
         aliases.insert(
             "PositiveInt".to_owned(),
-            AliasEntry { set: make_refined_set(vec![at_least(1.0)]), head: None, element: None, length_window: None },
+            AliasEntry {
+                set: make_refined_set(vec![at_least(1.0)]),
+                head: None,
+                element: None,
+                length_window: None,
+                admits_none: false,
+            },
         );
         let imports = no_imports();
         let environment = no_locals();
@@ -1295,11 +1324,23 @@ mod tests {
         let mut aliases = HashMap::new();
         aliases.insert(
             "Age".to_owned(),
-            AliasEntry { set: make_refined_set(vec![at_least(0.0)]), head: None, element: None, length_window: None },
+            AliasEntry {
+                set: make_refined_set(vec![at_least(0.0)]),
+                head: None,
+                element: None,
+                length_window: None,
+                admits_none: false,
+            },
         );
         aliases.insert(
             "Label".to_owned(),
-            AliasEntry { set: make_refined_set(vec![at_least(1.0)]), head: None, element: None, length_window: None },
+            AliasEntry {
+                set: make_refined_set(vec![at_least(1.0)]),
+                head: None,
+                element: None,
+                length_window: None,
+                admits_none: false,
+            },
         );
         aliases
     }

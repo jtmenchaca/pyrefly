@@ -77,13 +77,17 @@ use crate::refinedpy::fact_export::sha256_hex;
 /// `.refined/cache/<relpath>/audio-level.ts.refined.json`.
 const FOREIGN_ARTIFACT_SUFFIX: &str = ".refined.json";
 
-/// The one envelope this consumer admits (schema-v2.md). `language` is
-/// checked alongside `(kind, version)` — the kind is shared across every
-/// producer language, so the language field is what routes to the right
-/// runtime-band pins. A different triple is a decline, never a
-/// best-effort read: the fields' meanings are what the version pins.
+/// The one envelope this consumer admits (the RULED cases schema,
+/// JT-approved 2026-08-21). `language` is checked alongside `kind` — the
+/// kind is shared across every producer language, so the language field
+/// is what routes to the right runtime-band pins. NO version field is
+/// ever read or written: the schema carries no version ceremony, so a
+/// reader strict-parses the CURRENT shape and any other shape (a
+/// version field present, a bare "set", the old sequence spelling) is
+/// NO-FACT — the same decline every other unreadable artifact earns,
+/// re-exported by the existing self-refresh path rather than read
+/// best-effort.
 const FOREIGN_ARTIFACT_KIND: &str = "fact-artifact";
-const FOREIGN_ARTIFACT_VERSION: i64 = 2;
 const FOREIGN_ARTIFACT_LANGUAGE: &str = "typescript";
 
 /// The runtime band this checker's TypeScript pins commit to.
@@ -110,17 +114,46 @@ const FOREIGN_PRODUCER_NAME: &str = "refinedts-check-bin";
 /// built in place rather than installed onto `PATH`.
 const FOREIGN_PRODUCER_RELATIVE: &str = "packages/refinedts/refined-ts-go/refinedts-check-bin";
 
+/// One admitted case the wire carries — the reader's own twin of the
+/// writer's `Case` (`fact_export.rs`): the full kernel wire set grammar
+/// verbatim for a number/string case, and no set at all for the two
+/// whole-sort floors. `decode_wire_set` is the SAME decoder every other
+/// kernel answer goes through, so a set that crossed this edge and a set
+/// the kernel answered are the same value.
+///
+/// `Object` carries the RULED object case's own vocabulary (CROSS-
+/// LANGUAGE-EDGE.md §17, JT-prioritized 2026-08-21): each member NAME
+/// mapped to ITS OWN cases list (recursed through this same enum, so a
+/// nested object case is an ordinary `ForeignCase::Object` sitting inside
+/// a member's list) and whether the key set is `closed`. Stored here so
+/// the CONSUMER-side lowering (`foreign_edge.rs`'s object-case arm, a
+/// stated follow-up — not this lane's) has a typed shape to match on
+/// rather than re-parsing the JSON a second time.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ForeignCase {
+    Number(RefinedSet),
+    String(RefinedSet),
+    Boolean,
+    Null,
+    Object {
+        members: Vec<(String, Vec<ForeignCase>)>,
+        closed: bool,
+    },
+}
+
 /// One parameter position the target states: either a SEQUENCE (an
-/// element set plus the length floor the body relies on, carried as
-/// `(element, lengthAtLeast)`) or a plain SCALAR set.
+/// element's own cases plus the length floor the body relies on,
+/// carried as `(cases, lengthAtLeast)`) or a plain SCALAR cases list.
 #[derive(Debug, Clone)]
 pub struct ForeignTsEntry {
     pub name: String,
-    /// `Some` for a sequence position — the element set and the
+    /// `Some` for a sequence position — the element's own cases and the
     /// declaration's own length floor.
-    pub sequence: Option<(RefinedSet, i64)>,
-    /// `Some` for a scalar position — the position's own set.
-    pub scalar: Option<RefinedSet>,
+    pub sequence: Option<(Vec<ForeignCase>, i64)>,
+    /// `Some` for a scalar position — the position's own cases list,
+    /// never empty when present (a single case still spells as a
+    /// one-element list, matching the wire's own convention).
+    pub scalar: Option<Vec<ForeignCase>>,
 }
 
 /// One target function's whole exported fact.
@@ -128,7 +161,11 @@ pub struct ForeignTsEntry {
 pub struct ForeignTsFunctionFact {
     pub name: String,
     pub entry: Vec<ForeignTsEntry>,
-    pub return_set: RefinedSet,
+    /// The return's own cases list — one case lowers directly to a
+    /// single value; more than one lowers to a `Kind::KindUnion` of
+    /// arms (`foreign_edge.rs::foreign_return_value` does the lowering,
+    /// the one place a `ForeignCase` list becomes an `AbstractValue`).
+    pub return_cases: Vec<ForeignCase>,
     /// CHANNEL PURITY: the target writes NOTHING to stdout but the
     /// serialized result. Not a premise this file discharges — a
     /// property of the consumed function's return, checked where the
@@ -258,6 +295,10 @@ pub fn read_foreign_ts_artifact(target_path: &str) -> Result<ForeignTsArtifact, 
 /// memo consulted. A missing or failed artifact triggers ONE export
 /// attempt through the resolved producer; when no producer resolves,
 /// the sentence names the file and the command, exactly as before.
+/// `REFINED_EXPORT_CHAIN` is read ONCE here, at the point the spawn
+/// decision is made — never inside `export_foreign_ts_artifact` itself,
+/// which takes the chain as a plain parameter so it is testable without
+/// mutating process environment.
 fn read_foreign_ts_artifact_uncached(
     target_path: &str,
     artifact_path: &Path,
@@ -266,7 +307,8 @@ fn read_foreign_ts_artifact_uncached(
     if sentence.is_empty() {
         return (artifact, String::new());
     }
-    if let Err(export_sentence) = export_foreign_ts_artifact(target_path, artifact_path) {
+    let export_chain = std::env::var(EXPORT_CHAIN_ENV_VAR).unwrap_or_default();
+    if let Err(export_sentence) = export_foreign_ts_artifact(target_path, artifact_path, &export_chain) {
         return (None, format!("{sentence} (auto-export declined: {export_sentence})"));
     }
     read_and_verify_foreign_ts_artifact(target_path, artifact_path)
@@ -357,9 +399,58 @@ fn search_path_for(name: &str) -> Option<PathBuf> {
     std::env::split_paths(&path_var).map(|dir| dir.join(name)).find(|candidate| candidate.exists())
 }
 
+/// The environment variable carrying the cross-process auto-export
+/// chain: a colon-separated list of absolute target paths, one per
+/// export hop already in flight. This is internal state no invocation
+/// reads on purpose — it governs WHETHER an auto-export spawns, never
+/// WHICH binary runs, and is therefore a wholly separate concern from
+/// the no-env-producer-resolution ruling at `FOREIGN_PRODUCER_NAME`'s
+/// own doc (2026-08-20: the producer's OWN identity is never read from
+/// an environment variable, because that would break command-approval
+/// permissions). A Python checker auto-exporting a TypeScript target
+/// whose own auto-export recurses back to a Python target already on
+/// this chain would otherwise spawn forever, each hop a fresh process
+/// neither side's own in-memory recursion guard can see across.
+const EXPORT_CHAIN_ENV_VAR: &str = "REFINED_EXPORT_CHAIN";
+
+/// Whether `target_path`'s absolute form already appears as a hop in
+/// `chain` (the colon-separated `REFINED_EXPORT_CHAIN` value read at
+/// this process's own entry point) — `true` means spawning the
+/// producer for this target would recurse back through a hop already
+/// in flight, and the caller must decline rather than spawn.
+fn export_chain_contains(chain: &str, target_path: &str) -> bool {
+    let absolute_target = std::path::absolute(target_path).unwrap_or_else(|_| PathBuf::from(target_path));
+    chain.split(':').any(|hop| !hop.is_empty() && Path::new(hop) == absolute_target)
+}
+
+/// The sentence a chain-marked decline states: names the recursing
+/// target and the whole chain that led back to it, so a reader sees
+/// the cycle rather than a generic refusal.
+fn export_chain_cycle_sentence(chain: &str, target_path: &str) -> String {
+    let absolute_target = std::path::absolute(target_path).unwrap_or_else(|_| PathBuf::from(target_path));
+    let mut hops: Vec<&str> = chain.split(':').filter(|hop| !hop.is_empty()).collect();
+    hops.push(absolute_target.to_str().unwrap_or(target_path));
+    format!(
+        "the export of {} recurses back through a target already in flight — the auto-export chain is {}",
+        absolute_target.display(),
+        hops.join(" \u{2192} ")
+    )
+}
+
 /// Runs the resolved producer into the cache entry, answering `Ok(())`
-/// on success and `Err` naming what stopped it.
-fn export_foreign_ts_artifact(target_path: &str, artifact_path: &Path) -> Result<(), String> {
+/// on success and `Err` naming what stopped it. `export_chain` is this
+/// process's own `REFINED_EXPORT_CHAIN` value (read once, at the
+/// `-export-fact` entry point, and threaded down here as a plain
+/// parameter — never re-read from the environment inside this
+/// function) — when `target_path` already appears on it, this declines
+/// with the cycle sentence rather than spawning; otherwise the CHILD's
+/// own environment carries the chain plus `target_path` appended, so a
+/// nested auto-export the child triggers sees the extended chain in
+/// turn.
+fn export_foreign_ts_artifact(target_path: &str, artifact_path: &Path, export_chain: &str) -> Result<(), String> {
+    if export_chain_contains(export_chain, target_path) {
+        return Err(export_chain_cycle_sentence(export_chain, target_path));
+    }
     let Some(producer) = resolve_foreign_producer(target_path) else {
         return Err(format!(
             "no {FOREIGN_PRODUCER_NAME} under the project root and none on PATH"
@@ -368,11 +459,19 @@ fn export_foreign_ts_artifact(target_path: &str, artifact_path: &Path) -> Result
     if let Some(parent) = artifact_path.parent() {
         std::fs::create_dir_all(parent).map_err(|err| format!("the cache directory could not be created: {err}"))?;
     }
+    let absolute_target = std::path::absolute(target_path).unwrap_or_else(|_| PathBuf::from(target_path));
+    let absolute_target_words = absolute_target.to_string_lossy().into_owned();
+    let child_chain = if export_chain.is_empty() {
+        absolute_target_words.clone()
+    } else {
+        format!("{export_chain}:{absolute_target_words}")
+    };
     let output = Command::new(&producer)
         .arg("-export-fact")
         .arg(target_path)
         .arg("-o")
         .arg(artifact_path)
+        .env(EXPORT_CHAIN_ENV_VAR, child_chain)
         .output()
         .map_err(|err| format!("the export run failed: {err}"))?;
     if !output.status.success() {
@@ -422,6 +521,13 @@ fn read_and_verify_foreign_ts_artifact(
     if let Err(sentence) = check_target_integrity(&parsed, target_path, &artifact_path_words) {
         return (None, sentence);
     }
+    // PRODUCER FRESHNESS: an artifact older than the producer binary
+    // that would regenerate it is stale, the same as a hash mismatch —
+    // the producer may have changed what it exports since this artifact
+    // was written, and the content hash alone cannot see that.
+    if let Err(sentence) = check_producer_freshness(target_path, artifact_path, &artifact_path_words) {
+        return (None, sentence);
+    }
     let band = match nested_string(&parsed, "runtime", "band") {
         Some(band) => band,
         None => {
@@ -464,10 +570,12 @@ fn read_and_verify_foreign_ts_artifact(
     )
 }
 
-/// Reads the `refined` envelope and checks the `(kind, version,
-/// language)` triple. Any triple outside the one admitted form is a
-/// decline naming the triple it saw and the one form this reader
-/// accepts.
+/// Reads the `refined` envelope and checks the `(kind, language)` pair.
+/// NO version field is ever admitted: its PRESENCE is itself a decline
+/// (an old-shape artifact carrying `"version"` is exactly the
+/// no-version-ceremony rule's own negative case) — a reader strict-
+/// parses the current shape, and any other shape is no-fact, never a
+/// best-effort read.
 fn check_artifact_envelope(parsed: &Value, artifact_path_words: &str) -> Result<(), String> {
     let Some(envelope) = parsed.get("refined").and_then(Value::as_object) else {
         return Err(format!(
@@ -475,28 +583,30 @@ fn check_artifact_envelope(parsed: &Value, artifact_path_words: &str) -> Result<
         ));
     };
     let kind = envelope.get("kind").and_then(Value::as_str).unwrap_or("");
-    let version = envelope.get("version").and_then(Value::as_i64);
     let language = parsed.get("language").and_then(Value::as_str).unwrap_or("");
 
-    if kind == FOREIGN_ARTIFACT_KIND && version == Some(FOREIGN_ARTIFACT_VERSION) {
-        if language != FOREIGN_ARTIFACT_LANGUAGE {
-            return Err(format!(
-                "{artifact_path_words} states (kind \"{kind}\", version {}, language {}), and this edge reads \
-                 language \"{FOREIGN_ARTIFACT_LANGUAGE}\" for that pair — the language field is what selects \
-                 the runtime-band pins",
-                FOREIGN_ARTIFACT_VERSION,
-                quoted_or_none(language)
-            ));
-        }
-        return Ok(());
+    if envelope.contains_key("version") {
+        return Err(format!(
+            "{artifact_path_words} states a \"version\" field in its \"refined\" envelope, and this edge reads \
+             only the current cases schema, which carries no version field at all — re-export it with \
+             `{FOREIGN_EXPORT_COMMAND} <target>`"
+        ));
     }
-
-    let stated_version = version.map(|v| v.to_string()).unwrap_or_else(|| "nothing".to_owned());
-    Err(format!(
-        "{artifact_path_words} states (kind \"{kind}\", version {stated_version}), and this edge reads only \
-         (kind \"{FOREIGN_ARTIFACT_KIND}\", version {FOREIGN_ARTIFACT_VERSION}, language \
-         \"{FOREIGN_ARTIFACT_LANGUAGE}\") — the field meanings are what the version pins"
-    ))
+    if kind != FOREIGN_ARTIFACT_KIND {
+        return Err(format!(
+            "{artifact_path_words} states (kind \"{kind}\"), and this edge reads only (kind \
+             \"{FOREIGN_ARTIFACT_KIND}\") — the field meanings are what the kind pins"
+        ));
+    }
+    if language != FOREIGN_ARTIFACT_LANGUAGE {
+        return Err(format!(
+            "{artifact_path_words} states (kind \"{kind}\", language {}), and this edge reads language \
+             \"{FOREIGN_ARTIFACT_LANGUAGE}\" for that kind — the language field is what selects the \
+             runtime-band pins",
+            quoted_or_none(language)
+        ));
+    }
+    Ok(())
 }
 
 /// CROSS-LANGUAGE-EDGE.md's target-integrity premise, discharged by
@@ -519,6 +629,38 @@ fn check_target_integrity(parsed: &Value, target_path: &str, artifact_path_words
             "{artifact_path_words} states the fact of a target whose contents hash to {stated}, and \
              {target_path} hashes to {actual} — the exported fact is about different code than the code being \
              checked; re-export it with `{FOREIGN_EXPORT_COMMAND} {target_path}`"
+        ));
+    }
+    Ok(())
+}
+
+/// PRODUCER FRESHNESS: an artifact whose mtime predates the producer
+/// binary that would regenerate it is stale — the producer may compile
+/// a newer decider or a changed export shape since this file was
+/// written, and the content hash alone (a fact about the TARGET, not
+/// the PRODUCER) cannot see that. Resolves the producer through the
+/// SAME `resolve_foreign_producer` the auto-export path already calls
+/// — no second resolution rule.
+///
+/// No stamps, no counters, no version field: a plain mtime comparison.
+/// When the producer cannot be resolved, or either mtime cannot be
+/// read, this check contributes NOTHING — the hash rule alone governs,
+/// never an error from the staleness probe itself.
+fn check_producer_freshness(target_path: &str, artifact_path: &Path, artifact_path_words: &str) -> Result<(), String> {
+    let Some(producer) = resolve_foreign_producer(target_path) else {
+        return Ok(());
+    };
+    let Ok(producer_mtime) = std::fs::metadata(&producer).and_then(|meta| meta.modified()) else {
+        return Ok(());
+    };
+    let Ok(artifact_mtime) = std::fs::metadata(artifact_path).and_then(|meta| meta.modified()) else {
+        return Ok(());
+    };
+    if producer_mtime > artifact_mtime {
+        return Err(format!(
+            "{artifact_path_words} predates the producer {} that would regenerate it — the fact may be about \
+             a checker the producer no longer is; re-export it with `{FOREIGN_EXPORT_COMMAND} {target_path}`",
+            producer.display()
         ));
     }
     Ok(())
@@ -637,15 +779,13 @@ fn function_fact_of_row(row: &serde_json::Map<String, Value>, name: &str) -> Res
     let Some(returned) = row.get("return").and_then(Value::as_object) else {
         return Err(format!("states no return fact for {name}, so nothing crosses back from this call"));
     };
-    let Some(raw_set) = returned.get("set") else {
-        return Err(format!("states a return for {name} with no set, so the value crossing back is unbounded"));
-    };
+    let return_cases = cases_of(returned, &format!("the return for {name}"))?;
     let stdout_pure = returned.get("stdoutPure").and_then(Value::as_bool).unwrap_or(false);
     let (provenance_line, provenance_said) = artifact_provenance_of(row);
     Ok(ForeignTsFunctionFact {
         name: name.to_owned(),
         entry: entries,
-        return_set: decode_wire_set(raw_set),
+        return_cases,
         stdout_pure,
         provenance_line,
         provenance_said,
@@ -666,27 +806,123 @@ fn artifact_entries_of(row: &serde_json::Map<String, Value>, name: &str) -> Resu
         };
         let entry_name = entry_row.get("name").and_then(Value::as_str).unwrap_or("").to_owned();
         if let Some(sequence) = entry_row.get("sequence").and_then(Value::as_object) {
-            let Some(raw_element) = sequence.get("element") else {
-                return Err(format!("states a sequence entry {entry_name} for {name} with no element set"));
+            let Some(element) = sequence.get("element").and_then(Value::as_object) else {
+                return Err(format!("states a sequence entry {entry_name} for {name} with no element cases"));
             };
+            let element_cases = cases_of(element, &format!("the sequence entry {entry_name} for {name}"))?;
             let length_at_least = sequence.get("lengthAtLeast").and_then(Value::as_i64).unwrap_or(0);
             entries.push(ForeignTsEntry {
                 name: entry_name,
-                sequence: Some((decode_wire_set(raw_element), length_at_least)),
+                sequence: Some((element_cases, length_at_least)),
                 scalar: None,
             });
             continue;
         }
-        let Some(raw_set) = entry_row.get("set") else {
-            return Err(format!("states an entry position {entry_name} for {name} that is neither a sequence nor a set"));
-        };
+        let scalar_cases = cases_of(entry_row, &format!("the entry position {entry_name} for {name}"))?;
         entries.push(ForeignTsEntry {
             name: entry_name,
             sequence: None,
-            scalar: Some(decode_wire_set(raw_set)),
+            scalar: Some(scalar_cases),
         });
     }
     Ok(entries)
+}
+
+/// Reads a `"cases"` array off an object that carries one — the RULED
+/// schema's own unit at both the return position and a scalar entry
+/// position (and a sequence entry's `element` object). Strict-parse: a
+/// bare `"set"` field (the earlier shape) is NOT read as a one-case
+/// fallback — that shape is exactly what the no-version-ceremony rule
+/// calls NO-FACT, and the caller's own decline sentence is what a stale
+/// artifact earns, never a silent best-effort reinterpretation.
+fn cases_of(carrier: &serde_json::Map<String, Value>, described: &str) -> Result<Vec<ForeignCase>, String> {
+    let Some(raw_cases) = carrier.get("cases").and_then(Value::as_array) else {
+        return Err(format!(
+            "{described} states no \"cases\" array, so nothing says what shape the value takes — re-export \
+             it with `{FOREIGN_EXPORT_COMMAND} <target>`"
+        ));
+    };
+    cases_array_of(raw_cases, described)
+}
+
+/// Reads a cases array directly — `cases_of`'s own body, factored out so
+/// an object case's MEMBER (whose value in the wire IS the bare cases
+/// array, `fact_export.rs::Case::to_json`'s own `Case::Object` arm: `{name:
+/// cases_json(cases)}`, never a `{"cases": [...]}` wrapper) parses through
+/// the identical rule rather than a second copy of it.
+fn cases_array_of(raw_cases: &[Value], described: &str) -> Result<Vec<ForeignCase>, String> {
+    if raw_cases.is_empty() {
+        return Err(format!("{described} states an empty \"cases\" array, which admits no value at all"));
+    }
+    let mut cases = Vec::with_capacity(raw_cases.len());
+    for (index, raw_case) in raw_cases.iter().enumerate() {
+        let Some(case) = raw_case.as_object() else {
+            return Err(format!("{described} states an unreadable case {index}"));
+        };
+        let sort = case.get("sort").and_then(Value::as_str).unwrap_or("");
+        cases.push(match sort {
+            "number" => {
+                let Some(raw_set) = case.get("set") else {
+                    return Err(format!("{described} states a number case {index} with no set"));
+                };
+                ForeignCase::Number(decode_wire_set(raw_set))
+            }
+            "string" => {
+                let Some(raw_set) = case.get("set") else {
+                    return Err(format!("{described} states a string case {index} with no set"));
+                };
+                ForeignCase::String(decode_wire_set(raw_set))
+            }
+            "boolean" => ForeignCase::Boolean,
+            "null" => ForeignCase::Null,
+            "object" => object_case_of(case, &format!("{described}'s case {index}"))?,
+            other => {
+                return Err(format!(
+                    "{described} states a case {index} of sort {}, and this reader admits only \"number\", \
+                     \"string\", \"boolean\", \"null\", or \"object\"",
+                    quoted_or_none(other)
+                ));
+            }
+        });
+    }
+    Ok(cases)
+}
+
+/// Reads one `{"sort": "object", "members": {...}, "closed": bool}` case
+/// — the RULED object case's own strict parse (CROSS-LANGUAGE-EDGE.md
+/// §17, JT-prioritized 2026-08-21). `members` must be a JSON OBJECT
+/// mapping each key DIRECTLY to its own cases ARRAY (never a `{"cases":
+/// [...]}` wrapper — `fact_export.rs::Case::to_json`'s `Case::Object` arm
+/// writes `{name: cases_json(cases)}`, the bare array, so the parser's
+/// shape must match the writer's exactly), recursed through
+/// `cases_array_of` so a nested object case parses through the identical
+/// rule; `closed` must be a JSON BOOLEAN. Any deviation — `members`
+/// missing or not an object, `closed` missing or not a boolean, a
+/// member's own value not itself a cases array — declines by name through
+/// the ordinary `Err` path, exactly the same "an artifact is a file, not
+/// a promise" discipline every other malformed shape in this file earns;
+/// nothing here guesses at a member.
+fn object_case_of(case: &serde_json::Map<String, Value>, described: &str) -> Result<ForeignCase, String> {
+    let Some(raw_members) = case.get("members").and_then(Value::as_object) else {
+        return Err(format!(
+            "{described} states an object case with no \"members\" object, so nothing says what keys it admits"
+        ));
+    };
+    let Some(closed) = case.get("closed").and_then(Value::as_bool) else {
+        return Err(format!(
+            "{described} states an object case with no boolean \"closed\" field, so nothing says whether its \
+             key set is exact"
+        ));
+    };
+    let mut members = Vec::with_capacity(raw_members.len());
+    for (name, raw_member) in raw_members {
+        let Some(member_cases) = raw_member.as_array() else {
+            return Err(format!("{described} states a member '{name}' that is not a cases array"));
+        };
+        let cases = cases_array_of(member_cases, &format!("{described}'s member '{name}'"))?;
+        members.push((name.clone(), cases));
+    }
+    Ok(ForeignCase::Object { members, closed })
 }
 
 /// Reads where the target's claim was made. Absent fields answer
@@ -747,15 +983,15 @@ mod tests {
     fn well_formed_artifact(source: &[u8], called: &str) -> Value {
         let scalar = make_refined_set(vec![integer(), at_least(0.0)]);
         json!({
-            "refined": {"kind": FOREIGN_ARTIFACT_KIND, "version": FOREIGN_ARTIFACT_VERSION},
+            "refined": {"kind": FOREIGN_ARTIFACT_KIND},
             "target": {"file": "target.ts", "contentHash": format!("sha256:{}", sha256_hex(source))},
             "language": FOREIGN_ARTIFACT_LANGUAGE,
             "runtime": {"band": FOREIGN_RUNTIME_BAND},
             "surface": {"kind": "stdin-json", "stdin": "json", "stdout": "json", "calls": called},
             "functions": {
                 called: {
-                    "entry": [{"name": "x", "set": refined_kernel::wire_format::wire_set(&scalar)}],
-                    "return": {"set": refined_kernel::wire_format::wire_set(&scalar), "stdoutPure": true},
+                    "entry": [{"name": "x", "cases": [{"sort": "number", "set": refined_kernel::wire_format::wire_set(&scalar)}]}],
+                    "return": {"cases": [{"sort": "number", "set": refined_kernel::wire_format::wire_set(&scalar)}], "stdoutPure": true},
                     "provenance": {"line": 3, "said": "given 'x' is a nonnegative integer, this body's returns derive a nonnegative integer"},
                 }
             }
@@ -789,15 +1025,15 @@ mod tests {
     fn well_formed_argv_json_artifact(source: &[u8], called: &str, arg_index: i64) -> Value {
         let scalar = make_refined_set(vec![integer(), at_least(0.0)]);
         json!({
-            "refined": {"kind": FOREIGN_ARTIFACT_KIND, "version": FOREIGN_ARTIFACT_VERSION},
+            "refined": {"kind": FOREIGN_ARTIFACT_KIND},
             "target": {"file": "target.ts", "contentHash": format!("sha256:{}", sha256_hex(source))},
             "language": FOREIGN_ARTIFACT_LANGUAGE,
             "runtime": {"band": FOREIGN_RUNTIME_BAND},
             "surface": {"kind": "argv-json", "argIndex": arg_index, "stdout": "json", "calls": called},
             "functions": {
                 called: {
-                    "entry": [{"name": "x", "set": refined_kernel::wire_format::wire_set(&scalar)}],
-                    "return": {"set": refined_kernel::wire_format::wire_set(&scalar), "stdoutPure": true},
+                    "entry": [{"name": "x", "cases": [{"sort": "number", "set": refined_kernel::wire_format::wire_set(&scalar)}]}],
+                    "return": {"cases": [{"sort": "number", "set": refined_kernel::wire_format::wire_set(&scalar)}], "stdoutPure": true},
                     "provenance": {"line": 3, "said": "given 'x' is a nonnegative integer, this body's returns derive a nonnegative integer"},
                 }
             }
@@ -853,15 +1089,15 @@ mod tests {
     fn well_formed_file_json_artifact(source: &[u8], called: &str, arg_index: i64) -> Value {
         let scalar = make_refined_set(vec![integer(), at_least(0.0)]);
         json!({
-            "refined": {"kind": FOREIGN_ARTIFACT_KIND, "version": FOREIGN_ARTIFACT_VERSION},
+            "refined": {"kind": FOREIGN_ARTIFACT_KIND},
             "target": {"file": "target.ts", "contentHash": format!("sha256:{}", sha256_hex(source))},
             "language": FOREIGN_ARTIFACT_LANGUAGE,
             "runtime": {"band": FOREIGN_RUNTIME_BAND},
             "surface": {"kind": "file-json", "argIndex": arg_index, "stdout": "json", "calls": called},
             "functions": {
                 called: {
-                    "entry": [{"name": "x", "set": refined_kernel::wire_format::wire_set(&scalar)}],
-                    "return": {"set": refined_kernel::wire_format::wire_set(&scalar), "stdoutPure": true},
+                    "entry": [{"name": "x", "cases": [{"sort": "number", "set": refined_kernel::wire_format::wire_set(&scalar)}]}],
+                    "return": {"cases": [{"sort": "number", "set": refined_kernel::wire_format::wire_set(&scalar)}], "stdoutPure": true},
                     "provenance": {"line": 3, "said": "given 'x' is a nonnegative integer, this body's returns derive a nonnegative integer"},
                 }
             }
@@ -950,6 +1186,97 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
+    /// Writes a placeholder file at the producer's CONVENTION path
+    /// under `root` (`resolve_foreign_producer`'s own first-checked
+    /// location) — its content is never executed by these tests, only
+    /// its existence and mtime matter to `check_producer_freshness`.
+    fn write_placeholder_producer(root: &Path) -> PathBuf {
+        let producer_path = root.join(FOREIGN_PRODUCER_RELATIVE);
+        fs::create_dir_all(producer_path.parent().unwrap()).expect("create producer dir");
+        fs::write(&producer_path, b"placeholder producer").expect("write placeholder producer");
+        producer_path
+    }
+
+    /// An artifact older than the producer binary that would regenerate
+    /// it is STALE — the same path a hash mismatch takes: the freshness
+    /// gate declines, the uncached reader attempts one re-export through
+    /// the resolved producer, and (since the placeholder producer here
+    /// is not a real executable) that attempt fails, so the sentence
+    /// carries both the staleness reason and the auto-export failure.
+    #[test]
+    fn an_artifact_older_than_the_producer_is_stale_and_attempts_reexport() {
+        let root = temp_project_root("stale_producer");
+        let target = root.join("target.ts");
+        fs::write(&target, b"export function f(x: number): number { return x; }\n").expect("write target");
+        let source = fs::read(&target).expect("read target back");
+        let artifact_path = cache_artifact_path(target.to_str().unwrap());
+        fs::create_dir_all(artifact_path.parent().unwrap()).expect("create cache dir");
+        fs::write(&artifact_path, well_formed_artifact(&source, "f").to_string()).expect("write artifact");
+
+        // the producer binary is built (or rebuilt) AFTER the artifact
+        // already exists — the artifact predates it
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        write_placeholder_producer(&root);
+
+        let read = read_foreign_ts_artifact(target.to_str().unwrap());
+        let sentence = read.expect_err("an artifact older than its producer must decline as stale");
+        assert!(sentence.contains("predates the producer"), "sentence = {sentence:?}");
+        assert!(sentence.contains("auto-export declined"), "sentence = {sentence:?}");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// REGRESSION: an artifact newer than the producer, with a matching
+    /// hash, reads fresh — the freshness gate contributes nothing when
+    /// the artifact is not stale, and the existing premises (hash, band,
+    /// harness shape) still govern exactly as before this gate existed.
+    #[test]
+    fn an_artifact_newer_than_the_producer_with_a_matching_hash_reads_fresh() {
+        let root = temp_project_root("fresh_producer");
+        let target = root.join("target.ts");
+        fs::write(&target, b"export function f(x: number): number { return x; }\n").expect("write target");
+        let source = fs::read(&target).expect("read target back");
+
+        // the producer binary exists FIRST, then the artifact is written
+        // afterward — the artifact is newer than its producer
+        write_placeholder_producer(&root);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let artifact_path = cache_artifact_path(target.to_str().unwrap());
+        fs::create_dir_all(artifact_path.parent().unwrap()).expect("create cache dir");
+        fs::write(&artifact_path, well_formed_artifact(&source, "f").to_string()).expect("write artifact");
+
+        let read = read_foreign_ts_artifact(target.to_str().unwrap());
+        let artifact = read.expect("an artifact newer than its producer, with a matching hash, must read fresh");
+        assert_eq!(artifact.called.name, "f");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// REGRESSION: when no producer resolves at all (none at the
+    /// convention path, none on `PATH`), the freshness gate contributes
+    /// nothing and the hash rule alone governs — an artifact with a
+    /// matching hash reads fresh even though staleness can never be
+    /// checked in this project root.
+    #[test]
+    fn an_unresolvable_producer_leaves_the_hash_rule_alone_in_charge() {
+        let root = temp_project_root("no_producer");
+        let target = root.join("target.ts");
+        fs::write(&target, b"export function f(x: number): number { return x; }\n").expect("write target");
+        let source = fs::read(&target).expect("read target back");
+        let artifact_path = cache_artifact_path(target.to_str().unwrap());
+        fs::create_dir_all(artifact_path.parent().unwrap()).expect("create cache dir");
+        fs::write(&artifact_path, well_formed_artifact(&source, "f").to_string()).expect("write artifact");
+
+        // no producer written anywhere under root, and (assuming the
+        // test host has no refinedts-check-bin on PATH) none resolvable
+        // at all — the read must still succeed on the hash rule alone
+        let read = read_foreign_ts_artifact(target.to_str().unwrap());
+        let artifact = read.expect("with no producer resolvable, the hash rule alone must still admit the fact");
+        assert_eq!(artifact.called.name, "f");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn a_wrong_band_declines() {
         let root = temp_project_root("wrong_band");
@@ -976,7 +1303,8 @@ mod tests {
         fs::write(&target, b"export function f(x: number): number { return x; }\n").expect("write target");
         let source = fs::read(&target).expect("read target back");
         let mut artifact = well_formed_artifact(&source, "f");
-        artifact["functions"]["f"]["return"]["set"] = json!({"forms": [{"form": "not-a-real-form"}]});
+        artifact["functions"]["f"]["return"]["cases"] =
+            json!([{"sort": "number", "set": {"forms": [{"form": "not-a-real-form"}]}}]);
         let artifact_path = cache_artifact_path(target.to_str().unwrap());
         fs::create_dir_all(artifact_path.parent().unwrap()).expect("create cache dir");
         fs::write(&artifact_path, artifact.to_string()).expect("write artifact");
@@ -986,6 +1314,139 @@ mod tests {
         let read = read_foreign_ts_artifact(target.to_str().unwrap());
         let sentence = read.expect_err("a malformed form must decline, never panic the process");
         assert!(sentence.contains("kernel grammar"), "sentence = {sentence:?}");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // --- the RULED object case (CROSS-LANGUAGE-EDGE.md §17) ----------
+
+    /// A well-formed `{"sort": "object", "members": {...}, "closed": bool}`
+    /// case round-trips into the `ForeignCase::Object` shape exactly:
+    /// each member's own cases list decoded through the SAME `cases_of`
+    /// path a top-level return/entry position goes through, and `closed`
+    /// carried through unchanged.
+    #[test]
+    fn a_well_formed_object_case_round_trips_into_the_foreign_case_shape() {
+        let root = temp_project_root("object_case_well_formed");
+        let target = root.join("target.ts");
+        fs::write(&target, b"export function f(x: number): number { return x; }\n").expect("write target");
+        let source = fs::read(&target).expect("read target back");
+        let scalar = make_refined_set(vec![integer(), at_least(0.0)]);
+        let mut artifact = well_formed_artifact(&source, "f");
+        artifact["functions"]["f"]["return"]["cases"] = json!([{
+            "sort": "object",
+            "members": {
+                "age": [{"sort": "number", "set": refined_kernel::wire_format::wire_set(&scalar)}],
+            },
+            "closed": true,
+        }]);
+        let artifact_path = cache_artifact_path(target.to_str().unwrap());
+        fs::create_dir_all(artifact_path.parent().unwrap()).expect("create cache dir");
+        fs::write(&artifact_path, artifact.to_string()).expect("write artifact");
+
+        let read = read_foreign_ts_artifact(target.to_str().unwrap());
+        let artifact = read.expect("a well-formed object case reads as a fact");
+        assert_eq!(artifact.called.return_cases.len(), 1);
+        let ForeignCase::Object { members, closed } = &artifact.called.return_cases[0] else {
+            panic!("expected an object case, got {:?}", artifact.called.return_cases[0]);
+        };
+        assert!(*closed, "the artifact states closed: true");
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].0, "age");
+        assert_eq!(members[0].1, vec![ForeignCase::Number(scalar)]);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// An object case whose `members` field is not a JSON object (a bare
+    /// array, standing in for every other malformed shape) declines by
+    /// name — the strict parse never falls back to a best-effort reading.
+    #[test]
+    fn a_malformed_members_value_declines_by_name() {
+        let root = temp_project_root("object_case_malformed_members");
+        let target = root.join("target.ts");
+        fs::write(&target, b"export function f(x: number): number { return x; }\n").expect("write target");
+        let source = fs::read(&target).expect("read target back");
+        let mut artifact = well_formed_artifact(&source, "f");
+        artifact["functions"]["f"]["return"]["cases"] =
+            json!([{"sort": "object", "members": ["not", "an", "object"], "closed": true}]);
+        let artifact_path = cache_artifact_path(target.to_str().unwrap());
+        fs::create_dir_all(artifact_path.parent().unwrap()).expect("create cache dir");
+        fs::write(&artifact_path, artifact.to_string()).expect("write artifact");
+
+        let read = read_foreign_ts_artifact(target.to_str().unwrap());
+        let sentence = read.expect_err("a non-object \"members\" value must decline");
+        assert!(sentence.contains("members"), "sentence = {sentence:?}");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// An object case with no `closed` field at all (or a non-boolean
+    /// one) declines by name — the same strict parse as a missing
+    /// `members`.
+    #[test]
+    fn an_object_case_with_no_closed_field_declines_by_name() {
+        let root = temp_project_root("object_case_no_closed");
+        let target = root.join("target.ts");
+        fs::write(&target, b"export function f(x: number): number { return x; }\n").expect("write target");
+        let source = fs::read(&target).expect("read target back");
+        let mut artifact = well_formed_artifact(&source, "f");
+        artifact["functions"]["f"]["return"]["cases"] = json!([{"sort": "object", "members": {}}]);
+        let artifact_path = cache_artifact_path(target.to_str().unwrap());
+        fs::create_dir_all(artifact_path.parent().unwrap()).expect("create cache dir");
+        fs::write(&artifact_path, artifact.to_string()).expect("write artifact");
+
+        let read = read_foreign_ts_artifact(target.to_str().unwrap());
+        let sentence = read.expect_err("an object case with no \"closed\" field must decline");
+        assert!(sentence.contains("closed"), "sentence = {sentence:?}");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// An object case NESTED inside another object case's member —
+    /// `{"members": {"outer": [{"sort": "object", "members": {"inner": [...]}, "closed": true}]}}`
+    /// — parses through the identical recursive rule, so a member can
+    /// itself be an object case at any depth.
+    #[test]
+    fn a_nested_object_in_object_case_parses() {
+        let root = temp_project_root("object_case_nested");
+        let target = root.join("target.ts");
+        fs::write(&target, b"export function f(x: number): number { return x; }\n").expect("write target");
+        let source = fs::read(&target).expect("read target back");
+        let scalar = make_refined_set(vec![integer(), at_least(0.0)]);
+        let mut artifact = well_formed_artifact(&source, "f");
+        artifact["functions"]["f"]["return"]["cases"] = json!([{
+            "sort": "object",
+            "members": {
+                "outer": [{
+                    "sort": "object",
+                    "members": {
+                        "inner": [{"sort": "number", "set": refined_kernel::wire_format::wire_set(&scalar)}],
+                    },
+                    "closed": true,
+                }],
+            },
+            "closed": false,
+        }]);
+        let artifact_path = cache_artifact_path(target.to_str().unwrap());
+        fs::create_dir_all(artifact_path.parent().unwrap()).expect("create cache dir");
+        fs::write(&artifact_path, artifact.to_string()).expect("write artifact");
+
+        let read = read_foreign_ts_artifact(target.to_str().unwrap());
+        let artifact = read.expect("a nested object-in-object case reads as a fact");
+        let ForeignCase::Object { members, closed } = &artifact.called.return_cases[0] else {
+            panic!("expected the outer object case, got {:?}", artifact.called.return_cases[0]);
+        };
+        assert!(!closed, "the outer case states closed: false");
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].0, "outer");
+        let ForeignCase::Object { members: inner_members, closed: inner_closed } = &members[0].1[0] else {
+            panic!("expected the nested object case, got {:?}", members[0].1[0]);
+        };
+        assert!(*inner_closed, "the inner case states closed: true");
+        assert_eq!(inner_members.len(), 1);
+        assert_eq!(inner_members[0].0, "inner");
+        assert_eq!(inner_members[0].1, vec![ForeignCase::Number(scalar)]);
 
         fs::remove_dir_all(&root).ok();
     }
@@ -1200,26 +1661,99 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
-    /// A `(kind, version)` pair outside the one admitted form declines,
-    /// naming the triple it saw and the accepted form — never a
+    /// An unknown `kind` declines, naming the accepted form — never a
     /// best-effort read of a schema this reader does not know.
     #[test]
-    fn an_unknown_kind_version_triple_declines_naming_the_accepted_form() {
-        let root = temp_project_root("unknown_triple");
+    fn an_unknown_kind_declines_naming_the_accepted_form() {
+        let root = temp_project_root("unknown_kind");
         let target = root.join("target.ts");
         fs::write(&target, b"export function f(x: number): number { return x; }\n").expect("write target");
         let source = fs::read(&target).expect("read target back");
         let mut artifact = well_formed_artifact(&source, "f");
-        artifact["refined"] = json!({"kind": "fact-artifact", "version": 3});
+        artifact["refined"] = json!({"kind": "python-fact-artifact"});
         let artifact_path = cache_artifact_path(target.to_str().unwrap());
         fs::create_dir_all(artifact_path.parent().unwrap()).expect("create cache dir");
         fs::write(&artifact_path, artifact.to_string()).expect("write artifact");
 
         let read = read_foreign_ts_artifact(target.to_str().unwrap());
-        let sentence = read.expect_err("an unknown (kind, version) pair must decline");
-        assert!(sentence.contains("fact-artifact"), "sentence = {sentence:?}");
-        assert!(sentence.contains('3'), "sentence = {sentence:?}");
+        let sentence = read.expect_err("an unknown kind must decline");
+        assert!(sentence.contains("python-fact-artifact"), "sentence = {sentence:?}");
         assert!(sentence.contains(FOREIGN_ARTIFACT_KIND), "sentence = {sentence:?}");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// AN OLD-SHAPE ARTIFACT (a "version" field present, and the earlier
+    /// bare "set" spelling instead of "cases") reads as NO-FACT — the
+    /// no-version-ceremony rule's own negative case: the version field's
+    /// mere PRESENCE is enough to decline, independent of its value, and
+    /// the existing self-refresh re-export path is what a reader facing
+    /// this shape falls back on.
+    #[test]
+    fn an_old_shape_artifact_with_a_version_field_reads_as_no_fact() {
+        let root = temp_project_root("old_shape_version_field");
+        let target = root.join("target.ts");
+        fs::write(&target, b"export function f(x: number): number { return x; }\n").expect("write target");
+        let source = fs::read(&target).expect("read target back");
+        let scalar = make_refined_set(vec![integer(), at_least(0.0)]);
+        let artifact = json!({
+            "refined": {"kind": FOREIGN_ARTIFACT_KIND, "version": 2},
+            "target": {"file": "target.ts", "contentHash": format!("sha256:{}", sha256_hex(&source))},
+            "language": FOREIGN_ARTIFACT_LANGUAGE,
+            "runtime": {"band": FOREIGN_RUNTIME_BAND},
+            "surface": {"kind": "stdin-json", "stdin": "json", "stdout": "json", "calls": "f"},
+            "functions": {
+                "f": {
+                    "entry": [{"name": "x", "set": refined_kernel::wire_format::wire_set(&scalar)}],
+                    "return": {"set": refined_kernel::wire_format::wire_set(&scalar), "stdoutPure": true},
+                    "provenance": {"line": 3, "said": "the old shape's own sentence"},
+                }
+            }
+        });
+        let artifact_path = cache_artifact_path(target.to_str().unwrap());
+        fs::create_dir_all(artifact_path.parent().unwrap()).expect("create cache dir");
+        fs::write(&artifact_path, artifact.to_string()).expect("write artifact");
+
+        let read = read_foreign_ts_artifact(target.to_str().unwrap());
+        let sentence = read.expect_err("an old-shape artifact carrying a version field must read as no-fact");
+        assert!(sentence.contains("version"), "sentence = {sentence:?}");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The SAME old-shape refusal when the version field is absent but
+    /// the bare "set" spelling remains (never the "cases" list): the
+    /// reader's `cases_of` strict-parse declines naming the missing
+    /// "cases" array, rather than falling back to reading "set" as a
+    /// one-case list.
+    #[test]
+    fn an_old_shape_artifact_with_a_bare_set_reads_as_no_fact() {
+        let root = temp_project_root("old_shape_bare_set");
+        let target = root.join("target.ts");
+        fs::write(&target, b"export function f(x: number): number { return x; }\n").expect("write target");
+        let source = fs::read(&target).expect("read target back");
+        let scalar = make_refined_set(vec![integer(), at_least(0.0)]);
+        let artifact = json!({
+            "refined": {"kind": FOREIGN_ARTIFACT_KIND},
+            "target": {"file": "target.ts", "contentHash": format!("sha256:{}", sha256_hex(&source))},
+            "language": FOREIGN_ARTIFACT_LANGUAGE,
+            "runtime": {"band": FOREIGN_RUNTIME_BAND},
+            "surface": {"kind": "stdin-json", "stdin": "json", "stdout": "json", "calls": "f"},
+            "functions": {
+                "f": {
+                    "entry": [{"name": "x", "set": refined_kernel::wire_format::wire_set(&scalar)}],
+                    "return": {"set": refined_kernel::wire_format::wire_set(&scalar), "stdoutPure": true},
+                    "provenance": {"line": 3, "said": "the old shape's own sentence"},
+                }
+            }
+        });
+        let artifact_path = cache_artifact_path(target.to_str().unwrap());
+        fs::create_dir_all(artifact_path.parent().unwrap()).expect("create cache dir");
+        fs::write(&artifact_path, artifact.to_string()).expect("write artifact");
+
+        let read = read_foreign_ts_artifact(target.to_str().unwrap());
+        let sentence = read.expect_err("a bare \"set\" spelling with no \"cases\" array must read as no-fact");
+        assert!(sentence.contains("cases"), "sentence = {sentence:?}");
 
         fs::remove_dir_all(&root).ok();
     }
@@ -1243,6 +1777,124 @@ mod tests {
         let sentence = read.expect_err("an envelope naming a different language must decline");
         assert!(sentence.contains("python"), "sentence = {sentence:?}");
         assert!(sentence.contains("language"), "sentence = {sentence:?}");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // --- THE CROSS-PROCESS EXPORT-CHAIN CYCLE GUARD ----------------------
+    //
+    // `export_foreign_ts_artifact` takes the chain as a plain `&str`
+    // parameter rather than reading `REFINED_EXPORT_CHAIN` itself — the
+    // testable design chosen here: `std::env::set_var` is `unsafe` and
+    // races across this crate's parallel test runner (many tests in this
+    // file already run concurrently, each in its own temp project root),
+    // so a test cannot safely set the process environment and expect
+    // only ITS OWN call to observe that value. Parameterizing the chain
+    // and testing the parameterized function directly needs no process
+    // mutation at all.
+
+    /// A target whose absolute path already appears as a hop on the
+    /// chain is recognized regardless of a relative spelling at the call
+    /// site — the comparison is absolute-to-absolute.
+    #[test]
+    fn export_chain_contains_finds_a_hop_by_its_absolute_path() {
+        let root = temp_project_root("chain_contains");
+        let target = root.join("a.py");
+        fs::write(&target, b"# placeholder\n").expect("write target");
+        let absolute = std::path::absolute(&target).unwrap();
+        let chain = absolute.to_string_lossy().into_owned();
+
+        assert!(export_chain_contains(&chain, target.to_str().unwrap()));
+        assert!(!export_chain_contains(&chain, root.join("b.py").to_str().unwrap()));
+        assert!(!export_chain_contains("", target.to_str().unwrap()), "an empty chain contains no hop");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A multi-hop chain is read as ':'-separated absolute paths; a
+    /// target matching any hop (not only the last) is recognized.
+    #[test]
+    fn export_chain_contains_checks_every_hop_not_only_the_last() {
+        let root = temp_project_root("chain_multi_hop");
+        let a = root.join("a.py");
+        let b = root.join("b.ts");
+        fs::write(&a, b"# placeholder\n").expect("write a");
+        fs::write(&b, b"// placeholder\n").expect("write b");
+        let chain = format!(
+            "{}:{}",
+            std::path::absolute(&a).unwrap().to_string_lossy(),
+            std::path::absolute(&b).unwrap().to_string_lossy()
+        );
+
+        assert!(export_chain_contains(&chain, a.to_str().unwrap()), "the first hop must be recognized");
+        assert!(export_chain_contains(&chain, b.to_str().unwrap()), "the last hop must be recognized");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The cycle sentence names the recursing target and renders the
+    /// whole chain that led back to it, the recursing target appended
+    /// last — a reader sees the exact cycle, not a generic refusal.
+    #[test]
+    fn export_chain_cycle_sentence_names_the_recursing_target_and_the_whole_chain() {
+        let root = temp_project_root("chain_sentence");
+        let a = root.join("a.py");
+        let b = root.join("b.ts");
+        fs::write(&a, b"# placeholder\n").expect("write a");
+        fs::write(&b, b"// placeholder\n").expect("write b");
+        let absolute_a = std::path::absolute(&a).unwrap();
+        let absolute_b = std::path::absolute(&b).unwrap();
+        let chain = format!("{}:{}", absolute_a.to_string_lossy(), absolute_b.to_string_lossy());
+
+        let sentence = export_chain_cycle_sentence(&chain, a.to_str().unwrap());
+        assert!(sentence.contains("recurses back"), "sentence = {sentence:?}");
+        assert!(sentence.contains(&absolute_a.to_string_lossy().into_owned()), "sentence = {sentence:?}");
+        assert!(sentence.contains(&absolute_b.to_string_lossy().into_owned()), "sentence = {sentence:?}");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A target already on the chain declines the spawn outright — the
+    /// producer is never resolved or invoked, and the sentence names the
+    /// cycle, exactly the ruling this guard exists to apply. Uses a
+    /// project root with NO producer at all: if the guard failed to
+    /// short-circuit, the failure would read as an unresolved-producer
+    /// sentence instead, which this test's own assertion distinguishes
+    /// from the cycle sentence it requires.
+    #[test]
+    fn a_chain_marked_target_declines_the_spawn_with_the_cycle_sentence() {
+        let root = temp_project_root("chain_marked_declines");
+        let target = root.join("a.py");
+        fs::write(&target, b"# placeholder\n").expect("write target");
+        let artifact_path = cache_artifact_path(target.to_str().unwrap());
+        let absolute_target = std::path::absolute(&target).unwrap();
+        let chain = absolute_target.to_string_lossy().into_owned();
+
+        let result = export_foreign_ts_artifact(target.to_str().unwrap(), &artifact_path, &chain);
+        let sentence = result.expect_err("a target already on the chain must decline, not spawn");
+        assert!(sentence.contains("recurses back"), "sentence = {sentence:?}");
+        assert!(sentence.contains(&absolute_target.to_string_lossy().into_owned()), "sentence = {sentence:?}");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A clean chain (no hop matching the target) behaves exactly as
+    /// before this guard existed: with no producer resolvable in this
+    /// temp root, the decline names the ordinary "no producer" reason,
+    /// never the cycle sentence — the guard contributes nothing when the
+    /// target is not already in flight.
+    #[test]
+    fn a_clean_chain_spawns_as_today_and_declines_on_the_ordinary_no_producer_reason() {
+        let root = temp_project_root("chain_clean_spawns");
+        let target = root.join("a.py");
+        fs::write(&target, b"# placeholder\n").expect("write target");
+        let artifact_path = cache_artifact_path(target.to_str().unwrap());
+
+        let result = export_foreign_ts_artifact(target.to_str().unwrap(), &artifact_path, "");
+        let sentence = result.expect_err("no producer resolves in this empty temp root");
+        assert!(!sentence.contains("recurses back"), "sentence = {sentence:?}");
+        assert!(sentence.contains("no"), "sentence = {sentence:?}");
+        assert!(sentence.contains(FOREIGN_PRODUCER_NAME), "sentence = {sentence:?}");
 
         fs::remove_dir_all(&root).ok();
     }

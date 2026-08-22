@@ -361,7 +361,7 @@ pub fn export_fact_on_save(path: &Path) {
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.to_string_lossy().into_owned());
-    let export = export_module(&module, &source, &basename, &resolver, &kernel);
+    let export = export_module(&module, &source, &basename, &resolver, &kernel, entry_directory);
     for omission in &export.omissions {
         eprintln!(
             "{}: '{}' is not exported: {}",
@@ -459,6 +459,143 @@ mod tests {
         assert_eq!(
             value,
             "```python\nsamples: list[float] {len >= 1}\n```\n---\nNote: length matters here."
+        );
+    }
+
+    /// The dylib the tests below ask, the same load path
+    /// `check.rs`'s own `loaded_kernel` uses — `None` (rather than a
+    /// panic) when the native artifact has not been built, so a
+    /// checkout without `pnpm kernel:native` run yet skips these tests
+    /// instead of failing them.
+    fn loaded_kernel() -> Option<Arc<RefinedTSKernel>> {
+        let path = refined_kernel::kernel_bridge::dylib_path();
+        if !refined_kernel::kernel_bridge::kernel_artifacts_present(&path) {
+            eprintln!("native kernel dylib absent — build it first");
+            return None;
+        }
+        Some(load_kernel(&path).expect("load_kernel"))
+    }
+
+    fn parsed(source: &str) -> ruff_python_ast::ModModule {
+        ruff_python_parser::parse_module(source)
+            .expect("fixture source parses")
+            .into_syntax()
+    }
+
+    fn no_imports_resolver() -> crate::refinedpy::cross_module::ModuleResolver<'static> {
+        &|_: &str| None
+    }
+
+    /// A `Hover` shaped exactly like `HoverValue::format`'s own
+    /// post-trim output: the fenced host type line, and nothing past
+    /// it (no "Go to" link, no "Type source" block) — the same shape
+    /// `splice_refinedpy_hover` receives from `get_hover_with_verbosity`
+    /// before it appends the refined-set line.
+    fn host_only_hover(type_line: &str) -> Hover {
+        Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: format!("```python\n{type_line}\n```"),
+            }),
+            range: None,
+        }
+    }
+
+    /// The whole splice, end to end: a real declared set — `Level`'s
+    /// own `0.0 <= x <= 1.0` bound, read at the parameter annotation's
+    /// own position — spliced onto a host-only hover produces exactly
+    /// two lines inside the fence: the host type, then the refined
+    /// set. This is the shape a real editor hover shows once
+    /// `HoverValue::format` (lib/lsp/wasm/hover.rs) has dropped the
+    /// stock "Go to"/"Type source" blocks and
+    /// `splice_refinedpy_hover` (this file) has appended the set line.
+    #[test]
+    fn a_declared_set_splices_a_second_line_after_the_host_type() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let source = concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "Level = Annotated[float, Field(ge=0.0, le=1.0)]\n",
+            "\n",
+            "def f(level: Level) -> None:\n",
+            "    pass\n",
+        );
+        let module = parsed(source);
+        let position = ruff_text_size::TextSize::try_from(source.find("Level) -> None").unwrap())
+            .unwrap();
+        let set = refined_set_at_position(&module, no_imports_resolver(), &kernel, position)
+            .unwrap_or_else(|| panic!("expected a declared set at the parameter annotation"));
+        let spelled =
+            format_for_hover(&set).unwrap_or_else(|| panic!("expected a hover spelling for 0.0..1.0"));
+        let mut hover = host_only_hover("level: float");
+        splice_spelling_into_hover(&mut hover, &spelled);
+        let HoverContents::Markup(MarkupContent { value, .. }) = &hover.contents else {
+            panic!("expected Markup contents");
+        };
+        let lines: Vec<&str> = value.lines().collect();
+        assert_eq!(
+            lines,
+            vec!["```python", &format!("level: float {spelled}"), "```"],
+            "expected exactly the host type line followed by the refined-set line, got: {value}"
+        );
+    }
+
+    /// A position with no refinement vocabulary in scope
+    /// (`refined_set_at_position` returns `None` — no `type` alias, no
+    /// `Annotated`/`Literal` import anywhere in the module) leaves the
+    /// hover exactly as the host built it: the host type line alone,
+    /// no second line, no junk block.
+    #[test]
+    fn a_position_with_no_declared_vocabulary_leaves_the_host_line_alone() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let source = "def f(level: float) -> None:\n    pass\n";
+        let module = parsed(source);
+        let position = ruff_text_size::TextSize::try_from(source.find("float) -> None").unwrap())
+            .unwrap();
+        assert!(
+            refined_set_at_position(&module, no_imports_resolver(), &kernel, position).is_none(),
+            "a module with no refinement vocabulary must answer no set at any position"
+        );
+        // `splice_refinedpy_hover` takes exactly this early-out (its own
+        // `let Some(set) = ... else { return }`) whenever
+        // `refined_set_at_position` answers `None` — no splice call
+        // happens, so the host-built hover is untouched. Asserted here
+        // directly on the value a real hover would carry at this
+        // position: the fenced host type line, nothing more.
+        let hover = host_only_hover("level: float");
+        let HoverContents::Markup(MarkupContent { value, .. }) = &hover.contents else {
+            panic!("expected Markup contents");
+        };
+        assert_eq!(value, "```python\nlevel: float\n```");
+    }
+
+    /// `total`'s own position in `audio_level_unclamped.py`
+    /// (`total = sum(s * s for s in samples)`) answers no set today —
+    /// `refined_set_at_position` returns `None` there, so a real hover
+    /// stays host-line-only (`total: Literal[0] | float`, no second
+    /// line). Pins the exact position the design brief measured, so a
+    /// future change to the relational-sum recognizer's own read of
+    /// this Assign form is caught here rather than only in the editor.
+    #[test]
+    fn the_measured_total_position_answers_no_set_today() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let source = concat!(
+            "import math\n",
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "Sample = Annotated[float, Field(ge=-2.0, le=2.0)]\n",
+            "Level = Annotated[float, Field(ge=0.0, le=1.0)]\n",
+            "\n",
+            "def audio_level_unclamped(samples: Annotated[list[Sample], Field(min_length=1)]) -> Level:\n",
+            "    total = sum(s * s for s in samples)\n",
+            "    return math.sqrt(total / len(samples))\n",
+        );
+        let module = parsed(source);
+        let position =
+            ruff_text_size::TextSize::try_from(source.find("total = sum").unwrap()).unwrap();
+        assert!(
+            refined_set_at_position(&module, no_imports_resolver(), &kernel, position).is_none(),
+            "total's own position must answer no set until the relational-sum recognizer reads this Assign form"
         );
     }
 

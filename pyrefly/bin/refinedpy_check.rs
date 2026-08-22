@@ -140,7 +140,7 @@ fn export_file(path: &str, output: &Path, kernel: &Arc<RefinedTSKernel>) -> Exit
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.to_owned());
 
-    let export = export_module(&module, &source, &basename, &resolver, kernel);
+    let export = export_module(&module, &source, &basename, &resolver, kernel, entry_directory);
     for omission in &export.omissions {
         eprintln!(
             "{path}: '{}' is not exported: {}",

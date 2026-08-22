@@ -27,7 +27,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use refined_domain::abstract_value::{known_set, known_values, unknown, AbstractValue, Kind, ObjectKey, PrimitiveKind, SetKindTag};
+use refined_domain::abstract_value::{
+    known_set, known_values, possibly_absent, unknown, AbsentFlavor, AbstractValue, Kind, ObjectKey, PrimitiveKind,
+    SetKindTag,
+};
 use refined_domain::known_constructors::{known_list, known_object};
 use refined_domain::trust_grades::{TrustProved, TrustSpec};
 use refined_kernel::kernel_interface::RefinedTSKernel;
@@ -173,16 +176,19 @@ pub fn findings_for_module_at(
 ) -> Vec<Finding> {
     let aliases = compile_aliases(module);
     let imports = surface_imports(module);
-    if aliases.is_empty() && imports.annotated_names.is_empty() {
-        // Neither a module-level `type X = Annotated[...]` alias NOR a
-        // recognized `Annotated` import is present, so no statement in
-        // this module can carry refinement vocabulary this checker
-        // reads — the fast, zero-cost early return. A module with an
-        // inline-only `Annotated[...]` parameter annotation and NO
-        // `type` alias still has `imports.annotated_names` populated
-        // (`surface_imports` reads only import statements, cheap before
-        // any walk), so it reaches the walk below rather than being
-        // silently skipped.
+    if aliases.is_empty()
+        && imports.annotated_names.is_empty()
+        && imports.literal_names.is_empty()
+    {
+        // No module-level `type X = Annotated[...]` alias, no
+        // recognized `Annotated` import, and no `Literal` import — no
+        // statement in this module can carry refinement vocabulary
+        // this checker reads, so this is the fast, zero-cost early
+        // return. A module whose only vocabulary is an inline
+        // `Annotated[...]` or `Literal[...]` annotation still has the
+        // matching import set populated (`surface_imports` reads only
+        // import statements, cheap before any walk), so it reaches
+        // the walk below rather than being skipped without judgment.
         return Vec::new();
     }
     let surface = module_surface(module, resolver, kernel, IMPORT_DEPTH_CAP);
@@ -276,10 +282,14 @@ pub fn refined_set_at_position(
 ) -> Option<RefinedSet> {
     let aliases = compile_aliases(module);
     let imports = surface_imports(module);
-    if aliases.is_empty() && imports.annotated_names.is_empty() {
+    if aliases.is_empty()
+        && imports.annotated_names.is_empty()
+        && imports.literal_names.is_empty()
+    {
         // Same gate `findings_for_module_at` takes, and for the same
-        // reason: a module with neither a `type` alias nor a recognized
-        // `Annotated` import carries no refinement vocabulary at all.
+        // reason: a module with no `type` alias, no recognized
+        // `Annotated` import, and no `Literal` import carries no
+        // refinement vocabulary at all.
         return None;
     }
     if let Some(stated) = stated_refinement_at(module, &aliases, &imports, position) {
@@ -560,6 +570,62 @@ fn foreign_edge_consumer_position(body: &[Stmt], call_position: usize, parse_ran
         .map(|(index, _)| index)
 }
 
+/// Tries `foreign_edge::foreign_edge_at` at `position` in `body` — the
+/// SAME `Stmt::Assign`/`Stmt::With` gate and outcome handling
+/// `walk_body_with_self_binding`'s own per-statement loop already runs,
+/// pulled out so every statement list the checker walks (a function's own
+/// top-level body, an `if`-arm's body, a `with`-block's body) offers this
+/// recognition the same way, never a second mechanism. A recognized
+/// `Override` is keyed into `foreign_edge_overrides` under its own
+/// consumer position (`foreign_edge_consumer_position`'s own doc); a
+/// `Fired` records an RTS7001 directly; a `Decline` records this body's
+/// one blocker. A statement that is not this shape, or that
+/// `foreign_edge_at` does not recognize at all, is a no-op — the caller's
+/// own walk of `stmt` is untouched either way.
+fn serve_foreign_edge_at(
+    body: &[Stmt],
+    position: usize,
+    environment: &Environment,
+    context: &WalkContext,
+    blocked: &mut bool,
+    out: &mut Vec<Finding>,
+    foreign_edge_overrides: &mut HashMap<usize, (TextRange, AbstractValue)>,
+) {
+    if !matches!(body[position], Stmt::Assign(_) | Stmt::With(_)) {
+        return;
+    }
+    let Some(outcome) =
+        foreign_edge::foreign_edge_at(body, position, environment, context.kernel, context.entry_directory.as_deref())
+    else {
+        return;
+    };
+    match outcome {
+        foreign_edge::ForeignEdgeOutcome::Override { parse_range, value } => {
+            // The override applies at the STATEMENT HOLDING the
+            // `json.loads(...)` node — the sole consumer may sit any
+            // number of statements after the call, so find it by range
+            // containment rather than assuming a position. Keyed by
+            // that consumer's own position: an earlier still-pending
+            // entry for a DIFFERENT consumer position is untouched by
+            // this insert, so two recognized calls before either is
+            // consumed each keep their own entry.
+            if let Some(consumer_position) = foreign_edge_consumer_position(body, position, parse_range) {
+                foreign_edge_overrides.insert(consumer_position, (parse_range, value));
+            }
+        }
+        foreign_edge::ForeignEdgeOutcome::Fired { message, range } => {
+            out.push(Finding { range, code: "RTS7001", message });
+        }
+        foreign_edge::ForeignEdgeOutcome::Decline { message, range } => {
+            record_blocker(blocked, range, message, out);
+        }
+    }
+    // recognized whole (an override, a fire, or a named decline) — the
+    // statement itself still walks ordinarily afterward so `<name>`
+    // binds through the usual Assign path; only the LATER `json.loads`
+    // node's value is overridden.
+}
+
 /// `walk_body`'s full construction, plus one extra optional step:
 /// `self_binding`, when `Some`, binds the name `self` to that value
 /// AFTER parameter seeding — `walk_method_def`'s own seam into this
@@ -748,42 +814,7 @@ fn walk_body_with_self_binding(
         // statement recognizers coexist. A `With` statement also enters:
         // the temp-file carrier's unit starts at the tempfile with-block
         // (recognize_temp_file_edge), not at an Assign.
-        if matches!(stmt, Stmt::Assign(_) | Stmt::With(_)) {
-            if let Some(outcome) = foreign_edge::foreign_edge_at(
-                body,
-                position,
-                &environment,
-                context.kernel,
-                context.entry_directory.as_deref(),
-            ) {
-                match outcome {
-                    foreign_edge::ForeignEdgeOutcome::Override { parse_range, value } => {
-                        // The override applies at the STATEMENT HOLDING the
-                        // `json.loads(...)` node — the sole consumer may sit
-                        // any number of statements after the call, so find
-                        // it by range containment rather than assuming a
-                        // position. Keyed by that consumer's own position:
-                        // an earlier still-pending entry for a DIFFERENT
-                        // consumer position is untouched by this insert, so
-                        // two recognized calls before either is consumed
-                        // each keep their own entry.
-                        if let Some(consumer_position) = foreign_edge_consumer_position(body, position, parse_range) {
-                            foreign_edge_overrides.insert(consumer_position, (parse_range, value));
-                        }
-                    }
-                    foreign_edge::ForeignEdgeOutcome::Fired { message, range } => {
-                        out.push(Finding { range, code: "RTS7001", message });
-                    }
-                    foreign_edge::ForeignEdgeOutcome::Decline { message, range } => {
-                        record_blocker(&mut blocked, range, message, out);
-                    }
-                }
-                // recognized whole (an override, a fire, or a named
-                // decline) — the statement itself still walks ordinarily
-                // below so `<name>` binds through the usual Assign path;
-                // only the LATER `json.loads` node's value is overridden.
-            }
-        }
+        serve_foreign_edge_at(body, position, &environment, context, &mut blocked, out, &mut foreign_edge_overrides);
         let recognized = match stmt {
             Stmt::For(for_stmt) if for_stmt.orelse.is_empty() => {
                 relational_sum::recognize_accumulation(for_stmt, &environment)
@@ -1189,6 +1220,7 @@ fn seed_parameters(parameters: &Parameters, context: &WalkContext, environment: 
         // law in that file does. A string/sequence-shaped declared set
         // (`states_sequence` true, or `on_one_tuple_layer` false) is left
         // untagged, unchanged from today.
+        let admits_none = declared.admits_none;
         let seeded = if on_one_tuple_layer(&declared.set) && !states_sequence(&declared.set) {
             let sort = if requires_integer(&declared.set) {
                 PrimitiveKind::Integer
@@ -1201,6 +1233,26 @@ fn seed_parameters(parameters: &Parameters, context: &WalkContext, environment: 
             }
         } else {
             known_set(declared.set, None, TrustSpec, SetKindTag::None)
+        };
+        // `Optional[X]`/`X | None` (`declared.admits_none`): the parameter
+        // genuinely may arrive as `None` at runtime, so the seeded value
+        // must carry that admission the same way a JS `undefined`-or-`X`
+        // parameter would — wrapped in the maybe carrier
+        // (`possibly_absent`), its absent side pinned `NullOnly` (Python's
+        // `None`, never JS's `undefined`). Un-wrapped, a bare `Kind::Set`
+        // seed has NO shape a narrowing test could ever read as "possibly
+        // absent" (`narrowing.rs`'s own `is`/`is not None` arms only ever
+        // touch `Kind::Values`/`Kind::PossiblyUndefined`), so `sample is
+        // not None` against the un-wrapped seed decided PROVABLY TRUE
+        // outright (`expressions.rs::compare_pair`'s `is`/`is not` law
+        // settles identity the moment either side is KNOWN and not
+        // `Kind::Null` — a bare `Kind::Set` already qualifies) rather than
+        // staying the undecided test an Optional parameter's own guard
+        // must be.
+        let seeded = if admits_none {
+            possibly_absent(seeded, AbsentFlavor::NullOnly, Some(TrustSpec), false)
+        } else {
+            seeded
         };
         environment.bind(parameter.parameter.name.id.as_str(), seeded);
     }
@@ -1891,9 +1943,28 @@ pub fn derived_return_values(
     resolver: ModuleResolver,
     kernel: &Arc<RefinedTSKernel>,
 ) -> DerivedReturns {
+    derived_return_values_at(module, resolver, kernel, None)
+}
+
+/// `derived_return_values` plus the checked file's own directory — the
+/// export seam's twin of `findings_for_module_at`. A relative argv
+/// target inside a recognized foreign edge (`subprocess.run(["node",
+/// "./audio_level.ts"], ...)`) resolves against this directory, exactly
+/// as it does when the SAME body is walked for ordinary findings — a
+/// def whose derivation crosses to TypeScript exports the same way a
+/// def with no foreign edge does.
+pub fn derived_return_values_at(
+    module: &ModModule,
+    resolver: ModuleResolver,
+    kernel: &Arc<RefinedTSKernel>,
+    entry_directory: Option<&std::path::Path>,
+) -> DerivedReturns {
     let aliases = compile_aliases(module);
     let imports = surface_imports(module);
-    if aliases.is_empty() && imports.annotated_names.is_empty() {
+    if aliases.is_empty()
+        && imports.annotated_names.is_empty()
+        && imports.literal_names.is_empty()
+    {
         return DerivedReturns { values: HashMap::new(), blockers: HashMap::new() };
     }
     let surface = module_surface(module, resolver, kernel, IMPORT_DEPTH_CAP);
@@ -1926,9 +1997,7 @@ pub fn derived_return_values(
         module_callable_returns,
         strict_int_aliases: &strict_int_aliases,
         typed_dicts,
-        // the export derivation runs no foreign edge today — a .py body
-        // that itself crosses to TypeScript is a later composition
-        entry_directory: None,
+        entry_directory: entry_directory.map(|dir| dir.to_path_buf()),
         evaluations_recorder: None,
     };
     let mut values = HashMap::new();
@@ -2121,6 +2190,90 @@ fn walk_class_def(def: &StmtClassDef, enclosing_environment: &mut Environment, c
     walk_body(&def.body, None, None, self_model, context, out);
 }
 
+/// The one walrus-bound `subprocess.<callee>(...)` call reachable inside
+/// an `if`/`elif` TEST, if any — `(target, call)`, the same
+/// `Expr::Named::target`/`value` pair `bind_walrus_targets` already
+/// destructures, read again here rather than threaded through (this
+/// walk is a second, cheap traversal of a pure expression tree, the
+/// same posture `bind_walrus_targets`'s own doc already takes for its
+/// value-evaluation pass). Mirrors `bind_walrus_targets`'s own recursion
+/// shape so a walrus nested anywhere in the test (not only at the top)
+/// is found the same way it is already bound; stops at the first
+/// `Expr::Named` whose value is an `Expr::Call`, since a walrus can only
+/// ever bind once per test in the corpus's own idiom
+/// (`level_via_walrus_result`).
+fn walrus_bound_call_in_test(expr: &Expr) -> Option<(&ruff_python_ast::ExprName, &ruff_python_ast::ExprCall)> {
+    match expr {
+        Expr::Named(named) => {
+            if let (Expr::Name(target), Expr::Call(call)) = (named.target.as_ref(), named.value.as_ref()) {
+                return Some((target, call));
+            }
+            walrus_bound_call_in_test(named.value.as_ref())
+        }
+        Expr::BoolOp(op) => op.values.iter().find_map(walrus_bound_call_in_test),
+        Expr::BinOp(op) => walrus_bound_call_in_test(op.left.as_ref()).or_else(|| walrus_bound_call_in_test(op.right.as_ref())),
+        Expr::UnaryOp(op) => walrus_bound_call_in_test(op.operand.as_ref()),
+        Expr::Compare(compare) => walrus_bound_call_in_test(compare.left.as_ref())
+            .or_else(|| compare.comparators.iter().find_map(walrus_bound_call_in_test)),
+        Expr::Attribute(attribute) => walrus_bound_call_in_test(attribute.value.as_ref()),
+        _ => None,
+    }
+}
+
+/// Offers `arm_body`'s own consumer scan the same foreign-edge
+/// recognition a plain `Assign`/`With` statement already gets, for a
+/// walrus-bound `subprocess.<callee>(...)` call living in the `if`
+/// TEST rather than in the arm body itself
+/// (`level_via_walrus_result`'s own shape). Returns the per-consumer-
+/// position override map the arm body's own statement loop applies —
+/// the SAME map shape and publish/expire discipline
+/// `serve_foreign_edge_at`'s callers already keep, so no second
+/// mechanism exists for how an override reaches its consumer once
+/// recognized.
+fn serve_foreign_edge_in_walrus_test(
+    test: &Expr,
+    arm_body: &[Stmt],
+    environment: &Environment,
+    context: &WalkContext,
+    blocked: &mut bool,
+    out: &mut Vec<Finding>,
+) -> HashMap<usize, (TextRange, AbstractValue)> {
+    let mut foreign_edge_overrides = HashMap::new();
+    let Some((target, call)) = walrus_bound_call_in_test(test) else {
+        return foreign_edge_overrides;
+    };
+    let Some(outcome) = foreign_edge::foreign_edge_at_walrus_call(
+        call,
+        target,
+        arm_body,
+        0,
+        environment,
+        context.kernel,
+        context.entry_directory.as_deref(),
+    ) else {
+        return foreign_edge_overrides;
+    };
+    match outcome {
+        foreign_edge::ForeignEdgeOutcome::Override { parse_range, value } => {
+            if let Some(consumer_position) = arm_body
+                .iter()
+                .enumerate()
+                .find(|(_, statement)| statement.range().contains_range(parse_range))
+                .map(|(position, _)| position)
+            {
+                foreign_edge_overrides.insert(consumer_position, (parse_range, value));
+            }
+        }
+        foreign_edge::ForeignEdgeOutcome::Fired { message, range } => {
+            out.push(Finding { range, code: "RTS7001", message });
+        }
+        foreign_edge::ForeignEdgeOutcome::Decline { message, range } => {
+            record_blocker(blocked, range, message, out);
+        }
+    }
+    foreign_edge_overrides
+}
+
 /// `if test: body [elif test: body ...] [else: body]`
 /// (compound_stmts.rst, "The `if` statement"): each arm forks the
 /// incoming environment, narrows it by `assume` (the concurrent
@@ -2219,7 +2372,17 @@ fn walk_if(
                 // exactly as provably unbound as it would be in a straight-
                 // line body.
                 let mut arm_provably_unbound: HashSet<String> = HashSet::new();
-                for stmt in *body {
+                // FOREIGN EDGE: a walrus-bound `subprocess.<callee>(...)`
+                // call living in THIS test (`level_via_walrus_result`'s own
+                // shape) is offered to the same recognition an ordinary
+                // `Assign`/`With` statement gets — the arm body is where
+                // its sole `json.loads(...)` consumer sits.
+                let mut foreign_edge_overrides =
+                    serve_foreign_edge_in_walrus_test(test, body, &arm_environment, context, blocked, out);
+                for (position, stmt) in body.iter().enumerate() {
+                    if let Some((parse_range, value)) = foreign_edge_overrides.get(&position) {
+                        arm_environment.set_evaluated_node(Some((*parse_range, value.clone())));
+                    }
                     walk_statement(
                         stmt,
                         return_refinement,
@@ -2231,6 +2394,8 @@ fn walk_if(
                         blocked,
                         out,
                     );
+                    arm_environment.set_evaluated_node(None);
+                    foreign_edge_overrides.remove(&position);
                 }
                 *environment = if arm_terminates(body) { environment.fork() } else { arm_environment };
                 return;
@@ -2241,7 +2406,16 @@ fn walk_if(
             arm_environment = assume(test, arm_environment, context.kernel, true);
         }
         let mut arm_provably_unbound: HashSet<String> = HashSet::new();
-        for stmt in *body {
+        // FOREIGN EDGE: same walrus-in-test recognition as the
+        // provably-true short-circuit arm above, applied to this
+        // ordinary (possibly unknown-truthiness) arm's own body.
+        let mut foreign_edge_overrides = test
+            .map(|test| serve_foreign_edge_in_walrus_test(test, body, &arm_environment, context, blocked, out))
+            .unwrap_or_default();
+        for (position, stmt) in body.iter().enumerate() {
+            if let Some((parse_range, value)) = foreign_edge_overrides.get(&position) {
+                arm_environment.set_evaluated_node(Some((*parse_range, value.clone())));
+            }
             walk_statement(
                 stmt,
                 return_refinement,
@@ -2253,6 +2427,8 @@ fn walk_if(
                 blocked,
                 out,
             );
+            arm_environment.set_evaluated_node(None);
+            foreign_edge_overrides.remove(&position);
         }
         if !arm_terminates(body) {
             surviving.push(arm_environment);
@@ -2912,7 +3088,18 @@ fn walk_with(
         }
     }
     let mut with_provably_unbound: HashSet<String> = HashSet::new();
-    for stmt in &with_stmt.body {
+    // FOREIGN EDGE: a temp-file leg (or any other recognized crossing
+    // call) nested inside this with-block's own body is offered to
+    // `serve_foreign_edge_at` the same way the top-level body loop offers
+    // it — `with_stmt.body` is itself a statement list, so nesting one
+    // level inside another `with` (`level_via_nested_tempdir`) no longer
+    // removes it from every scan `foreign_edge_at` ever runs.
+    let mut foreign_edge_overrides: HashMap<usize, (TextRange, AbstractValue)> = HashMap::new();
+    for (position, stmt) in with_stmt.body.iter().enumerate() {
+        serve_foreign_edge_at(&with_stmt.body, position, environment, context, blocked, out, &mut foreign_edge_overrides);
+        if let Some((parse_range, value)) = foreign_edge_overrides.get(&position) {
+            environment.set_evaluated_node(Some((*parse_range, value.clone())));
+        }
         walk_statement(
             stmt,
             return_refinement,
@@ -2924,6 +3111,8 @@ fn walk_with(
             blocked,
             out,
         );
+        environment.set_evaluated_node(None);
+        foreign_edge_overrides.remove(&position);
     }
 }
 
@@ -6319,6 +6508,29 @@ mod tests {
     fn offset_of(source: &str, needle: &str) -> TextSize {
         let byte_offset = source.find(needle).unwrap_or_else(|| panic!("{needle:?} not found in fixture"));
         TextSize::try_from(byte_offset).expect("fixture offsets fit in TextSize")
+    }
+
+    /// A module whose ONLY refinement vocabulary is a bare
+    /// `Literal[...]` annotation — no `type` alias, no `Annotated`
+    /// import — is judged: the engagement gate reads the `Literal`
+    /// import as refinement vocabulary too. Pins the gate widening;
+    /// before it, this module returned zero findings without ever
+    /// reaching the walk.
+    #[test]
+    fn a_literal_only_module_is_judged() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let source = concat!(
+            "from typing import Literal\n",
+            "\n",
+            "def pick(level: Literal[1, 2, 4]) -> Literal[1, 2]:\n",
+            "    return level\n",
+        );
+        let module = parsed(source);
+        let findings = findings_for_module_at(&module, no_imports_resolver(), &kernel, None);
+        assert!(
+            !findings.is_empty(),
+            "a Literal-only module must reach the walk and judge its rows"
+        );
     }
 
     /// `refined_set_at_position` at a PARAMETER's own annotation
@@ -10495,6 +10707,184 @@ mod tests {
             consumer, None,
             "a range no later statement contains must answer no consumer position, the same way an override \
              with nothing to key never gets applied anywhere"
+        );
+    }
+
+    /* ── the export walk's own entry_directory ───────────────────────
+     *
+     * `derived_return_values_at` threads `entry_directory` into the
+     * SAME `WalkContext` field `findings_for_module_at` already
+     * populates, so `serve_foreign_edge_at`'s `foreign_edge_at` call
+     * (line ~588) resolves a relative argv target the identical way
+     * during export as during an ordinary check. `register_fixture_
+     * artifact` is private to `foreign_edge::tests` (unreachable from
+     * here — the brief's own boundary), so these tests cannot drive a
+     * recognized edge all the way to `Override`. What IS reachable: the
+     * recognized-but-undischarged edge's own DECLINE sentence, which
+     * `discharge_edge_premises` builds from `edge.target_path` AFTER
+     * joining it against `entry_directory` when one is given
+     * (foreign_edge.rs:395-403). A relative target with no directory
+     * stays the bare literal the source wrote; the identical body walked
+     * WITH a directory reports the JOINED (absolute) path instead — an
+     * observable difference that exists only if the walk actually
+     * carried `entry_directory` through to `foreign_edge_at`, which is
+     * the one fact these tests pin.
+     */
+
+    /// A one-def module whose only statement is a recognized (relative-
+    /// target) foreign edge that consumes nothing further — the walk
+    /// records it as `blockers`, never `values` (no `return` anywhere in
+    /// the body), so the blocker sentence is exactly what
+    /// `discharge_edge_premises` names for this decline. Carries a
+    /// `type` alias with no other role than clearing
+    /// `derived_return_values_at`'s own early exit (`aliases.is_empty()
+    /// && imports.annotated_names.is_empty()`) — with neither present
+    /// the walk never runs at all, foreign edge included.
+    fn foreign_edge_only_module() -> ModModule {
+        parsed(concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Age = Annotated[int, Field(ge=0, le=120)]\n",
+            "\n",
+            "def f(boosted):\n",
+            "    result = subprocess.run(\n",
+            "        [\"node\", \"./audio_level.ts\"],\n",
+            "        input=json.dumps(boosted),\n",
+            "        capture_output=True,\n",
+            "        text=True,\n",
+            "    )\n",
+            "    parsed = json.loads(result.stdout)\n",
+        ))
+    }
+
+    /// `derived_return_values` (no directory, the pre-existing entry
+    /// point) leaves a relative argv target UNJOINED — the blocker names
+    /// the bare literal the source wrote, never an absolute path.
+    #[test]
+    fn derived_return_values_with_no_directory_names_the_bare_relative_target() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = foreign_edge_only_module();
+        let derived = derived_return_values(&module, no_imports_resolver(), &kernel);
+        let blocker = derived.blockers.get("f").unwrap_or_else(|| {
+            panic!("expected a recorded blocker for 'f'; values = {:?}, blockers = {:?}", derived.values, derived.blockers)
+        });
+        assert!(
+            blocker.contains("./audio_level.ts"),
+            "with no entry_directory the target must stay the bare relative literal: {blocker:?}"
+        );
+    }
+
+    /// `derived_return_values_at` WITH a directory joins the SAME
+    /// relative target against it before the artifact read — the
+    /// blocker now names the absolute (joined) path, proving the export
+    /// walk carried `entry_directory` into `foreign_edge_at` exactly as
+    /// `findings_for_module_at` already does for an ordinary check.
+    #[test]
+    fn derived_return_values_at_with_a_directory_joins_the_relative_target_before_declining() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = foreign_edge_only_module();
+        let directory = std::path::Path::new("/tmp/refinedpy-export-directory-fixture");
+        let derived = derived_return_values_at(&module, no_imports_resolver(), &kernel, Some(directory));
+        let blocker = derived.blockers.get("f").unwrap_or_else(|| {
+            panic!("expected a recorded blocker for 'f'; values = {:?}, blockers = {:?}", derived.values, derived.blockers)
+        });
+        // `Path::join` keeps the source's own leading "./" verbatim
+        // (foreign_edge.rs's own join: `directory.join(target)` where
+        // `target` is `Path::new("./audio_level.ts")`), so the joined
+        // spelling is the directory plus that exact relative text, not
+        // a normalized form.
+        let joined = directory.join("./audio_level.ts");
+        assert!(
+            blocker.contains(&joined.to_string_lossy().into_owned()),
+            "with entry_directory given, the target must be joined against it before the read: {blocker:?}"
+        );
+    }
+
+    /// A module with no foreign edge at all keeps deriving its return
+    /// exactly the same whether or not a directory is given — threading
+    /// `entry_directory` through must never change a def's OWN
+    /// derivation when nothing in its body ever reads it.
+    #[test]
+    fn derived_return_values_at_with_a_directory_does_not_disturb_an_ordinary_def() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let source = concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "Age = Annotated[int, Field(ge=0)]\n",
+            "\n",
+            "def f(x: Age) -> Age:\n",
+            "    return x\n",
+        );
+        let module = parsed(source);
+        let no_directory = derived_return_values(&module, no_imports_resolver(), &kernel);
+        let with_directory = derived_return_values_at(
+            &module,
+            no_imports_resolver(),
+            &kernel,
+            Some(std::path::Path::new("/tmp/refinedpy-export-directory-fixture")),
+        );
+        assert_eq!(
+            format!("{:?}", no_directory.values.get("f")),
+            format!("{:?}", with_directory.values.get("f")),
+            "an ordinary def's derived return must be identical regardless of entry_directory"
+        );
+    }
+
+    /// `sample`'s own read INSIDE the `if sample is not None:` arm — the
+    /// position `refined_set_at_position` answers for the `sample` name
+    /// at the `return sample` site — must read the ANNOTATED, non-None
+    /// set (`>= -2 && <= 2`), never the wrapper: `narrow_is_none`'s own
+    /// `Kind::PossiblyUndefined` unwrap arm is what this pins.
+    #[test]
+    fn an_is_not_none_guarded_parameter_narrows_to_its_annotated_set() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let source = concat!(
+            "from typing import Annotated, Optional\n",
+            "from pydantic import Field\n",
+            "Sample = Optional[Annotated[float, Field(ge=-2.0, le=2.0)]]\n",
+            "\n",
+            "def f(sample: Sample) -> None:\n",
+            "    if sample is not None:\n",
+            "        return sample\n",
+            "    return None\n",
+        );
+        let module = parsed(source);
+        let position = offset_of(source, "sample\n    return None");
+        let set = refined_set_at_position(&module, no_imports_resolver(), &kernel, position)
+            .unwrap_or_else(|| panic!("expected the narrowed `sample` read to answer a declared set"));
+        assert_eq!(format_for_diagnostics(&set), ">= -2 && <= 2");
+    }
+
+    /// The ternary twin of the above: `sample if sample is not None else
+    /// 0.0` forks and narrows the SAME way an `if`/`else` STATEMENT does
+    /// (`expressions.rs::evaluate_ternary`'s own routing through
+    /// `narrowing::assume`) — the joined value is wider than a `Level`
+    /// return (`>= 0 && <= 1`), so it fires RTS7001, never sits
+    /// undetermined behind RTS7002.
+    #[test]
+    fn an_is_not_none_guarded_ternary_joins_to_a_wider_set_and_fires() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "from typing import Annotated, Optional\n",
+            "from pydantic import Field\n",
+            "Level = Annotated[float, Field(ge=0.0, le=1.0)]\n",
+            "Sample = Optional[Annotated[float, Field(ge=-2.0, le=2.0)]]\n",
+            "def f(sample: Sample) -> Level:\n",
+            "    return sample if sample is not None else 0.0\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        let undetermined: Vec<&Finding> = findings.iter().filter(|f| f.code == "RTS7002").collect();
+        assert!(
+            undetermined.is_empty(),
+            "the ternary's joined value must be readable, never RTS7002: {:?}",
+            findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+        );
+        let fires: Vec<&Finding> = findings.iter().filter(|f| f.code == "RTS7001").collect();
+        assert_eq!(
+            fires.len(),
+            1,
+            "the joined set (>= -2 && <= 2, or 0.0) is wider than Level (>= 0 && <= 1) and must fire: {:?}",
+            findings.iter().map(|f| &f.message).collect::<Vec<_>>()
         );
     }
 }

@@ -248,6 +248,27 @@ pub fn judge(
     // `| None` wrapper only sets `admits_none`, never clears `element`,
     // per typereading.rs's union-arm recursion), and `admits_none` wins
     // the same way it does for every other declaration shape.
+    //
+    // `Kind::PossiblyUndefined` (an `Optional[X]`/`X | None`-declared
+    // PARAMETER's own seed, `check.rs::seed_parameters`, narrowed or not
+    // — an un-narrowed wrapper reaches here exactly like a bare
+    // un-narrowed `Kind::Null` already does): the wrapper's absent side
+    // is Python's `None`, judged the SAME way a bare `Kind::Null` already
+    // is right below (`declared.admits_none` wins, or fires the
+    // structural mismatch) — a flowing `None` is `None` whether it
+    // arrived as the exact null_value or as this wrapper's own absent
+    // admission. The wrapper's PRESENT side (`value.inner`) judges
+    // through this SAME seam recursively, so a parameter's own annotated
+    // set still fires/silences/blocks exactly as it would un-wrapped —
+    // the maybe carrier changes nothing about what its present side
+    // states.
+    if value.kind == Kind::PossiblyUndefined {
+        if !declared.admits_none {
+            return Verdict::Fire(refutation("None", &declared.spelling, &declared.set));
+        }
+        let inner = value.inner.as_deref().expect("Kind::PossiblyUndefined always carries an inner value");
+        return judge(inner, declared, kernel);
+    }
     if let Some(element) = &declared.element {
         if value.kind == Kind::Null {
             if declared.admits_none {
@@ -756,7 +777,7 @@ fn repetition_element_is_codepoints(form: &refined_sets::refinement_forms::Refin
     }
 }
 
-fn sequence_shaped(set: &refined_sets::refinement_forms::RefinedSet) -> bool {
+pub(crate) fn sequence_shaped(set: &refined_sets::refinement_forms::RefinedSet) -> bool {
     use refined_sets::refinement_forms::Form;
     !set.forms.is_empty()
         && set.forms.iter().all(|form| match form.form {

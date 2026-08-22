@@ -129,46 +129,56 @@
 //! Float.
 //!
 //! CORNER CHECK: the return set's own corner values must be ones the
-//! JSON leg can actually carry. `JSON.stringify` on the TypeScript
-//! target's own side commits to legal JSON text (RFC 8259), which has
-//! no token for ±Infinity — `JSON.stringify(Infinity)` answers the
-//! bare literal `null` (ECMA-262's `SerializeJSONProperty`, the
-//! finiteness check on a Number value), a value outside the claimed
-//! numeric set landing at this leg's own `json.loads` consumer. A
-//! return set whose corners admit ±Infinity degrades to a named
-//! undetermined instead of binding the set as stated
+//! TypeScript target's own serializer actually carries. The mechanism is
+//! NOT that legal JSON text (RFC 8259) has no token for ±Infinity — a
+//! JSON leg can carry it fine (`1e999` is legal JSON text and parses to
+//! Infinity in both runtimes). The mechanism is `JSON.stringify` itself:
+//! it serializes a non-finite Number as the bare literal `null`
+//! (ECMA-262's `SerializeJSONProperty`, the finiteness check on a Number
+//! value), a value outside the claimed numeric set landing at this leg's
+//! own `json.loads` consumer. A return set whose corners admit ±Infinity
+//! degrades to a named undetermined instead of binding the set as stated
 //! (`foreign_return_value_or_undetermined`); NaN is already excluded
 //! from every `RefinedSet` at construction (the boundary ruling), so
 //! only the two infinite corners need the check.
 
 use std::sync::Arc;
 
+use refined_domain::abstract_value::kind_union_of;
 use refined_domain::abstract_value::known_set;
+use refined_domain::abstract_value::known_values;
+use refined_domain::abstract_value::null_value;
 use refined_domain::abstract_value::AbstractValue;
 use refined_domain::abstract_value::Kind;
+use refined_domain::abstract_value::ObjectKey;
 use refined_domain::abstract_value::PrimitiveKind;
 use refined_domain::abstract_value::SetKindTag;
+use refined_domain::known_constructors::known_object;
 use refined_domain::lattice_operations::set_of_known;
 use refined_domain::trust_grades::TrustSpec;
 use refined_kernel::kernel_interface::RefinedTSKernel;
-use refined_sets::refinement_forms::on_one_tuple_layer;
+use refined_sets::refinement_forms::make_refined_set;
+use refined_sets::refinement_forms::one_of;
 use refined_sets::refinement_forms::requires_integer;
+use refined_sets::refinement_forms::union;
 use refined_sets::refinement_forms::Form;
 use refined_sets::refinement_forms::RefinedSet;
 use refined_sets::repetition_window_forms::as_repetition;
+use ruff_python_ast::ConversionFlag;
 use ruff_python_ast::Expr;
 use ruff_python_ast::ExprCall;
 use ruff_python_ast::ExprList;
 use ruff_python_ast::ExprName;
+use ruff_python_ast::InterpolatedStringElement;
 use ruff_python_ast::Stmt;
 use ruff_python_ast::StmtAssign;
 use ruff_python_ast::StmtWith;
 use ruff_text_size::Ranged;
 use ruff_text_size::TextRange;
 
-use crate::refinedpy::assignability::states_sequence;
 use crate::refinedpy::diagnostic_sentences;
 use crate::refinedpy::env::Environment;
+use crate::refinedpy::foreign_edge_artifact::ForeignCase;
 use crate::refinedpy::foreign_edge_artifact::ForeignSurface;
 use crate::refinedpy::foreign_edge_artifact::ForeignTsArtifact;
 use crate::refinedpy::foreign_edge_artifact::ForeignTsEntry;
@@ -305,10 +315,82 @@ pub fn foreign_edge_at(
     kernel: &Arc<RefinedTSKernel>,
     entry_directory: Option<&std::path::Path>,
 ) -> Option<ForeignEdgeOutcome> {
+    // The idiomatic `with subprocess.Popen([...]) as process:` wrapping
+    // (`level_via_popen_context_manager`'s own shape) puts its OWN
+    // consumer — the `.communicate()` assign and, later, the
+    // `json.loads(...)` read — inside the WITH-BLOCK's own body, never
+    // as a sibling of the `with` statement in `statements`. Every other
+    // recognized shape (a plain `Assign`, or the temp-file `with`) keeps
+    // scanning `statements` exactly as before; only this one shape scans
+    // its own nested body instead.
+    if let Stmt::With(with_stmt) = &statements[index] {
+        if recognize_temp_file_edge(with_stmt, statements, index, environment).is_none() {
+            if let Some(edge) = recognize_popen_context_manager_edge(with_stmt, environment) {
+                return finish_recognized_edge(edge, &with_stmt.body, environment, kernel, entry_directory);
+            }
+        }
+    }
     let edge = recognize_foreign_edge(statements, index, environment)?;
+    finish_recognized_edge(edge, statements, environment, kernel, entry_directory)
+}
+
+/// Recognizes a cross-language call directly off a walrus-bound `<name>
+/// := subprocess.<callee>(...)` inside an `if`/`elif` TEST (`level_via_
+/// walrus_result`'s own shape: `Stmt::If`, never an `Assign`/`With`, so
+/// `foreign_edge_at`'s own `statements[index]` dispatch structurally
+/// never reaches it) and, on all premises green, answers the override
+/// the caller publishes for the rest of the ARM body's walk.
+///
+/// `target`/`call` are the walrus's own `Expr::Named::target`/`value`
+/// (already destructured by the caller, which knows the walrus shape);
+/// `arm_body` is the taken arm's own statement list — the return leg's
+/// sole-consumer scan runs over THAT list (`sole_parse_consumer_of`
+/// reads forward from `arm_scan_from`), since the `json.loads(...)`
+/// consumer sits inside the arm, never as a sibling of the outer `if`.
+/// Answers `None` for every callee this crate does not recognize at all
+/// — the same "not this shape, no sentence owed" contract
+/// `recognize_foreign_edge` keeps for its own Assign path.
+pub fn foreign_edge_at_walrus_call(
+    call: &ExprCall,
+    target: &ExprName,
+    arm_body: &[Stmt],
+    arm_scan_from: usize,
+    environment: &Environment,
+    kernel: &Arc<RefinedTSKernel>,
+    entry_directory: Option<&std::path::Path>,
+) -> Option<ForeignEdgeOutcome> {
+    let edge = recognize_subprocess_callee(call, target, arm_body, arm_scan_from, environment)?;
+    // The walrus-bound call sits inside the `if` TEST, never as a member
+    // of `arm_body` — there is no call STATEMENT for the return leg's
+    // scan to skip past, unlike the `Stmt::Assign`/`Stmt::With` shapes
+    // `finish_recognized_edge`'s other callers supply. The whole arm
+    // body is offered to the consumer scan from its own start.
+    finish_recognized_edge_from_start(edge, arm_body, environment, kernel, entry_directory)
+}
+
+/// The post-recognition premises every recognized edge shares, whichever
+/// syntactic shape (`Stmt::Assign`, `Stmt::With`, or a walrus-bound call
+/// inside an `if` test) supplied it: resolve a relative target path,
+/// read the target's own artifact, check the carrier identity, discharge
+/// the outbound leg, and check channel purity. Answers the discharged
+/// `ForeignEdge`/artifact pair once every premise up to (not including)
+/// the return leg's own consumer scan is green — the one step that
+/// differs between callers (`sole_parse_consumer_of`'s "skip past the
+/// call statement" scan for `Stmt::Assign`/`Stmt::With`, versus the
+/// walrus path's "scan the whole arm body" one, since there is no call
+/// statement to skip past at all), left to each caller's own thin
+/// wrapper.
+fn discharge_edge_premises(
+    edge: Result<ForeignEdge, RecognitionDecline>,
+    environment: &Environment,
+    kernel: &Arc<RefinedTSKernel>,
+    entry_directory: Option<&std::path::Path>,
+) -> Result<(ForeignEdge, ForeignTsArtifact), ForeignEdgeOutcome> {
     let mut edge = match edge {
         Ok(edge) => edge,
-        Err(decline) => return Some(ForeignEdgeOutcome::Decline { message: decline.message, range: decline.range }),
+        Err(decline) => {
+            return Err(ForeignEdgeOutcome::Decline { message: decline.message, range: decline.range });
+        }
     };
     // A relative argv entry is relative to the FILE that wrote it, never
     // to the process's cwd — join it against the checked file's own
@@ -322,7 +404,7 @@ pub fn foreign_edge_at(
     let artifact = match read_foreign_ts_artifact(&edge.target_path) {
         Ok(artifact) => artifact,
         Err(reason) => {
-            return Some(ForeignEdgeOutcome::Decline {
+            return Err(ForeignEdgeOutcome::Decline {
                 message: "the target ".to_owned() + &edge.target_path + " states no fact for this edge — " + &reason,
                 range: edge.call,
             });
@@ -338,34 +420,80 @@ pub fn foreign_edge_at(
     // the target's surface states the one it actually reads — a JSON
     // transport model applies only when both name the SAME carrier.
     if let Some(mismatch) = channel_mismatch_decline(edge.channel, &artifact.surface) {
-        return Some(ForeignEdgeOutcome::Decline { message: mismatch, range: edge.call });
+        return Err(ForeignEdgeOutcome::Decline { message: mismatch, range: edge.call });
     }
     // the OUTBOUND leg: every premise about what crosses out, discharged
     // against the value the walk holds for it
     if let Some(outcome) = check_outbound_leg(&edge, &artifact, environment, kernel) {
-        return Some(outcome);
+        return Err(outcome);
     }
     // CHANNEL PURITY: the wire is stdout, and the claim assumes stdout
     // carries exactly the serialized result
     if !artifact.called.stdout_pure {
-        return Some(ForeignEdgeOutcome::Decline {
+        return Err(ForeignEdgeOutcome::Decline {
             message: "the target ".to_owned() + &artifact.called.name + " does not state that it writes "
                 + "nothing else to stdout, and this edge reads its result off stdout — "
                 + "the channel-purity premise is undischarged",
             range: edge.call,
         });
     }
-    // the RETURN leg: the target's own fact, attached to the parse —
-    // unless the declared return admits a corner the JSON leg cannot
-    // carry, which degrades to a named undetermined instead of binding
-    // the set as stated
-    match sole_parse_consumer_of(statements, edge.consumer_scan_from, &edge.result_name, edge.result_read) {
-        Ok(parse_range) => match foreign_return_value_or_undetermined(&artifact) {
-            Ok(value) => Some(ForeignEdgeOutcome::Override { parse_range, value }),
-            Err(message) => Some(ForeignEdgeOutcome::Decline { message, range: parse_range }),
+    Ok((edge, artifact))
+}
+
+/// Answers the return leg's own outcome once `sole_parse_consumer_of`
+/// (or its inclusive-scan sibling) has already run: the target's own
+/// fact, attached to the parse — unless the declared return admits a
+/// corner the target's own `JSON.stringify` serializes as `null`, which
+/// degrades to a named undetermined instead of binding the set as
+/// stated.
+fn return_leg_outcome(consumer: Result<TextRange, String>, artifact: &ForeignTsArtifact, call: TextRange) -> ForeignEdgeOutcome {
+    match consumer {
+        Ok(parse_range) => match foreign_return_value_or_undetermined(artifact) {
+            Ok(value) => ForeignEdgeOutcome::Override { parse_range, value },
+            Err(message) => ForeignEdgeOutcome::Decline { message, range: parse_range },
         },
-        Err(message) => Some(ForeignEdgeOutcome::Decline { message, range: edge.call }),
+        Err(message) => ForeignEdgeOutcome::Decline { message, range: call },
     }
+}
+
+/// `discharge_edge_premises` plus the ordinary return-leg scan
+/// (`sole_parse_consumer_of`, which skips past the call's own statement
+/// at `edge.consumer_scan_from`) — the `Stmt::Assign`/`Stmt::With`
+/// callers' own finish, unchanged from before the walrus entry point
+/// existed.
+fn finish_recognized_edge(
+    edge: Result<ForeignEdge, RecognitionDecline>,
+    statements: &[Stmt],
+    environment: &Environment,
+    kernel: &Arc<RefinedTSKernel>,
+    entry_directory: Option<&std::path::Path>,
+) -> Option<ForeignEdgeOutcome> {
+    let (edge, artifact) = match discharge_edge_premises(edge, environment, kernel, entry_directory) {
+        Ok(discharged) => discharged,
+        Err(outcome) => return Some(outcome),
+    };
+    let consumer = sole_parse_consumer_of(statements, edge.consumer_scan_from, &edge.result_name, edge.result_read);
+    Some(return_leg_outcome(consumer, &artifact, edge.call))
+}
+
+/// `discharge_edge_premises` plus the INCLUSIVE return-leg scan
+/// (`sole_parse_consumer_from`, over the whole of `statements` — no call
+/// statement to skip past) — `foreign_edge_at_walrus_call`'s own finish,
+/// since its recognized call sits inside the `if` TEST rather than as a
+/// member of `statements` at all.
+fn finish_recognized_edge_from_start(
+    edge: Result<ForeignEdge, RecognitionDecline>,
+    statements: &[Stmt],
+    environment: &Environment,
+    kernel: &Arc<RefinedTSKernel>,
+    entry_directory: Option<&std::path::Path>,
+) -> Option<ForeignEdgeOutcome> {
+    let (edge, artifact) = match discharge_edge_premises(edge, environment, kernel, entry_directory) {
+        Ok(discharged) => discharged,
+        Err(outcome) => return Some(outcome),
+    };
+    let consumer = sole_parse_consumer_from(statements, &edge.result_name, edge.result_read);
+    Some(return_leg_outcome(consumer, &artifact, edge.call))
 }
 
 /// Whether the call's own carrier and the target's declared surface
@@ -428,30 +556,88 @@ fn read_foreign_ts_artifact(target_path: &str) -> Result<ForeignTsArtifact, Stri
 }
 
 /// The fact the `json.loads` result wears: the target's stated return
-/// set, at the grade the crossing's weakest cited boundary admits.
+/// cases, at the grade the crossing's weakest cited boundary admits —
+/// one case lowers directly to its own value; more than one lowers to a
+/// `Kind::KindUnion` of arms (the machinery every consumer of a sort
+/// union already shares: `judge`, isinstance/match narrowing). An
+/// `ForeignCase::Object` return case is real wire vocabulary now: it
+/// lowers to `Kind::Object` through the same `known_object` constructor
+/// every dict-literal read already builds (`foreign_case_value`'s own
+/// Object arm), so the Result-shape corpus of "several object cases in
+/// one return list" reads through this exact same function unchanged —
+/// `kind_union_of` is already generic over its arms' own Kind, taking no
+/// object-specific branch.
 ///
 /// `TrustSpec`, mirroring the Go twin's `foreignReturnValue`: the value
 /// is not this kernel's own decision about this expression, it is
 /// another language's claim carried across a transport whose identity
 /// is a CITED PREMISE, not a proved theorem.
-///
-/// The SORT tag comes from the set's own forms, never a stamp: an
-/// explicit `Integer` form, or every member of an all-integer `OneOf`
-/// (a union-of-integer-literal return like `union_levels.ts`'s derived
-/// `{1, 2, 4}` — `requires_or_reads_integer` below), reads Integer; a
-/// numeric set stating neither reads Float; a set that is not on the
-/// numeric one-tuple layer at all (a sequence return, or a
-/// string-sorted one) carries no numeric tag — the same
-/// `on_one_tuple_layer`/`states_sequence` gate `check.rs`'s
-/// `declared_set_instance` already applies to a DECLARED position,
-/// applied here to a CROSSED one.
-fn foreign_return_value(artifact: &ForeignTsArtifact) -> AbstractValue {
-    let set = artifact.called.return_set.clone();
-    if on_one_tuple_layer(&set) && !states_sequence(&set) {
-        let sort = if requires_or_reads_integer(&set) { PrimitiveKind::Integer } else { PrimitiveKind::Float };
-        return AbstractValue { kind_tag: Some(sort), ..known_set(set, None, TrustSpec, SetKindTag::None) };
+fn foreign_return_value(artifact: &ForeignTsArtifact) -> Result<AbstractValue, String> {
+    foreign_case_list_value(&artifact.called.return_cases, &artifact.called.name)
+}
+
+/// A cases LIST lowered to one `AbstractValue` — one case direct, several
+/// through `kind_union_of` — the same channel `foreign_return_value`
+/// applies at the top level and a member's own `Vec<ForeignCase>`
+/// (`ForeignCase::Object`'s own field) applies once per member, since a
+/// member's cases list is the identical "one or several wire cases name
+/// one value" shape recursed one layer down.
+fn foreign_case_list_value(cases: &[ForeignCase], function_name: &str) -> Result<AbstractValue, String> {
+    let mut values = Vec::with_capacity(cases.len());
+    for case in cases {
+        values.push(foreign_case_value(case, function_name)?);
     }
-    known_set(set, None, TrustSpec, SetKindTag::None)
+    Ok(kind_union_of(values))
+}
+
+/// One case lowered to its own `AbstractValue`: a number/string set
+/// case's SORT comes from the case tag itself, never guessed from the
+/// set's own forms — the whole point of the wire stating "number" or
+/// "string" explicitly is that a crossed return never needs the
+/// declared-position sort law's own shape heuristic. `requires_or_
+/// reads_integer` still decides Integer vs Float WITHIN a number case
+/// (a union-of-integer-literal return like `union_levels.ts`'s derived
+/// `{1, 2, 4}` reads Integer; a numeric set stating neither reads
+/// Float) — that distinction is orthogonal to the case's own number/
+/// string/boolean/null tag.
+///
+/// `ForeignCase::Object` lowers into the domain's own object vocabulary
+/// — the same `Kind::Object` shape `collection_models.rs`'s
+/// `dict_literal_value` builds for an ordinary `{...}` display, through
+/// the identical `known_object` constructor
+/// (`refined_domain::known_constructors::known_object`), never a
+/// parallel object representation. Each member's own cases list
+/// recurses through `foreign_case_list_value` — the same one-direct/
+/// several-union channel this function's own caller applies at the top
+/// level — so a member typed as several wire cases (a Result-shape
+/// member itself carrying a nested object union) lowers the same way a
+/// multi-case return does. `complete` comes straight from the case's own
+/// `closed`: a closed case states its member list is the WHOLE key set,
+/// which is exactly what `known_object`'s `complete` flag claims.
+/// Every member key is a plain string entry (`numeric: false`) — the
+/// wire's own member-name vocabulary is always a JSON object key, never
+/// a Python int-keyed dict entry. `stated` is `None` (no
+/// `ObjectAnnotationRef` for a value this checker derived rather than
+/// read off a declared annotation) and `bare_proto` is `false`,
+/// matching `dict_literal_value`'s own call.
+fn foreign_case_value(case: &ForeignCase, function_name: &str) -> Result<AbstractValue, String> {
+    Ok(match case {
+        ForeignCase::Number(set) => {
+            let sort = if requires_or_reads_integer(set) { PrimitiveKind::Integer } else { PrimitiveKind::Float };
+            AbstractValue { kind_tag: Some(sort), ..known_set(set.clone(), None, TrustSpec, SetKindTag::None) }
+        }
+        ForeignCase::String(set) => known_set(set.clone(), None, TrustSpec, SetKindTag::None),
+        ForeignCase::Boolean => known_values(vec![0.0, 1.0], PrimitiveKind::Boolean, TrustSpec),
+        ForeignCase::Null => null_value(),
+        ForeignCase::Object { members, closed } => {
+            let mut keys = Vec::with_capacity(members.len());
+            for (name, member_cases) in members {
+                let value = foreign_case_list_value(member_cases, function_name)?;
+                keys.push(ObjectKey { name: name.clone(), numeric: false, value });
+            }
+            known_object(keys, None, *closed, TrustSpec, false)
+        }
+    })
 }
 
 /// Whether a set's own forms state an integer sort — `requires_integer`
@@ -487,27 +673,23 @@ fn requires_or_reads_integer(set: &RefinedSet) -> bool {
     false
 }
 
-/// Which infinite corner a return set's own forms admit — `None` when
-/// the return is not a scalar on the numeric one-tuple layer at all
-/// (a sequence return states no scalar corner this JSON-number premise
-/// is about; a compound object/array return is a different wire shape
-/// entirely, out of this check's scope), or when a scalar return's own
-/// hull is bounded on both ends. A set is an INTERSECTION of its
-/// forms, so a ray form (`AtLeast`/`Above` narrows the hull's lower end
-/// up; `AtMost`/`Below` narrows the upper end down) only leaves a side
-/// unbounded when NO form in the intersection states a finite bound on
-/// that side — the same reading `set_simplification.rs`'s own
-/// `hull_of` computes for simplification, done locally here since that
-/// reader is private to its crate. A `Union` widens to the LOOSER of
-/// its two arms' own hulls (either arm admitting the corner means the
-/// union does); a `Difference` reads only its left arm's hull (removing
-/// members never widens). NaN is excluded from every `RefinedSet` at
-/// construction (the boundary ruling), so only the two infinite
-/// corners are asked about here.
+/// Which infinite corner a NUMBER case's own set admits — `None` when
+/// the case's own hull is bounded on both ends. A set is an
+/// INTERSECTION of its forms, so a ray form (`AtLeast`/`Above` narrows
+/// the hull's lower end up; `AtMost`/`Below` narrows the upper end
+/// down) only leaves a side unbounded when NO form in the intersection
+/// states a finite bound on that side — the same reading
+/// `set_simplification.rs`'s own `hull_of` computes for simplification,
+/// done locally here since that reader is private to its crate. A
+/// `Union` widens to the LOOSER of its two arms' own hulls (either arm
+/// admitting the corner means the union does); a `Difference` reads
+/// only its left arm's hull (removing members never widens). NaN is
+/// excluded from every `RefinedSet` at construction (the boundary
+/// ruling), so only the two infinite corners are asked about here. The
+/// case tag itself already says "number" — no `on_one_tuple_layer`/
+/// `states_sequence` shape gate is needed to tell a number case from a
+/// string/sequence one.
 fn uncarriable_corner_of(set: &RefinedSet) -> Option<&'static str> {
-    if !on_one_tuple_layer(set) || states_sequence(set) {
-        return None;
-    }
     let hull = hull_of(set);
     if hull.lo == f64::NEG_INFINITY {
         return Some("-Infinity");
@@ -559,25 +741,33 @@ fn hull_of(set: &RefinedSet) -> ScalarHull {
     ScalarHull { lo, hi }
 }
 
-/// The return leg's own fact, degraded to a named undetermined when
-/// the target's declared return admits a corner (+Infinity or
-/// -Infinity) the JSON stdout leg cannot carry — `JSON.stringify`
-/// writes that corner as the bare token `null` (ECMA-262's
-/// `SerializeJSONProperty`), a value outside the claimed numeric set
-/// landing at this call's own consumer. A finite-cornered set binds
-/// exactly as `foreign_return_value` already reads it; this is the
-/// gate every caller of `foreign_return_value` for a RETURN (never an
-/// entry — the outbound leg's own NaN-freedom check is the different,
-/// already-landed premise for the value crossing OUT) must pass
-/// through first.
+/// The return leg's own fact, degraded to a named undetermined when the
+/// target's declared return admits a corner (+Infinity or -Infinity)
+/// the target's own `JSON.stringify` serializes as the bare token
+/// `null` (ECMA-262's `SerializeJSONProperty`, the finiteness check on a
+/// Number value — not an RFC 8259 gap, since `1e999` is legal JSON text
+/// that parses to Infinity in both runtimes), a value outside the
+/// claimed numeric set landing at this call's own consumer. Every
+/// NUMBER case among the return's own cases is checked
+/// (a string/boolean/null case states no scalar corner this premise is
+/// about); a finite-cornered return binds exactly as `foreign_return_
+/// value` already reads it. This is the gate every caller of `foreign_
+/// return_value` for a RETURN (never an entry — the outbound leg's own
+/// NaN-freedom check is the different, already-landed premise for the
+/// value crossing OUT) must pass through first.
 fn foreign_return_value_or_undetermined(artifact: &ForeignTsArtifact) -> Result<AbstractValue, String> {
-    if let Some(corner) = uncarriable_corner_of(&artifact.called.return_set) {
-        return Err(diagnostic_sentences::foreign_edge_return_admits_uncarriable_corner(
-            &artifact.called.name,
-            corner,
-        ));
+    for case in &artifact.called.return_cases {
+        let ForeignCase::Number(set) = case else {
+            continue;
+        };
+        if let Some(corner) = uncarriable_corner_of(set) {
+            return Err(diagnostic_sentences::foreign_edge_return_admits_uncarriable_corner(
+                &artifact.called.name,
+                corner,
+            ));
+        }
     }
-    Ok(foreign_return_value(artifact))
+    foreign_return_value(artifact)
 }
 
 /* ── recognition ──────────────────────────────────────────────────── */
@@ -727,22 +917,33 @@ fn exact_string_text(value: &AbstractValue) -> Option<String> {
 }
 
 /// Reads one statement as `<name> = subprocess.run(...)`,
-/// `<name> = subprocess.check_output(...)`, or the two-statement
+/// `<name> = subprocess.check_output(...)`, the two-statement
 /// `<name> = subprocess.Popen(...)` / `<a>, <b> = <name>.communicate(...)`
-/// pair — the three `subprocess` callees whose argv shape and keywords
-/// this checker reads.
+/// pair, or the two-statement AWAITED twin `<name> = await asyncio
+/// .create_subprocess_exec(...)` / `<a>, <b> = await <name>.communicate(
+/// ...)` — the four `subprocess`/`asyncio` callees whose argv shape and
+/// keywords this checker reads.
 ///
 /// `None` — not this shape at all, no sentence owed (including a plain
 /// `subprocess.Popen(...)` whose very first statement is not even a
 /// `subprocess` call, which is not this recognizer's concern at all).
-/// `Some(Err(...))` — this IS a recognized `subprocess.*` call and
-/// something about its spelling stopped the resolution, so the caller
+/// `Some(Err(...))` — this IS a recognized `subprocess.*`/`asyncio.*` call
+/// and something about its spelling stopped the resolution, so the caller
 /// owes a sentence naming it.
 fn recognize_foreign_edge(
     statements: &[Stmt],
     index: usize,
     environment: &Environment,
 ) -> Option<Result<ForeignEdge, RecognitionDecline>> {
+    // The `with subprocess.Popen(...) as process:` wrapping is handled
+    // one level up, in `foreign_edge_at` itself, before this function is
+    // even called: that shape's own consumer scan must run over the
+    // WITH-BLOCK'S body, never over `statements` (the temp-file shape's
+    // consumer, in contrast, is a SIBLING statement after the with-block,
+    // which is exactly what this function's own `statements`/`index`
+    // scan already serves). Reaching this branch at all with a `With`
+    // statement therefore means the Popen wrapping already declined (or
+    // this is not it), and only the temp-file shape remains to try.
     if let Stmt::With(with_stmt) = &statements[index] {
         return recognize_temp_file_edge(with_stmt, statements, index, environment);
     }
@@ -755,9 +956,43 @@ fn recognize_foreign_edge(
     let [Expr::Name(target)] = assign.targets.as_slice() else {
         return None;
     };
+    // `await asyncio.create_subprocess_exec(...)` wraps its call in
+    // `Expr::Await` — unwrapped and tried FIRST, since no recognized
+    // `subprocess.*` callee is ever itself awaited (the sync callees run
+    // to completion synchronously), so a bare `Expr::Call` never matches
+    // this row and falls straight through to the unchanged sync path.
+    if let Expr::Await(awaited) = assign.value.as_ref() {
+        if let Expr::Call(call) = awaited.value.as_ref() {
+            if let Some(result) =
+                recognize_asyncio_create_subprocess_exec(statements, index, call, target, environment)
+            {
+                return Some(result);
+            }
+        }
+        return None;
+    }
     let Expr::Call(call) = assign.value.as_ref() else {
         return None;
     };
+    recognize_subprocess_callee(call, target, statements, index, environment)
+}
+
+/// Reads `<target> = subprocess.<attr>(...)`'s CALLEE off an already-
+/// destructured `call`/`target` pair — the module-name/shadow check and
+/// the `run`/`check_output`/`Popen` dispatch, shared by
+/// `recognize_foreign_edge`'s own `Stmt::Assign` path and
+/// `foreign_edge_at_walrus_call`'s walrus-bound path (`if (result :=
+/// subprocess.run(...)).returncode == 0:`), which has no `Stmt::Assign`
+/// to destructure at all — a `Named` expression binds through
+/// `Expr::Named::target`/`value` directly, the identical shape once the
+/// wrapping statement is stripped away.
+fn recognize_subprocess_callee(
+    call: &ExprCall,
+    target: &ExprName,
+    statements: &[Stmt],
+    index: usize,
+    environment: &Environment,
+) -> Option<Result<ForeignEdge, RecognitionDecline>> {
     let Expr::Attribute(attribute) = call.func.as_ref() else {
         return None;
     };
@@ -1168,6 +1403,390 @@ fn recognize_subprocess_popen(
         result_name: stdout_name,
         result_read: ResultRead::Bare,
         consumer_scan_from: index + 1,
+        runner: reading.runner,
+    }))
+}
+
+/// `<name> = await asyncio.create_subprocess_exec("node", "<script>.ts",
+/// stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE)`
+/// immediately followed by `<stdout_name>, <_> = await <name>.communicate(
+/// json.dumps(<payload>).encode())` — the awaited twin of
+/// `recognize_subprocess_popen`'s own two-statement Popen/`.communicate()`
+/// unit. Three deltas from the sync shape, all read through, never a
+/// second pipeline: the runner/script argv rides `create_subprocess_exec`'s
+/// own VARIADIC positional arguments (`program, *args`) rather than one
+/// list literal; both this call and the `.communicate()` call it awaits
+/// are wrapped in `Expr::Await`, unwrapped before each is read; and the
+/// payload/return values ride BYTES (`json.dumps(...).encode()` going out,
+/// `json.loads(...)` reading a `.decode()`-unwrapped — or bare bytes —
+/// binding coming back), so `text=True` is neither passed nor required
+/// here, unlike every synchronous shape this crate recognizes.
+///
+/// `None` — not this shape at all (the awaited call is not
+/// `asyncio.create_subprocess_exec(...)`, or a shadowed `asyncio` name).
+/// `Some(Err(...))` — this IS the recognized awaited call and something
+/// about its own spelling, or the awaited `.communicate()` call that must
+/// follow it, stops the resolution.
+fn recognize_asyncio_create_subprocess_exec(
+    statements: &[Stmt],
+    index: usize,
+    call: &ExprCall,
+    target: &ExprName,
+    environment: &Environment,
+) -> Option<Result<ForeignEdge, RecognitionDecline>> {
+    let Expr::Attribute(attribute) = call.func.as_ref() else {
+        return None;
+    };
+    let Expr::Name(module_name) = attribute.value.as_ref() else {
+        return None;
+    };
+    // a local binding named `asyncio` is not the module — the same
+    // shadow-on-rebind rule every other builtin/module recognition in
+    // this crate applies (relational_sum.rs's own `sum` shadow check)
+    if module_name.id.as_str() != "asyncio"
+        || environment.read("asyncio").is_some()
+        || attribute.attr.as_str() != "create_subprocess_exec"
+    {
+        return None;
+    }
+    let call_range = call.range();
+    let reading = match asyncio_argv_runner_and_script(call, environment)? {
+        Ok(reading) => reading,
+        Err(decline) => return Some(Err(decline)),
+    };
+    if let Some(decline) = script_extension_decline(&reading.script_text, reading.runner, call_range) {
+        return Some(Err(decline));
+    }
+    if let Some(decline) = asyncio_create_subprocess_exec_keywords_of(call) {
+        return Some(Err(RecognitionDecline { message: decline, range: call_range }));
+    }
+    let Some(next) = statements.get(index + 1) else {
+        return Some(Err(RecognitionDecline {
+            message: format!(
+                "this call runs {} on {} through asyncio.create_subprocess_exec and nothing follows it in \
+                this body, so the checker cannot find the awaited .communicate() call that reads the \
+                captured output back",
+                reading.runner.word(),
+                reading.script_text
+            ),
+            range: call_range,
+        }));
+    };
+    let Some((stdout_name, payload)) = awaited_communicate_call_of(next, target.id.as_str()) else {
+        return Some(Err(RecognitionDecline {
+            message: format!(
+                "the statement after this asyncio.create_subprocess_exec call is not exactly `<name>, \
+                <name> = await {}.communicate(json.dumps(...))` (optionally `.encode()`-wrapped), so the \
+                checker cannot find the captured output or the outbound payload",
+                target.id.as_str()
+            ),
+            range: call_range,
+        }));
+    };
+    Some(Ok(ForeignEdge {
+        call: call_range,
+        target_path: resolve_target_path(&reading.script_text),
+        payload,
+        channel: Channel::Stdin,
+        result_name: stdout_name,
+        result_read: ResultRead::Bare,
+        consumer_scan_from: index + 1,
+        runner: reading.runner,
+    }))
+}
+
+/// `asyncio.create_subprocess_exec`'s own argv reading: the runner and
+/// script ride the call's VARIADIC positional arguments (`program, *args`)
+/// rather than one list literal — `["node", script]`/`["deno", "run",
+/// script]`/`["npx", "tsx", script]` reread as `call.arguments.args`
+/// holding exactly two or three positional elements, the same runner-word
+/// match and script resolution `argv_runner_and_script` already applies
+/// to a list literal's own elements.
+fn asyncio_argv_runner_and_script(
+    call: &ExprCall,
+    environment: &Environment,
+) -> Option<Result<ArgvReading, RecognitionDecline>> {
+    let call_range = call.range();
+    match call.arguments.args.as_ref() {
+        [interpreter, script] => {
+            let Some(interpreter_text) = literal_string(interpreter) else {
+                return Some(Err(RecognitionDecline {
+                    message: "this call's leading positional argument is not a written string literal \
+                        naming the interpreter"
+                        .to_owned(),
+                    range: call_range,
+                }));
+            };
+            let runner = match interpreter_text {
+                "node" => Runner::Node,
+                "bun" => Runner::Bun,
+                _ => return None,
+            };
+            Some(script_text_of(script, environment).map(|script_text| ArgvReading { runner, script_text }))
+        }
+        [interpreter, second_word, script] => {
+            let (Some(interpreter_text), Some(second_word_text)) =
+                (literal_string(interpreter), literal_string(second_word))
+            else {
+                return Some(Err(RecognitionDecline {
+                    message: "this call's leading positional argument is not a written string literal \
+                        naming the interpreter"
+                        .to_owned(),
+                    range: call_range,
+                }));
+            };
+            let runner = match (interpreter_text, second_word_text) {
+                ("deno", "run") => Runner::Deno,
+                ("npx", "tsx") => Runner::NpxTsx,
+                _ => return None,
+            };
+            Some(script_text_of(script, environment).map(|script_text| ArgvReading { runner, script_text }))
+        }
+        _ => Some(Err(RecognitionDecline {
+            message: "this call's positional arguments do not hold exactly (\"node\", \"<script>.ts\") (or \
+                a recognized deno/bun/npx-tsx runner row), so the checker cannot name the code that runs \
+                next"
+                .to_owned(),
+            range: call_range,
+        })),
+    }
+}
+
+/// Reads the `asyncio.create_subprocess_exec` keyword arguments:
+/// `stdin=asyncio.subprocess.PIPE` and `stdout=asyncio.subprocess.PIPE` —
+/// BOTH required (`.communicate()`'s own call, not this one, carries the
+/// payload); any other keyword declines. No `text=True` keyword exists
+/// for this callee at all (`library/asyncio-subprocess.rst`: the stream
+/// always carries bytes), so it is neither read nor required here, unlike
+/// `subprocess_popen_keywords_of`'s own sync check. An explicitly
+/// non-PIPE `stdout` (a real file handle, `asyncio.subprocess.DEVNULL`,
+/// anything else) refuses recognition with the same "cannot read the
+/// target's stdout back" sentence the sync Popen row already speaks —
+/// one channel-refusal sentence family, not a second one for the async
+/// spelling.
+fn asyncio_create_subprocess_exec_keywords_of(call: &ExprCall) -> Option<String> {
+    let mut stdin_pipe = false;
+    let mut stdout_pipe = false;
+    for keyword in call.arguments.keywords.iter() {
+        let Some(name) = keyword.arg.as_ref() else {
+            return Some(
+                "this call passes a keyword argument through **, which the checker cannot read into a \
+                fixed set of premises"
+                    .to_owned(),
+            );
+        };
+        match name.as_str() {
+            "stdin" => stdin_pipe = is_asyncio_subprocess_pipe(&keyword.value),
+            "stdout" => stdout_pipe = is_asyncio_subprocess_pipe(&keyword.value),
+            other => {
+                return Some(format!(
+                    "this call passes the keyword {other}, which this edge's recognized shape does not admit"
+                ));
+            }
+        }
+    }
+    if !stdin_pipe {
+        return Some(
+            "this call does not pass stdin=asyncio.subprocess.PIPE, so the checker cannot tell that the \
+            payload crosses out on stdin"
+                .to_owned(),
+        );
+    }
+    if !stdout_pipe {
+        return Some(
+            "this call does not pass stdout=asyncio.subprocess.PIPE, so the checker cannot read the \
+            target's stdout back"
+                .to_owned(),
+        );
+    }
+    None
+}
+
+/// Whether an expression is exactly `asyncio.subprocess.PIPE` — the
+/// awaited shape's own spelling of the sync `subprocess.PIPE` sentinel
+/// (`library/asyncio-subprocess.rst`: `asyncio.subprocess.PIPE` is the
+/// same integer constant `subprocess.PIPE` is, re-exported under the
+/// `asyncio.subprocess` namespace for this callee's own keywords). A
+/// two-level attribute chain (`asyncio.subprocess.PIPE`), unlike the
+/// sync shape's one-level `subprocess.PIPE`.
+fn is_asyncio_subprocess_pipe(expression: &Expr) -> bool {
+    let Expr::Attribute(pipe_attribute) = expression else {
+        return false;
+    };
+    if pipe_attribute.attr.as_str() != "PIPE" {
+        return false;
+    }
+    let Expr::Attribute(subprocess_attribute) = pipe_attribute.value.as_ref() else {
+        return false;
+    };
+    let Expr::Name(module_name) = subprocess_attribute.value.as_ref() else {
+        return false;
+    };
+    module_name.id.as_str() == "asyncio" && subprocess_attribute.attr.as_str() == "subprocess"
+}
+
+/// Reads `<a>, <b> = await <process_name>.communicate(json.dumps(<payload>)
+/// .encode())` — the awaited twin of `communicate_call_of`: the call
+/// itself is wrapped in `Expr::Await` (unwrapped first), and the
+/// positional argument is `json.dumps(...)` OPTIONALLY wrapped in
+/// `.encode()` — the call sends bytes on the wire (`library/asyncio-
+/// subprocess.rst`: `Process.communicate`'s own `input` parameter is
+/// `bytes | None`), and `.encode()` carries the identical JSON text
+/// `json_dumps_argument_of` already reads through; the wrapper itself is
+/// stripped before that shared reader ever sees the expression, so a
+/// bare `json.dumps(...)` (no `.encode()` at all — a caller relying on
+/// `communicate`'s own str-to-bytes convenience, if the target's own
+/// stdlib version admits it) is read exactly the same way.
+fn awaited_communicate_call_of(statement: &Stmt, process_name: &str) -> Option<(String, Expr)> {
+    let Stmt::Assign(assign) = statement else {
+        return None;
+    };
+    let [Expr::Tuple(targets)] = assign.targets.as_slice() else {
+        return None;
+    };
+    let [Expr::Name(stdout_name), _] = targets.elts.as_slice() else {
+        return None;
+    };
+    let Expr::Await(awaited) = assign.value.as_ref() else {
+        return None;
+    };
+    let Expr::Call(call) = awaited.value.as_ref() else {
+        return None;
+    };
+    let Expr::Attribute(attribute) = call.func.as_ref() else {
+        return None;
+    };
+    let Expr::Name(receiver) = attribute.value.as_ref() else {
+        return None;
+    };
+    if receiver.id.as_str() != process_name || attribute.attr.as_str() != "communicate" {
+        return None;
+    }
+    if !call.arguments.keywords.is_empty() {
+        return None;
+    }
+    let [argument] = call.arguments.args.as_ref() else {
+        return None;
+    };
+    let unwrapped = unwrap_bytes_encode(argument);
+    let payload = json_dumps_argument_of(unwrapped)?;
+    Some((stdout_name.id.as_str().to_owned(), payload))
+}
+
+/// Strips a trailing `.encode()` call off an expression — `<expr>.encode(
+/// )` with no arguments and no keywords answers `<expr>` itself; every
+/// other shape (a bare expression with no `.encode()` at all, or a
+/// receiver method call `.encode()` does not directly wrap) answers the
+/// expression unchanged. Shared by the outbound payload's own `json.dumps(
+/// ...).encode()` unwrap and would apply identically to a return-leg
+/// `.decode()` unwrap were one written the same way (`unwrap_bytes_decode`
+/// is the separate, differently-shaped reader that one needs, since it
+/// reads a NAME rather than a call).
+fn unwrap_bytes_encode(expression: &Expr) -> &Expr {
+    let Expr::Call(call) = expression else {
+        return expression;
+    };
+    let Expr::Attribute(attribute) = call.func.as_ref() else {
+        return expression;
+    };
+    if attribute.attr.as_str() != "encode" || !call.arguments.args.is_empty() || !call.arguments.keywords.is_empty() {
+        return expression;
+    }
+    attribute.value.as_ref()
+}
+
+/// `with subprocess.Popen(["node", "<script>.ts"], stdin=subprocess.PIPE,
+/// stdout=subprocess.PIPE, text=True) as process: <stdout>, _ = process
+/// .communicate(json.dumps(<payload>)); return json.loads(<stdout>)` —
+/// the idiomatic context-manager spelling of the flat two-statement
+/// Popen/`.communicate()` unit `recognize_subprocess_popen` already
+/// reads, here read against the with-block's OWN body instead of the
+/// statements that follow it (`level_via_popen_context_manager`'s own
+/// shape): the with's context expression is the Popen call itself, the
+/// `as` target is the name `.communicate()` is called on, and both the
+/// `.communicate()` assign and its own consumer sit INSIDE this
+/// with-block's body, never as siblings after it.
+///
+/// `None` — not this shape at all: the context expression is not
+/// `subprocess.Popen(...)` (a shadowed `subprocess` name reads the same
+/// as not-this-shape, mirroring every other recognizer's shadow-on-
+/// rebind check), or the `with` binds no bare name via `as`. `Some(Err(
+/// ...))` — this IS a recognized Popen context manager and something
+/// about its spelling, or the `.communicate()` call that must open its
+/// own body, stops the resolution.
+fn recognize_popen_context_manager_edge(
+    with_stmt: &StmtWith,
+    environment: &Environment,
+) -> Option<Result<ForeignEdge, RecognitionDecline>> {
+    let with_range = with_stmt.range();
+    let [item] = with_stmt.items.as_slice() else {
+        return None;
+    };
+    let Expr::Call(call) = &item.context_expr else {
+        return None;
+    };
+    let Expr::Attribute(attribute) = call.func.as_ref() else {
+        return None;
+    };
+    let Expr::Name(module_name) = attribute.value.as_ref() else {
+        return None;
+    };
+    if module_name.id.as_str() != "subprocess"
+        || environment.read("subprocess").is_some()
+        || attribute.attr.as_str() != "Popen"
+    {
+        return None;
+    }
+    let Some(process_name) = item.optional_vars.as_deref().and_then(as_bare_name) else {
+        return Some(Err(RecognitionDecline {
+            message: "this subprocess.Popen(...) with-statement binds no bare name via 'as', so the checker \
+                cannot find the .communicate() call that reads the captured output back"
+                .to_owned(),
+            range: with_range,
+        }));
+    };
+    let call_range = call.range();
+    let reading = match recognized_argv(call, environment)? {
+        Ok(reading) => reading,
+        Err(decline) => return Some(Err(decline)),
+    };
+    if let Some(decline) = script_extension_decline(&reading.script_text, reading.runner, call_range) {
+        return Some(Err(decline));
+    }
+    if let Some(decline) = subprocess_popen_keywords_of(call) {
+        return Some(Err(RecognitionDecline { message: decline, range: call_range }));
+    }
+    let Some(first) = with_stmt.body.first() else {
+        return Some(Err(RecognitionDecline {
+            message: format!(
+                "this with-block's body is empty, so the checker cannot find the .communicate() call that \
+                reads {process_name}'s captured output back"
+            ),
+            range: with_range,
+        }));
+    };
+    let Some((stdout_name, payload)) = communicate_call_of(first, process_name) else {
+        return Some(Err(RecognitionDecline {
+            message: format!(
+                "this with-block's first statement is not exactly `<name>, <name> = {process_name}.communicate(\
+                json.dumps(...))`, so the checker cannot find the captured output or the outbound payload"
+            ),
+            range: with_range,
+        }));
+    };
+    Some(Ok(ForeignEdge {
+        call: call_range,
+        target_path: resolve_target_path(&reading.script_text),
+        payload,
+        channel: Channel::Stdin,
+        result_name: stdout_name,
+        result_read: ResultRead::Bare,
+        // The `.communicate()` statement sits at the with-body's own
+        // index 0 — the return leg's sole-consumer scan (over
+        // `with_stmt.body`, per `foreign_edge_at`'s own routing) starts
+        // looking the statement AFTER it, exactly as the flat Popen
+        // shape's `index + 1` does relative to its own statement list.
+        consumer_scan_from: 0,
         runner: reading.runner,
     }))
 }
@@ -1830,8 +2449,20 @@ fn is_subprocess_pipe(expression: &Expr) -> bool {
     module_name.id.as_str() == "subprocess" && attribute.attr.as_str() == "PIPE"
 }
 
-/// Reads `json.dumps(<expr>)` and answers the single argument.
+/// Reads `json.dumps(<expr>)` and answers the single argument. An
+/// f-string wrapping EXACTLY one interpolation, with no literal text
+/// around it and no conversion (`!s`/`!r`/`!a`) or format spec
+/// (`level_via_fstring_argv_data`'s own `f"{json.dumps(boosted)}"`
+/// shape) unwraps to that interpolation's own inner expression first —
+/// the spelling an f-string always produces for a lone substitution, and
+/// the only shape `json_dumps_argument_of` reads through; a literal
+/// character anywhere alongside the interpolation, more than one
+/// interpolation, or a conversion/format spec all decline unchanged
+/// (falls through to the `Expr::Call` check below, which then answers
+/// `None` for the wrapper).
 fn json_dumps_argument_of(expression: &Expr) -> Option<Expr> {
+    let expression = single_interpolation_call(expression).unwrap_or_else(|| expression.clone());
+    let expression = &expression;
     let Expr::Call(call) = expression else {
         return None;
     };
@@ -1851,6 +2482,29 @@ fn json_dumps_argument_of(expression: &Expr) -> Option<Expr> {
         return None;
     };
     Some(argument.clone())
+}
+
+/// The sole interpolation's own inner expression, for an f-string that
+/// spells EXACTLY one substitution and nothing else — no literal
+/// character before, between, or after it, and no conversion or format
+/// spec on that one interpolation. `None` for every other f-string shape
+/// (mixed literal text, zero or multiple interpolations, a conversion or
+/// format spec, or an implicitly concatenated f-string, which
+/// `as_single_part_fstring` itself already declines) and for any
+/// expression that is not `Expr::FString` at all.
+fn single_interpolation_call(expression: &Expr) -> Option<Expr> {
+    let Expr::FString(fstring) = expression else {
+        return None;
+    };
+    let single = fstring.as_single_part_fstring()?;
+    let elements: &[InterpolatedStringElement] = &single.elements;
+    let [InterpolatedStringElement::Interpolation(interpolation)] = elements else {
+        return None;
+    };
+    if interpolation.conversion != ConversionFlag::None || interpolation.format_spec.is_some() {
+        return None;
+    }
+    Some(interpolation.expression.as_ref().clone())
 }
 
 /// A written string literal's own text.
@@ -1914,17 +2568,52 @@ fn check_outbound_leg(
             artifact,
         ));
     }
-    if let Some((element_set, length_at_least)) = &entry.sequence {
-        return check_sequence_crossing(edge, artifact, entry, element_set, *length_at_least, &crossing, kernel);
+    if let Some((element_cases, length_at_least)) = &entry.sequence {
+        return check_sequence_crossing(edge, artifact, entry, element_cases, *length_at_least, &crossing, kernel);
     }
-    if let Some(scalar_set) = &entry.scalar {
-        return check_scalar_crossing(edge, artifact, entry, scalar_set, &crossing, kernel);
+    if let Some(scalar_cases) = &entry.scalar {
+        return check_scalar_crossing(edge, artifact, entry, scalar_cases, &crossing, kernel);
     }
     Some(ForeignEdgeOutcome::Decline {
         message: "the target ".to_owned() + &artifact.called.name + " states an entry position " + &entry.name
             + " that is neither a sequence nor a scalar set — nothing says whether the value fits",
         range: payload_range,
     })
+}
+
+/// The union of every NUMBER/STRING case's own set among an entry's
+/// cases — the one admitted set a kernel `scalar_subset` ask judges a
+/// numeric/string crossing value against. `None` when the cases list
+/// carries no set-bearing case at all (every case is Boolean/Null, or an
+/// Object case), since there is then no set for a numeric/string
+/// crossing to fit — the caller's own existing decline sentence
+/// ("nothing says whether the value fits") runs unchanged.
+///
+/// An `ForeignCase::Object` entry case answers no-set BY DESIGN, not as
+/// a staging placeholder: the outbound leg's own question is "does the
+/// value CROSSING OUT fit the entry's admitted set," and this checker
+/// has no OBJECT-shaped crossing value to ask that of at all today (an
+/// outbound Python payload never lowers to `Kind::Object` on this path —
+/// `expressions::evaluate_expression` is asked for a Python dict's OWN
+/// shape, not the entry's declared one). Fitting an outbound object
+/// payload against a declared object entry is a SEPARATE designed unit
+/// (its own queue entry: a receiver-shaped fit check, not a return-value
+/// lowering) — the consumer-side RETURN lowering this file now carries
+/// (`foreign_case_value`'s own Object arm) does not, by itself, give the
+/// entry leg anything new to check.
+fn admitted_set_of_cases(cases: &[ForeignCase]) -> Option<RefinedSet> {
+    let mut union_set: Option<RefinedSet> = None;
+    for case in cases {
+        let set = match case {
+            ForeignCase::Number(set) | ForeignCase::String(set) => set.clone(),
+            ForeignCase::Boolean | ForeignCase::Null | ForeignCase::Object { .. } => continue,
+        };
+        union_set = Some(match union_set {
+            None => set,
+            Some(rest) => make_refined_set(vec![union(set, rest)]),
+        });
+    }
+    union_set
 }
 
 /// Whether a value crossing out may carry NaN — the two ways NaN rides
@@ -1946,13 +2635,13 @@ fn nan_freedom_obstacle(crossing: &AbstractValue) -> Option<&'static str> {
 }
 
 /// Judges an array payload against a sequence entry: the elements
-/// inside the stated element set, and the length floor at or above the
-/// stated one.
+/// inside the union of the element's own number/string cases, and the
+/// length floor at or above the stated one.
 fn check_sequence_crossing(
     edge: &ForeignEdge,
     artifact: &ForeignTsArtifact,
     entry: &ForeignTsEntry,
-    element_set: &RefinedSet,
+    element_cases: &[ForeignCase],
     length_at_least: i64,
     crossing: &AbstractValue,
     kernel: &Arc<RefinedTSKernel>,
@@ -1975,8 +2664,15 @@ fn check_sequence_crossing(
             range: payload_range,
         });
     };
+    let Some(element_set) = admitted_set_of_cases(element_cases) else {
+        return Some(ForeignEdgeOutcome::Decline {
+            message: "the target ".to_owned() + &artifact.called.name + " admits a sequence at " + &entry.name
+                + " whose element cases carry no number/string set — nothing says whether an element fits",
+            range: payload_range,
+        });
+    };
     // the ELEMENT fit — a real kernel ask
-    let fits = match foreign_scalar_subset(kernel, &window.element, element_set) {
+    let fits = match foreign_scalar_subset(kernel, &window.element, &element_set) {
         Some(fits) => fits,
         None => {
             return Some(ForeignEdgeOutcome::Decline {
@@ -2015,17 +2711,36 @@ fn check_sequence_crossing(
     None
 }
 
-/// Judges a scalar payload against a scalar entry — the same
-/// `scalar_subset` ask, without a length to carry.
+/// Judges a scalar payload against a scalar entry's own cases: a
+/// `Kind::Null` crossing fits when a `Null` case is among them (the
+/// `admits_none` entry's own reading); every other crossing is judged
+/// against the union of the entry's number/string cases through the
+/// same `scalar_subset` kernel ask as before — a `Boolean` case widens
+/// that union to admit `0`/`1` (a Python `bool` is an `int` subclass),
+/// so a numeric judge already covers a boolean crossing without a
+/// separate arm.
 fn check_scalar_crossing(
     edge: &ForeignEdge,
     artifact: &ForeignTsArtifact,
     entry: &ForeignTsEntry,
-    entry_set: &RefinedSet,
+    entry_cases: &[ForeignCase],
     crossing: &AbstractValue,
     kernel: &Arc<RefinedTSKernel>,
 ) -> Option<ForeignEdgeOutcome> {
     let payload_range = edge.payload.range();
+    if crossing.kind == Kind::Null {
+        if entry_cases.iter().any(|case| matches!(case, ForeignCase::Null)) {
+            return None;
+        }
+        return Some(fire_at(
+            payload_range,
+            format!(
+                "the value crossing to {} is None, and the target's stated entry admits no null case",
+                artifact.called.name
+            ),
+            artifact,
+        ));
+    }
     let Some(crossing_set) = set_of_known(crossing) else {
         return Some(ForeignEdgeOutcome::Decline {
             message: "the target ".to_owned() + &artifact.called.name + " admits a value at " + &entry.name
@@ -2033,7 +2748,22 @@ fn check_scalar_crossing(
             range: payload_range,
         });
     };
-    let fits = match foreign_scalar_subset(kernel, &crossing_set, entry_set) {
+    let mut entry_set = admitted_set_of_cases(entry_cases);
+    if entry_cases.iter().any(|case| matches!(case, ForeignCase::Boolean)) {
+        let boolean_set = make_refined_set(vec![one_of(&[0.0, 1.0])]);
+        entry_set = Some(match entry_set {
+            None => boolean_set,
+            Some(rest) => make_refined_set(vec![union(boolean_set, rest)]),
+        });
+    }
+    let Some(entry_set) = entry_set else {
+        return Some(ForeignEdgeOutcome::Decline {
+            message: "the target ".to_owned() + &artifact.called.name + " admits a value at " + &entry.name
+                + " whose cases carry no number/string/boolean set — nothing says whether the value fits",
+            range: payload_range,
+        });
+    };
+    let fits = match foreign_scalar_subset(kernel, &crossing_set, &entry_set) {
         Some(fits) => fits,
         None => {
             return Some(ForeignEdgeOutcome::Decline {
@@ -2107,10 +2837,20 @@ fn sole_parse_consumer_of(
     result_name: &str,
     result_read: ResultRead,
 ) -> Result<TextRange, String> {
+    sole_parse_consumer_from(&statements[index + 1..], result_name, result_read)
+}
+
+/// `sole_parse_consumer_of`'s own scan, taking the slice to scan
+/// directly rather than a call's own index plus one — the walrus-bound
+/// entry point (`foreign_edge_at_walrus_call`) has no call STATEMENT to
+/// skip past at all (the call sits inside the `if` TEST, not as a member
+/// of the arm body), so its whole arm body is scanned from its own
+/// start, never offset by one.
+fn sole_parse_consumer_from(statements: &[Stmt], result_name: &str, result_read: ResultRead) -> Result<TextRange, String> {
     let mut found: Option<TextRange> = None;
     let mut count = 0usize;
     let mut written = false;
-    for statement in &statements[index + 1..] {
+    for statement in statements {
         if statement_writes_name(statement, result_name) {
             written = true;
         }
@@ -2215,8 +2955,15 @@ fn foreign_parse_calls_in(
 }
 
 /// Whether a node is exactly `json.loads(<name>.stdout)` (`result_read
-/// == StdoutAttribute`) or plain `json.loads(<name>)` (`result_read ==
-/// Bare`).
+/// == StdoutAttribute`) or `json.loads(<name>)`, OPTIONALLY
+/// `.decode()`-wrapped (`result_read == Bare`) — the awaited asyncio
+/// shape's `stdout_bytes` binding carries raw bytes
+/// (`library/asyncio-subprocess.rst`: `Process.communicate`'s own return
+/// is `bytes`, never `str`), so `json.loads(stdout_bytes)` reads bytes
+/// directly (`json.loads` accepts `bytes | bytearray | str` per
+/// `library/json.rst`) exactly as readily as a `.decode()`-unwrapped
+/// text binding — both spellings name the identical captured value, so
+/// neither is preferred over the other.
 fn is_foreign_parse_of(expression: &Expr, name: &str, result_read: ResultRead) -> bool {
     let Expr::Call(call) = expression else {
         return false;
@@ -2247,12 +2994,34 @@ fn is_foreign_parse_of(expression: &Expr, name: &str, result_read: ResultRead) -
             result_name.id.as_str() == name && result_attribute.attr.as_str() == "stdout"
         }
         ResultRead::Bare => {
-            let Expr::Name(result_name) = argument else {
+            let Expr::Name(result_name) = unwrap_bytes_decode(argument) else {
                 return false;
             };
             result_name.id.as_str() == name
         }
     }
+}
+
+/// Strips a trailing `.decode()` call off an expression — `<expr>.decode(
+/// )` with no arguments and no keywords answers `<expr>` itself; every
+/// other shape (a bare expression with no `.decode()` at all) answers the
+/// expression unchanged. The return-leg counterpart of
+/// `unwrap_bytes_encode`'s outbound unwrap: reads a NAME through the
+/// wrapper (`is_foreign_parse_of`'s own use, matching the unwrapped
+/// expression against `Expr::Name`) rather than an arbitrary expression,
+/// so it answers `&Expr` directly rather than a reference the caller
+/// must re-match.
+fn unwrap_bytes_decode(expression: &Expr) -> &Expr {
+    let Expr::Call(call) = expression else {
+        return expression;
+    };
+    let Expr::Attribute(attribute) = call.func.as_ref() else {
+        return expression;
+    };
+    if attribute.attr.as_str() != "decode" || !call.arguments.args.is_empty() || !call.arguments.keywords.is_empty() {
+        return expression;
+    }
+    attribute.value.as_ref()
 }
 
 /// Walks every expression reachable from a statement without crossing
@@ -2430,17 +3199,15 @@ mod tests {
     use std::collections::HashSet;
     use std::path::PathBuf;
 
-    use refined_domain::abstract_value::known_values;
     use refined_domain::abstract_value::possibly_nan;
     use refined_domain::trust_grades::TrustProved;
+    use crate::refinedpy::collection_models::subscript_read;
     use refined_kernel::kernel_bridge::dylib_path;
     use refined_kernel::kernel_bridge::kernel_artifacts_present;
     use refined_kernel::kernel_bridge::load_kernel;
     use refined_sets::refinement_forms::at_least;
     use refined_sets::refinement_forms::at_most;
     use refined_sets::refinement_forms::integer;
-    use refined_sets::refinement_forms::make_refined_set;
-    use refined_sets::refinement_forms::one_of;
     use refined_sets::refinement_forms::star;
     use refined_sets::repetition_window_forms::repetition;
 
@@ -2506,10 +3273,17 @@ mod tests {
                 name: "audioLevel".to_owned(),
                 entry: vec![ForeignTsEntry {
                     name: "boosted".to_owned(),
-                    sequence: Some((make_refined_set(vec![at_least(-2.0), at_most(2.0)]), 1)),
+                    sequence: Some((
+                        vec![ForeignCase::Number(make_refined_set(vec![at_least(-2.0), at_most(2.0)]))],
+                        1,
+                    )),
                     scalar: None,
                 }],
-                return_set: make_refined_set(vec![integer(), at_least(0.0), at_most(1.0)]),
+                return_cases: vec![ForeignCase::Number(make_refined_set(vec![
+                    integer(),
+                    at_least(0.0),
+                    at_most(1.0),
+                ]))],
                 stdout_pure: true,
                 provenance_line: 30,
                 provenance_said: "audioLevel's own kernel summary".to_owned(),
@@ -2534,7 +3308,7 @@ mod tests {
     fn audio_level_unbounded_return_artifact() -> ForeignTsArtifact {
         ForeignTsArtifact {
             called: ForeignTsFunctionFact {
-                return_set: make_refined_set(vec![at_least(0.0)]),
+                return_cases: vec![ForeignCase::Number(make_refined_set(vec![at_least(0.0)]))],
                 ..audio_level_ts_artifact().called
             },
             ..audio_level_ts_artifact()
@@ -2547,7 +3321,7 @@ mod tests {
     fn audio_level_float_return_artifact() -> ForeignTsArtifact {
         ForeignTsArtifact {
             called: ForeignTsFunctionFact {
-                return_set: make_refined_set(vec![at_least(0.0), at_most(1.0)]),
+                return_cases: vec![ForeignCase::Number(make_refined_set(vec![at_least(0.0), at_most(1.0)]))],
                 ..audio_level_ts_artifact().called
             },
             ..audio_level_ts_artifact()
@@ -2562,7 +3336,74 @@ mod tests {
     fn audio_level_one_of_integer_return_artifact() -> ForeignTsArtifact {
         ForeignTsArtifact {
             called: ForeignTsFunctionFact {
-                return_set: make_refined_set(vec![one_of(&[1.0, 2.0, 4.0])]),
+                return_cases: vec![ForeignCase::Number(make_refined_set(vec![one_of(&[1.0, 2.0, 4.0])]))],
+                ..audio_level_ts_artifact().called
+            },
+            ..audio_level_ts_artifact()
+        }
+    }
+
+    /// The same fact, with a single CLOSED, empty-member OBJECT return
+    /// case — pins `known_object`'s own shape for the plainest object
+    /// case (`foreign_case_value`'s own Object arm): no members, and
+    /// `complete: true` straight from `closed`.
+    fn audio_level_object_return_artifact() -> ForeignTsArtifact {
+        ForeignTsArtifact {
+            called: ForeignTsFunctionFact {
+                return_cases: vec![ForeignCase::Object { members: vec![], closed: true }],
+                ..audio_level_ts_artifact().called
+            },
+            ..audio_level_ts_artifact()
+        }
+    }
+
+    /// The Result-shape return: two OBJECT cases in one return list —
+    /// `{"ok": bool, "value": number in [0, 1]}` and `{"ok": bool,
+    /// "error": string}` — lowering through the same multi-case
+    /// `Kind::KindUnion` channel a scalar multi-case return already uses
+    /// (`foreign_return_value`'s own doc).
+    fn audio_level_result_shape_return_artifact() -> ForeignTsArtifact {
+        ForeignTsArtifact {
+            called: ForeignTsFunctionFact {
+                return_cases: vec![
+                    ForeignCase::Object {
+                        members: vec![
+                            ("ok".to_owned(), vec![ForeignCase::Boolean]),
+                            (
+                                "value".to_owned(),
+                                vec![ForeignCase::Number(make_refined_set(vec![at_least(0.0), at_most(1.0)]))],
+                            ),
+                        ],
+                        closed: true,
+                    },
+                    ForeignCase::Object {
+                        members: vec![
+                            ("ok".to_owned(), vec![ForeignCase::Boolean]),
+                            (
+                                "error".to_owned(),
+                                vec![ForeignCase::String(make_refined_set(vec![]))],
+                            ),
+                        ],
+                        closed: true,
+                    },
+                ],
+                ..audio_level_ts_artifact().called
+            },
+            ..audio_level_ts_artifact()
+        }
+    }
+
+    /// The same fact, with an OBJECT case at the ENTRY (outbound) leg
+    /// instead of the return — `admitted_set_of_cases`'s own Object arm,
+    /// a designed remainder distinct from the return-side lowering.
+    fn audio_level_object_entry_artifact() -> ForeignTsArtifact {
+        ForeignTsArtifact {
+            called: ForeignTsFunctionFact {
+                entry: vec![ForeignTsEntry {
+                    name: "boosted".to_owned(),
+                    sequence: None,
+                    scalar: Some(vec![ForeignCase::Object { members: vec![], closed: true }]),
+                }],
                 ..audio_level_ts_artifact().called
             },
             ..audio_level_ts_artifact()
@@ -2612,9 +3453,9 @@ mod tests {
 
     /// DEFECT 1's fix: a return set admitting +Infinity (an unbounded
     /// `atLeast` with no upper ray) degrades to a named undetermined
-    /// naming the corner and the leg, rather than binding the set as
-    /// stated — the JSON stdout leg cannot carry `+Infinity`
-    /// (`JSON.stringify(Infinity)` answers the bare token `null`).
+    /// naming the corner and the mechanism, rather than binding the set
+    /// as stated — the target's own `JSON.stringify(Infinity)` answers
+    /// the bare token `null`, not an RFC 8259 gap.
     #[test]
     fn an_unbounded_return_degrades_to_the_named_undetermined() {
         register_fixture_artifact("./audio_level.ts", audio_level_unbounded_return_artifact());
@@ -2625,7 +3466,7 @@ mod tests {
             ForeignEdgeOutcome::Decline { message, .. } => {
                 assert!(message.contains("audioLevel"), "{message}");
                 assert!(message.contains("+Infinity"), "{message}");
-                assert!(message.contains("JSON stdout leg"), "{message}");
+                assert!(message.contains("JSON.stringify"), "{message}");
                 assert!(message.contains("cannot be trusted"), "{message}");
             }
             ForeignEdgeOutcome::Override { .. } => {
@@ -2633,6 +3474,100 @@ mod tests {
             }
             ForeignEdgeOutcome::Fired { message, .. } => {
                 panic!("wanted the corner-check decline, got a fire: {message}")
+            }
+        }
+    }
+
+    /// A single CLOSED, empty-member OBJECT return case binds through
+    /// `known_object` — pins the plainest object shape
+    /// (`foreign_case_value`'s own Object arm): `Kind::Object`, no keys,
+    /// `complete: true` straight from the case's own `closed`.
+    #[test]
+    fn a_closed_empty_object_return_case_binds_as_a_complete_object() {
+        register_fixture_artifact("./audio_level.ts", audio_level_object_return_artifact());
+        let Some(kernel) = loaded_kernel() else { return };
+        let body = def_body(FIXTURE_SOURCE);
+        let environment = env_with(&[("boosted", boosted_sequence_value())]);
+        match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("the shape recognizes") {
+            ForeignEdgeOutcome::Override { value, .. } => {
+                assert_eq!(value.kind, Kind::Object);
+                assert!(value.keys.is_empty());
+                assert!(value.complete);
+            }
+            ForeignEdgeOutcome::Decline { message, .. } => {
+                panic!("wanted an override binding the closed empty object, got a decline: {message}")
+            }
+            ForeignEdgeOutcome::Fired { message, .. } => {
+                panic!("wanted an override binding the closed empty object, got a fire: {message}")
+            }
+        }
+    }
+
+    /// END-TO-END PIN: the Result-shape return (two OBJECT cases — `{ok,
+    /// value}` and `{ok, error}`) binds at `json.loads`, and a member
+    /// read (`parsed["value"]`, `collection_models.rs`'s `subscript_read`
+    /// own `Kind::Object` arm) reaches a judged verdict against a
+    /// declared window: the crossed `"value"` member's own number window
+    /// is `[0, 1]`, so asking the kernel whether it fits inside `[0, 2]`
+    /// answers true, and outside `[10, 20]` answers false — the
+    /// consumer-side judge running unchanged over a value this lane's
+    /// lowering produced.
+    #[test]
+    fn a_result_shape_return_binds_and_its_value_member_judges_against_a_declared_window() {
+        register_fixture_artifact("./audio_level.ts", audio_level_result_shape_return_artifact());
+        let Some(kernel) = loaded_kernel() else { return };
+        let body = def_body(FIXTURE_SOURCE);
+        let environment = env_with(&[("boosted", boosted_sequence_value())]);
+        let value = match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("the shape recognizes") {
+            ForeignEdgeOutcome::Override { value, .. } => value,
+            ForeignEdgeOutcome::Decline { message, .. } => {
+                panic!("wanted an override binding the Result-shape union, got a decline: {message}")
+            }
+            ForeignEdgeOutcome::Fired { message, .. } => {
+                panic!("wanted an override binding the Result-shape union, got a fire: {message}")
+            }
+        };
+        assert_eq!(value.kind, Kind::KindUnion);
+        assert_eq!(value.arms.len(), 2);
+        for arm in &value.arms {
+            assert_eq!(arm.kind, Kind::Object);
+            assert!(arm.complete);
+        }
+        let value_key = known_values(
+            "value".chars().map(|c| c as u32 as f64).collect(),
+            PrimitiveKind::String,
+            TrustProved,
+        );
+        let value_member = subscript_read(&value.arms[0], &value_key).expect("the \"value\" member reads");
+        assert_eq!(value_member.kind, Kind::Set);
+        assert_eq!(value_member.kind_tag, Some(PrimitiveKind::Float));
+        let inside_window = make_refined_set(vec![at_least(0.0), at_most(2.0)]);
+        let outside_window = make_refined_set(vec![at_least(10.0), at_most(20.0)]);
+        assert_eq!(foreign_scalar_subset(&kernel, &value_member.set, &inside_window), Some(true));
+        assert_eq!(foreign_scalar_subset(&kernel, &value_member.set, &outside_window), Some(false));
+    }
+
+    /// An OBJECT case at the ENTRY (outbound) leg declines through the
+    /// existing "nothing says whether the value fits" sentence —
+    /// `admitted_set_of_cases` answers no-set for an Object case exactly
+    /// as it already does for Boolean/Null, so no new sentence is owed
+    /// at this leg.
+    #[test]
+    fn an_object_entry_case_declines_at_the_outbound_leg() {
+        register_fixture_artifact("./audio_level.ts", audio_level_object_entry_artifact());
+        let Some(kernel) = loaded_kernel() else { return };
+        let body = def_body(FIXTURE_SOURCE);
+        let environment = env_with(&[("boosted", boosted_sequence_value())]);
+        match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("the shape recognizes") {
+            ForeignEdgeOutcome::Decline { message, .. } => {
+                assert!(message.contains("audioLevel"), "{message}");
+                assert!(message.contains("whether the value fits"), "{message}");
+            }
+            ForeignEdgeOutcome::Override { .. } => {
+                panic!("wanted the entry-leg decline, got an override binding an unlowered case")
+            }
+            ForeignEdgeOutcome::Fired { message, .. } => {
+                panic!("wanted the entry-leg decline, got a fire: {message}")
             }
         }
     }
@@ -3121,6 +4056,71 @@ mod tests {
         }
     }
 
+    /// FIX 4: the argv-json payload spelled through an f-string wrapping
+    /// exactly one interpolation, `f"{json.dumps(boosted)}"`, rather than
+    /// a bare `json.dumps(...)` call (`level_via_fstring_argv_data`,
+    /// d-data-legs.py:238). Before this fix, `json_dumps_argument_of`
+    /// required `Expr::Call` as its very first check; an f-string is
+    /// `Expr::FString`, which failed that guard immediately, so
+    /// `argv_json_call_of`'s own payload read answered `None` and the
+    /// whole argv-json shape declined to match at all — the call fell
+    /// through to the ordinary two-element stdin shape, which itself
+    /// declines (a three-element argv is not that shape either), so
+    /// `foreign_edge_at` answered a decline naming the wrong construct
+    /// (an unrecognized three-element argv) rather than reading through
+    /// to the payload. This pins the fix: the trivial single-
+    /// interpolation f-string wrapper unwraps to its inner
+    /// `json.dumps(...)` call, and the argv-json shape recognizes and
+    /// binds the proved return exactly as the bare-call spelling does.
+    #[test]
+    fn an_fstring_wrapped_argv_json_payload_recognizes_and_binds_the_proved_return() {
+        register_fixture_artifact("./audio_level.ts", audio_level_argv_json_artifact());
+        let Some(kernel) = loaded_kernel() else { return };
+        let source = concat!(
+            "def audio_level_via_fstring_argv(boosted):\n",
+            "    result = subprocess.run(\n",
+            "        [\"node\", \"./audio_level.ts\", f\"{json.dumps(boosted)}\"],\n",
+            "        capture_output=True,\n",
+            "        text=True,\n",
+            "    )\n",
+            "    return json.loads(result.stdout)\n",
+        );
+        let body = def_body(source);
+        let environment = env_with(&[("boosted", boosted_sequence_value())]);
+        match foreign_edge_at(&body, 0, &environment, &kernel, None)
+            .expect("the f-string-wrapped argv-json shape recognizes")
+        {
+            ForeignEdgeOutcome::Override { value, .. } => {
+                assert_eq!(value.kind, Kind::Set);
+                assert_eq!(value.kind_tag, Some(PrimitiveKind::Integer));
+            }
+            ForeignEdgeOutcome::Decline { message, .. } => panic!("wanted an override, got a decline: {message}"),
+            ForeignEdgeOutcome::Fired { message, .. } => panic!("wanted an override, got a fire: {message}"),
+        }
+    }
+
+    /// REGRESSION PIN: the bare `json.dumps(...)` argv-json spelling
+    /// still recognizes exactly as before this fix — the f-string
+    /// wrapper is an ADDITIONAL readable spelling of the same payload
+    /// position, never a replacement for the direct-call shape
+    /// `json_dumps_argument_of` already read.
+    #[test]
+    fn the_bare_call_argv_json_payload_still_recognizes_after_the_fstring_fix() {
+        register_fixture_artifact("./audio_level.ts", audio_level_argv_json_artifact());
+        let Some(kernel) = loaded_kernel() else { return };
+        let body = def_body(ARGV_JSON_FIXTURE_SOURCE);
+        let environment = env_with(&[("boosted", boosted_sequence_value())]);
+        match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("the bare-call argv-json shape recognizes")
+        {
+            ForeignEdgeOutcome::Override { value, .. } => {
+                assert_eq!(value.kind, Kind::Set);
+                assert_eq!(value.kind_tag, Some(PrimitiveKind::Integer));
+            }
+            ForeignEdgeOutcome::Decline { message, .. } => panic!("wanted an override, got a decline: {message}"),
+            ForeignEdgeOutcome::Fired { message, .. } => panic!("wanted an override, got a fire: {message}"),
+        }
+    }
+
     /// A `temp_path` reassigned between the `with`-block's own dump and
     /// the call that reads it back stays undetermined, naming the
     /// rebound name — the carrier premise (the bytes dumped are the
@@ -3192,6 +4192,57 @@ mod tests {
             foreign_edge_at(&body, 0, &environment, &kernel, None).is_none(),
             "a locally shadowed tempfile must not be read as the module"
         );
+    }
+
+    /// FIX 3: the exact temp-file unit `TEMP_FILE_FIXTURE_SOURCE` proves,
+    /// nested one level inside an outer `with tempfile
+    /// .TemporaryDirectory():` block (`level_via_nested_tempdir`,
+    /// d-data-legs.py:266). `recognize_temp_file_edge` reads whichever
+    /// `statements`/`index` it is handed with no assumption about
+    /// nesting depth — this pins that premise directly: calling
+    /// `foreign_edge_at` at position 0 of the OUTER with-block's own
+    /// body (the exact statement list and index `check.rs`'s
+    /// `walk_with` now offers per statement, after this fix) recognizes
+    /// and binds the proved return exactly as the top-level case does.
+    /// Before this fix, `walk_with` walked its own body through a plain
+    /// per-statement `walk_statement` loop with no call into
+    /// `foreign_edge_at` at all, so this position was never even
+    /// offered the recognition this test drives directly.
+    #[test]
+    fn a_temp_file_edge_nested_inside_a_temporary_directory_recognizes_and_binds() {
+        register_fixture_artifact(
+            "./audio_level.ts",
+            ForeignTsArtifact { surface: ForeignSurface::FileJson { arg_index: 2 }, ..audio_level_ts_artifact() },
+        );
+        let Some(kernel) = loaded_kernel() else { return };
+        let source = concat!(
+            "def f(boosted):\n",
+            "    with tempfile.TemporaryDirectory():\n",
+            "        with tempfile.NamedTemporaryFile(mode=\"w\", suffix=\".json\", delete=False) as handle:\n",
+            "            json.dump(boosted, handle)\n",
+            "            temp_path = handle.name\n",
+            "        result = subprocess.run(\n",
+            "            [\"node\", \"./audio_level.ts\", temp_path],\n",
+            "            capture_output=True,\n",
+            "            text=True,\n",
+            "        )\n",
+            "        return json.loads(result.stdout)\n",
+        );
+        let body = def_body(source);
+        let Stmt::With(outer_with) = &body[0] else {
+            panic!("this fixture's own top-level statement must be the outer TemporaryDirectory with-block");
+        };
+        let environment = env_with(&[("boosted", boosted_sequence_value())]);
+        match foreign_edge_at(&outer_with.body, 0, &environment, &kernel, None)
+            .expect("the nested temp-file shape recognizes")
+        {
+            ForeignEdgeOutcome::Override { value, .. } => {
+                assert_eq!(value.kind, Kind::Set);
+                assert_eq!(value.kind_tag, Some(PrimitiveKind::Integer));
+            }
+            ForeignEdgeOutcome::Decline { message, .. } => panic!("wanted an override, got a decline: {message}"),
+            ForeignEdgeOutcome::Fired { message, .. } => panic!("wanted an override, got a fire: {message}"),
+        }
     }
 
     /* ── subprocess.check_output ──────────────────────────────────── */
@@ -3501,6 +4552,103 @@ mod tests {
         }
     }
 
+    /* ── a walrus-bound call inside an `if` test ──────────────────────── */
+
+    /// The walrus's own `Expr::Named::target`/`value` pair, read off the
+    /// first statement's own `if`-test — the exact destructuring
+    /// `walk_if`'s `serve_foreign_edge_in_walrus_test` (check.rs) performs
+    /// before calling `foreign_edge_at_walrus_call`, rebuilt here so this
+    /// test drives that same entry point directly rather than through the
+    /// checker's own statement walk (per this module's own artifact-stub
+    /// constraint: only a test living here can observe an `Override`).
+    fn walrus_test_target_and_call(if_stmt: &ruff_python_ast::StmtIf) -> (ExprName, ExprCall) {
+        let Expr::Compare(compare) = if_stmt.test.as_ref() else {
+            panic!("this fixture's own if-test must be a comparison wrapping the walrus");
+        };
+        let Expr::Attribute(attribute) = compare.left.as_ref() else {
+            panic!("this fixture's own if-test must read an attribute off the walrus-bound name");
+        };
+        let Expr::Named(named) = attribute.value.as_ref() else {
+            panic!("this fixture's own if-test must embed a walrus binding");
+        };
+        let Expr::Name(target) = named.target.as_ref() else {
+            panic!("the walrus target must be a bare name");
+        };
+        let Expr::Call(call) = named.value.as_ref() else {
+            panic!("the walrus value must be a call");
+        };
+        (target.clone(), call.clone())
+    }
+
+    /// FIX 2: `if (result := subprocess.run(...)).returncode == 0: return
+    /// json.loads(result.stdout)` (`level_via_walrus_result`, d-data-
+    /// legs.py:205). Before this fix, `recognize_foreign_edge` dispatched
+    /// only on `statements[index]` being `Stmt::Assign`/`Stmt::With` —
+    /// the SAME gate `check.rs`'s own body loop applied before ever
+    /// calling `foreign_edge_at` at all. This statement is a `Stmt::If`
+    /// whose TEST embeds the walrus, so the recognizer never fired at
+    /// all — not recognized-and-blocked, structurally unreached. This
+    /// pins the fix's own entry point directly: `foreign_edge_at_walrus_
+    /// call`, given the walrus's own target/call and the taken arm's own
+    /// body (where the `json.loads(...)` consumer sits), recognizes and
+    /// binds the proved return exactly as the flat `Assign`-shaped call
+    /// already does.
+    #[test]
+    fn a_walrus_bound_run_call_in_an_if_test_recognizes_and_binds_the_proved_return() {
+        register_fixture_artifact("./audio_level.ts", audio_level_ts_artifact());
+        let Some(kernel) = loaded_kernel() else { return };
+        let source = concat!(
+            "def audio_level_via_walrus(boosted):\n",
+            "    if (result := subprocess.run(\n",
+            "        [\"node\", \"./audio_level.ts\"],\n",
+            "        input=json.dumps(boosted),\n",
+            "        capture_output=True,\n",
+            "        text=True,\n",
+            "    )).returncode == 0:\n",
+            "        return json.loads(result.stdout)\n",
+            "    return 0\n",
+        );
+        let body = def_body(source);
+        let Stmt::If(if_stmt) = &body[0] else {
+            panic!("this fixture's own top-level statement must be the if");
+        };
+        let (target, call) = walrus_test_target_and_call(if_stmt);
+        let environment = env_with(&[("boosted", boosted_sequence_value())]);
+        let outcome = foreign_edge_at_walrus_call(&call, &target, &if_stmt.body, 0, &environment, &kernel, None)
+            .expect("the walrus-bound run call recognizes");
+        match outcome {
+            ForeignEdgeOutcome::Override { value, .. } => {
+                assert_eq!(value.kind, Kind::Set);
+                assert_eq!(value.kind_tag, Some(PrimitiveKind::Integer));
+            }
+            ForeignEdgeOutcome::Decline { message, .. } => panic!("wanted an override, got a decline: {message}"),
+            ForeignEdgeOutcome::Fired { message, .. } => panic!("wanted an override, got a fire: {message}"),
+        }
+    }
+
+    /// REGRESSION PIN: the flat `Assign`-shaped spelling
+    /// (`result = subprocess.run(...)`, read through `foreign_edge_at`'s
+    /// ordinary `Stmt::Assign` dispatch) still recognizes exactly as
+    /// before this fix — the walrus-in-test entry point is an ADDITIONAL
+    /// way to reach `recognize_subprocess_callee`, never a replacement
+    /// for `recognize_foreign_edge`'s own `Stmt::Assign` path.
+    #[test]
+    fn the_flat_assign_shaped_run_call_still_recognizes_after_the_walrus_fix() {
+        register_fixture_artifact("./audio_level.ts", audio_level_ts_artifact());
+        let Some(kernel) = loaded_kernel() else { return };
+        let body = def_body(FIXTURE_SOURCE);
+        let environment = env_with(&[("boosted", boosted_sequence_value())]);
+        let outcome = foreign_edge_at(&body, 0, &environment, &kernel, None).expect("the flat shape recognizes");
+        match outcome {
+            ForeignEdgeOutcome::Override { value, .. } => {
+                assert_eq!(value.kind, Kind::Set);
+                assert_eq!(value.kind_tag, Some(PrimitiveKind::Integer));
+            }
+            ForeignEdgeOutcome::Decline { message, .. } => panic!("wanted an override, got a decline: {message}"),
+            ForeignEdgeOutcome::Fired { message, .. } => panic!("wanted an override, got a fire: {message}"),
+        }
+    }
+
     /* ── subprocess.Popen ─────────────────────────────────────────────── */
 
     #[test]
@@ -3572,6 +4720,300 @@ mod tests {
         }
     }
 
+    /// FIX 1: `with subprocess.Popen([...]) as process:` — the idiomatic
+    /// context-manager wrapping of the flat Popen/`.communicate()` pair
+    /// above (`level_via_popen_context_manager`, a-invocation-
+    /// functions.py:80). Before this fix, `recognize_foreign_edge`'s own
+    /// `Stmt::With` branch tried only `recognize_temp_file_edge` with no
+    /// fallthrough, so this call never reached `recognize_subprocess_
+    /// popen` at all — `foreign_edge_at` answered `None` (structurally
+    /// unrecognized, not a decline) and `process.communicate(...)`'s
+    /// result read as an ordinary opaque call. This pins the fix:
+    /// `foreign_edge_at` now tries the Popen-context-manager shape when
+    /// the temp-file shape declines the whole with-statement, reading
+    /// the `.communicate()` assign and its own `json.loads(...)`
+    /// consumer out of the WITH-BLOCK's own body.
+    #[test]
+    fn popen_inside_a_with_block_recognizes_and_binds_the_proved_return() {
+        register_fixture_artifact("./audio_level.ts", audio_level_ts_artifact());
+        let Some(kernel) = loaded_kernel() else { return };
+        let source = concat!(
+            "def f(boosted):\n",
+            "    with subprocess.Popen(\n",
+            "        [\"node\", \"./audio_level.ts\"],\n",
+            "        stdin=subprocess.PIPE,\n",
+            "        stdout=subprocess.PIPE,\n",
+            "        text=True,\n",
+            "    ) as process:\n",
+            "        stdout, _stderr = process.communicate(json.dumps(boosted))\n",
+            "        return json.loads(stdout)\n",
+        );
+        let body = def_body(source);
+        let environment = env_with(&[("boosted", boosted_sequence_value())]);
+        match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("the with-wrapped Popen pair recognizes")
+        {
+            ForeignEdgeOutcome::Override { value, .. } => {
+                assert_eq!(value.kind, Kind::Set);
+                assert_eq!(value.kind_tag, Some(PrimitiveKind::Integer));
+            }
+            ForeignEdgeOutcome::Decline { message, .. } => panic!("wanted an override, got a decline: {message}"),
+            ForeignEdgeOutcome::Fired { message, .. } => panic!("wanted an override, got a fire: {message}"),
+        }
+    }
+
+    /// REGRESSION PIN: the flat (non-with) Popen/`.communicate()` spelling
+    /// still recognizes exactly as before this fix — the with-wrapped
+    /// shape is an ADDITIONAL recognized shape, never a replacement for
+    /// the statement-pair one `recognize_subprocess_popen` already reads.
+    #[test]
+    fn the_flat_popen_pair_still_recognizes_after_the_with_fix() {
+        register_fixture_artifact("./audio_level.ts", audio_level_ts_artifact());
+        let Some(kernel) = loaded_kernel() else { return };
+        let source = concat!(
+            "def f(boosted):\n",
+            "    process = subprocess.Popen(\n",
+            "        [\"node\", \"./audio_level.ts\"],\n",
+            "        stdin=subprocess.PIPE,\n",
+            "        stdout=subprocess.PIPE,\n",
+            "        text=True,\n",
+            "    )\n",
+            "    stdout, _stderr = process.communicate(json.dumps(boosted))\n",
+            "    return json.loads(stdout)\n",
+        );
+        let body = def_body(source);
+        let environment = env_with(&[("boosted", boosted_sequence_value())]);
+        match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("the flat Popen pair still recognizes") {
+            ForeignEdgeOutcome::Override { value, .. } => {
+                assert_eq!(value.kind, Kind::Set);
+                assert_eq!(value.kind_tag, Some(PrimitiveKind::Integer));
+            }
+            ForeignEdgeOutcome::Decline { message, .. } => panic!("wanted an override, got a decline: {message}"),
+            ForeignEdgeOutcome::Fired { message, .. } => panic!("wanted an override, got a fire: {message}"),
+        }
+    }
+
+    /* ── asyncio.create_subprocess_exec ──────────────────────────────── */
+
+    /// EDGE-COVERAGE §K's own headline row (`k-async-invocation.py`'s
+    /// `level_via_async_subprocess`): the awaited twin of
+    /// `popen_with_communicate_recognizes_and_binds_the_proved_return`,
+    /// spelled with `await asyncio.create_subprocess_exec(...)` and
+    /// `await proc.communicate(json.dumps(...).encode())` in place of
+    /// `subprocess.Popen`/`.communicate(json.dumps(...))`. Pins that the
+    /// async spelling now recognizes and binds the target's own proved
+    /// return, exactly like the synchronous shape.
+    #[test]
+    fn async_create_subprocess_exec_recognizes_and_binds_the_proved_return() {
+        register_fixture_artifact("./audio_level.ts", audio_level_ts_artifact());
+        let Some(kernel) = loaded_kernel() else { return };
+        let source = concat!(
+            "async def f(boosted):\n",
+            "    proc = await asyncio.create_subprocess_exec(\n",
+            "        \"node\",\n",
+            "        \"./audio_level.ts\",\n",
+            "        stdin=asyncio.subprocess.PIPE,\n",
+            "        stdout=asyncio.subprocess.PIPE,\n",
+            "    )\n",
+            "    stdout_bytes, _stderr = await proc.communicate(json.dumps(boosted).encode())\n",
+            "    return json.loads(stdout_bytes)\n",
+        );
+        let body = def_body(source);
+        let environment = env_with(&[("boosted", boosted_sequence_value())]);
+        match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("the async create_subprocess_exec pair recognizes")
+        {
+            ForeignEdgeOutcome::Override { value, .. } => {
+                assert_eq!(value.kind, Kind::Set);
+                assert_eq!(value.kind_tag, Some(PrimitiveKind::Integer));
+            }
+            ForeignEdgeOutcome::Decline { message, .. } => panic!("wanted an override, got a decline: {message}"),
+            ForeignEdgeOutcome::Fired { message, .. } => panic!("wanted an override, got a fire: {message}"),
+        }
+    }
+
+    /// EDGE-COVERAGE §K's second row (`level_via_async_subprocess_optional`):
+    /// the identical async call, with the SAME recognition — the
+    /// declared-return widening to `Optional[Level]` this row measures is
+    /// a return-judge question, downstream of recognition, so this test
+    /// pins that recognition itself is unaffected by the declared return
+    /// shape and still binds the same proved fact.
+    #[test]
+    fn async_create_subprocess_exec_recognizes_regardless_of_the_declared_return() {
+        register_fixture_artifact("./audio_level.ts", audio_level_ts_artifact());
+        let Some(kernel) = loaded_kernel() else { return };
+        let source = concat!(
+            "async def f(boosted):\n",
+            "    proc = await asyncio.create_subprocess_exec(\n",
+            "        \"node\",\n",
+            "        \"./audio_level.ts\",\n",
+            "        stdin=asyncio.subprocess.PIPE,\n",
+            "        stdout=asyncio.subprocess.PIPE,\n",
+            "    )\n",
+            "    stdout_bytes, _stderr = await proc.communicate(json.dumps(boosted).encode())\n",
+            "    return json.loads(stdout_bytes)\n",
+        );
+        let body = def_body(source);
+        let environment = env_with(&[("boosted", boosted_sequence_value())]);
+        match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("the async pair recognizes") {
+            ForeignEdgeOutcome::Override { value, .. } => {
+                assert_eq!(value.kind, Kind::Set);
+                assert_eq!(value.kind_tag, Some(PrimitiveKind::Integer));
+            }
+            ForeignEdgeOutcome::Decline { message, .. } => panic!("wanted an override, got a decline: {message}"),
+            ForeignEdgeOutcome::Fired { message, .. } => panic!("wanted an override, got a fire: {message}"),
+        }
+    }
+
+    /// The bytes encode/decode unwrapping, pinned on BOTH legs at once:
+    /// the outbound payload rides `json.dumps(...).encode()` (unwrapped
+    /// by `unwrap_bytes_encode` before `json_dumps_argument_of` reads it)
+    /// and the return leg reads `json.loads(stdout_text.decode())`
+    /// (unwrapped by `unwrap_bytes_decode` before `is_foreign_parse_of`
+    /// matches the name) — the `.encode()`/`.decode()` wrapper on either
+    /// leg names the identical JSON text/bytes as the unwrapped spelling
+    /// pinned above, so this recognizes and binds the same proved return.
+    #[test]
+    fn async_create_subprocess_exec_unwraps_encode_and_decode_on_both_legs() {
+        register_fixture_artifact("./audio_level.ts", audio_level_ts_artifact());
+        let Some(kernel) = loaded_kernel() else { return };
+        let source = concat!(
+            "async def f(boosted):\n",
+            "    proc = await asyncio.create_subprocess_exec(\n",
+            "        \"node\",\n",
+            "        \"./audio_level.ts\",\n",
+            "        stdin=asyncio.subprocess.PIPE,\n",
+            "        stdout=asyncio.subprocess.PIPE,\n",
+            "    )\n",
+            "    stdout_text, _stderr = await proc.communicate(json.dumps(boosted).encode())\n",
+            "    return json.loads(stdout_text.decode())\n",
+        );
+        let body = def_body(source);
+        let environment = env_with(&[("boosted", boosted_sequence_value())]);
+        match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("the .decode()-wrapped consumer recognizes")
+        {
+            ForeignEdgeOutcome::Override { value, .. } => {
+                assert_eq!(value.kind, Kind::Set);
+                assert_eq!(value.kind_tag, Some(PrimitiveKind::Integer));
+            }
+            ForeignEdgeOutcome::Decline { message, .. } => panic!("wanted an override, got a decline: {message}"),
+            ForeignEdgeOutcome::Fired { message, .. } => panic!("wanted an override, got a fire: {message}"),
+        }
+    }
+
+    /// The bare (non-`.encode()`) payload and bare (non-`.decode()`)
+    /// return both still recognize — `json_dumps_argument_of`/
+    /// `is_foreign_parse_of` read through an ABSENT wrapper exactly as
+    /// readily as a present one, since `unwrap_bytes_encode`/
+    /// `unwrap_bytes_decode` answer the expression unchanged when no
+    /// `.encode()`/`.decode()` call wraps it.
+    #[test]
+    fn async_create_subprocess_exec_recognizes_without_encode_or_decode() {
+        register_fixture_artifact("./audio_level.ts", audio_level_ts_artifact());
+        let Some(kernel) = loaded_kernel() else { return };
+        let source = concat!(
+            "async def f(boosted):\n",
+            "    proc = await asyncio.create_subprocess_exec(\n",
+            "        \"node\",\n",
+            "        \"./audio_level.ts\",\n",
+            "        stdin=asyncio.subprocess.PIPE,\n",
+            "        stdout=asyncio.subprocess.PIPE,\n",
+            "    )\n",
+            "    stdout_bytes, _stderr = await proc.communicate(json.dumps(boosted))\n",
+            "    return json.loads(stdout_bytes)\n",
+        );
+        let body = def_body(source);
+        let environment = env_with(&[("boosted", boosted_sequence_value())]);
+        match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("the unwrapped pair recognizes") {
+            ForeignEdgeOutcome::Override { value, .. } => {
+                assert_eq!(value.kind, Kind::Set);
+                assert_eq!(value.kind_tag, Some(PrimitiveKind::Integer));
+            }
+            ForeignEdgeOutcome::Decline { message, .. } => panic!("wanted an override, got a decline: {message}"),
+            ForeignEdgeOutcome::Fired { message, .. } => panic!("wanted an override, got a fire: {message}"),
+        }
+    }
+
+    /// An explicitly non-PIPE `stdout` (`asyncio.subprocess.DEVNULL`)
+    /// refuses recognition — this call IS `asyncio.create_subprocess_exec`
+    /// with a readable runner/script, but the checker cannot read the
+    /// target's stdout back at all, so it declines with the same
+    /// channel-refusal sentence family `subprocess_popen_keywords_of`'s
+    /// own sync check already speaks, never a second sentence for the
+    /// async spelling.
+    #[test]
+    fn async_create_subprocess_exec_with_a_non_pipe_stdout_declines() {
+        let source = concat!(
+            "async def f(boosted):\n",
+            "    proc = await asyncio.create_subprocess_exec(\n",
+            "        \"node\",\n",
+            "        \"./audio_level.ts\",\n",
+            "        stdin=asyncio.subprocess.PIPE,\n",
+            "        stdout=asyncio.subprocess.DEVNULL,\n",
+            "    )\n",
+            "    stdout_bytes, _stderr = await proc.communicate(json.dumps(boosted).encode())\n",
+            "    return json.loads(stdout_bytes)\n",
+        );
+        let body = def_body(source);
+        let environment = env_with(&[("boosted", boosted_sequence_value())]);
+        let Some(kernel) = loaded_kernel() else { return };
+        match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("the call itself is recognized") {
+            ForeignEdgeOutcome::Decline { message, .. } => assert!(message.contains("stdout"), "{message}"),
+            _ => panic!("wanted a decline naming the non-PIPE stdout"),
+        }
+    }
+
+    /// REGRESSION PIN: every synchronous shape this crate already
+    /// recognized (`subprocess.run`, `subprocess.Popen`) still recognizes
+    /// after the asyncio row is added — the awaited path is reached only
+    /// when the assign's own value is `Expr::Await`, so a bare
+    /// `Expr::Call` value falls straight through to the unchanged sync
+    /// dispatch, never through the new asyncio reader at all.
+    #[test]
+    fn the_synchronous_subprocess_run_shape_still_recognizes_after_the_asyncio_row() {
+        register_fixture_artifact("./audio_level.ts", audio_level_ts_artifact());
+        let Some(kernel) = loaded_kernel() else { return };
+        let body = def_body(FIXTURE_SOURCE);
+        let environment = env_with(&[("boosted", boosted_sequence_value())]);
+        match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("subprocess.run still recognizes") {
+            ForeignEdgeOutcome::Override { value, .. } => {
+                assert_eq!(value.kind, Kind::Set);
+                assert_eq!(value.kind_tag, Some(PrimitiveKind::Integer));
+            }
+            ForeignEdgeOutcome::Decline { message, .. } => panic!("wanted an override, got a decline: {message}"),
+            ForeignEdgeOutcome::Fired { message, .. } => panic!("wanted an override, got a fire: {message}"),
+        }
+    }
+
+    /// REGRESSION PIN: the synchronous Popen/`.communicate()` pair still
+    /// recognizes after the asyncio row is added — the SAME pin
+    /// `the_flat_popen_pair_still_recognizes_after_the_with_fix` already
+    /// keeps for the with-wrapped fix, rerun here for the asyncio one.
+    #[test]
+    fn the_synchronous_popen_shape_still_recognizes_after_the_asyncio_row() {
+        register_fixture_artifact("./audio_level.ts", audio_level_ts_artifact());
+        let Some(kernel) = loaded_kernel() else { return };
+        let source = concat!(
+            "def f(boosted):\n",
+            "    process = subprocess.Popen(\n",
+            "        [\"node\", \"./audio_level.ts\"],\n",
+            "        stdin=subprocess.PIPE,\n",
+            "        stdout=subprocess.PIPE,\n",
+            "        text=True,\n",
+            "    )\n",
+            "    stdout, _stderr = process.communicate(json.dumps(boosted))\n",
+            "    return json.loads(stdout)\n",
+        );
+        let body = def_body(source);
+        let environment = env_with(&[("boosted", boosted_sequence_value())]);
+        match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("Popen still recognizes") {
+            ForeignEdgeOutcome::Override { value, .. } => {
+                assert_eq!(value.kind, Kind::Set);
+                assert_eq!(value.kind_tag, Some(PrimitiveKind::Integer));
+            }
+            ForeignEdgeOutcome::Decline { message, .. } => panic!("wanted an override, got a decline: {message}"),
+            ForeignEdgeOutcome::Fired { message, .. } => panic!("wanted an override, got a fire: {message}"),
+        }
+    }
+
     /* ── disk-backed integration: a real artifact, read for real ────── */
     //
     // These exercise the sibling's own `read_foreign_ts_artifact` against
@@ -3605,21 +5047,22 @@ mod tests {
     }
 
     /// A well-formed `audioLevel` artifact JSON, with the real sha256 of
-    /// `source` as its target contentHash — the exact schema
-    /// `foreign_edge_artifact.rs`'s own module doc spells.
+    /// `source` as its target contentHash — the exact RULED cases schema
+    /// `foreign_edge_artifact.rs`'s own module doc spells, no version
+    /// field at all.
     fn well_formed_audio_level_artifact(source: &[u8]) -> serde_json::Value {
         let element = make_refined_set(vec![at_least(-2.0), at_most(2.0)]);
         let return_set = make_refined_set(vec![integer(), at_least(0.0), at_most(1.0)]);
         json!({
-            "refined": {"kind": "fact-artifact", "version": 2},
+            "refined": {"kind": "fact-artifact"},
             "target": {"file": "audio_level.ts", "contentHash": format!("sha256:{}", crate::refinedpy::fact_export::sha256_hex(source))},
             "language": "typescript",
             "runtime": {"band": "es2023+"},
             "surface": {"kind": "stdin-json", "stdin": "json", "stdout": "json", "calls": "audioLevel"},
             "functions": {
                 "audioLevel": {
-                    "entry": [{"name": "boosted", "sequence": {"element": wire_set(&element), "lengthAtLeast": 1}}],
-                    "return": {"set": wire_set(&return_set), "stdoutPure": true},
+                    "entry": [{"name": "boosted", "sequence": {"element": {"cases": [{"sort": "number", "set": wire_set(&element)}]}, "lengthAtLeast": 1}}],
+                    "return": {"cases": [{"sort": "number", "set": wire_set(&return_set)}], "stdoutPure": true},
                     "provenance": {"line": 30, "said": "audioLevel's own kernel summary"},
                 }
             }

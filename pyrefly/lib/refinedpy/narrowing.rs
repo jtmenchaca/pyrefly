@@ -69,6 +69,7 @@ use std::sync::Arc;
 use refined_domain::abstract_value::kind_union_of;
 use refined_domain::abstract_value::known_set;
 use refined_domain::abstract_value::known_values;
+use refined_domain::abstract_value::null_value;
 use refined_domain::abstract_value::AbstractValue;
 use refined_domain::abstract_value::Kind;
 use refined_domain::abstract_value::PrimitiveKind;
@@ -444,14 +445,14 @@ fn is_numeric_or_boolean(kind_tag: PrimitiveKind) -> bool {
     )
 }
 
-/// `is None` / `is not None` (mission point 5): only a Values-kind
-/// binding is touched — the empty Values state means "provably not
-/// None among the tracked exact values," which is sound because None
-/// itself is never a member of a Values state (Values carries only
-/// host-sorted numbers/booleans/strings/arrays, never the absent
-/// marker). A non-Values binding (including one already `Kind::Null`)
-/// passes through unchanged, per the mission's instruction that
-/// non-Values states pass through everywhere this wave.
+/// `is None` / `is not None` (mission point 5): a Values-kind binding
+/// narrows by emptying (see below); a `Kind::PossiblyUndefined` binding
+/// — an `Optional[X]`/`X | None`-declared parameter's own seed
+/// (`check.rs::seed_parameters`) — narrows by UNWRAPPING, the maybe
+/// carrier's own reason for existing. A non-Values, non-wrapper binding
+/// (including one already `Kind::Null`) passes through unchanged, per
+/// the mission's instruction that non-Values states pass through
+/// everywhere this wave.
 fn narrow_is_none(left: &Expr, op: CmpOp, right: &Expr, environment: &mut Environment, truth: bool) {
     let is_not = op == CmpOp::IsNot;
     let name = if is_none_literal(right) {
@@ -467,6 +468,24 @@ fn narrow_is_none(left: &Expr, op: CmpOp, right: &Expr, environment: &mut Enviro
     let Some(current) = environment.read(name).cloned() else {
         return;
     };
+    // `name is None` true, or `name is not None` false, both mean
+    // "None": a `Kind::PossiblyUndefined` wrapper's own absent side
+    // proves this reachable, so the TRUE reading of "None" rebinds to
+    // the exact null_value (matching what `assignability::judge` reads
+    // directly for an admits_none declaration) — never the wrapper
+    // itself, since the wrapper's present side is now proved
+    // unreachable on this fork.
+    // `name is None` false, or `name is not None` true, both mean "not
+    // None": the wrapper's own INNER value is what remains — unwrapped,
+    // so a later read sees the plain present-side value (the annotated
+    // set, a plain scalar, …) rather than the maybe carrier.
+    let means_is_none = truth != is_not;
+    if current.kind == Kind::PossiblyUndefined {
+        let inner = current.inner.as_deref().expect("Kind::PossiblyUndefined always carries an inner value");
+        let narrowed = if means_is_none { null_value() } else { inner.clone() };
+        environment.bind(name, narrowed);
+        return;
+    }
     if current.kind != Kind::Values {
         return;
     }
@@ -480,7 +499,6 @@ fn narrow_is_none(left: &Expr, op: CmpOp, right: &Expr, environment: &mut Enviro
     // "not None" — a Values binding already satisfies that for every
     // member, so it is left as is (still narrows nothing further, which
     // is sound: no member is dropped).
-    let means_is_none = truth != is_not;
     if means_is_none {
         let grade = trust_level_of(&current);
         environment.bind(name, known_values(Vec::new(), kind_tag, grade));
@@ -1818,5 +1836,59 @@ mod tests {
             "value.set = {:?} must still admit values above 120 (200, …)",
             value.set
         );
+    }
+
+    /// `sample is not None` proving TRUE against a `Kind::PossiblyUndefined`
+    /// binding (an `Optional[X]`-declared parameter's own seed,
+    /// `check.rs::seed_parameters`) unwraps to the wrapper's own INNER
+    /// value — the annotated set, never the wrapper itself.
+    #[test]
+    fn test_is_not_none_true_unwraps_a_possibly_undefined_binding() {
+        use refined_domain::abstract_value::possibly_absent;
+        use refined_domain::abstract_value::AbsentFlavor;
+
+        let mut locally_bound = HashSet::new();
+        locally_bound.insert("sample".to_owned());
+        let mut environment = Environment::new(locally_bound);
+        let inner = known_set(
+            make_refined_set(vec![at_least(-2.0), refined_sets::refinement_forms::at_most(2.0)]),
+            None,
+            TrustProved,
+            SetKindTag::None,
+        );
+        environment.bind("sample", possibly_absent(inner.clone(), AbsentFlavor::NullOnly, None, false));
+
+        let Some(narrowed) = assumed("sample is not None", environment, true) else {
+            return;
+        };
+        let value = narrowed.read("sample").expect("sample still bound");
+        assert_eq!(value.kind, Kind::Set, "the wrapper must unwrap to its inner Kind::Set, not stay a maybe carrier");
+        assert_eq!(value.set, inner.set);
+    }
+
+    /// The mirror: `sample is None` proving TRUE rebinds to the exact
+    /// `null_value` — the wrapper's absent side, matching what
+    /// `assignability::judge` reads directly for a bare `None`.
+    #[test]
+    fn test_is_none_true_rebinds_a_possibly_undefined_binding_to_null() {
+        use refined_domain::abstract_value::possibly_absent;
+        use refined_domain::abstract_value::AbsentFlavor;
+
+        let mut locally_bound = HashSet::new();
+        locally_bound.insert("sample".to_owned());
+        let mut environment = Environment::new(locally_bound);
+        let inner = known_set(
+            make_refined_set(vec![at_least(-2.0), refined_sets::refinement_forms::at_most(2.0)]),
+            None,
+            TrustProved,
+            SetKindTag::None,
+        );
+        environment.bind("sample", possibly_absent(inner, AbsentFlavor::NullOnly, None, false));
+
+        let Some(narrowed) = assumed("sample is None", environment, true) else {
+            return;
+        };
+        let value = narrowed.read("sample").expect("sample still bound");
+        assert_eq!(value.kind, Kind::Null, "the wrapper must rebind to the exact null_value on the is-None-true fork");
     }
 }
