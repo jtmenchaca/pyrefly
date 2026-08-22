@@ -59,13 +59,13 @@ use ruff_python_ast::{
     StmtImportFrom,
 };
 
-use crate::refinedpy::env::Environment;
-use crate::refinedpy::expressions::evaluate_expression;
-use crate::refinedpy::function_table::{
+use crate::env::Environment;
+use crate::expressions::evaluate_expression;
+use crate::function_table::{
     function_table_from_module, merged, FunctionTable, ENTRY_MODULE,
 };
-use crate::refinedpy::instances::{class_table, ClassModel};
-use crate::refinedpy::surface::{compile_aliases, surface_imports};
+use crate::instances::{class_table, ClassModel};
+use crate::surface::{compile_aliases, surface_imports};
 
 /// How a module NAME becomes a parsed module: the CLI resolves a
 /// sibling `.py` file on disk (`disk_resolver`), the LSP resolves
@@ -368,7 +368,7 @@ fn pull_member(
                 fields: class_model
                     .fields
                     .iter()
-                    .map(|field| crate::refinedpy::instances::ClassField {
+                    .map(|field| crate::instances::ClassField {
                         name: field.name.clone(),
                         declared: field.declared.clone(),
                         default: field.default.clone(),
@@ -380,7 +380,7 @@ fn pull_member(
                     .map(|(property_name, property)| {
                         (
                             property_name.clone(),
-                            crate::refinedpy::instances::PropertyModel {
+                            crate::instances::PropertyModel {
                                 backing: property.backing.clone(),
                                 declared: property.declared.clone(),
                             },
@@ -659,7 +659,7 @@ mod tests {
         let module_object = surface.bindings.get("h").expect("h binds a module object");
         assert_eq!(module_object.kind, Kind::Object);
         assert_eq!(
-            crate::refinedpy::collection_models::subscript_read(
+            crate::collection_models::subscript_read(
                 module_object,
                 &known_values(
                     "forty".chars().map(|c| c as u32 as f64).collect(),

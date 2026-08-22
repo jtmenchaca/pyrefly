@@ -1,0 +1,88 @@
+/*
+ * Copyright (c) TypeRefinery.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+//! The served RefinedPy LSP binary: pyrefly's own CLI, with RefinedPy's
+//! four hooks registered before any request is served. Everything past
+//! `register_refinedpy_hooks()` is pyrefly's own `bin/main.rs`, copied
+//! rather than called through, because that file's `run`/`main` are
+//! not `pub` — the smallest way to reuse its exact argument parsing and
+//! dispatch without changing pyrefly's own binary crate.
+
+use std::env::args_os;
+use std::process::ExitCode;
+
+use clap::Parser;
+use clap::crate_version;
+use pyrefly::commands::lsp::filter_unrecognized_lsp_args;
+use pyrefly::library::library::library::library::Command;
+use pyrefly::library::library::library::library::util::CommonGlobalArgs;
+use pyrefly_util::args::get_args_expanded;
+use pyrefly_util::panic::exit_on_panic;
+use pyrefly_util::telemetry::NoTelemetry;
+
+// fbcode likes to set its own allocator in fbcode.default_allocator
+// So when we set our own allocator, buck build buck2 or buck2 build buck2 often breaks.
+// Making jemalloc the default only when we do a cargo build.
+#[global_allocator]
+#[cfg(all(any(target_os = "linux", target_os = "macos"), not(fbcode_build)))]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[global_allocator]
+#[cfg(target_os = "windows")]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+/// Main CLI entrypoint for the RefinedPy LSP server.
+#[derive(Debug, Parser)]
+#[command(name = "refinedpy-lsp")]
+#[command(about = "Pyrefly's language server with RefinedPy hooks registered", long_about = None)]
+#[command(version)]
+struct Args {
+    /// Common global arguments shared across commands.
+    #[command(flatten)]
+    common: CommonGlobalArgs,
+
+    /// Subcommand execution args.
+    #[command(subcommand)]
+    command: Command,
+}
+
+/// Run based on the command line arguments.
+async fn run() -> anyhow::Result<ExitCode> {
+    let expanded_args = get_args_expanded(args_os())?;
+    let filtered_args = filter_unrecognized_lsp_args(expanded_args);
+    let args = Args::parse_from(filtered_args);
+    args.common.init(false);
+    let thread_count = args.common.thread_count();
+    let (status, _) = args
+        .command
+        .run(crate_version!(), &NoTelemetry, None, thread_count)
+        .await?;
+    Ok(status.to_exit_code())
+}
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> ExitCode {
+    // Enable stack overflow backtraces for debugging.
+    // This is unsafe and only intended for debug builds.
+    #[cfg(not(windows))]
+    #[cfg(feature = "debug-stack-overflow")]
+    unsafe {
+        backtrace_on_stack_overflow::enable();
+    }
+    exit_on_panic();
+    refinedpy_lsp::register_refinedpy_hooks();
+    let res = run().await;
+    match res {
+        Ok(code) => code,
+        Err(e) => {
+            // If you return a Result from main, and RUST_BACKTRACE=1 is set, then
+            // it will print a backtrace - which is not what we want.
+            eprintln!("{e:#}");
+            ExitCode::FAILURE
+        }
+    }
+}

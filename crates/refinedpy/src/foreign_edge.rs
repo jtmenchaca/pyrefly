@@ -178,17 +178,17 @@ use ruff_python_ast::StmtWith;
 use ruff_text_size::Ranged;
 use ruff_text_size::TextRange;
 
-use crate::refinedpy::assignability;
-use crate::refinedpy::diagnostic_sentences;
-use crate::refinedpy::env::Environment;
-use crate::refinedpy::foreign_edge_artifact::ForeignCase;
-use crate::refinedpy::foreign_edge_artifact::ForeignSurface;
-use crate::refinedpy::foreign_edge_artifact::ForeignTsArtifact;
-use crate::refinedpy::foreign_edge_artifact::ForeignTsEntry;
+use crate::assignability;
+use crate::diagnostic_sentences;
+use crate::env::Environment;
+use crate::foreign_edge_artifact::ForeignCase;
+use crate::foreign_edge_artifact::ForeignSurface;
+use crate::foreign_edge_artifact::ForeignTsArtifact;
+use crate::foreign_edge_artifact::ForeignTsEntry;
 #[cfg(test)]
-use crate::refinedpy::foreign_edge_artifact::ForeignTsFunctionFact;
+use crate::foreign_edge_artifact::ForeignTsFunctionFact;
 #[cfg(not(test))]
-use crate::refinedpy::foreign_edge_artifact::read_foreign_ts_artifact as read_foreign_ts_artifact_landed;
+use crate::foreign_edge_artifact::read_foreign_ts_artifact as read_foreign_ts_artifact_landed;
 
 /// How the return leg's sole consumer reads the captured text back off
 /// the bound name — the two shapes this crate's recognized calls
@@ -1010,7 +1010,7 @@ fn const_folded_text_of(expression: &Expr, environment: &Environment, kernel: &A
             }
         }
     }
-    let folded = crate::refinedpy::expressions::evaluate_expression(expression, environment, kernel);
+    let folded = crate::expressions::evaluate_expression(expression, environment, kernel);
     exact_string_text(&folded)
 }
 
@@ -2930,7 +2930,7 @@ fn check_outbound_leg(
         });
     }
     let entry = &artifact.called.entry[0];
-    let crossing = crate::refinedpy::expressions::evaluate_expression(&edge.payload, environment, kernel);
+    let crossing = crate::expressions::evaluate_expression(&edge.payload, environment, kernel);
     let payload_range = edge.payload.range();
     // NaN-FREEDOM: NaN stringifies to `null` in json.dumps, so the
     // target would receive a value this program never computed
@@ -3622,7 +3622,7 @@ mod tests {
 
     use refined_domain::abstract_value::possibly_nan;
     use refined_domain::trust_grades::TrustProved;
-    use crate::refinedpy::collection_models::subscript_read;
+    use crate::collection_models::subscript_read;
     use refined_kernel::kernel_bridge::dylib_path;
     use refined_kernel::kernel_bridge::kernel_artifacts_present;
     use refined_kernel::kernel_bridge::load_kernel;
@@ -3633,7 +3633,7 @@ mod tests {
     use refined_sets::repetition_window_forms::repetition;
 
     use super::*;
-    use crate::refinedpy::foreign_edge_artifact::ForeignSurface;
+    use crate::foreign_edge_artifact::ForeignSurface;
 
     thread_local! {
         static FIXTURE_ARTIFACTS: RefCell<HashMap<String, ForeignTsArtifact>> = RefCell::new(HashMap::new());
@@ -5634,7 +5634,7 @@ mod tests {
     use refined_kernel::wire_format::wire_set;
     use serde_json::json;
 
-    use crate::refinedpy::foreign_edge_artifact;
+    use crate::foreign_edge_artifact;
 
     /// A fresh temp directory marked as a project root with `.git`, so
     /// `cache_artifact_path`/`project_root_of` resolve exactly this
@@ -5659,7 +5659,7 @@ mod tests {
         let return_set = make_refined_set(vec![integer(), at_least(0.0), at_most(1.0)]);
         json!({
             "refined": {"kind": "fact-artifact"},
-            "target": {"file": "audio_level.ts", "contentHash": format!("sha256:{}", crate::refinedpy::fact_export::sha256_hex(source))},
+            "target": {"file": "audio_level.ts", "contentHash": format!("sha256:{}", crate::fact_export::sha256_hex(source))},
             "language": "typescript",
             "runtime": {"band": "es2023+"},
             "surface": {"kind": "stdin-json", "stdin": "json", "stdout": "json", "calls": "audioLevel"},

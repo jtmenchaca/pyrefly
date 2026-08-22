@@ -43,25 +43,25 @@ use ruff_python_ast::{
 };
 use ruff_text_size::{Ranged, TextRange, TextSize};
 
-use crate::refinedpy::assignability::{judge, states_sequence, Verdict};
-use crate::refinedpy::bytes_models::{self, BytesAnswer};
-use crate::refinedpy::collection_models::{dict_get_result, dict_with_item, dict_without_item, list_literal_value, list_with_item, mutated_receiver, subscript_read};
-use crate::refinedpy::cross_module::{module_surface, ModuleResolver, IMPORT_DEPTH_CAP};
-use crate::refinedpy::diagnostic_sentences::{empty_set, unhonorable_annotation};
-use crate::refinedpy::env::Environment;
-use crate::refinedpy::expressions::{binary_arithmetic_value, evaluate_expression, fieldless_exception_value, provable_raise, register_retained_callables};
-use crate::refinedpy::foreign_edge;
-use crate::refinedpy::function_table::{function_table, merged, FunctionTable};
-use crate::refinedpy::instances;
-use crate::refinedpy::instances::{class_table, judge_construction, ClassModel, ConstructionVerdict};
-use crate::refinedpy::loops::{loop_final_environment, LoopAnswer};
-use crate::refinedpy::match_arms;
-use crate::refinedpy::match_arms::match_taken_environment;
-use crate::refinedpy::narrowing::assume;
-use crate::refinedpy::relational_sum;
-use crate::refinedpy::summaries;
-use crate::refinedpy::surface::{compile_aliases, strict_int_alias_names, surface_imports, AliasEntry};
-use crate::refinedpy::typereading::{base_sort_return_refinement, callable_return_refinement, declared_refinement, typed_dict_return_refinement, DeclaredRefinement};
+use crate::assignability::{judge, states_sequence, Verdict};
+use crate::bytes_models::{self, BytesAnswer};
+use crate::collection_models::{dict_get_result, dict_with_item, dict_without_item, list_literal_value, list_with_item, mutated_receiver, subscript_read};
+use crate::cross_module::{module_surface, ModuleResolver, IMPORT_DEPTH_CAP};
+use crate::diagnostic_sentences::{empty_set, unhonorable_annotation};
+use crate::env::Environment;
+use crate::expressions::{binary_arithmetic_value, evaluate_expression, fieldless_exception_value, provable_raise, register_retained_callables};
+use crate::foreign_edge;
+use crate::function_table::{function_table, merged, FunctionTable};
+use crate::instances;
+use crate::instances::{class_table, judge_construction, ClassModel, ConstructionVerdict};
+use crate::loops::{loop_final_environment, LoopAnswer};
+use crate::match_arms;
+use crate::match_arms::match_taken_environment;
+use crate::narrowing::assume;
+use crate::relational_sum;
+use crate::summaries;
+use crate::surface::{compile_aliases, strict_int_alias_names, surface_imports, AliasEntry};
+use crate::typereading::{base_sort_return_refinement, callable_return_refinement, declared_refinement, typed_dict_return_refinement, DeclaredRefinement};
 
 /// One refinement finding: the range it anchors to, the RTS code, and
 /// the rendered message.
@@ -83,7 +83,7 @@ pub struct Finding {
 /// each field means behind a generic "options" name.
 struct WalkContext<'a> {
     aliases: &'a HashMap<String, AliasEntry>,
-    imports: &'a crate::refinedpy::surface::SurfaceImports,
+    imports: &'a crate::surface::SurfaceImports,
     kernel: &'a Arc<RefinedTSKernel>,
     functions: Arc<FunctionTable>,
     classes: Arc<HashMap<String, ClassModel>>,
@@ -122,7 +122,7 @@ struct WalkContext<'a> {
     /// caller of it is safe to join). `seed_parameters` reads this to
     /// fold an UNANNOTATED parameter's every caller argument at that
     /// position into a literal-union seed.
-    caller_arguments: Arc<crate::refinedpy::function_table::CallerArguments>,
+    caller_arguments: Arc<crate::function_table::CallerArguments>,
     /// The checked file's own directory, when the caller knows it — a
     /// foreign edge's relative argv entry (`"./audio_level.ts"`) is
     /// relative to the file that wrote it, never to the eventual
@@ -246,7 +246,7 @@ pub fn findings_for_module_at(
     let module_callable_returns = Arc::new(module_level_callable_returns(module, &aliases, &imports));
     let strict_int_aliases = strict_int_alias_names(module);
     let typed_dicts = Arc::new(instances::typed_dict_table(module, &aliases, &imports));
-    let caller_arguments = Arc::new(crate::refinedpy::function_table::caller_argument_positions(module));
+    let caller_arguments = Arc::new(crate::function_table::caller_argument_positions(module));
     let context = WalkContext {
         aliases: &aliases,
         imports: &imports,
@@ -326,7 +326,7 @@ pub fn refined_set_at_position(
     let module_callable_returns = Arc::new(module_level_callable_returns(module, &aliases, &imports));
     let strict_int_aliases = strict_int_alias_names(module);
     let typed_dicts = Arc::new(instances::typed_dict_table(module, &aliases, &imports));
-    let caller_arguments = Arc::new(crate::refinedpy::function_table::caller_argument_positions(module));
+    let caller_arguments = Arc::new(crate::function_table::caller_argument_positions(module));
     let recorder = Arc::new(Mutex::new(Vec::new()));
     let context = WalkContext {
         aliases: &aliases,
@@ -365,7 +365,7 @@ pub fn refined_set_at_position(
 fn stated_refinement_at(
     module: &ModModule,
     aliases: &HashMap<String, AliasEntry>,
-    imports: &crate::refinedpy::surface::SurfaceImports,
+    imports: &crate::surface::SurfaceImports,
     position: TextSize,
 ) -> Option<RefinedSet> {
     stated_refinement_in_body(&module.body, aliases, imports, position)
@@ -374,7 +374,7 @@ fn stated_refinement_at(
 fn stated_refinement_in_body(
     body: &[Stmt],
     aliases: &HashMap<String, AliasEntry>,
-    imports: &crate::refinedpy::surface::SurfaceImports,
+    imports: &crate::surface::SurfaceImports,
     position: TextSize,
 ) -> Option<RefinedSet> {
     for stmt in body {
@@ -478,7 +478,7 @@ fn abstract_value_as_refined_set(value: &AbstractValue) -> Option<RefinedSet> {
 fn module_level_callable_returns(
     module: &ModModule,
     aliases: &HashMap<String, AliasEntry>,
-    imports: &crate::refinedpy::surface::SurfaceImports,
+    imports: &crate::surface::SurfaceImports,
 ) -> HashMap<String, DeclaredRefinement> {
     let no_locals = Environment::new(HashSet::new());
     let mut out = HashMap::new();
@@ -1004,7 +1004,7 @@ fn merged_classes_for_body(body: &[Stmt], context: &WalkContext) -> Arc<HashMap<
 fn local_class_table(
     body: &[Stmt],
     aliases: &HashMap<String, AliasEntry>,
-    imports: &crate::refinedpy::surface::SurfaceImports,
+    imports: &crate::surface::SurfaceImports,
     kernel: &Arc<RefinedTSKernel>,
 ) -> HashMap<String, ClassModel> {
     let local_defs = body
@@ -1206,7 +1206,7 @@ fn seed_parameters(parameters: &Parameters, enclosing_def_name: Option<&str>, co
         // unjudged and helper bodies gain no new blockers.
         let Some(declared) =
             declared_refinement(annotation, context.aliases, context.imports, environment)
-                .or_else(|| crate::refinedpy::typereading::base_sort_return_refinement(annotation))
+                .or_else(|| crate::typereading::base_sort_return_refinement(annotation))
         else {
             continue;
         };
@@ -1378,7 +1378,7 @@ fn unannotated_parameter_caller_seed(
             Some(_) => return None,
         }
     }
-    Some(crate::refinedpy::string_models::string_literal_value(&agreed_text?))
+    Some(crate::string_models::string_literal_value(&agreed_text?))
 }
 
 /// A fresh, empty-locally-bound `Environment` seeded with every MODULE-
@@ -2166,7 +2166,7 @@ pub fn derived_return_values_at(
     let module_callable_returns = Arc::new(module_level_callable_returns(module, &aliases, &imports));
     let strict_int_aliases = strict_int_alias_names(module);
     let typed_dicts = Arc::new(instances::typed_dict_table(module, &aliases, &imports));
-    let caller_arguments = Arc::new(crate::refinedpy::function_table::caller_argument_positions(module));
+    let caller_arguments = Arc::new(crate::function_table::caller_argument_positions(module));
     let context = WalkContext {
         aliases: &aliases,
         imports: &imports,
@@ -4392,7 +4392,7 @@ fn direct_alias_annotation(
 /// `None` for every other shape (a bare alias name, `dict[...]`,
 /// `list[...]`, or any expression this table has no vocabulary for at
 /// all) — those are ordinary Python, never this diagnostic's business.
-fn unhonorable_annotated_spelling(annotation: &Expr, imports: &crate::refinedpy::surface::SurfaceImports) -> Option<String> {
+fn unhonorable_annotated_spelling(annotation: &Expr, imports: &crate::surface::SurfaceImports) -> Option<String> {
     let Expr::Subscript(subscript) = annotation else {
         return None;
     };
@@ -9037,7 +9037,7 @@ mod tests {
         let table = local_function_table(&g.body);
         let def = table.def("add_one").expect("the lambda-assign registers a synthetic def named add_one");
         assert_eq!(def.parameters.args.len(), 1, "the lambda's own parameter carries through");
-        let result = crate::refinedpy::summaries::call_result(
+        let result = crate::summaries::call_result(
             def,
             &[refined_domain::abstract_value::known_values(
                 vec![120.0],
@@ -9718,8 +9718,8 @@ mod tests {
             let code_points: Vec<f64> = text.chars().map(|c| c as u32 as f64).collect();
             known_values(code_points, PrimitiveKind::String, TrustProved)
         }
-        let grouped = crate::refinedpy::collection_models::dict_literal_value(
-            &[Some(crate::refinedpy::collection_models::DictKey::string("young"))],
+        let grouped = crate::collection_models::dict_literal_value(
+            &[Some(crate::collection_models::DictKey::string("young"))],
             &[list_literal_value(&[integer(40.0)])],
         );
         // "young" is present: setdefault_append reads its existing list
@@ -9727,7 +9727,7 @@ mod tests {
         let after_young = setdefault_append(&grouped, &string("young"), &list_literal_value(&[]), &integer(41.0))
             .expect("appending onto a present key's list must decide");
         assert_eq!(
-            crate::refinedpy::collection_models::subscript_read(&after_young, &string("young")),
+            crate::collection_models::subscript_read(&after_young, &string("young")),
             Some(list_literal_value(&[integer(40.0), integer(41.0)]))
         );
         // "old" is absent: setdefault_append inserts the default list,
@@ -9736,7 +9736,7 @@ mod tests {
         let after_old = setdefault_append(&after_young, &string("old"), &list_literal_value(&[]), &integer(200.0))
             .expect("appending onto a fresh default list must decide");
         assert_eq!(
-            crate::refinedpy::collection_models::subscript_read(&after_old, &string("old")),
+            crate::collection_models::subscript_read(&after_old, &string("old")),
             Some(list_literal_value(&[integer(200.0)]))
         );
     }

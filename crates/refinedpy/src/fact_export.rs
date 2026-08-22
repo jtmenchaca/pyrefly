@@ -64,18 +64,18 @@ use serde_json::Map;
 use serde_json::Value;
 use serde_json::json;
 
-use crate::refinedpy::assignability::sequence_shaped;
-use crate::refinedpy::assignability::states_sequence;
-use crate::refinedpy::check::derived_return_values_at;
-use crate::refinedpy::cross_module::ModuleResolver;
-use crate::refinedpy::env::Environment;
-use crate::refinedpy::surface::AliasEntry;
-use crate::refinedpy::surface::SurfaceImports;
-use crate::refinedpy::surface::compile_aliases;
-use crate::refinedpy::surface::surface_imports;
-use crate::refinedpy::typereading::DeclaredRefinement;
-use crate::refinedpy::typereading::base_sort_return_refinement;
-use crate::refinedpy::typereading::declared_refinement;
+use crate::assignability::sequence_shaped;
+use crate::assignability::states_sequence;
+use crate::check::derived_return_values_at;
+use crate::cross_module::ModuleResolver;
+use crate::env::Environment;
+use crate::surface::AliasEntry;
+use crate::surface::SurfaceImports;
+use crate::surface::compile_aliases;
+use crate::surface::surface_imports;
+use crate::typereading::DeclaredRefinement;
+use crate::typereading::base_sort_return_refinement;
+use crate::typereading::declared_refinement;
 
 /// One admitted return/entry shape, the RULED cases schema's own unit
 /// (CROSS-LANGUAGE-EDGE.md's fact-artifact cases design, JT-approved
@@ -382,7 +382,7 @@ pub fn export_module(
 /// or the module declaring no top-level def at all) — the save hook
 /// skips the full walk rather than paying it for an artifact that would
 /// carry no functions.
-pub(crate) fn has_exportable_defs(module: &ModModule) -> bool {
+pub fn has_exportable_defs(module: &ModModule) -> bool {
     let aliases = compile_aliases(module);
     let imports = surface_imports(module);
     let environment = Environment::new(HashSet::new());
@@ -430,7 +430,7 @@ fn def_has_a_declared_entry(
 /// entry — the caller re-exports rather than trusting a cache it cannot
 /// read, exactly the same "an artifact is a file, not a promise"
 /// discipline `foreign_edge_artifact.rs` applies to a foreign artifact.
-pub(crate) fn cached_hash_matches(artifact_path: &Path, source_bytes: &[u8]) -> bool {
+pub fn cached_hash_matches(artifact_path: &Path, source_bytes: &[u8]) -> bool {
     let Ok(raw) = std::fs::read(artifact_path) else {
         return false;
     };
@@ -2665,7 +2665,7 @@ mod tests {
         };
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../fixtures/tutorial/audio_level_python_only.py"
+            "/../../../fixtures/tutorial/audio_level_python_only.py"
         );
         let source = std::fs::read(path).expect("the tutorial fixture is committed beside the checker");
         let text = String::from_utf8(source.clone()).expect("the fixture is UTF-8");

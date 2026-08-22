@@ -8,7 +8,7 @@ codegen-units = 1
 strip = "debuginfo"
 
 [profile.dev]
-debug = 1
+debug = 0
 
 [profile.bench]
 lto = false
@@ -31,6 +31,8 @@ members = [
   "crates/pyrefly_python",
   "crates/pyrefly_types",
   "crates/pyrefly_util",
+  "crates/refinedpy",
+  "crates/refinedpy_lsp",
   "crates/tsp_types",
   "pyrefly",
   "pyrefly_wasm",

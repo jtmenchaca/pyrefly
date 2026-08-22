@@ -57,19 +57,19 @@ use ruff_python_ast::UnaryOp;
 use ruff_text_size::Ranged;
 use ruff_text_size::TextRange;
 
-use crate::refinedpy::assignability;
-use crate::refinedpy::builtin_models;
-use crate::refinedpy::bytes_models;
-use crate::refinedpy::bytes_models::BytesAnswer;
-use crate::refinedpy::collection_models;
-use crate::refinedpy::env;
-use crate::refinedpy::env::Environment;
-use crate::refinedpy::foreign_edge;
-use crate::refinedpy::instances;
-use crate::refinedpy::math_models;
-use crate::refinedpy::narrowing;
-use crate::refinedpy::string_models;
-use crate::refinedpy::summaries;
+use crate::assignability;
+use crate::builtin_models;
+use crate::bytes_models;
+use crate::bytes_models::BytesAnswer;
+use crate::collection_models;
+use crate::env;
+use crate::env::Environment;
+use crate::foreign_edge;
+use crate::instances;
+use crate::math_models;
+use crate::narrowing;
+use crate::string_models;
+use crate::summaries;
 
 /// What this expression evaluates to in this environment. `unknown()`
 /// is the honest default for every construct not yet built — an
@@ -2794,7 +2794,7 @@ fn receiver_def_local_classes(
                 body: def.body.iter().filter(|stmt| matches!(stmt, ruff_python_ast::Stmt::ClassDef(_))).cloned().collect(),
             };
             let empty_aliases = std::collections::HashMap::new();
-            let empty_imports = crate::refinedpy::surface::surface_imports(&ruff_python_ast::ModModule {
+            let empty_imports = crate::surface::surface_imports(&ruff_python_ast::ModModule {
                 node_index: ruff_python_ast::AtomicNodeIndex::NONE,
                 range: TextRange::default(),
                 body: Vec::new().into(),
@@ -6689,7 +6689,7 @@ mod tests {
         let module = ruff_python_parser::parse_module("def add(acc, age):\n    return acc + age\n")
             .expect("test module parses")
             .into_syntax();
-        let table = std::sync::Arc::new(crate::refinedpy::function_table::function_table(&module));
+        let table = std::sync::Arc::new(crate::function_table::function_table(&module));
         let mut environment = empty_environment();
         environment.set_functions(table);
         let parsed = parse_expression("reduce(add, [10, 20], 0)").expect("test source must parse");
@@ -6850,7 +6850,7 @@ mod tests {
         let module = ruff_python_parser::parse_module("def double(x):\n    return x + x\n")
             .expect("test module parses")
             .into_syntax();
-        let table = std::sync::Arc::new(crate::refinedpy::function_table::function_table(&module));
+        let table = std::sync::Arc::new(crate::function_table::function_table(&module));
         let mut environment = empty_environment();
         environment.set_functions(table);
         let parsed = parse_expression("double(3)").expect("test source must parse");
@@ -6869,7 +6869,7 @@ mod tests {
         let module = ruff_python_parser::parse_module("def double(x):\n    return x + x\n")
             .expect("test module parses")
             .into_syntax();
-        let table = std::sync::Arc::new(crate::refinedpy::function_table::function_table(&module));
+        let table = std::sync::Arc::new(crate::function_table::function_table(&module));
         let mut environment = empty_environment();
         environment.set_functions(table);
         environment.bind("double", opaque_value("a function value"));
@@ -6888,7 +6888,7 @@ mod tests {
         let module = ruff_python_parser::parse_module("def double(x):\n    return x + x\n")
             .expect("test module parses")
             .into_syntax();
-        let table = std::sync::Arc::new(crate::refinedpy::function_table::function_table(&module));
+        let table = std::sync::Arc::new(crate::function_table::function_table(&module));
         let mut environment = empty_environment();
         environment.set_functions(table);
         environment.bind("double", known_values(vec![9.0], PrimitiveKind::Integer, TrustProved));
@@ -6905,7 +6905,7 @@ mod tests {
         let module = ruff_python_parser::parse_module("def len(x):\n    return 999\n")
             .expect("test module parses")
             .into_syntax();
-        let table = std::sync::Arc::new(crate::refinedpy::function_table::function_table(&module));
+        let table = std::sync::Arc::new(crate::function_table::function_table(&module));
         let mut environment = empty_environment();
         environment.set_functions(table);
         let parsed = parse_expression("len([1, 2, 3])").expect("test source must parse");
@@ -6930,7 +6930,7 @@ mod tests {
         ))
         .expect("test module parses")
         .into_syntax();
-        let table = std::sync::Arc::new(crate::refinedpy::function_table::function_table(&module));
+        let table = std::sync::Arc::new(crate::function_table::function_table(&module));
         let mut environment = empty_environment();
         environment.set_functions(table);
         let parsed = parse_expression("over_ages()").expect("test source must parse");
@@ -6983,7 +6983,7 @@ mod tests {
             ),
             "a yield one level inside a for-loop body is generator-shaped"
         );
-        let table = std::sync::Arc::new(crate::refinedpy::function_table::function_table(&module));
+        let table = std::sync::Arc::new(crate::function_table::function_table(&module));
         let mut environment = empty_environment();
         environment.set_functions(table);
         let parsed = parse_expression("stream()").expect("test source must parse");
@@ -7008,7 +7008,7 @@ mod tests {
         ))
         .expect("test module parses")
         .into_syntax();
-        let table = std::sync::Arc::new(crate::refinedpy::function_table::function_table(&module));
+        let table = std::sync::Arc::new(crate::function_table::function_table(&module));
         let mut environment = empty_environment();
         environment.set_functions(table);
         let parsed = parse_expression("next(over_ages())").expect("test source must parse");
@@ -7032,8 +7032,8 @@ mod tests {
         .expect("test module parses")
         .into_syntax();
         let aliases = std::collections::HashMap::new();
-        let imports = crate::refinedpy::surface::surface_imports(&module);
-        let classes = std::sync::Arc::new(crate::refinedpy::instances::class_table(
+        let imports = crate::surface::surface_imports(&module);
+        let classes = std::sync::Arc::new(crate::instances::class_table(
             &module, &aliases, &imports, &kernel,
         ));
         let mut environment = empty_environment();
@@ -7042,7 +7042,7 @@ mod tests {
         let value = evaluate_expression(&parsed.into_expr(), &environment, &kernel);
         assert_eq!(value.kind, Kind::Object);
         assert_eq!(
-            crate::refinedpy::instances::field_read(&value, "age"),
+            crate::instances::field_read(&value, "age"),
             Some(known_values(vec![40.0], PrimitiveKind::Integer, TrustProved))
         );
     }
@@ -7079,9 +7079,9 @@ mod tests {
         ))
         .expect("test module parses")
         .into_syntax();
-        let table = std::sync::Arc::new(crate::refinedpy::function_table::function_table(&module));
+        let table = std::sync::Arc::new(crate::function_table::function_table(&module));
         let aliases = std::collections::HashMap::new();
-        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let imports = crate::surface::surface_imports(&module);
         let ruff_python_ast::Stmt::FunctionDef(make_ok_builder) = &module.body[0] else {
             panic!("module's first statement is def make_ok_builder")
         };
@@ -7089,7 +7089,7 @@ mod tests {
         // `Builder` (whose `size` answers "ab") — the first-scanned-wins
         // shape `local_class_table`'s recursive merge would leave behind
         // for a body enclosing both nested defs.
-        let stale_classes = std::sync::Arc::new(crate::refinedpy::instances::class_table(
+        let stale_classes = std::sync::Arc::new(crate::instances::class_table(
             &ruff_python_ast::ModModule {
                 node_index: ruff_python_ast::AtomicNodeIndex::NONE,
                 range: TextRange::default(),
@@ -7127,8 +7127,8 @@ mod tests {
         .expect("test module parses")
         .into_syntax();
         let aliases = std::collections::HashMap::new();
-        let imports = crate::refinedpy::surface::surface_imports(&module);
-        let classes = std::sync::Arc::new(crate::refinedpy::instances::class_table(
+        let imports = crate::surface::surface_imports(&module);
+        let classes = std::sync::Arc::new(crate::instances::class_table(
             &module, &aliases, &imports, &kernel,
         ));
         let mut environment = empty_environment();
@@ -7158,9 +7158,9 @@ mod tests {
     fn environment_with_person_classes(kernel: &Arc<RefinedTSKernel>) -> Environment {
         let module = person_next_year_module();
         let aliases = std::collections::HashMap::new();
-        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let imports = crate::surface::surface_imports(&module);
         let classes =
-            std::sync::Arc::new(crate::refinedpy::instances::class_table(&module, &aliases, &imports, kernel));
+            std::sync::Arc::new(crate::instances::class_table(&module, &aliases, &imports, kernel));
         let mut environment = empty_environment();
         environment.set_classes(classes);
         environment
@@ -7212,9 +7212,9 @@ mod tests {
         .expect("test module parses")
         .into_syntax();
         let aliases = std::collections::HashMap::new();
-        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let imports = crate::surface::surface_imports(&module);
         let classes =
-            std::sync::Arc::new(crate::refinedpy::instances::class_table(&module, &aliases, &imports, &kernel));
+            std::sync::Arc::new(crate::instances::class_table(&module, &aliases, &imports, &kernel));
         let mut environment = empty_environment();
         environment.set_classes(classes);
         let constructed = parse_expression("Counter()").expect("test source must parse");
@@ -7227,7 +7227,7 @@ mod tests {
         // nested expression read never writes the mutated instance back
         let still_bound = environment.read("counter").expect("counter remains bound");
         assert_eq!(
-            crate::refinedpy::instances::field_read(still_bound, "count"),
+            crate::instances::field_read(still_bound, "count"),
             Some(known_values(vec![0.0], PrimitiveKind::Integer, TrustProved))
         );
     }
@@ -7249,9 +7249,9 @@ mod tests {
         .expect("test module parses")
         .into_syntax();
         let aliases = std::collections::HashMap::new();
-        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let imports = crate::surface::surface_imports(&module);
         let classes =
-            std::sync::Arc::new(crate::refinedpy::instances::class_table(&module, &aliases, &imports, &kernel));
+            std::sync::Arc::new(crate::instances::class_table(&module, &aliases, &imports, &kernel));
         let mut environment = empty_environment();
         environment.set_classes(classes);
         let constructed = parse_expression("Person(40)").expect("test source must parse");
@@ -7295,11 +7295,11 @@ mod tests {
         .expect("test module parses")
         .into_syntax();
         let aliases = std::collections::HashMap::new();
-        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let imports = crate::surface::surface_imports(&module);
         let classes =
-            std::sync::Arc::new(crate::refinedpy::instances::class_table(&module, &aliases, &imports, &kernel));
+            std::sync::Arc::new(crate::instances::class_table(&module, &aliases, &imports, &kernel));
         let child = classes.get("Child").expect("Child class recorded");
-        let constructed_child = crate::refinedpy::instances::judge_construction(child, &[], &[], &kernel).instance;
+        let constructed_child = crate::instances::judge_construction(child, &[], &[], &kernel).instance;
         let mut environment = empty_environment();
         environment.set_classes(classes.clone());
         environment.bind("self", constructed_child);
@@ -7807,7 +7807,7 @@ mod tests {
         let module = ruff_python_parser::parse_module("def counted(n) -> int:\n    while n > 0:\n        n -= 1\n    return n\n")
             .expect("test module parses")
             .into_syntax();
-        let table = std::sync::Arc::new(crate::refinedpy::function_table::function_table(&module));
+        let table = std::sync::Arc::new(crate::function_table::function_table(&module));
         let mut environment = empty_environment();
         environment.set_functions(table);
         let parsed = parse_expression("f\"n={counted(3)}\"").expect("test source must parse");
@@ -8183,7 +8183,7 @@ mod tests {
     fn test_array_double_constructor_reads_a_float_tagged_element() {
         let Some(kernel) = loaded_kernel() else { return };
         let module = ruff_python_parser::parse_module("import array\n").expect("test module parses").into_syntax();
-        let table = std::sync::Arc::new(crate::refinedpy::function_table::function_table(&module));
+        let table = std::sync::Arc::new(crate::function_table::function_table(&module));
         let mut environment = empty_environment();
         environment.set_functions(table);
         let parsed = parse_expression("array.array(\"d\", [10.0, 20.0, 30.0])[2]").expect("test source must parse");
@@ -8285,7 +8285,7 @@ mod tests {
     fn test_importlib_import_module_answers_opaque() {
         let Some(kernel) = loaded_kernel() else { return };
         let module = ruff_python_parser::parse_module("import importlib\n").expect("test module parses").into_syntax();
-        let table = std::sync::Arc::new(crate::refinedpy::function_table::function_table(&module));
+        let table = std::sync::Arc::new(crate::function_table::function_table(&module));
         let mut environment = empty_environment();
         environment.set_functions(table);
         let parsed = parse_expression("importlib.import_module(\"d_helper\")").expect("test source must parse");
@@ -8314,12 +8314,12 @@ mod tests {
         .expect("test module parses")
         .into_syntax();
         let empty_aliases = std::collections::HashMap::new();
-        let empty_imports = crate::refinedpy::surface::surface_imports(&ruff_python_ast::ModModule {
+        let empty_imports = crate::surface::surface_imports(&ruff_python_ast::ModModule {
             node_index: ruff_python_ast::AtomicNodeIndex::NONE,
             range: TextRange::default(),
             body: Vec::new().into(),
         });
-        let classes = crate::refinedpy::instances::class_table(&module, &empty_aliases, &empty_imports, &kernel);
+        let classes = crate::instances::class_table(&module, &empty_aliases, &empty_imports, &kernel);
         let mut environment = empty_environment();
         environment.set_classes(std::sync::Arc::new(classes));
         let parsed = parse_expression("next(GenAges().ages())").expect("test source must parse");
@@ -8339,7 +8339,7 @@ mod tests {
         ))
         .expect("test module parses")
         .into_syntax();
-        let table = std::sync::Arc::new(crate::refinedpy::function_table::function_table(&module));
+        let table = std::sync::Arc::new(crate::function_table::function_table(&module));
         let mut environment = empty_environment();
         environment.set_functions(table);
         let parsed = parse_expression("await anext(async_yield_ages())").expect("test source must parse");
@@ -8359,7 +8359,7 @@ mod tests {
         let module = ruff_python_parser::parse_module("def only_keyword(*, age):\n    return age\n")
             .expect("test module parses")
             .into_syntax();
-        let table = std::sync::Arc::new(crate::refinedpy::function_table::function_table(&module));
+        let table = std::sync::Arc::new(crate::function_table::function_table(&module));
         let mut environment = empty_environment();
         environment.set_functions(table);
         let parsed = parse_expression("only_keyword(age=200)").expect("test source must parse");
@@ -8376,7 +8376,7 @@ mod tests {
         let module = ruff_python_parser::parse_module("def gather_kwargs(**fields):\n    return fields[\"age\"]\n")
             .expect("test module parses")
             .into_syntax();
-        let table = std::sync::Arc::new(crate::refinedpy::function_table::function_table(&module));
+        let table = std::sync::Arc::new(crate::function_table::function_table(&module));
         let mut environment = empty_environment();
         environment.set_functions(table);
         let parsed = parse_expression("gather_kwargs(age=200)").expect("test source must parse");

@@ -308,7 +308,7 @@ use crate::lsp::non_wasm::protocol::Response;
 use crate::lsp::non_wasm::queue::HeavyTaskQueue;
 use crate::lsp::non_wasm::queue::LspEvent;
 use crate::lsp::non_wasm::queue::LspQueue;
-use crate::lsp::non_wasm::refinedpy;
+use crate::lsp::non_wasm::refinement_hooks::hooks;
 use crate::lsp::non_wasm::safe_delete_file::safe_delete_file_code_action;
 use crate::lsp::non_wasm::stdlib::should_show_stdlib_error;
 use crate::lsp::non_wasm::transaction_manager::TransactionManager;
@@ -1504,7 +1504,7 @@ pub fn lsp_loop(
     thread_count: ThreadCount,
     lsp_start_time: Instant,
 ) -> anyhow::Result<()> {
-    refinedpy::configure_kernel_dylib();
+    (hooks().configure_kernel_dylib)();
     info!("Reading messages");
     let lsp_queue = LspQueue::new();
     let from = telemetry.surface();
@@ -3118,7 +3118,7 @@ impl Server {
         Self::append_unused_parameter_diagnostics(transaction, handle, diagnostics);
         Self::append_unused_import_diagnostics(transaction, handle, diagnostics);
         Self::append_unused_variable_diagnostics(transaction, handle, diagnostics);
-        refinedpy::append_refinedpy_diagnostics(transaction, handle, diagnostics);
+        (hooks().append_refinedpy_diagnostics)(transaction, handle, diagnostics);
     }
 
     /// Publish diagnostics & send a semantic token refresh for the given handles
@@ -3694,7 +3694,7 @@ impl Server {
             self.recheck_queue.queue_task(
                 TelemetryEventKind::RefinedPyExportOnSave,
                 Box::new(move |_server, _telemetry, _telemetry_event| {
-                    refinedpy::export_fact_on_save(&export_path);
+                    (hooks().export_fact_on_save)(&export_path);
                 }),
             );
             self.invalidate(TelemetryEventKind::InvalidateDisk, None, move |t| {
@@ -5248,7 +5248,7 @@ impl Server {
         // handle, or a position with nothing to say leaves `result`
         // exactly as pyrefly's own hover built it.
         if let Some(result) = result.as_mut() {
-            refinedpy::splice_refinedpy_hover(transaction, &handle, position, &mut result.hover);
+            (hooks().splice_refinedpy_hover)(transaction, &handle, position, &mut result.hover);
         }
         Ok(result)
     }

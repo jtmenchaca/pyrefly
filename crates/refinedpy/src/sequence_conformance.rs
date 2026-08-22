@@ -76,7 +76,7 @@ mod tests {
     use refined_sets::codepoint_sets::string_tuple;
     use refined_sets::refinement_forms::{make_refined_set, one_of, RefinedSet};
 
-    use crate::refinedpy::string_models::{string_literal_value, string_method_result};
+    use crate::string_models::{string_literal_value, string_method_result};
 
     /// `loaded_kernel` mirrors `lattice_conformance.rs`'s own helper.
     fn loaded_kernel() -> Option<Arc<RefinedTSKernel>> {

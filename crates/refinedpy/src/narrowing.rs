@@ -91,7 +91,7 @@ use ruff_python_ast::Number;
 use ruff_python_ast::Stmt;
 use ruff_python_ast::UnaryOp;
 
-use crate::refinedpy::env::Environment;
+use crate::env::Environment;
 
 /// Tighten `environment` by what `condition` being `truth` says.
 /// Returns the narrowed environment for that arm. The honest default
@@ -1300,7 +1300,7 @@ mod tests {
     /// call` reads via `environment.functions()`.
     fn environment_with_function_table(source: &str) -> Environment {
         let module = ruff_python_parser::parse_module(source).expect("test source must parse").into_syntax();
-        let table = crate::refinedpy::function_table::function_table(&module);
+        let table = crate::function_table::function_table(&module);
         let mut environment = Environment::new(HashSet::new());
         environment.set_functions(Arc::new(table));
         environment

@@ -369,7 +369,7 @@ fn dict_constructor_call(arguments: &[AbstractValue]) -> Option<AbstractValue> {
     if pairs.kind != Kind::List {
         return None;
     }
-    let mut keys: Vec<Option<crate::refinedpy::collection_models::DictKey>> = Vec::with_capacity(pairs.items.len());
+    let mut keys: Vec<Option<crate::collection_models::DictKey>> = Vec::with_capacity(pairs.items.len());
     let mut values: Vec<AbstractValue> = Vec::with_capacity(pairs.items.len());
     for pair in &pairs.items {
         if pair.kind != Kind::List || pair.items.len() != 2 {
@@ -380,14 +380,14 @@ fn dict_constructor_call(arguments: &[AbstractValue]) -> Option<AbstractValue> {
             return None;
         }
         let key_text: String = key.values.iter().filter_map(|point| char::from_u32(*point as i64 as u32)).collect();
-        keys.push(Some(crate::refinedpy::collection_models::DictKey::string(&key_text)));
+        keys.push(Some(crate::collection_models::DictKey::string(&key_text)));
         values.push(pair.items[1].clone());
     }
     // dict_literal_value's own last-value-wins overwrite rule handles a
     // repeated key exactly the way this constructor's own cited row
     // does — this file reaches into collection_models.rs for the one
     // shared building block rather than duplicating that merge loop
-    Some(crate::refinedpy::collection_models::dict_literal_value(&keys, &values))
+    Some(crate::collection_models::dict_literal_value(&keys, &values))
 }
 
 /// `iter(object)` (one-argument form, no `sentinel`) — library/functions.html#iter:
@@ -723,7 +723,7 @@ fn is_string_sorted_argument(argument: &AbstractValue) -> bool {
         return false;
     }
     argument.kind_tag == Some(PrimitiveKind::String)
-        || (argument.kind_tag.is_none() && crate::refinedpy::assignability::sequence_shaped(&argument.set))
+        || (argument.kind_tag.is_none() && crate::assignability::sequence_shaped(&argument.set))
 }
 
 /// `chr(i)` on a known Integer code point — library/functions.html#chr:

@@ -83,23 +83,23 @@ use ruff_python_ast::StmtFunctionDef;
 use ruff_python_ast::StmtIf;
 use ruff_text_size::TextRange;
 
-use crate::refinedpy::collection_models::dict_with_item;
-use crate::refinedpy::collection_models::list_with_item;
-use crate::refinedpy::env::Environment;
-use crate::refinedpy::expressions::binary_arithmetic_value;
-use crate::refinedpy::expressions::evaluate_expression;
-use crate::refinedpy::function_table::FunctionTable;
-use crate::refinedpy::function_table::ENTRY_MODULE;
-use crate::refinedpy::instances::class_table;
-use crate::refinedpy::instances::field_read;
-use crate::refinedpy::instances::field_write;
-use crate::refinedpy::instances::self_attribute_name;
-use crate::refinedpy::instances::ClassModel;
-use crate::refinedpy::match_arms;
-use crate::refinedpy::narrowing;
-use crate::refinedpy::summary_lowering::lower_function_body;
-use crate::refinedpy::summary_lowering::LoweredBody;
-use crate::refinedpy::surface::surface_imports;
+use crate::collection_models::dict_with_item;
+use crate::collection_models::list_with_item;
+use crate::env::Environment;
+use crate::expressions::binary_arithmetic_value;
+use crate::expressions::evaluate_expression;
+use crate::function_table::FunctionTable;
+use crate::function_table::ENTRY_MODULE;
+use crate::instances::class_table;
+use crate::instances::field_read;
+use crate::instances::field_write;
+use crate::instances::self_attribute_name;
+use crate::instances::ClassModel;
+use crate::match_arms;
+use crate::narrowing;
+use crate::summary_lowering::lower_function_body;
+use crate::summary_lowering::LoweredBody;
+use crate::surface::surface_imports;
 
 /// The deepest a call chain interprets before declining outright. A
 /// same-module call whose body calls itself (directly or through a
@@ -1620,7 +1620,7 @@ fn bind_parameters(
     }
     if let Some(vararg) = def.parameters.vararg.as_ref() {
         let tail: Vec<AbstractValue> = arguments.iter().skip(covered).cloned().collect();
-        let tail_value = crate::refinedpy::collection_models::tuple_literal_value(&tail);
+        let tail_value = crate::collection_models::tuple_literal_value(&tail);
         environment.bind(vararg.name.id.as_str(), tail_value);
     }
     Some(())
@@ -1713,7 +1713,7 @@ pub(crate) fn interpret_body(
                         // before the immutable read" rule `check.rs::
                         // sink_value` follows for its own statement
                         // forms.
-                        crate::refinedpy::expressions::register_retained_callables(value_expr, environment);
+                        crate::expressions::register_retained_callables(value_expr, environment);
                         evaluate_return_value(value_expr, environment, kernel, super_resolver)?
                     }
                     None => null_value(),
@@ -1744,8 +1744,8 @@ pub(crate) fn interpret_body(
             Stmt::FunctionDef(def) => {
                 let closure = free_variable_snapshot(def, environment);
                 let key = environment.next_retained_callable_key();
-                environment.record_retained_callable(key, crate::refinedpy::env::RetainedCallable::from_def(def, closure));
-                environment.bind(def.name.id.as_str(), crate::refinedpy::env::retained_callable_value(key));
+                environment.record_retained_callable(key, crate::env::RetainedCallable::from_def(def, closure));
+                environment.bind(def.name.id.as_str(), crate::env::retained_callable_value(key));
             }
             // `for <name> in <iterable>: <body>` — bounded to a KNOWN
             // `Kind::List` receiver with every item known (the same
@@ -2123,8 +2123,8 @@ fn write_subscript_target(
     let key = evaluate_expression(subscript.slice.as_ref(), environment, kernel);
     let value = evaluate_expression(value_expr, environment, kernel);
     let new_receiver = match receiver.kind {
-        Kind::Object => crate::refinedpy::collection_models::dict_with_item(&receiver, &key, &value)?,
-        Kind::List => crate::refinedpy::collection_models::list_with_item(&receiver, &key, &value)?,
+        Kind::Object => crate::collection_models::dict_with_item(&receiver, &key, &value)?,
+        Kind::List => crate::collection_models::list_with_item(&receiver, &key, &value)?,
         _ => return None,
     };
     environment.bind(name.id.as_str(), new_receiver);
@@ -2191,7 +2191,7 @@ fn write_mutating_call_expr(expr: &Expr, kernel: &Arc<RefinedTSKernel>, environm
         return Some(());
     }
     let (new_receiver, _result) =
-        crate::refinedpy::collection_models::mutated_receiver(attribute.attr.as_str(), &receiver, &arguments)?;
+        crate::collection_models::mutated_receiver(attribute.attr.as_str(), &receiver, &arguments)?;
     environment.bind(receiver_name.id.as_str(), new_receiver);
     Some(())
 }
@@ -2546,7 +2546,7 @@ mod tests {
         assert_eq!(result.kind, Kind::Object);
         assert_eq!(result.kind_word, Some("a function value"));
         assert!(
-            crate::refinedpy::env::retained_callable_key(&result).is_some(),
+            crate::env::retained_callable_key(&result).is_some(),
             "a retained callable's source must parse as its table key: {result:?}"
         );
         // the retained body was recorded against `call_result`'s own

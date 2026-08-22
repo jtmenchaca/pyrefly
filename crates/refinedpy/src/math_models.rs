@@ -872,7 +872,7 @@ mod tests {
     use refined_kernel::kernel_bridge::load_kernel;
 
     use super::*;
-    use crate::refinedpy::expressions::binary_arithmetic_value_with_kernel;
+    use crate::expressions::binary_arithmetic_value_with_kernel;
 
     fn int_operand(value: f64) -> AbstractValue {
         known_values(vec![value], PrimitiveKind::Integer, TrustProved)

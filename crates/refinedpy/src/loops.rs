@@ -108,15 +108,15 @@ use ruff_python_ast::UnaryOp;
 use ruff_text_size::Ranged;
 use ruff_text_size::TextRange;
 
-use crate::refinedpy::assignability::judge;
-use crate::refinedpy::assignability::Verdict;
-use crate::refinedpy::collection_models;
-use crate::refinedpy::env::Environment;
-use crate::refinedpy::expressions::binary_arithmetic_value;
-use crate::refinedpy::expressions::evaluate_expression;
-use crate::refinedpy::instances;
-use crate::refinedpy::summaries::iterable_element_sort;
-use crate::refinedpy::typereading::DeclaredRefinement;
+use crate::assignability::judge;
+use crate::assignability::Verdict;
+use crate::collection_models;
+use crate::env::Environment;
+use crate::expressions::binary_arithmetic_value;
+use crate::expressions::evaluate_expression;
+use crate::instances;
+use crate::summaries::iterable_element_sort;
+use crate::typereading::DeclaredRefinement;
 
 /// A `while` loop is only concretely executed up to this many
 /// iterations. Reaching the cap with the condition still true means
@@ -358,7 +358,7 @@ fn custom_iterator_element_pass(
         return None;
     };
     let next_method = instances::method_def_of(model, next_method_name)?;
-    let declared = crate::refinedpy::typereading::base_sort_return_refinement(next_method.returns.as_deref()?)?;
+    let declared = crate::typereading::base_sort_return_refinement(next_method.returns.as_deref()?)?;
     let element = known_set(declared.set, None, TrustSpec, SetKindTag::None);
 
     let mut one_pass = environment.fork();
@@ -2103,9 +2103,9 @@ mod tests {
     /// table — the generator-call tests need `environment.functions()`
     /// to resolve the callee, which `parsed_loop`'s single-statement
     /// module cannot carry.
-    fn parsed_loop_with_functions(source: &str) -> (Stmt, Arc<crate::refinedpy::function_table::FunctionTable>) {
+    fn parsed_loop_with_functions(source: &str) -> (Stmt, Arc<crate::function_table::FunctionTable>) {
         let module = parse_module(source).expect("fixture source parses").into_syntax();
-        let table = Arc::new(crate::refinedpy::function_table::function_table(&module));
+        let table = Arc::new(crate::function_table::function_table(&module));
         let loop_stmt = module.body.into_iter().last().expect("at least one top-level statement");
         (loop_stmt, table)
     }

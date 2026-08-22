@@ -33,15 +33,15 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use pyrefly::refinedpy::check::findings_for_module_at;
-use pyrefly::refinedpy::cross_module::disk_resolver;
-use pyrefly::refinedpy::fact_export::export_module;
-use pyrefly::refinedpy::foreign_edge_artifact::cache_artifact_path;
-use pyrefly::refinedpy::foreign_edge_artifact::set_project_root_override;
-use pyrefly::refinedpy::kernel_path::resolve_kernel_dylib;
-use pyrefly::refinedpy::markers::line_col;
-use pyrefly::refinedpy::markers::line_starts_of;
-use pyrefly::refinedpy::markers::markers_of;
+use refinedpy::check::findings_for_module_at;
+use refinedpy::cross_module::disk_resolver;
+use refinedpy::fact_export::export_module;
+use refinedpy::foreign_edge_artifact::cache_artifact_path;
+use refinedpy::foreign_edge_artifact::set_project_root_override;
+use refinedpy::kernel_path::resolve_kernel_dylib;
+use refinedpy::markers::line_col;
+use refinedpy::markers::line_starts_of;
+use refinedpy::markers::markers_of;
 use refined_kernel::kernel_bridge::load_kernel;
 use refined_kernel::kernel_interface::RefinedTSKernel;
 

@@ -16,10 +16,6 @@ path = "lib/lib.rs"
 name = "pyrefly"
 path = "bin/main.rs"
 
-[[bin]]
-name = "refinedpy-check"
-path = "bin/refinedpy_check.rs"
-
 [[test]]
 name = "pyrefly_laziness_tests"
 path = "test_laziness/mod.rs"

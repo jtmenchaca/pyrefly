@@ -109,7 +109,7 @@ use ruff_python_ast::StmtFor;
 use ruff_text_size::Ranged;
 use ruff_text_size::TextRange;
 
-use crate::refinedpy::env::Environment;
+use crate::env::Environment;
 
 /// The slot the running total lives in.
 const TOTAL_SLOT: i64 = 0;

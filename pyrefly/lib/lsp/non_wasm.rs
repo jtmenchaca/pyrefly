@@ -19,7 +19,7 @@ pub mod move_symbol_new_file;
 mod mru;
 pub mod protocol;
 pub mod queue;
-pub mod refinedpy;
+pub mod refinement_hooks;
 pub mod safe_delete_file;
 pub mod server;
 pub mod stdlib;

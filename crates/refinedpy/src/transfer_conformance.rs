@@ -113,9 +113,9 @@ mod tests {
     use refined_sets::refinement_forms::{at_least, at_most, make_refined_set, one_of, RefinedSet};
     use ruff_python_ast::Operator;
 
-    use crate::refinedpy::expressions::binary_arithmetic_value;
-    use crate::refinedpy::expressions::binary_arithmetic_value_with_kernel;
-    use crate::refinedpy::math_models::math_call_result;
+    use crate::expressions::binary_arithmetic_value;
+    use crate::expressions::binary_arithmetic_value_with_kernel;
+    use crate::math_models::math_call_result;
 
     /// `loaded_kernel` mirrors `lattice_conformance.rs`'s own helper
     /// exactly: a missing dylib artifact prints to stderr and the caller

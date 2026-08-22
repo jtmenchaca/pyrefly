@@ -40,12 +40,12 @@ use refined_sets::refinement_forms::make_refined_set;
 use ruff_python_ast::{Expr, ExprCall, ModModule, Number, Stmt, StmtClassDef, StmtFunctionDef, UnaryOp};
 use ruff_text_size::TextRange;
 
-use crate::refinedpy::assignability::{judge, Verdict};
-use crate::refinedpy::env::Environment;
-use crate::refinedpy::expressions::evaluate_expression;
-use crate::refinedpy::function_table::FunctionTable;
-use crate::refinedpy::surface::{AliasEntry, SurfaceImports};
-use crate::refinedpy::typereading::{declared_refinement, DeclaredRefinement};
+use crate::assignability::{judge, Verdict};
+use crate::env::Environment;
+use crate::expressions::evaluate_expression;
+use crate::function_table::FunctionTable;
+use crate::surface::{AliasEntry, SurfaceImports};
+use crate::typereading::{declared_refinement, DeclaredRefinement};
 
 /// One class's declared shape: its name, its fields (in construction
 /// order), its property accessors (read/write aliases that are never
@@ -1050,7 +1050,7 @@ fn field_call_default(call: &ruff_python_ast::ExprCall) -> Option<AbstractValue>
     } else {
         PrimitiveKind::Integer
     };
-    let value = crate::refinedpy::surface::literal_number(&keyword.value)?;
+    let value = crate::surface::literal_number(&keyword.value)?;
     Some(known_values(vec![value], sort, TrustProved))
 }
 
@@ -1476,7 +1476,7 @@ pub fn method_call_result(
     kernel: &Arc<RefinedTSKernel>,
     depth: u32,
 ) -> Option<(AbstractValue, AbstractValue)> {
-    use crate::refinedpy::summaries::{collect_bound_names, interpret_body, CALL_DEPTH_CAP};
+    use crate::summaries::{collect_bound_names, interpret_body, CALL_DEPTH_CAP};
 
     if depth >= CALL_DEPTH_CAP {
         return None;
@@ -1667,7 +1667,7 @@ pub fn generator_yields(
     kernel: &Arc<RefinedTSKernel>,
     depth: u32,
 ) -> Option<Vec<AbstractValue>> {
-    use crate::refinedpy::summaries::CALL_DEPTH_CAP;
+    use crate::summaries::CALL_DEPTH_CAP;
     if depth >= CALL_DEPTH_CAP {
         return None;
     }
@@ -1719,7 +1719,7 @@ pub fn generator_yields(
 /// opens with one must not decline solely because its first statement is
 /// not `Expr::Yield`.
 fn yields_of_body(body: &[Stmt], environment: &mut Environment, kernel: &Arc<RefinedTSKernel>) -> Option<Vec<AbstractValue>> {
-    let Some(first) = crate::refinedpy::summaries::first_non_docstring_statement(body) else {
+    let Some(first) = crate::summaries::first_non_docstring_statement(body) else {
         // nothing but leading docstrings — no yield anywhere
         return Some(Vec::new());
     };
@@ -1980,8 +1980,8 @@ mod tests {
             "    age: Age\n",
             "    label: str\n",
         ));
-        let aliases = crate::refinedpy::surface::compile_aliases(&module);
-        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let aliases = crate::surface::compile_aliases(&module);
+        let imports = crate::surface::surface_imports(&module);
         let table = class_table(&module, &aliases, &imports, &kernel);
         let person = table.get("Person").expect("Person class recorded");
         assert_eq!(person.fields.len(), 2);
@@ -2003,8 +2003,8 @@ mod tests {
             "    age: Age\n",
             "    label: str\n",
         ));
-        let aliases = crate::refinedpy::surface::compile_aliases(&module);
-        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let aliases = crate::surface::compile_aliases(&module);
+        let imports = crate::surface::surface_imports(&module);
         let table = typed_dict_table(&module, &aliases, &imports);
         let members = table.get("PersonDict").expect("PersonDict recorded");
         assert_eq!(members.len(), 1, "only age reads a refinement; bare str states none");
@@ -2020,7 +2020,7 @@ mod tests {
             "    age: int\n",
         ));
         let aliases = HashMap::new();
-        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let imports = crate::surface::surface_imports(&module);
         let table = typed_dict_table(&module, &aliases, &imports);
         assert!(table.get("Person").is_none(), "a plain BaseModel class is not a TypedDict");
     }
@@ -2037,7 +2037,7 @@ mod tests {
             "    age: int = 40\n",
         ));
         let aliases = HashMap::new();
-        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let imports = crate::surface::surface_imports(&module);
         let table = class_table(&module, &aliases, &imports, &kernel);
         let counted = table.get("Counted").expect("Counted class recorded");
         assert_eq!(counted.fields.len(), 1, "ClassVar row must not become a field");
@@ -2065,8 +2065,8 @@ mod tests {
             "class Resident(BaseModel):\n",
             "    address: Address\n",
         ));
-        let aliases = crate::refinedpy::surface::compile_aliases(&module);
-        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let aliases = crate::surface::compile_aliases(&module);
+        let imports = crate::surface::surface_imports(&module);
         let table = class_table(&module, &aliases, &imports, &kernel);
         let resident = table.get("Resident").expect("Resident class recorded");
         let address_field = resident.fields.iter().find(|field| field.name == "address").expect("address field present");
@@ -2093,8 +2093,8 @@ mod tests {
             "class Resident(BaseModel):\n",
             "    person: Person\n",
         ));
-        let aliases = crate::refinedpy::surface::compile_aliases(&module);
-        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let aliases = crate::surface::compile_aliases(&module);
+        let imports = crate::surface::surface_imports(&module);
         let table = class_table(&module, &aliases, &imports, &kernel);
         let resident = table.get("Resident").expect("Resident class recorded");
         let person_field = resident.fields.iter().find(|field| field.name == "person").expect("person field present");
@@ -2117,7 +2117,7 @@ mod tests {
             "    address: Missing\n",
         ));
         let aliases = HashMap::new();
-        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let imports = crate::surface::surface_imports(&module);
         let table = class_table(&module, &aliases, &imports, &kernel);
         let resident = table.get("Resident").expect("Resident class recorded");
         let address_field = resident.fields.iter().find(|field| field.name == "address").expect("address field present");
@@ -2223,7 +2223,7 @@ mod tests {
             "            raise ValueError(\"hi must be >= lo\")\n",
         ));
         let aliases = HashMap::new();
-        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let imports = crate::surface::surface_imports(&module);
         let table = class_table(&module, &aliases, &imports, &kernel);
         let range_model = table.get("Range").expect("Range class recorded");
         let keyword = vec![
@@ -2249,7 +2249,7 @@ mod tests {
             "            raise ValueError(\"hi must be >= lo\")\n",
         ));
         let aliases = HashMap::new();
-        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let imports = crate::surface::surface_imports(&module);
         let table = class_table(&module, &aliases, &imports, &kernel);
         let range_model = table.get("Range").expect("Range class recorded");
         let keyword = vec![
@@ -2278,7 +2278,7 @@ mod tests {
             "            raise ValueError(\"hi must be >= lo\")\n",
         ));
         let aliases = HashMap::new();
-        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let imports = crate::surface::surface_imports(&module);
         let table = class_table(&module, &aliases, &imports, &kernel);
         let range_model = table.get("Range").expect("Range class recorded");
         let verdict = judge_construction(range_model, &[], &[], &kernel);
@@ -2331,8 +2331,8 @@ mod tests {
             "class Person(BaseModel):\n",
             "    age: Annotated[int, Field(ge=0, le=120)]\n",
         ));
-        let aliases = crate::refinedpy::surface::compile_aliases(&module);
-        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let aliases = crate::surface::compile_aliases(&module);
+        let imports = crate::surface::surface_imports(&module);
         let table = class_table(&module, &aliases, &imports, &kernel);
         let person = table.get("Person").expect("Person class recorded");
         assert!(person.fields[0].declared.is_some(), "inline Annotated field reads its own set");
@@ -2361,7 +2361,7 @@ mod tests {
             "        self.age = age\n",
         ));
         let aliases = HashMap::new();
-        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let imports = crate::surface::surface_imports(&module);
         let table = class_table(&module, &aliases, &imports, &kernel);
         let person = table.get("Person").expect("Person class recorded");
         assert_eq!(person.fields.len(), 1);
@@ -2395,8 +2395,8 @@ mod tests {
             "    def __init__(self, age: int) -> None:\n",
             "        self.age = age\n",
         ));
-        let aliases = crate::refinedpy::surface::compile_aliases(&module);
-        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let aliases = crate::surface::compile_aliases(&module);
+        let imports = crate::surface::surface_imports(&module);
         let table = class_table(&module, &aliases, &imports, &kernel);
         let person = table.get("Person").expect("Person class recorded");
         assert_eq!(person.fields.len(), 1, "the AnnAssign and __init__ rows name the same field");
@@ -2422,7 +2422,7 @@ mod tests {
             "        self.total = 0\n",
         ));
         let aliases = HashMap::new();
-        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let imports = crate::surface::surface_imports(&module);
         let table = class_table(&module, &aliases, &imports, &kernel);
         let counter = table.get("Counter").expect("Counter class recorded");
         assert_eq!(counter.fields.len(), 2);
@@ -2449,7 +2449,7 @@ mod tests {
             "        self.cache = build_cache()\n",
         ));
         let aliases = HashMap::new();
-        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let imports = crate::surface::surface_imports(&module);
         let table = class_table(&module, &aliases, &imports, &kernel);
         let cached = table.get("Cached").expect("Cached class recorded");
         assert_eq!(cached.fields.len(), 1);
@@ -2479,7 +2479,7 @@ mod tests {
             "        super().__init__(age)\n",
         ));
         let aliases = HashMap::new();
-        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let imports = crate::surface::surface_imports(&module);
         let table = class_table(&module, &aliases, &imports, &kernel);
         let kid = table.get("KidYears").expect("KidYears class recorded");
         assert_eq!(kid.fields.len(), 1, "the super() call links to the SAME field, not a duplicate");
@@ -2510,8 +2510,8 @@ mod tests {
             "    def __init__(self, age: int) -> None:\n",
             "        super().__init__(age)\n",
         ));
-        let aliases = crate::refinedpy::surface::compile_aliases(&module);
-        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let aliases = crate::surface::compile_aliases(&module);
+        let imports = crate::surface::surface_imports(&module);
         let table = class_table(&module, &aliases, &imports, &kernel);
         let kid = table.get("KidAged").expect("KidAged class recorded");
         assert!(kid.fields[0].declared.is_some(), "the parent's AnnAssign-declared Age set carries through");
@@ -2536,7 +2536,7 @@ mod tests {
             "    pass\n",
         ));
         let aliases = HashMap::new();
-        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let imports = crate::surface::surface_imports(&module);
         let table = class_table(&module, &aliases, &imports, &kernel);
         let child = table.get("ChildYears").expect("ChildYears class recorded");
         assert_eq!(child.fields.len(), 1);
@@ -2567,7 +2567,7 @@ mod tests {
             "        self._held = value\n",
         ));
         let aliases = HashMap::new();
-        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let imports = crate::surface::surface_imports(&module);
         let table = class_table(&module, &aliases, &imports, &kernel);
         let aged = table.get("Aged").expect("Aged class recorded");
         assert!(aged.properties.contains_key("age"));
@@ -2601,8 +2601,8 @@ mod tests {
             "    def age(self, value: Age) -> None:\n",
             "        self._held = value\n",
         ));
-        let aliases = crate::refinedpy::surface::compile_aliases(&module);
-        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let aliases = crate::surface::compile_aliases(&module);
+        let imports = crate::surface::surface_imports(&module);
         let table = class_table(&module, &aliases, &imports, &kernel);
         let aged = table.get("Aged").expect("Aged class recorded");
         assert!(aged.properties["age"].declared.is_some(), "the setter's Age annotation is read");
@@ -2624,7 +2624,7 @@ mod tests {
             "        return self.age + 1\n",
         ));
         let aliases = HashMap::new();
-        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let imports = crate::surface::surface_imports(&module);
         let table = class_table(&module, &aliases, &imports, &kernel);
         let aged = table.get("Aged").expect("Aged class recorded");
         let cloned = aged.clone();
@@ -2646,7 +2646,7 @@ mod tests {
             "        return self.age + 1\n",
         ));
         let aliases = HashMap::new();
-        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let imports = crate::surface::surface_imports(&module);
         let table = class_table(&module, &aliases, &imports, &kernel);
         let aged = table.get("Aged").expect("Aged class recorded");
         let method = method_def_of(aged, "next_year").expect("next_year is a declared method");
@@ -2676,7 +2676,7 @@ mod tests {
             "        return 2\n",
         ));
         let aliases = HashMap::new();
-        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let imports = crate::surface::surface_imports(&module);
         let table = class_table(&module, &aliases, &imports, &kernel);
         let kid = table.get("KidYears").expect("KidYears class recorded");
         let instance = judge_construction(kid, &[(integer_value(40.0), range_of("40"))], &[], &kernel).instance;
@@ -2710,7 +2710,7 @@ mod tests {
             "        self.age = 200\n",
         ));
         let aliases = HashMap::new();
-        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let imports = crate::surface::surface_imports(&module);
         let table = class_table(&module, &aliases, &imports, &kernel);
         let outlaw = table.get("Outlaw").expect("Outlaw class recorded");
         let instance = judge_construction(outlaw, &[(integer_value(40.0), range_of("40"))], &[], &kernel).instance;
@@ -2741,7 +2741,7 @@ mod tests {
             "        return super().years() + 1\n",
         ));
         let aliases = HashMap::new();
-        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let imports = crate::surface::surface_imports(&module);
         let table = class_table(&module, &aliases, &imports, &kernel);
         let kid = table.get("KidYears").expect("KidYears class recorded");
         let instance = judge_construction(kid, &[(integer_value(40.0), range_of("40"))], &[], &kernel).instance;

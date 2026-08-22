@@ -28,10 +28,10 @@ use ruff_python_ast::Number;
 use ruff_python_ast::UnaryOp;
 use ruff_python_parser::parse_expression;
 
-use crate::refinedpy::env::Environment;
-use crate::refinedpy::surface::AliasEntry;
-use crate::refinedpy::surface::SurfaceImports;
-use crate::refinedpy::surface::annotated_expression_set;
+use crate::env::Environment;
+use crate::surface::AliasEntry;
+use crate::surface::SurfaceImports;
+use crate::surface::annotated_expression_set;
 
 /// A refinement an annotation states, with the spelling diagnostics
 /// use for it (the alias name, or the formatted set for inline forms).
@@ -902,7 +902,7 @@ mod tests {
         let module = ruff_python_parser::parse_module("x = 1")
             .expect("test module parses")
             .into_syntax();
-        crate::refinedpy::surface::surface_imports(&module)
+        crate::surface::surface_imports(&module)
     }
 
     #[test]
@@ -1106,8 +1106,8 @@ mod tests {
         )
         .expect("test module parses")
         .into_syntax();
-        let imports = crate::refinedpy::surface::surface_imports(&module);
-        let aliases = crate::refinedpy::surface::compile_aliases(&module);
+        let imports = crate::surface::surface_imports(&module);
+        let aliases = crate::surface::compile_aliases(&module);
         let environment = no_locals();
 
         let alias_annotation = name_expr("Boosted");
@@ -1157,8 +1157,8 @@ mod tests {
             let module = ruff_python_parser::parse_module(source)
                 .expect("test module parses")
                 .into_syntax();
-            let imports = crate::refinedpy::surface::surface_imports(&module);
-            let aliases = crate::refinedpy::surface::compile_aliases(&module);
+            let imports = crate::surface::surface_imports(&module);
+            let aliases = crate::surface::compile_aliases(&module);
             let got = declared_refinement(&name_expr("Boosted"), &aliases, &imports, &environment)
                 .expect("Boosted resolves for every spelling");
             shapes.push((got.spelling, got.element_length, got.element.map(|e| e.set)));
@@ -1180,8 +1180,8 @@ mod tests {
         )
         .expect("test module parses")
         .into_syntax();
-        let imports = crate::refinedpy::surface::surface_imports(&module);
-        let aliases = crate::refinedpy::surface::compile_aliases(&module);
+        let imports = crate::surface::surface_imports(&module);
+        let aliases = crate::surface::compile_aliases(&module);
         let environment = no_locals();
 
         let got = declared_refinement(&name_expr("Age"), &aliases, &imports, &environment)
@@ -1428,7 +1428,7 @@ mod tests {
         )
         .expect("test module parses")
         .into_syntax();
-        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let imports = crate::surface::surface_imports(&module);
         let annotation = annotated_or_none_annotation(&module);
         let aliases = HashMap::new();
         let environment = no_locals();
@@ -1451,7 +1451,7 @@ mod tests {
         )
         .expect("test module parses")
         .into_syntax();
-        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let imports = crate::surface::surface_imports(&module);
         let annotation = annotated_or_none_annotation(&module);
         let aliases = HashMap::new();
         let environment = no_locals();
@@ -1473,7 +1473,7 @@ mod tests {
         let module = ruff_python_parser::parse_module("x: \"Sequence[Age]\" = None\n")
             .expect("test module parses")
             .into_syntax();
-        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let imports = crate::surface::surface_imports(&module);
         let annotation = annotated_or_none_annotation(&module);
         let aliases = age_aliases();
         let environment = no_locals();
@@ -1496,7 +1496,7 @@ mod tests {
         )
         .expect("test module parses")
         .into_syntax();
-        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let imports = crate::surface::surface_imports(&module);
         let annotation = annotated_or_none_annotation(&module);
         let aliases = HashMap::new();
         let environment = no_locals();
@@ -1520,7 +1520,7 @@ mod tests {
         )
         .expect("test module parses")
         .into_syntax();
-        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let imports = crate::surface::surface_imports(&module);
         let annotation = annotated_or_none_annotation(&module);
         let aliases = HashMap::new();
         let environment = no_locals();
@@ -1545,7 +1545,7 @@ mod tests {
         )
         .expect("test module parses")
         .into_syntax();
-        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let imports = crate::surface::surface_imports(&module);
         let annotation = annotated_or_none_annotation(&module);
         let aliases = HashMap::new();
         let environment = no_locals();
@@ -1571,7 +1571,7 @@ mod tests {
         )
         .expect("test module parses")
         .into_syntax();
-        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let imports = crate::surface::surface_imports(&module);
         let annotation = annotated_or_none_annotation(&module);
         let aliases = HashMap::new();
         let environment = no_locals();
@@ -1599,7 +1599,7 @@ mod tests {
         )
         .expect("test module parses")
         .into_syntax();
-        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let imports = crate::surface::surface_imports(&module);
         let annotation = annotated_or_none_annotation(&module);
         let aliases = HashMap::new();
         let environment = no_locals();
@@ -1620,7 +1620,7 @@ mod tests {
         )
         .expect("test module parses")
         .into_syntax();
-        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let imports = crate::surface::surface_imports(&module);
         let annotation = annotated_or_none_annotation(&module);
         let aliases = HashMap::new();
         let environment = no_locals();
@@ -1649,7 +1649,7 @@ mod tests {
         )
         .expect("test module parses")
         .into_syntax();
-        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let imports = crate::surface::surface_imports(&module);
         let annotation = annotated_or_none_annotation(&module);
         let aliases = HashMap::new();
         let environment = no_locals();
@@ -1669,7 +1669,7 @@ mod tests {
         )
         .expect("test module parses")
         .into_syntax();
-        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let imports = crate::surface::surface_imports(&module);
         let annotation = annotated_or_none_annotation(&module);
         let aliases = HashMap::new();
         let environment = no_locals();
@@ -1709,7 +1709,7 @@ mod tests {
         )
         .expect("test module parses")
         .into_syntax();
-        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let imports = crate::surface::surface_imports(&module);
         let annotation = annotated_or_none_annotation(&module);
         let aliases = age_aliases();
         let environment = no_locals();
@@ -1735,7 +1735,7 @@ mod tests {
         )
         .expect("test module parses")
         .into_syntax();
-        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let imports = crate::surface::surface_imports(&module);
         let annotation = annotated_or_none_annotation(&module);
         let aliases = HashMap::new();
         let environment = no_locals();
@@ -1762,7 +1762,7 @@ mod tests {
         )
         .expect("test module parses")
         .into_syntax();
-        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let imports = crate::surface::surface_imports(&module);
         let annotation = annotated_or_none_annotation(&module);
         let aliases = HashMap::new();
         let environment = no_locals();
@@ -1803,7 +1803,7 @@ mod tests {
         )
         .expect("test module parses")
         .into_syntax();
-        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let imports = crate::surface::surface_imports(&module);
         let annotation = annotated_or_none_annotation(&module);
         let aliases = age_aliases();
         let environment = no_locals();
@@ -1828,7 +1828,7 @@ mod tests {
         )
         .expect("test module parses")
         .into_syntax();
-        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let imports = crate::surface::surface_imports(&module);
         let annotation = annotated_or_none_annotation(&module);
         let aliases = age_aliases();
         let environment = no_locals();
@@ -1850,7 +1850,7 @@ mod tests {
         )
         .expect("test module parses")
         .into_syntax();
-        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let imports = crate::surface::surface_imports(&module);
         let annotation = annotated_or_none_annotation(&module);
         let aliases = age_aliases();
         let environment = no_locals();
@@ -1868,7 +1868,7 @@ mod tests {
         )
         .expect("test module parses")
         .into_syntax();
-        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let imports = crate::surface::surface_imports(&module);
         let annotation = annotated_or_none_annotation(&module);
         let aliases = age_aliases();
         let environment = no_locals();
@@ -1892,7 +1892,7 @@ mod tests {
         )
         .expect("test module parses")
         .into_syntax();
-        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let imports = crate::surface::surface_imports(&module);
         let annotation = def_return_annotation(&module);
         let aliases = age_aliases();
         let environment = no_locals();
@@ -1921,7 +1921,7 @@ mod tests {
         )
         .expect("test module parses")
         .into_syntax();
-        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let imports = crate::surface::surface_imports(&module);
         let annotation = def_return_annotation(&module);
         let aliases = HashMap::new();
         let environment = no_locals();
@@ -1950,7 +1950,7 @@ mod tests {
         )
         .expect("test module parses")
         .into_syntax();
-        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let imports = crate::surface::surface_imports(&module);
         let annotation = def_return_annotation(&module);
         let aliases = age_aliases();
         let environment = no_locals();
@@ -1972,7 +1972,7 @@ mod tests {
         )
         .expect("test module parses")
         .into_syntax();
-        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let imports = crate::surface::surface_imports(&module);
         let annotation = def_return_annotation(&module);
         let aliases = age_aliases();
         let environment = no_locals();
@@ -1993,7 +1993,7 @@ mod tests {
         )
         .expect("test module parses")
         .into_syntax();
-        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let imports = crate::surface::surface_imports(&module);
         let annotation = def_return_annotation(&module);
         let aliases = age_aliases();
         let environment = no_locals();
@@ -2015,7 +2015,7 @@ mod tests {
         )
         .expect("test module parses")
         .into_syntax();
-        let imports = crate::refinedpy::surface::surface_imports(&module);
+        let imports = crate::surface::surface_imports(&module);
         let annotation = def_return_annotation(&module);
         let aliases = age_aliases();
         let environment = no_locals();

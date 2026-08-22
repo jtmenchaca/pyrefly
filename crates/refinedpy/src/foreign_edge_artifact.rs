@@ -70,7 +70,7 @@ use refined_kernel::wire_decode::decode_wire_set;
 use refined_sets::refinement_forms::RefinedSet;
 use serde_json::Value;
 
-use crate::refinedpy::fact_export::sha256_hex;
+use crate::fact_export::sha256_hex;
 
 /// What the producer appends to the target's path under the project
 /// cache: `audio-level.ts` caches as
@@ -1484,7 +1484,7 @@ mod tests {
     fn conformance_fixtures_dir() -> PathBuf {
         // this crate's manifest: packages/refinedpy/pyrefly/pyrefly
         // the corpus:            packages/refinedts/edge-premise-fixtures
-        PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../refinedts/edge-premise-fixtures"))
+        PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../../refinedts/edge-premise-fixtures"))
     }
 
     /// One manifest row, read generically off the JSON — only the

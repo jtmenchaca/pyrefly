@@ -22,14 +22,14 @@ use refined_sets::format_string_shapes::format_py_number;
 use refined_sets::refinement_forms::on_one_tuple_layer;
 use refined_sets::refinement_forms::requires_integer;
 
-use crate::refinedpy::diagnostic_sentences::at_index;
-use crate::refinedpy::diagnostic_sentences::at_key;
-use crate::refinedpy::diagnostic_sentences::containment_refutation;
-use crate::refinedpy::diagnostic_sentences::cross_sort_of_value;
-use crate::refinedpy::diagnostic_sentences::refutation;
-use crate::refinedpy::diagnostic_sentences::required_words;
-use crate::refinedpy::diagnostic_sentences::SENTENCE;
-use crate::refinedpy::typereading::DeclaredRefinement;
+use crate::diagnostic_sentences::at_index;
+use crate::diagnostic_sentences::at_key;
+use crate::diagnostic_sentences::containment_refutation;
+use crate::diagnostic_sentences::cross_sort_of_value;
+use crate::diagnostic_sentences::refutation;
+use crate::diagnostic_sentences::required_words;
+use crate::diagnostic_sentences::SENTENCE;
+use crate::typereading::DeclaredRefinement;
 
 /// What judging one value against one declared set concluded.
 pub enum Verdict {
@@ -1050,7 +1050,7 @@ mod tests {
     fn true_division_of_two_ints_still_fires_into_an_int_sorted_alias() {
         let Some(kernel) = loaded_kernel() else { return };
         let declared = age_refinement();
-        let two_float = crate::refinedpy::expressions::binary_arithmetic_value(
+        let two_float = crate::expressions::binary_arithmetic_value(
             ruff_python_ast::Operator::Div,
             &known_values(vec![6.0], PrimitiveKind::Integer, TrustProved),
             &known_values(vec![3.0], PrimitiveKind::Integer, TrustProved),

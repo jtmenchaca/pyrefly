@@ -14,6 +14,12 @@
 //! after pyrefly's own diagnostics on the same read-only transaction
 //! the host already validated with `Require::Everything` — the check
 //! never calls `set_memory` or `run` itself.
+//!
+//! This crate holds no direct call sites into pyrefly's server: it
+//! implements the four `RefinementHooks` function pointers
+//! (`pyrefly::lsp::non_wasm::refinement_hooks`) and installs them via
+//! `register_refinedpy_hooks`, so pyrefly's library never depends on
+//! this crate or on the `refinedpy` engine it wraps.
 
 use std::path::Path;
 use std::path::PathBuf;
@@ -27,6 +33,9 @@ use lsp_types::HoverContents;
 use lsp_types::MarkupContent;
 use lsp_types::MarkupKind;
 use lsp_types::NumberOrString;
+use pyrefly::lsp::non_wasm::refinement_hooks::RefinementHooks;
+use pyrefly::lsp::non_wasm::refinement_hooks::register;
+use pyrefly::state::state::Transaction;
 use pyrefly_build::handle::Handle;
 use pyrefly_python::module::Module;
 use refined_kernel::kernel_bridge::kernel_if_loaded;
@@ -37,20 +46,31 @@ use refined_sets::format_for_hover::replaces_host_type;
 use ruff_text_size::TextRange;
 use ruff_text_size::TextSize;
 
-use crate::refinedpy::check::findings_for_module;
-use crate::refinedpy::check::findings_for_module_at;
-use crate::refinedpy::check::refined_set_at_position;
-use crate::refinedpy::cross_module::disk_resolver;
-use crate::refinedpy::diagnostic_sentences::stale_marker_refusal;
-use crate::refinedpy::fact_export::cached_hash_matches;
-use crate::refinedpy::fact_export::export_module;
-use crate::refinedpy::fact_export::has_exportable_defs;
-use crate::refinedpy::foreign_edge_artifact::cache_artifact_path;
-use crate::refinedpy::markers::Marker;
-use crate::refinedpy::markers::line_col;
-use crate::refinedpy::markers::line_starts_of;
-use crate::refinedpy::markers::markers_of;
-use crate::state::state::Transaction;
+use refinedpy::check::findings_for_module;
+use refinedpy::check::findings_for_module_at;
+use refinedpy::check::refined_set_at_position;
+use refinedpy::cross_module::disk_resolver;
+use refinedpy::diagnostic_sentences::stale_marker_refusal;
+use refinedpy::fact_export::cached_hash_matches;
+use refinedpy::fact_export::export_module;
+use refinedpy::fact_export::has_exportable_defs;
+use refinedpy::foreign_edge_artifact::cache_artifact_path;
+use refinedpy::markers::Marker;
+use refinedpy::markers::line_col;
+use refinedpy::markers::line_starts_of;
+use refinedpy::markers::markers_of;
+
+/// Installs all four RefinedPy hook implementations into pyrefly's
+/// registry. Callable once, before serving any request — the served
+/// binary's own `main` calls this before `lsp_loop` runs.
+pub fn register_refinedpy_hooks() {
+    register(RefinementHooks {
+        configure_kernel_dylib,
+        append_refinedpy_diagnostics,
+        export_fact_on_save,
+        splice_refinedpy_hover,
+    });
+}
 
 /// Resolved once before the LSP loop serves requests; `None` when no
 /// kernel artifact could be found, in which case every check declines.
@@ -59,12 +79,12 @@ static KERNEL_DYLIB: OnceLock<Option<PathBuf>> = OnceLock::new();
 /// Resolve and remember the kernel dylib path. Called once from
 /// `lsp_loop` before the event loop starts, so every check that runs
 /// sees the same answer.
-pub fn configure_kernel_dylib() {
-    KERNEL_DYLIB.get_or_init(crate::refinedpy::kernel_path::resolve_kernel_dylib);
+fn configure_kernel_dylib() {
+    KERNEL_DYLIB.get_or_init(refinedpy::kernel_path::resolve_kernel_dylib);
 }
 
 /// The configured kernel dylib path, if one was found.
-pub fn kernel_dylib() -> Option<&'static PathBuf> {
+fn kernel_dylib() -> Option<&'static PathBuf> {
     KERNEL_DYLIB.get().and_then(|found| found.as_ref())
 }
 
@@ -83,7 +103,7 @@ fn kernel() -> Option<Arc<RefinedTSKernel>> {
 /// `append_ide_specific_diagnostics`, so this is the one place
 /// refinement findings enter the LSP surface. A missing kernel
 /// artifact or a non-`.py` handle appends nothing.
-pub fn append_refinedpy_diagnostics(
+fn append_refinedpy_diagnostics(
     transaction: &Transaction<'_>,
     handle: &Handle,
     items: &mut Vec<Diagnostic>,
@@ -164,7 +184,7 @@ pub fn append_refinedpy_diagnostics(
 /// say (`refined_set_at_position` returns `None`, or the set states
 /// nothing past the host type — `format_for_hover` returns `None`)
 /// leaves `hover` exactly as the host built it.
-pub fn splice_refinedpy_hover(transaction: &Transaction<'_>, handle: &Handle, position: TextSize, hover: &mut Hover) {
+fn splice_refinedpy_hover(transaction: &Transaction<'_>, handle: &Handle, position: TextSize, hover: &mut Hover) {
     if !handle
         .path()
         .as_path()
@@ -185,7 +205,7 @@ pub fn splice_refinedpy_hover(transaction: &Transaction<'_>, handle: &Handle, po
             refined_set_at_position(&ast, &resolver, &kernel, position)
         }
         None => {
-            let no_imports: crate::refinedpy::cross_module::ModuleResolver = &|_: &str| None;
+            let no_imports: refinedpy::cross_module::ModuleResolver = &|_: &str| None;
             refined_set_at_position(&ast, no_imports, &kernel, position)
         }
     }) else {
@@ -331,7 +351,7 @@ fn marker_line_text_range(line_starts: &[usize], source: &str, line: usize) -> T
 /// rename) — the same discipline `export_file` in the CLI already
 /// uses, load-bearing once a live LSP writes the cache mid-session
 /// (fact-freshness.md, "Two writers, one entry").
-pub fn export_fact_on_save(path: &Path) {
+fn export_fact_on_save(path: &Path) {
     if path.extension().is_none_or(|ext| ext != "py") {
         return;
     }
@@ -482,7 +502,7 @@ mod tests {
             .into_syntax()
     }
 
-    fn no_imports_resolver() -> crate::refinedpy::cross_module::ModuleResolver<'static> {
+    fn no_imports_resolver() -> refinedpy::cross_module::ModuleResolver<'static> {
         &|_: &str| None
     }
 

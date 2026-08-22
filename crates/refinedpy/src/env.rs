@@ -29,9 +29,9 @@ use ruff_python_ast::StmtReturn;
 use ruff_text_size::Ranged;
 use ruff_text_size::TextRange;
 
-use crate::refinedpy::function_table::FunctionTable;
-use crate::refinedpy::instances::ClassModel;
-use crate::refinedpy::typereading::DeclaredRefinement;
+use crate::function_table::FunctionTable;
+use crate::instances::ClassModel;
+use crate::typereading::DeclaredRefinement;
 
 /// The word every retained-callable `AbstractValue` carries on
 /// `kind_word` — the same word `expressions.rs`'s own `Expr::Lambda`

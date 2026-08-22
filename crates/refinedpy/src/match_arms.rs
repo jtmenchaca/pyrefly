@@ -91,11 +91,11 @@ use ruff_python_ast::MatchCase;
 use ruff_python_ast::Pattern;
 use ruff_python_ast::Singleton;
 
-use crate::refinedpy::collection_models::subscript_read;
-use crate::refinedpy::env::Environment;
-use crate::refinedpy::expressions::evaluate_expression;
-use crate::refinedpy::instances::field_read;
-use crate::refinedpy::instances::ClassModel;
+use crate::collection_models::subscript_read;
+use crate::env::Environment;
+use crate::expressions::evaluate_expression;
+use crate::instances::field_read;
+use crate::instances::ClassModel;
 
 /// The field names a `MatchClass` pattern's own class name resolves to,
 /// in `__match_args__`/declaration order — `None` when `classes` carries
@@ -107,7 +107,7 @@ use crate::refinedpy::instances::ClassModel;
 fn class_pattern_fields<'a>(
     class_pattern: &ruff_python_ast::PatternMatchClass,
     classes: Option<&'a HashMap<String, ClassModel>>,
-) -> Option<&'a [crate::refinedpy::instances::ClassField]> {
+) -> Option<&'a [crate::instances::ClassField]> {
     let Expr::Name(class_name) = class_pattern.cls.as_ref() else {
         return None;
     };
@@ -374,7 +374,7 @@ fn enumerable_numeric_members(subject: &AbstractValue) -> Option<Vec<f64>> {
         };
     }
     if subject.kind == Kind::Set {
-        return crate::refinedpy::collection_models::scalars_of_union_of_singletons(&subject.set);
+        return crate::collection_models::scalars_of_union_of_singletons(&subject.set);
     }
     None
 }
@@ -1116,7 +1116,7 @@ mod tests {
     fn string_value_pattern_hit() {
         let Some(kernel) = loaded_kernel() else { return };
         let cases = match_cases("match x:\n    case \"left\":\n        pass\n");
-        let subject = crate::refinedpy::string_models::string_literal_value("left");
+        let subject = crate::string_models::string_literal_value("left");
         let environment = empty_environment();
         let outcome = arm_outcome(&cases[0].pattern, cases[0].guard.as_deref(), &subject, &environment, &kernel);
         assert!(matches!(outcome, ArmOutcome::Taken(_)), "\"left\" must match `case \"left\":`");
@@ -1129,7 +1129,7 @@ mod tests {
     fn string_value_pattern_miss() {
         let Some(kernel) = loaded_kernel() else { return };
         let cases = match_cases("match x:\n    case \"left\":\n        pass\n");
-        let subject = crate::refinedpy::string_models::string_literal_value("right");
+        let subject = crate::string_models::string_literal_value("right");
         let environment = empty_environment();
         let outcome = arm_outcome(&cases[0].pattern, cases[0].guard.as_deref(), &subject, &environment, &kernel);
         assert!(matches!(outcome, ArmOutcome::NotTaken), "\"right\" must not match `case \"left\":`");
@@ -1351,8 +1351,8 @@ mod tests {
             ClassModel {
                 name: "Point".to_owned(),
                 fields: vec![
-                    crate::refinedpy::instances::ClassField { name: "x".to_owned(), declared: None, default: None },
-                    crate::refinedpy::instances::ClassField { name: "y".to_owned(), declared: None, default: None },
+                    crate::instances::ClassField { name: "x".to_owned(), declared: None, default: None },
+                    crate::instances::ClassField { name: "y".to_owned(), declared: None, default: None },
                 ],
                 properties: HashMap::new(),
                 methods: HashMap::new(),
@@ -1374,8 +1374,8 @@ mod tests {
             ClassModel {
                 name: "Point".to_owned(),
                 fields: vec![
-                    crate::refinedpy::instances::ClassField { name: "x".to_owned(), declared: None, default: None },
-                    crate::refinedpy::instances::ClassField { name: "y".to_owned(), declared: None, default: None },
+                    crate::instances::ClassField { name: "x".to_owned(), declared: None, default: None },
+                    crate::instances::ClassField { name: "y".to_owned(), declared: None, default: None },
                 ],
                 properties: HashMap::new(),
                 methods: HashMap::new(),
@@ -1502,8 +1502,8 @@ mod tests {
             ClassModel {
                 name: "Point".to_owned(),
                 fields: vec![
-                    crate::refinedpy::instances::ClassField { name: "x".to_owned(), declared: None, default: None },
-                    crate::refinedpy::instances::ClassField { name: "y".to_owned(), declared: None, default: None },
+                    crate::instances::ClassField { name: "x".to_owned(), declared: None, default: None },
+                    crate::instances::ClassField { name: "y".to_owned(), declared: None, default: None },
                 ],
                 properties: HashMap::new(),
                 methods: HashMap::new(),
@@ -1530,8 +1530,8 @@ mod tests {
             ClassModel {
                 name: "Point".to_owned(),
                 fields: vec![
-                    crate::refinedpy::instances::ClassField { name: "x".to_owned(), declared: None, default: None },
-                    crate::refinedpy::instances::ClassField { name: "y".to_owned(), declared: None, default: None },
+                    crate::instances::ClassField { name: "x".to_owned(), declared: None, default: None },
+                    crate::instances::ClassField { name: "y".to_owned(), declared: None, default: None },
                 ],
                 properties: HashMap::new(),
                 methods: HashMap::new(),
