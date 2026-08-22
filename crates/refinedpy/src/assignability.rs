@@ -523,9 +523,7 @@ pub fn judge(
         // the rest of the file's judging, and never misread as a
         // verdict.
         if is_string {
-            let asked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                (kernel.member)(&declared.set, &value.values)
-            }));
+            let asked = crate::kernel_ask::ask_kernel(|| (kernel.member)(&declared.set, &value.values));
             return match asked {
                 Ok(true) => Verdict::Silent,
                 Ok(false) => Verdict::Fire(refutation(
@@ -537,9 +535,7 @@ pub fn judge(
             };
         }
         for v in &value.values {
-            let asked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                (kernel.member)(&declared.set, &[*v])
-            }));
+            let asked = crate::kernel_ask::ask_kernel(|| (kernel.member)(&declared.set, &[*v]));
             match asked {
                 Ok(true) => {}
                 Ok(false) => {
@@ -666,9 +662,7 @@ pub fn judge(
         let numeric_repetition_into_scalar =
             states_sequence(&value.set) && on_one_tuple_layer(&declared.set);
         if sequence_question || numeric_repetition_into_scalar {
-            let seq_asked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                (kernel.seq_subset)(&value.set, &declared.set)
-            }));
+            let seq_asked = crate::kernel_ask::ask_kernel(|| (kernel.seq_subset)(&value.set, &declared.set));
             match seq_asked {
                 Ok(true) => return Verdict::Silent,
                 Ok(false) => {
@@ -681,9 +675,7 @@ pub fn judge(
                 Err(_) => {}
             }
         }
-        let asked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            (kernel.scalar_subset)(&value.set, &declared.set)
-        }));
+        let asked = crate::kernel_ask::ask_kernel(|| (kernel.scalar_subset)(&value.set, &declared.set));
         return match asked {
             Ok(true) => Verdict::Silent,
             Ok(false) => Verdict::Fire(containment_refutation(

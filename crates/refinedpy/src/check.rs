@@ -49,7 +49,7 @@ use crate::collection_models::{dict_get_result, dict_with_item, dict_without_ite
 use crate::cross_module::{module_surface, ModuleResolver, IMPORT_DEPTH_CAP};
 use crate::diagnostic_sentences::{empty_set, unhonorable_annotation};
 use crate::env::Environment;
-use crate::expressions::{binary_arithmetic_value, evaluate_expression, fieldless_exception_value, provable_raise, register_retained_callables};
+use crate::expressions::{binary_arithmetic_value, evaluate_expression, fieldless_exception_value, possible_raise, provable_raise, register_retained_callables};
 use crate::foreign_edge;
 use crate::function_table::{function_table, merged, FunctionTable};
 use crate::instances;
@@ -3113,25 +3113,49 @@ fn walk_match(
     out: &mut Vec<Finding>,
 ) {
     let subject_value = evaluate_expression(match_stmt.subject.as_ref(), environment, context.kernel);
-    if let Some((taken_index, mut arm_env)) =
-        match_taken_environment(&subject_value, &match_stmt.cases, environment, context.kernel)
+    // The subject's own bare name, when it has one, so a split arm can
+    // rebind it to the arm's intersection — the same name the fallback
+    // path below already reads off `Expr::Name`.
+    let subject_name = match match_stmt.subject.as_ref() {
+        Expr::Name(name) => Some(name.id.as_str()),
+        _ => None,
+    };
     {
-        let mut case_provably_unbound: HashSet<String> = HashSet::new();
-        for stmt in &match_stmt.cases[taken_index].body {
-            walk_statement(
-                stmt,
-                return_refinement,
-                yield_refinement,
-                context,
-                &mut arm_env,
-                aug_assign_refinements,
-                &mut case_provably_unbound,
-                blocked,
-                out,
-            );
+        // The arm-body walker match_taken_environment calls per decided
+        // arm — the identical per-arm walk `walk_if` runs for a fork:
+        // a fresh provably-unbound set, every statement through
+        // walk_statement, and the arm's own termination read off its
+        // last statement. This walker can always walk, so it never
+        // answers `None` (the decline arm is for callers whose own
+        // interpreters can genuinely refuse, `summaries.rs`).
+        let mut walk_arm = |body: &[Stmt], arm_environment: &mut Environment| -> Option<bool> {
+            let mut arm_provably_unbound: HashSet<String> = HashSet::new();
+            for stmt in body {
+                walk_statement(
+                    stmt,
+                    return_refinement,
+                    yield_refinement,
+                    context,
+                    arm_environment,
+                    aug_assign_refinements,
+                    &mut arm_provably_unbound,
+                    blocked,
+                    out,
+                );
+            }
+            Some(!arm_terminates(body))
+        };
+        if let Some((post_environment, _falls_through)) = match_taken_environment(
+            &subject_value,
+            subject_name,
+            &match_stmt.cases,
+            environment,
+            context.kernel,
+            &mut walk_arm,
+        ) {
+            *environment = post_environment;
+            return;
         }
-        *environment = arm_env;
-        return;
     }
 
     let mut surviving: Vec<Environment> = Vec::new();
@@ -3833,6 +3857,13 @@ fn walk_name_aug_assign(
         environment.forget(name);
         return;
     }
+    // A SOMETIMES-raise (the divisor's set admits 0 among other values)
+    // fires its finding and the walk continues with the split value —
+    // some runs raise, the rest produce the value, so neither replaces
+    // the other (`expressions.rs::possible_raise`'s own claim).
+    if let Some((range, message)) = possible_raise(assign.value.as_ref(), environment, context.kernel) {
+        out.push(Finding { range, code: "RTS7001", message });
+    }
     bind_walrus_targets(assign.value.as_ref(), context, aug_assign_refinements, environment, out);
     let current = environment.read(name).cloned().unwrap_or_else(unknown);
     let operand = evaluate_expression(assign.value.as_ref(), environment, context.kernel);
@@ -4414,11 +4445,11 @@ fn unhonorable_annotated_spelling(annotation: &Expr, imports: &crate::surface::S
 /// diagnostic simply does not fire — the annotation still compiled and
 /// still judges normally.
 fn declared_set_is_empty(set: &RefinedSet, kernel: &Arc<RefinedTSKernel>) -> Option<bool> {
-    let scalar_asked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (kernel.scalar_empty)(set)));
+    let scalar_asked = crate::kernel_ask::ask_kernel(|| (kernel.scalar_empty)(set));
     if let Ok(empty) = scalar_asked {
         return Some(empty);
     }
-    let seq_asked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (kernel.seq_empty)(set)));
+    let seq_asked = crate::kernel_ask::ask_kernel(|| (kernel.seq_empty)(set));
     seq_asked.ok()
 }
 
@@ -5044,6 +5075,13 @@ fn sink_value(
     if let Some((range, message)) = provable_raise(expr, environment, context.kernel) {
         out.push(Finding { range, code: "RTS7001", message });
         return None;
+    }
+    // A SOMETIMES-raise fires and evaluation continues: the divisor's
+    // set admits 0 among other values, so some runs raise and the rest
+    // produce the split value — the finding and the value both stand
+    // (`expressions.rs::possible_raise`'s own claim).
+    if let Some((range, message)) = possible_raise(expr, environment, context.kernel) {
+        out.push(Finding { range, code: "RTS7001", message });
     }
     if let Some(result) = instance_method_call_result(expr, context, environment) {
         return Some(result);

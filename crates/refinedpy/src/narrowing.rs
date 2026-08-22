@@ -62,8 +62,6 @@
 //! `and`'s multi-value form share one conjunction helper on both
 //! channels.
 
-use std::panic::catch_unwind;
-use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
 use refined_domain::abstract_value::kind_union_of;
@@ -171,7 +169,7 @@ fn narrow_set_kind_names(condition: &Expr, environment: &mut Environment, kernel
         // nothing" — never read as a refutation, mirroring
         // assignability.rs's own containment-ask recover() (and
         // refined-ts-go's narrowRefusable).
-        let asked = catch_unwind(AssertUnwindSafe(|| (kernel.narrow)(&tree)));
+        let asked = crate::kernel_ask::ask_kernel(|| (kernel.narrow)(&tree));
         let Ok(answer) = asked else {
             continue;
         };

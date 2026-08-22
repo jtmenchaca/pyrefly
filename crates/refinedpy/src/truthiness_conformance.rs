@@ -177,15 +177,11 @@ mod tests {
         if state.undef || state.null || state.nan || state.thrown {
             return Some(false);
         }
-        let scalar_asked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            (kernel.scalar_empty)(&state.set)
-        }));
+        let scalar_asked = crate::kernel_ask::ask_kernel(|| (kernel.scalar_empty)(&state.set));
         if let Ok(empty) = scalar_asked {
             return Some(empty);
         }
-        let seq_asked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            (kernel.seq_empty)(&state.set)
-        }));
+        let seq_asked = crate::kernel_ask::ask_kernel(|| (kernel.seq_empty)(&state.set));
         seq_asked.ok()
     }
 

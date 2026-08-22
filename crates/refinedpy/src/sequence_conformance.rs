@@ -150,10 +150,7 @@ mod tests {
         let receiver_set = string_tuple(receiver);
         let needle_set = string_tuple(needle);
         let ask = ask.clone();
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            (ask)(&receiver_set, &needle_set)
-        }))
-        .ok()
+        crate::kernel_ask::ask_kernel(move || (ask)(&receiver_set, &needle_set)).ok()
     }
 
     /// The word pairs every string predicate row runs. Chosen for the
@@ -608,10 +605,8 @@ mod tests {
             // the KERNEL's rule: the scalar subset relation. An empty
             // `oneOf` is the VOID (never the empty word), which is
             // exactly the empty collection's scalar reading.
-            let kernel_answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                (kernel.scalar_subset)(&scalar_set_of(receiver), &scalar_set_of(other))
-            }))
-            .ok();
+            let kernel_answer =
+                crate::kernel_ask::ask_kernel(|| (kernel.scalar_subset)(&scalar_set_of(receiver), &scalar_set_of(other))).ok();
 
             assert_scrutiny_row(&label, Some(adapter), kernel_answer);
             match kernel_answer {
@@ -649,10 +644,8 @@ mod tests {
         for (receiver, other) in &pairs {
             let label = format!("issuperset({receiver:?}, {other:?})");
             let adapter = other.iter().all(|element| receiver.contains(element));
-            let kernel_answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                (kernel.scalar_subset)(&scalar_set_of(other), &scalar_set_of(receiver))
-            }))
-            .ok();
+            let kernel_answer =
+                crate::kernel_ask::ask_kernel(|| (kernel.scalar_subset)(&scalar_set_of(other), &scalar_set_of(receiver))).ok();
             assert_scrutiny_row(&label, Some(adapter), kernel_answer);
             if let Some(k) = kernel_answer {
                 assert_agrees_bool(&label, adapter, k);

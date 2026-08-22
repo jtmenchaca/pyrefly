@@ -239,7 +239,7 @@ fn floor_call_over_set(value: &AbstractValue, kernel: &Arc<RefinedTSKernel>) -> 
         return None;
     }
     let nan_operand = PowOperandWire { kind: PowOperandKind::NaN, set: make_refined_set(vec![]) };
-    let asked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let asked = crate::kernel_ask::ask_kernel(|| {
         (kernel.transfer)(&TransferQuestion {
             op: TransferQuestionOp::Floor,
             a: value.set.clone(),
@@ -248,7 +248,7 @@ fn floor_call_over_set(value: &AbstractValue, kernel: &Arc<RefinedTSKernel>) -> 
             base: nan_operand.clone(),
             exp: nan_operand,
         })
-    }))
+    })
     .ok()?;
     let grade = derived_trust_level(TrustSpec, std::slice::from_ref(value));
     // the same `Integral` domain the single-value row gates on: an
@@ -297,7 +297,7 @@ fn int_transfer_call(
     kernel: &Arc<RefinedTSKernel>,
 ) -> Option<AbstractValue> {
     let nan_operand = PowOperandWire { kind: PowOperandKind::NaN, set: make_refined_set(vec![]) };
-    let asked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let asked = crate::kernel_ask::ask_kernel(|| {
         (kernel.transfer)(&TransferQuestion {
             op,
             a,
@@ -306,7 +306,7 @@ fn int_transfer_call(
             base: nan_operand.clone(),
             exp: nan_operand,
         })
-    }))
+    })
     .ok()?;
     match asked.kind {
         TransferAnswerKind::Values => {
@@ -650,7 +650,7 @@ fn sqrt_call_over_set(value: &AbstractValue, kernel: &Arc<RefinedTSKernel>) -> O
         return None;
     }
     let nan_operand = PowOperandWire { kind: PowOperandKind::NaN, set: make_refined_set(vec![]) };
-    let asked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let asked = crate::kernel_ask::ask_kernel(|| {
         (kernel.transfer)(&TransferQuestion {
             op: TransferQuestionOp::Sqrt,
             a: value.set.clone(),
@@ -659,7 +659,7 @@ fn sqrt_call_over_set(value: &AbstractValue, kernel: &Arc<RefinedTSKernel>) -> O
             base: nan_operand.clone(),
             exp: nan_operand,
         })
-    }))
+    })
     .ok()?;
     let grade = derived_trust_level(TrustSpec, std::slice::from_ref(value));
     match asked.kind {

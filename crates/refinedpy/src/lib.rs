@@ -25,6 +25,7 @@ pub mod foreign_edge;
 pub mod foreign_edge_artifact;
 pub mod function_table;
 pub mod instances;
+pub mod kernel_ask;
 pub mod kernel_path;
 pub mod lattice_conformance;
 pub mod loops;

@@ -581,7 +581,7 @@ fn min_max_call_over_sets(
     for (next_set, next_sort) in &operands[1..] {
         all_int = all_int && *next_sort == PrimitiveKind::Integer;
         let nan_operand = PowOperandWire { kind: PowOperandKind::NaN, set: make_refined_set(vec![]) };
-        let asked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let asked = crate::kernel_ask::ask_kernel(|| {
             (kernel.transfer)(&TransferQuestion {
                 op,
                 a: acc_set.clone(),
@@ -590,7 +590,7 @@ fn min_max_call_over_sets(
                 base: nan_operand.clone(),
                 exp: nan_operand,
             })
-        }))
+        })
         .ok()?;
         match asked.kind {
             TransferAnswerKind::Values => {

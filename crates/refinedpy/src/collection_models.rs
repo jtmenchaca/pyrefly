@@ -623,7 +623,7 @@ fn kernel_joined_set(so_far: AbstractValue, found: AbstractValue) -> AbstractVal
     let Some(state_b) = known_state_of(&found) else {
         return fallback();
     };
-    let asked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (kernel.join_state)(&state_a, &state_b)));
+    let asked = crate::kernel_ask::ask_kernel(|| (kernel.join_state)(&state_a, &state_b));
     let Ok(joined_state) = asked else {
         return fallback();
     };

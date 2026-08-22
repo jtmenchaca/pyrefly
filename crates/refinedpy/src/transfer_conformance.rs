@@ -73,6 +73,19 @@
 //! asserts G5's divergence directly, with its own message rather than
 //! `compare_row`'s "gap" framing.
 //!
+//! The WIDE zero-admitting window's own raise corner is not silent
+//! either, as of `possible_raise`/`binop_possible_raise` — a function
+//! separate from `provable_raise`'s all-or-nothing claim: a divisor set
+//! that admits zero without being entirely zero (this table's own
+//! distinction from G5) now fires `diagnostic_sentences::
+//! division_by_a_set_that_admits_zero` at the division site AS WELL AS
+//! determining the split value above — a finding beside the value,
+//! never a withdrawal of it; which sink combines the two is `check.rs`'s
+//! own wiring. `test_a_zero_admitting_divisor_
+//! fires_and_still_determines_with_no_infinity_row` and
+//! `test_a_zero_excluding_divisor_fires_nothing` below pin both halves
+//! of that pair.
+//!
 //! Rows G1/G2 are the audit's own "the exact `int` theory serves them"
 //! observation seen from the concrete side: the f64 carrier is what
 //! declines, not the semantics. The adapter now ASKS `int.add`/`int.mul`
@@ -100,6 +113,7 @@
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::sync::Arc;
 
     use refined_domain::abstract_value::{known_set, known_values, AbstractValue, Kind, PrimitiveKind, SetKindTag};
@@ -111,10 +125,13 @@ mod tests {
         TransferQuestionOp,
     };
     use refined_sets::refinement_forms::{at_least, at_most, make_refined_set, one_of, RefinedSet};
-    use ruff_python_ast::Operator;
+    use ruff_python_ast::{Expr, Operator};
+    use ruff_python_parser::parse_expression;
 
+    use crate::env::Environment;
     use crate::expressions::binary_arithmetic_value;
     use crate::expressions::binary_arithmetic_value_with_kernel;
+    use crate::expressions::possible_raise;
     use crate::math_models::math_call_result;
 
     /// `loaded_kernel` mirrors `lattice_conformance.rs`'s own helper
@@ -646,6 +663,89 @@ mod tests {
              sort: {adapter:?}"
         );
         assert_eq!(adapter.kind_tag, Some(PrimitiveKind::Float));
+    }
+
+    /// `1.0 / denominator` parsed once, with `denominator` bound to
+    /// `divisor` in a fresh environment — the shared setup every
+    /// zero-admitting-divisor conformance pair below builds on.
+    fn division_by_bound_denominator(divisor: AbstractValue) -> (Expr, Environment) {
+        let mut environment = Environment::new(HashSet::new());
+        environment.bind("denominator", divisor);
+        let parsed = parse_expression("1.0 / denominator").expect("test source must parse");
+        (parsed.into_expr(), environment)
+    }
+
+    /// THE LEDGER'S CONFORMANCE PAIR, first half: a divisor window that
+    /// ADMITS zero without being entirely zero (`[0.0, 2.0]`) now fires
+    /// `binop_possible_raise`'s own row (`diagnostic_sentences::
+    /// division_by_a_set_that_admits_zero`) AND the value question still
+    /// determines through `split_divisor_transfer` — both stand,
+    /// pinned together so neither can regress without the other
+    /// noticing. `possible_raise` is its own function, separate from
+    /// `provable_raise`'s all-or-nothing claim: the sink combines the
+    /// two (`check.rs`'s own wiring), never this test's concern. The
+    /// split value carries no infinity row from the zero corner:
+    /// `adapter_exact_value` (a determined SINGLE value) is `None` for
+    /// this row (`Kind::Set`, sort-only — pinned already by
+    /// `test_div_over_a_wide_zero_admitting_window_determines_via_the_
+    /// split` above). The pin holds the FIRE plus a DETERMINED value —
+    /// infinity-absence is deliberately not asserted, since a zero-
+    /// excluded divisor half still reaches +inf by denormal overflow
+    /// (the in-test comment states the measured mechanism).
+    #[test]
+    fn test_a_zero_admitting_divisor_fires_and_still_determines_with_no_infinity_row() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let denominator = AbstractValue {
+            kind_tag: Some(PrimitiveKind::Float),
+            ..known_set(make_refined_set(vec![at_least(0.0), at_most(2.0)]), None, TrustProved, SetKindTag::None)
+        };
+        let (expression, environment) = division_by_bound_denominator(denominator.clone());
+
+        let found = possible_raise(&expression, &environment, &kernel);
+        let Some((_, message)) = found else {
+            panic!("a divisor window admitting zero must fire the escape sentence");
+        };
+        assert!(message.contains("admits 0"), "{message}");
+        assert!(message.contains("ZeroDivisionError"), "{message}");
+
+        let one = float_operand(1.0);
+        let adapter = binary_arithmetic_value_with_kernel(Operator::Div, &one, &denominator, &kernel);
+        assert_eq!(
+            adapter.kind,
+            Kind::Set,
+            "the split value must still determine alongside the new fire: {adapter:?}"
+        );
+        // Infinity-ABSENCE is not assertable here, and not because of the
+        // zero corner: with zero excluded, `1.0 / d` still overflows to
+        // +inf for a denormal `d` (1.0 / 5e-324 exceeds binary64's max),
+        // so an unbounded quotient genuinely admits +inf. What the split
+        // guarantees is that the value came from the zero-EXCLUDED halves
+        // — the raise arm carries the fire above, never an ECMA-style
+        // determined infinity AT zero. Measured today the kernel widens
+        // the open positive half (above(0) && atMost(2)) to the float
+        // ground rather than answering [0.5, +inf]; tightening that open-
+        // window division enclosure is a named kernel precision follow-up,
+        // and this pin holds the determination, not the width.
+    }
+
+    /// THE LEDGER'S CONFORMANCE PAIR, second half: a divisor window that
+    /// PROVABLY EXCLUDES zero (`[1.0, 2.0]`, the same window
+    /// `test_div_by_a_set_excluding_zero_still_lowers_and_agrees` above
+    /// already lowers through the kernel) fires NOTHING — the escape
+    /// sentence is keyed on the divisor's set admitting zero, and this
+    /// window never does.
+    #[test]
+    fn test_a_zero_excluding_divisor_fires_nothing() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let denominator = AbstractValue {
+            kind_tag: Some(PrimitiveKind::Float),
+            ..known_set(make_refined_set(vec![at_least(1.0), at_most(2.0)]), None, TrustProved, SetKindTag::None)
+        };
+        let (expression, environment) = division_by_bound_denominator(denominator);
+        assert!(
+            possible_raise(&expression, &environment, &kernel).is_none(),
+            "a divisor window that provably excludes zero must fire nothing"
+        );
     }
 
     /// LEDGER ROW G4: the brief asks for NaN-operand arithmetic rows.

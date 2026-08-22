@@ -195,12 +195,8 @@ mod tests {
         if a.undef != b.undef || a.null != b.null || a.nan != b.nan {
             return false;
         }
-        let a_subset_b = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            (kernel.scalar_subset)(&a.set, &b.set)
-        }));
-        let b_subset_a = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            (kernel.scalar_subset)(&b.set, &a.set)
-        }));
+        let a_subset_b = crate::kernel_ask::ask_kernel(|| (kernel.scalar_subset)(&a.set, &b.set));
+        let b_subset_a = crate::kernel_ask::ask_kernel(|| (kernel.scalar_subset)(&b.set, &a.set));
         match (a_subset_b, b_subset_a) {
             (Ok(a_in_b), Ok(b_in_a)) => a_in_b && b_in_a,
             _ if a.set == b.set => true,

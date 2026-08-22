@@ -1795,39 +1795,60 @@ pub(crate) fn interpret_body(
             // `match subject: case ... case ...` — mirrors `check.rs::
             // walk_match`'s own two-path reading, restricted to this
             // interpreter's return-collecting shape. A DECIDED subject
-            // (`match_arms::match_taken_environment`) walks only the one
-            // taken arm. Every match this corpus's callee bodies build
-            // uses a STRING-literal `MatchValue` pattern (`case "left":`),
-            // which `match_arms.rs` never decides (its own `single_
-            // numeric_value` reads Number/Boolean-tagged subjects only —
-            // see that file's own doc), so in practice this call always
-            // falls to the JOIN path below: every case forks the incoming
-            // environment, binds whatever `match_arms::pattern_bound_
-            // captures` can name (a plain literal/wildcard pattern names
-            // none — `Some(Vec::new())` — so this never actually blocks on
-            // an unnameable capture for the shapes this corpus builds),
-            // interprets that arm's body, and every surviving arm (one
-            // that falls through rather than returning) joins through
-            // `Environment::join`, the same discipline `interpret_
-            // undecided_arms` gives an `if`/`elif`/`else` chain. A case
-            // whose own pattern cannot even be NAMED (a sequence/mapping/
-            // class pattern past `pattern_bound_captures`'s own flat-
-            // capture scope) declines the whole call — this restricted
-            // interpreter has no blocker-recording channel to fall back
-            // to the way `check.rs`'s full walk does.
+            // (`match_arms::match_taken_environment`) walks every arm its
+            // own per-arm scalar split reaches (an unconditional single
+            // arm, or several partial-overlap arms joined the way
+            // `Environment::join` already joins any two branches) via the
+            // closure below, which delegates to THIS function's own
+            // `interpret_body` — `declined` catches an inner decline
+            // (`interpret_body` answering `None`) so it propagates as
+            // this whole call's own decline rather than being misread as
+            // "the match was undecided." Every match this corpus's
+            // callee bodies build uses a STRING-literal `MatchValue`
+            // pattern (`case "left":`), which `match_arms.rs`'s scalar
+            // narrowing never decides (its own `enumerable_numeric_
+            // members` reads Number/Boolean/Integer/Float-tagged subjects
+            // only — see that file's own doc), so in practice this call
+            // always falls to the JOIN path below: every case forks the
+            // incoming environment, binds whatever `match_arms::
+            // pattern_bound_captures` can name (a plain literal/wildcard
+            // pattern names none — `Some(Vec::new())` — so this never
+            // actually blocks on an unnameable capture for the shapes
+            // this corpus builds), interprets that arm's body, and every
+            // surviving arm (one that falls through rather than
+            // returning) joins through `Environment::join`, the same
+            // discipline `interpret_undecided_arms` gives an `if`/`elif`/
+            // `else` chain. A case whose own pattern cannot even be
+            // NAMED (a sequence/mapping/class pattern past `pattern_
+            // bound_captures`'s own flat-capture scope) declines the
+            // whole call — this restricted interpreter has no
+            // blocker-recording channel to fall back to the way
+            // `check.rs`'s full walk does.
             Stmt::Match(match_stmt) => {
                 let subject_value = evaluate_expression(match_stmt.subject.as_ref(), environment, kernel);
-                if let Some((taken_index, mut arm_env)) =
-                    match_arms::match_taken_environment(&subject_value, &match_stmt.cases, environment, kernel)
-                {
-                    let falls_through = interpret_body(
-                        &match_stmt.cases[taken_index].body,
-                        kernel,
-                        depth,
-                        &mut arm_env,
-                        returns,
-                        super_resolver,
-                    )?;
+                let subject_name = match match_stmt.subject.as_ref() {
+                    Expr::Name(name) => Some(name.id.as_str()),
+                    _ => None,
+                };
+                let mut declined = false;
+                let decided = match_arms::match_taken_environment(
+                    &subject_value,
+                    subject_name,
+                    &match_stmt.cases,
+                    environment,
+                    kernel,
+                    &mut |body, arm_env| {
+                        let result = interpret_body(body, kernel, depth, arm_env, returns, super_resolver);
+                        if result.is_none() {
+                            declined = true;
+                        }
+                        result
+                    },
+                );
+                if declined {
+                    return None;
+                }
+                if let Some((arm_env, falls_through)) = decided {
                     *environment = arm_env;
                     if !falls_through {
                         return Some(false);

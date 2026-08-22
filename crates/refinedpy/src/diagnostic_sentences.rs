@@ -337,6 +337,25 @@ pub fn unhonorable_annotation(spelling: &str) -> String {
     format!("this annotation '{spelling}' is recognized as a refinement statement but this table could not compile it")
 }
 
+/// The zero-admitting-divisor fire — `binop_possible_raise`'s own
+/// row for a divisor window that ADMITS zero without being entirely
+/// zero (`expressions.rs`'s `split_divisor_transfer`, which asks the
+/// value question over the divisor's zero-excluded halves). The value
+/// side keeps determining through that split; this sentence names the
+/// escape the split's own value answer cannot speak to: the divisor's
+/// set admits `0`, and CPython raises `ZeroDivisionError` there
+/// (`expressions.rst` §6.7, arith.10 — Python `/`, `//`, and `%` each
+/// raise on a zero right operand, the divergence from ECMA's own
+/// determined `±Infinity`/NaN answer at that same corner). Names the
+/// guard that discharges it, the same teaching move
+/// `os_system_no_stdout_capture` makes for its own fixable respelling.
+pub fn division_by_a_set_that_admits_zero() -> String {
+    "this expression's divisor set admits 0 — CPython raises ZeroDivisionError there (expressions.rst \
+    §6.7); a zero guard on the divisor (for example `if divisor != 0:`) discharges this before the \
+    division runs"
+        .to_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use refined_sets::codepoint_sets::string_tuple;
@@ -573,5 +592,16 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("could not compile it"), "{message}");
+    }
+
+    /// The zero-admitting-divisor sentence names the raise, cites the
+    /// library clause, and teaches the guard that discharges it.
+    #[test]
+    fn the_division_by_a_set_that_admits_zero_sentence_names_the_raise_and_the_guard() {
+        let message = division_by_a_set_that_admits_zero();
+        assert!(message.contains("admits 0"), "{message}");
+        assert!(message.contains("ZeroDivisionError"), "{message}");
+        assert!(message.contains("expressions.rst"), "{message}");
+        assert!(message.contains("if divisor != 0:"), "{message}");
     }
 }

@@ -3187,11 +3187,11 @@ fn foreign_scalar_subset(kernel: &Arc<RefinedTSKernel>, a: &RefinedSet, b: &Refi
         || assignability::states_sequence(b)
         || assignability::sequence_shaped(b);
     if sequence_question {
-        if let Ok(fits) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (kernel.seq_subset)(a, b))) {
+        if let Ok(fits) = crate::kernel_ask::ask_kernel(|| (kernel.seq_subset)(a, b)) {
             return Some(fits);
         }
     }
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (kernel.scalar_subset)(a, b))).ok()
+    crate::kernel_ask::ask_kernel(|| (kernel.scalar_subset)(a, b)).ok()
 }
 
 /// Builds the `Fired` outcome: an RTS7001 sentence with the target's own

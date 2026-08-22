@@ -762,7 +762,7 @@ fn function_fact_of(parsed: &Value, name: &str, artifact_path_words: &str) -> Re
              row for it"
         ));
     };
-    let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| function_fact_of_row(row, name)));
+    let decoded = crate::kernel_ask::ask_kernel(|| function_fact_of_row(row, name));
     match decoded {
         Ok(Ok(fact)) => Ok(fact),
         Ok(Err(sentence)) => Err(format!("{artifact_path_words} {sentence}")),

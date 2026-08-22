@@ -84,12 +84,15 @@ use refined_domain::abstract_value::unknown;
 use refined_domain::abstract_value::AbstractValue;
 use refined_domain::abstract_value::Kind;
 use refined_domain::abstract_value::PrimitiveKind;
+use refined_domain::trust_grades::min_trust_level;
+use refined_domain::trust_grades::trust_level_of;
 use refined_domain::trust_grades::TrustProved;
 use refined_kernel::kernel_interface::RefinedTSKernel;
 use ruff_python_ast::Expr;
 use ruff_python_ast::MatchCase;
 use ruff_python_ast::Pattern;
 use ruff_python_ast::Singleton;
+use ruff_python_ast::Stmt;
 
 use crate::collection_models::subscript_read;
 use crate::env::Environment;
@@ -377,6 +380,65 @@ fn enumerable_numeric_members(subject: &AbstractValue) -> Option<Vec<f64>> {
         return crate::collection_models::scalars_of_union_of_singletons(&subject.set);
     }
     None
+}
+
+/// One `case` pattern's own flat list of numeric literals — every value
+/// a `MatchValue`/`MatchOr`-of-numerics/`MatchAs`-wrapping-one names,
+/// read via `pattern_proved_value` and unwrapped back to its bare
+/// `Vec<f64>` (this function drops the tag/grade `pattern_proved_value`
+/// carries, since the two callers below fold the result against a
+/// SUBJECT's own tag, never the pattern's). `None` for a pattern
+/// `pattern_proved_value` itself does not prove a value for (a bare
+/// capture/wildcard, a singleton `None`, a sequence/mapping/class
+/// pattern) — the same declines, read through the one existing proof
+/// function rather than re-deriving them.
+fn pattern_literal_members(pattern: &Pattern, environment: &Environment, kernel: &Arc<RefinedTSKernel>) -> Option<Vec<f64>> {
+    pattern_proved_value(pattern, environment, kernel).map(|proved| proved.values)
+}
+
+/// A decidable scalar subject's own narrowed value after ONE arm's
+/// pattern decides TAKEN or NOT-TAKEN against it — the intersection/
+/// difference pair `narrowing.rs`'s own isinstance/comparison leaves
+/// already spell for a Values binding (`narrow_name_against_literal`'s
+/// `filter` by a kept predicate, `narrow_isinstance_call`'s KindUnion
+/// `filter` by tag match), applied here to a match arm's own admitted
+/// members instead of a comparison/isinstance test:
+///
+/// - TAKEN (`keep_matched` true): the arm's own environment sees the
+///   INTERSECTION — exactly the subject's admitted members that the
+///   pattern's own literals also name (`case 1:` over `{1, 2, 4}`
+///   narrows to `{1}`; `case 2 | 4:` narrows to `{2, 4}`, the union of
+///   admitted alternatives, which IS the intersection of `{1, 2, 4}`
+///   with the pattern's own `{2, 4}`).
+/// - NOT-TAKEN (`keep_matched` false): the remainder every LATER arm
+///   and the wildcard must see is the DIFFERENCE — the subject's
+///   admitted members with the pattern's own literals removed.
+///
+/// `None` when the subject does not enumerate (`enumerable_numeric_
+/// members`) or the pattern proves no literal (`pattern_literal_
+/// members`) — the caller's own job to fall back to the unnarrowed
+/// subject in that case, never to guess. The narrowed result keeps the
+/// subject's own `kind_tag` (a pattern's literal tag is never trusted
+/// over the subject's, matching `narrow_name_against_literal`'s own
+/// "the binding's own tag survives" reading) and the WEAKER of the two
+/// trust grades (`min_trust_level` — a narrowing is never claimed
+/// stronger than either input that fed it).
+fn narrow_scalar_subject(
+    subject: &AbstractValue,
+    pattern: &Pattern,
+    keep_matched: bool,
+    environment: &Environment,
+    kernel: &Arc<RefinedTSKernel>,
+) -> Option<AbstractValue> {
+    let subject_members = enumerable_numeric_members(subject)?;
+    let kind_tag = subject.kind_tag?;
+    let pattern_members = pattern_literal_members(pattern, environment, kernel)?;
+    let kept: Vec<f64> = subject_members
+        .into_iter()
+        .filter(|member| pattern_members.contains(member) == keep_matched)
+        .collect();
+    let grade = min_trust_level(trust_level_of(subject), TrustProved);
+    Some(known_values(kept, kind_tag, grade))
 }
 
 /// The code-point vector an AbstractValue carries, if it is a known
@@ -897,30 +959,252 @@ pub fn pattern_bound_captures(
     }
 }
 
+/// Whether `narrowed` is the SAME admitted set as `remaining` — both
+/// read through `enumerable_numeric_members` and compared as sets
+/// (order-independent: a join can enumerate its members in either
+/// order). `narrowed` is always a subset of `remaining` by construction
+/// (`narrow_scalar_subject`'s own intersection), so equal LENGTH with
+/// every member of one present in the other is exactly set equality
+/// here — this is the FULL-OVERLAP test: an arm whose intersection is
+/// the whole remaining subject consumes it entirely, the same
+/// unconditional Taken this file gave every arm before the per-arm
+/// split existed (no later arm can ever be reached, so no join is
+/// needed for this arm).
+fn is_full_overlap(narrowed: &AbstractValue, remaining: &AbstractValue) -> bool {
+    let (Some(narrowed_members), Some(remaining_members)) =
+        (enumerable_numeric_members(narrowed), enumerable_numeric_members(remaining))
+    else {
+        return false;
+    };
+    narrowed_members.len() == remaining_members.len()
+        && remaining_members.iter().all(|member| narrowed_members.contains(member))
+}
+
+/// Rebinds `subject_name` (the match subject's own name, when the
+/// subject expression is a bare `Name`) and every name `pattern`
+/// captures (`pattern_captures`) to `intersected` inside `arm_env` — the
+/// two slots the PARTIAL-OVERLAP split (`match_taken_environment`'s own
+/// doc) must narrow before the arm's body ever walks: a bare `MatchAs`
+/// binds its own name to the raw `remaining_subject` when the pattern
+/// is Taken (`match_as_outcome`'s own doc), which is correct only for
+/// the FULL-overlap case; a split arm's body must see the INTERSECTION
+/// instead, on every name that would otherwise still read the coarser
+/// pre-split claim. A pattern with no nameable captures
+/// (`pattern_captures` answers `None` for a shape past this file's flat
+/// scope — never reached here, since only a literal/or pattern that
+/// itself proved a value reaches a split) simply rebinds the subject
+/// name alone.
+fn rebind_split_subject(
+    arm_env: &mut Environment,
+    subject_name: Option<&str>,
+    pattern: &Pattern,
+    intersected: &AbstractValue,
+) {
+    if let Some(name) = subject_name {
+        arm_env.bind(name, intersected.clone());
+    }
+    if let Some(captures) = pattern_captures(pattern, None) {
+        for name in captures {
+            arm_env.bind(&name, intersected.clone());
+        }
+    }
+}
+
 /// Walk every arm of a match statement in order, deciding each with
-/// `arm_outcome`, and enforcing the poisoning rule `apply_guard`'s doc
-/// states: once an arm's guard is Undecidable, every LATER arm is also
-/// Undecidable — CPython only reaches a later case when every earlier
-/// pattern failed or its guard was known false, and an Undecidable
-/// guard means this file cannot rule out that the earlier arm actually
-/// ran. Returns `Some((index, env))` for the exactly one arm decided
-/// Taken with every earlier arm decided NotTaken; `None` when no arm is
-/// decidably reached (either an arm is Undecidable before any Taken, or
-/// every arm resolves NotTaken with no wildcard/capture fallthrough).
+/// `arm_outcome`, joining the arms that survive exactly the way
+/// `walk_if` joins its own branch environments (`Environment::join`,
+/// left-folded over every surviving arm — 1 survivor is that arm alone,
+/// 2+ actually joins; see `finalize_survivors`). `walk_arm_body(body,
+/// &mut arm_env)` runs the caller's OWN statement walker over one arm's
+/// body (`check.rs`'s `walk_statement` loop, `summaries.rs`'s
+/// `interpret_body` — this file stays walker-agnostic on purpose, so it
+/// never depends on either caller's own types) and answers `Some(true)`
+/// when the arm survives (falls through, matching `arm_terminates`'s
+/// own reading of "does not end in `return`/`raise`"), `Some(false)`
+/// when it terminates, or `None` when the walk itself must decline the
+/// WHOLE match (an unsupported statement inside the body) — propagated
+/// here by `?`, the same short-circuit `interpret_body`'s own callers
+/// already rely on.
+///
+/// Returns `Some((environment, falls_through))`: the post-match
+/// environment (the one taken arm's own, or every surviving split arm's
+/// joined together), and whether the match AS A WHOLE falls through —
+/// `true` unless every reached arm terminated. `None` means no arm is
+/// decidably reached at all (the whole match is undecided from its own
+/// start, no body has walked, and the caller's own join-fallback is
+/// free to re-walk every case for itself).
+///
+/// A subject that DOES NOT enumerate (`enumerable_numeric_members`
+/// answers `None` — an unbounded `Kind::Set` ray, `Kind::Unknown`, a
+/// non-numeric subject, …) never splits: every arm is judged, walked,
+/// and joined exactly as before this rule existed — one arm's own
+/// `Taken` outcome is unconditional (the same "later arms are dead,
+/// stop scanning" this function always gave), and the answer is that
+/// one arm's own body's environment.
+///
+/// A DECIDABLE SCALAR SUBJECT splits per arm — the abstractly-precise
+/// reading of what a multi-valued subject actually means: SOME admitted
+/// values take this arm, the rest fall through to later ones, the same
+/// two-branch shape an `if`/`else` over an unknown boolean already
+/// walks. Before an arm is even judged, an ALREADY-EMPTY
+/// `remaining_subject` (every earlier arm together consumed every
+/// admitted value) makes it — and every arm after it — dead: no body
+/// walks, nothing joins, the loop simply runs out (this is the
+/// wildcard-sees-emptiness case: `case 1: / case 2 | 4: / case _:` over
+/// `{1, 2, 4}` leaves the wildcard's own `remaining_subject` empty, and
+/// its body never walks). Otherwise, a Taken arm asks `narrow_scalar_
+/// subject`'s own INTERSECTION (`keep_matched: true`) against
+/// `remaining_subject`:
+///
+/// - the intersection is the WHOLE remaining subject (`is_full_overlap`)
+///   — this arm alone consumes every value still live, so it behaves as
+///   an unconditional Taken: no later arm is ever reached, and this
+///   function returns as soon as this one arm's own body is walked
+///   (survives or not; a survivor is the sole answer, no join needed).
+/// - the intersection is a PROPER, NONEMPTY subset — a genuine split:
+///   `rebind_split_subject` narrows the arm's own subject binding and
+///   capture(s) down to the intersection, the body walks under THAT
+///   narrower claim, and (if it survives) its environment joins the
+///   later arms' the same way two `if`/`else` branches join. The
+///   DIFFERENCE (`keep_matched: false`) becomes the new
+///   `remaining_subject` for every arm still to come, and the walk
+///   continues scanning rather than stopping.
+/// - `narrow_scalar_subject` answers `None` (the pattern proves no
+///   scalar literal — a bare capture/wildcard, a guard-only arm, a
+///   class/sequence/mapping pattern) — the pattern is not itself
+///   scalar-decidable even though the subject is, so this arm keeps
+///   TODAY'S binary semantics: unconditional Taken, no split.
+///
+/// An `Undecidable` arm still poisons every LATER arm exactly as
+/// before — this file cannot rule out that arm having actually run.
+/// When no EARLIER arm's body has walked yet, the whole match declines
+/// (`None`), the same as before this rule existed. Once an earlier
+/// split arm's body already walked for real, declining here would let
+/// the caller's join-fallback re-walk it a second time (duplicating any
+/// side effects that walk already recorded) — so this answers instead
+/// with whatever already survived (see the `any_arm_walked` guard on
+/// the `Undecidable` arm below).
 pub fn match_taken_environment(
     subject_value: &AbstractValue,
+    subject_name: Option<&str>,
     cases: &[MatchCase],
     environment: &Environment,
     kernel: &Arc<RefinedTSKernel>,
-) -> Option<(usize, Environment)> {
-    for (index, case) in cases.iter().enumerate() {
-        match arm_outcome(&case.pattern, case.guard.as_deref(), subject_value, environment, kernel) {
-            ArmOutcome::Taken(arm_env) => return Some((index, arm_env)),
-            ArmOutcome::NotTaken => continue,
-            ArmOutcome::Undecidable => return None,
+    walk_arm_body: &mut dyn FnMut(&[Stmt], &mut Environment) -> Option<bool>,
+) -> Option<(Environment, bool)> {
+    let mut remaining_subject = subject_value.clone();
+    let mut survivors: Vec<Environment> = Vec::new();
+    // Whether ANY arm's body was actually walked (an unconditional Taken,
+    // or a split arm) — distinguishes "every arm bottomed out at
+    // NotTaken/dead, the match is genuinely undecided" (still `None`,
+    // the caller's own join-fallback engages, exactly as before this
+    // rule existed) from "arms were decided and walked, but every
+    // surviving one terminated" (a real answer, falls-through `false` —
+    // the same "0 survivors" reading `walk_if`'s own join gives, never
+    // a fallback re-walk that would run those bodies' side effects a
+    // second time).
+    let mut any_arm_walked = false;
+    for case in cases {
+        // An already-exhausted remaining subject makes this arm (and
+        // every arm after it) dead: no runtime value is left for it to
+        // ever see, so its body never walks and it never joins.
+        if enumerable_numeric_members(&remaining_subject).is_some_and(|members| members.is_empty()) {
+            continue;
+        }
+        match arm_outcome(&case.pattern, case.guard.as_deref(), &remaining_subject, environment, kernel) {
+            ArmOutcome::Taken(mut arm_env) => {
+                let intersection = narrow_scalar_subject(&remaining_subject, &case.pattern, true, environment, kernel);
+                let split = intersection
+                    .as_ref()
+                    .filter(|intersected| !is_full_overlap(intersected, &remaining_subject));
+                let Some(intersected) = split else {
+                    // no scalar split for this arm — unconditional Taken,
+                    // exactly today's behavior: walk its body once and
+                    // commit ITS OWN environment regardless of whether
+                    // the body survives (`check.rs`'s pre-existing
+                    // decided-arm branch committed `arm_env`
+                    // unconditionally too — a body ending in
+                    // `return`/`raise` is still the honest post-match
+                    // state, the same way a single surviving `if` arm
+                    // needs no join). No later arm is ever reached; the
+                    // whole match falls through iff this one body does.
+                    let survives = walk_arm_body(&case.body, &mut arm_env)?;
+                    return Some((arm_env, survives));
+                };
+                // a genuine partial split: narrow this arm's own subject
+                // binding/capture(s) to the intersection, walk under
+                // that narrower claim, and thread the difference onward
+                // to every arm still to come instead of stopping here.
+                any_arm_walked = true;
+                rebind_split_subject(&mut arm_env, subject_name, &case.pattern, intersected);
+                let survives = walk_arm_body(&case.body, &mut arm_env)?;
+                if survives {
+                    survivors.push(arm_env);
+                }
+                if let Some(narrowed) =
+                    narrow_scalar_subject(&remaining_subject, &case.pattern, false, environment, kernel)
+                {
+                    remaining_subject = narrowed;
+                }
+                continue;
+            }
+            ArmOutcome::NotTaken => {
+                if let Some(narrowed) =
+                    narrow_scalar_subject(&remaining_subject, &case.pattern, false, environment, kernel)
+                {
+                    remaining_subject = narrowed;
+                }
+                continue;
+            }
+            // An Undecidable arm poisons every LATER arm exactly as
+            // before — this file cannot rule out that arm having
+            // actually run. When NO earlier arm's body was walked yet,
+            // that is still `None`: the whole match is undecided from
+            // its own start, and the caller's join-fallback is free to
+            // re-walk every case from scratch. Once an earlier SPLIT
+            // arm's body already walked for real (side effects: findings
+            // recorded, returns collected), falling back would re-walk
+            // it a second time — so this answers with whatever already
+            // survived instead (falls-through `true` only when at least
+            // one split arm actually survived; `false`, same as the
+            // "no survivors" tail below, otherwise).
+            ArmOutcome::Undecidable => {
+                if !any_arm_walked {
+                    return None;
+                }
+                return Some(if survivors.is_empty() {
+                    (environment.fork(), false)
+                } else {
+                    (finalize_survivors(survivors), true)
+                });
+            }
         }
     }
-    None
+    if survivors.is_empty() {
+        return if any_arm_walked { Some((environment.fork(), false)) } else { None };
+    }
+    Some((finalize_survivors(survivors), true))
+}
+
+/// The join every split-arm walk in `match_taken_environment` funnels
+/// through — the SAME shape `walk_if`'s own tail takes
+/// (`check.rs::walk_if`): 1 survivor is that arm's environment alone,
+/// 2+ left-folds through `Environment::join` exactly as `walk_if`/
+/// today's `walk_match` join their own branch environments — this
+/// function never invents a different join. The caller never calls
+/// this with an empty `survivors` (it reads that case itself, before
+/// ever reaching here — see `match_taken_environment`'s own tail).
+fn finalize_survivors(mut survivors: Vec<Environment>) -> Environment {
+    match survivors.len() {
+        1 => survivors.into_iter().next().expect("len checked above"),
+        _ => {
+            let mut joined = survivors.remove(0);
+            for arm in survivors {
+                joined = Environment::join(joined, &arm);
+            }
+            joined
+        }
+    }
 }
 
 #[cfg(test)]
@@ -937,7 +1221,6 @@ mod tests {
     use refined_kernel::kernel_bridge::kernel_artifacts_present;
     use refined_kernel::kernel_bridge::load_kernel;
     use ruff_python_ast::ModModule;
-    use ruff_python_ast::Stmt;
 
     use super::*;
 
@@ -1041,6 +1324,142 @@ mod tests {
         let mut values = proved.values.clone();
         values.sort_by(f64::total_cmp);
         assert_eq!(values, vec![2.0, 4.0], "`case 2 | 4:` proves exactly {{2, 4}}");
+    }
+
+    /// The set-subject narrowing rule, pinned directly against
+    /// `narrow_scalar_subject`: a multi-valued `{1, 2, 4}` subject
+    /// through `case 1:` keeps the INTERSECTION — exactly `{1}`, the one
+    /// admitted member the literal names, never the pattern's own
+    /// literal alone and never the untouched subject.
+    #[test]
+    fn narrow_scalar_subject_keeps_the_intersection_for_a_literal_arm() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let cases = match_cases("match x:\n    case 1:\n        pass\n");
+        let subject = known_values(vec![1.0, 2.0, 4.0], PrimitiveKind::Integer, TrustProved);
+        let environment = empty_environment();
+        let narrowed = narrow_scalar_subject(&subject, &cases[0].pattern, true, &environment, &kernel)
+            .expect("a multi-valued {1, 2, 4} subject enumerates and `case 1:` proves a literal");
+        assert_eq!(narrowed.values, vec![1.0], "`case 1:` over {{1, 2, 4}} narrows to exactly {{1}}");
+    }
+
+    /// The or-pattern half: `case 2 | 4:` over the same subject keeps
+    /// the UNION of admitted alternatives — `{2, 4}` — which IS the
+    /// intersection of the subject with the pattern's own `{2, 4}`.
+    #[test]
+    fn narrow_scalar_subject_keeps_the_union_of_admitted_alternatives_for_an_or_arm() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let cases = match_cases("match x:\n    case 2 | 4:\n        pass\n");
+        let subject = known_values(vec![1.0, 2.0, 4.0], PrimitiveKind::Integer, TrustProved);
+        let environment = empty_environment();
+        let narrowed = narrow_scalar_subject(&subject, &cases[0].pattern, true, &environment, &kernel)
+            .expect("a multi-valued {1, 2, 4} subject enumerates and `case 2 | 4:` proves a union of literals");
+        let mut values = narrowed.values.clone();
+        values.sort_by(f64::total_cmp);
+        assert_eq!(values, vec![2.0, 4.0], "`case 2 | 4:` over {{1, 2, 4}} narrows to exactly {{2, 4}}");
+    }
+
+    /// A literal not admitted by the subject at all makes the arm dead:
+    /// the intersection is empty, matching `match_value_outcome`'s own
+    /// NotTaken verdict for the same pair (`value_pattern_miss_on_
+    /// multi_valued_subject` above).
+    #[test]
+    fn narrow_scalar_subject_intersection_is_empty_for_a_literal_the_subject_never_admits() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let cases = match_cases("match x:\n    case 8:\n        pass\n");
+        let subject = known_values(vec![1.0, 2.0, 4.0], PrimitiveKind::Integer, TrustProved);
+        let environment = empty_environment();
+        let narrowed = narrow_scalar_subject(&subject, &cases[0].pattern, true, &environment, &kernel)
+            .expect("a multi-valued {1, 2, 4} subject enumerates and `case 8:` proves a literal");
+        assert!(narrowed.values.is_empty(), "8 is not admitted by {{1, 2, 4}}: the arm's own intersection is empty");
+    }
+
+    /// The DIFFERENCE half — the remainder a NotTaken arm leaves for
+    /// every later arm and the eventual wildcard: a multi-valued
+    /// `{1, 2, 4}` subject minus `case 1:`'s own literal is exactly
+    /// `{2, 4}`.
+    #[test]
+    fn narrow_scalar_subject_keeps_the_difference_for_a_not_taken_arm() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let cases = match_cases("match x:\n    case 1:\n        pass\n");
+        let subject = known_values(vec![1.0, 2.0, 4.0], PrimitiveKind::Integer, TrustProved);
+        let environment = empty_environment();
+        let remainder = narrow_scalar_subject(&subject, &cases[0].pattern, false, &environment, &kernel)
+            .expect("a multi-valued {1, 2, 4} subject enumerates and `case 1:` proves a literal");
+        let mut values = remainder.values.clone();
+        values.sort_by(f64::total_cmp);
+        assert_eq!(values, vec![2.0, 4.0], "{{1, 2, 4}} minus {{1}} is exactly {{2, 4}}");
+    }
+
+    /// The visible per-arm split the ledger construct names: a
+    /// multi-valued `{1, 2, 4}` subject through `case 1 as a: / case 2 |
+    /// 4 as b: / case _ as c:` — arm one's body walks with `a` bound to
+    /// exactly `{1}` (the intersection), arm two's walks with `b` bound
+    /// to exactly `{2, 4}` (the intersection of the DIFFERENCE `{2, 4}`
+    /// left after arm one with arm two's own `{2, 4}`), and the
+    /// wildcard's own remaining subject is exhausted to empty by the
+    /// first two arms together — so its body never walks at all. Each
+    /// walked arm behaves as a genuine `if`/`elif` branch: both arm one
+    /// and arm two survive (return `Some(true)`), so their environments
+    /// JOIN (`Environment::join`, the same call `walk_if` makes) rather
+    /// than either one alone winning outright.
+    #[test]
+    fn match_taken_environment_splits_a_multi_valued_subject_across_its_arms() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let cases = match_cases(concat!(
+            "match x:\n",
+            "    case 1 as a:\n",
+            "        pass\n",
+            "    case 2 | 4 as b:\n",
+            "        pass\n",
+            "    case _ as c:\n",
+            "        pass\n",
+        ));
+        let subject = known_values(vec![1.0, 2.0, 4.0], PrimitiveKind::Integer, TrustProved);
+        let environment = empty_environment();
+        let mut walked_bodies: Vec<Environment> = Vec::new();
+        let (joined, falls_through) = match_taken_environment(&subject, None, &cases, &environment, &kernel, &mut |_body, arm_env| {
+            walked_bodies.push(arm_env.fork());
+            Some(true)
+        })
+        .expect("a multi-valued {1, 2, 4} subject through three arms that together cover it is decided");
+        assert!(falls_through, "both walked arms survive, so the whole match falls through");
+        assert_eq!(walked_bodies.len(), 2, "only arm one and arm two walk; the wildcard's own remainder is empty");
+
+        let mut first_arm_a = walked_bodies[0].read("a").expect("arm one's own capture binds `a`").values.clone();
+        first_arm_a.sort_by(f64::total_cmp);
+        assert_eq!(first_arm_a, vec![1.0], "arm one's body sees `a` narrowed to exactly {{1}}, the intersection");
+
+        let mut second_arm_b = walked_bodies[1].read("b").expect("arm two's own capture binds `b`").values.clone();
+        second_arm_b.sort_by(f64::total_cmp);
+        assert_eq!(second_arm_b, vec![2.0, 4.0], "arm two's body sees `b` narrowed to exactly {{2, 4}}, the intersection");
+
+        assert!(joined.read("c").is_none(), "the wildcard's own capture `c` never binds — its body never walked");
+    }
+
+    /// The dead-arm half of the same construct, pinned directly:
+    /// `narrow_scalar_subject`'s own membership question over the
+    /// wildcard's remaining subject — once `case 1:` and `case 2 | 4:`
+    /// have both been subtracted from `{1, 2, 4}`, what remains is the
+    /// EMPTY set `enumerable_numeric_members` reads back, the exact
+    /// signal `match_taken_environment`'s own dead-arm skip
+    /// (`is_some_and(|members| members.is_empty())`) tests before ever
+    /// calling `arm_outcome` on a later arm.
+    #[test]
+    fn wildcard_remaining_subject_is_empty_after_earlier_arms_consume_every_admitted_value() {
+        let subject = known_values(vec![1.0, 2.0, 4.0], PrimitiveKind::Integer, TrustProved);
+        let cases = match_cases("match x:\n    case 1:\n        pass\n");
+        let environment = empty_environment();
+        let Some(kernel) = loaded_kernel() else { return };
+        let after_first_arm = narrow_scalar_subject(&subject, &cases[0].pattern, false, &environment, &kernel)
+            .expect("{1, 2, 4} enumerates and `case 1:` proves a literal");
+        let or_cases = match_cases("match x:\n    case 2 | 4:\n        pass\n");
+        let after_second_arm =
+            narrow_scalar_subject(&after_first_arm, &or_cases[0].pattern, false, &environment, &kernel)
+                .expect("{2, 4} enumerates and `case 2 | 4:` proves a union of literals");
+        assert!(
+            after_second_arm.values.is_empty(),
+            "case 1: then case 2 | 4: together consume every admitted value: {{1, 2, 4}} minus {{1}} minus {{2, 4}} is empty"
+        );
     }
 
     /// A `Kind::Set` subject that enumerates a union-of-singletons form
@@ -1257,7 +1676,7 @@ mod tests {
     }
 
     #[test]
-    fn match_taken_environment_walks_in_order_and_poisons_after_undecidable_guard() {
+    fn match_taken_environment_walks_the_one_arm_a_single_valued_subject_takes() {
         let Some(kernel) = loaded_kernel() else { return };
         let cases = match_cases(concat!(
             "match x:\n",
@@ -1268,11 +1687,14 @@ mod tests {
         ));
         let subject = known_values(vec![2.0], PrimitiveKind::Number, TrustProved);
         let environment = empty_environment();
-        let result = match_taken_environment(&subject, &cases, &environment, &kernel);
-        let Some((index, _)) = result else {
-            panic!("case 2 must be decidably reached")
-        };
-        assert_eq!(index, 1, "the second arm (index 1) is the one that takes 2");
+        let mut walked: Vec<usize> = Vec::new();
+        let (_, falls_through) = match_taken_environment(&subject, None, &cases, &environment, &kernel, &mut |_body, _arm_env| {
+            walked.push(walked.len());
+            Some(true)
+        })
+        .expect("case 2 must be decidably reached");
+        assert!(falls_through, "an ordinary `pass` body survives");
+        assert_eq!(walked, vec![0], "a single-valued subject of 2 is a full-overlap arm: only `case 2:` walks, unconditionally");
     }
 
     #[test]
@@ -1288,7 +1710,7 @@ mod tests {
         let subject = known_values(vec![3.0], PrimitiveKind::Number, TrustProved);
         let environment = empty_environment();
         assert!(
-            match_taken_environment(&subject, &cases, &environment, &kernel).is_none(),
+            match_taken_environment(&subject, None, &cases, &environment, &kernel, &mut |_body, _arm_env| Some(true)).is_none(),
             "3 matches neither arm and there is no wildcard fallthrough"
         );
     }

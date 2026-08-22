@@ -62,6 +62,7 @@ use crate::builtin_models;
 use crate::bytes_models;
 use crate::bytes_models::BytesAnswer;
 use crate::collection_models;
+use crate::diagnostic_sentences;
 use crate::env;
 use crate::env::Environment;
 use crate::foreign_edge;
@@ -4709,7 +4710,7 @@ fn int_transfer_answer(
         kind: refined_kernel::transfer_questions::PowOperandKind::NaN,
         set: make_refined_set(vec![]),
     };
-    let asked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let asked = crate::kernel_ask::ask_kernel(|| {
         (kernel.transfer)(&refined_kernel::transfer_questions::TransferQuestion {
             op: transfer_op,
             a: left_set,
@@ -4718,7 +4719,7 @@ fn int_transfer_answer(
             base: nan_operand.clone(),
             exp: nan_operand,
         })
-    }));
+    });
     let answer = asked.ok()?;
     use refined_kernel::transfer_questions::TransferAnswerKind;
     match answer.kind {
@@ -4859,7 +4860,7 @@ fn shift_as_int_composition(
 /// function only PROVES the exclusion, it never guesses it, so any
 /// doubt routes to "may be zero."
 fn divisor_provably_excludes_zero(divisor: &RefinedSet, kernel: &Arc<RefinedTSKernel>) -> bool {
-    let asked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (kernel.member)(divisor, &[0.0])));
+    let asked = crate::kernel_ask::ask_kernel(|| (kernel.member)(divisor, &[0.0]));
     matches!(asked, Ok(false))
 }
 
@@ -4900,11 +4901,11 @@ fn split_divisor_transfer(
     use refined_kernel::transfer_questions::TransferQuestionOp;
 
     let ask_half = |divisor_half: RefinedSet| -> Option<refined_kernel::transfer_questions::TransferAnswer> {
-        let empty = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (kernel.scalar_empty)(&divisor_half)));
+        let empty = crate::kernel_ask::ask_kernel(|| (kernel.scalar_empty)(&divisor_half));
         if matches!(empty, Ok(true)) || empty.is_err() {
             return None;
         }
-        let asked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let asked = crate::kernel_ask::ask_kernel(|| {
             (kernel.transfer)(&TransferQuestion {
                 op: TransferQuestionOp::Div,
                 a: left_set.clone(),
@@ -4919,7 +4920,7 @@ fn split_divisor_transfer(
                     set: make_refined_set(vec![]),
                 },
             })
-        }));
+        });
         asked.ok()
     };
 
@@ -5059,7 +5060,7 @@ fn transfer_over_sets(
     let answer = if op == Operator::Div && !divisor_provably_excludes_zero(&right_set, kernel) {
         split_divisor_transfer(left_set, &right_set, kernel)?
     } else {
-        let asked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let asked = crate::kernel_ask::ask_kernel(|| {
             (kernel.transfer)(&refined_kernel::transfer_questions::TransferQuestion {
                 op: transfer_op,
                 a: left_set,
@@ -5074,7 +5075,7 @@ fn transfer_over_sets(
                     set: make_refined_set(vec![]),
                 },
             })
-        }));
+        });
         asked.ok()?
     };
     use refined_kernel::transfer_questions::TransferAnswerKind;
@@ -5344,6 +5345,13 @@ fn f64_to_exact_i64(value: f64) -> Option<i64> {
 /// answers `None` — this function never guesses at a raise the way it
 /// never guesses at a value.
 ///
+/// Every row here means every run raises, full stop — `check.rs::
+/// sink_value`'s own all-or-nothing gate (a fire here skips the value
+/// question entirely). A SOMETIMES-raises escape (some admitted operand
+/// values raise, the rest still produce a value) is a DIFFERENT claim
+/// and lives in its own function, `possible_raise` below — never a row
+/// here.
+///
 /// Recognized rows, each cited in the function that decides it: zero-
 /// divisor arithmetic (`/`, `//`, `%`), an out-of-range/absent
 /// subscript on a known List/Object, a bytes-like read/write whose
@@ -5422,10 +5430,9 @@ pub fn provable_raise(
 /// zero alongside other values (`age - age`'s own `[0, 0]` window
 /// against a `/`, for instance). A wider window that only ADMITS zero
 /// (e.g. `[0.0, 2.0]`) is a SOMETIMES-raises divisor, which this
-/// function must NOT fire on — `divisor_provably_excludes_zero` is the
-/// gate that keeps the VALUE question silent there instead
-/// (`transfer_over_sets`); firing an unconditional raise for a
-/// mostly-nonzero window would be a false positive, the same
+/// function must NOT fire on — `possible_raise`/`binop_possible_raise`
+/// below is that window's own row; firing an unconditional raise for a
+/// mostly-nonzero window here would be a false positive, the same
 /// overreach `rounding_argument_raises`' finite-argument gate avoids
 /// on the value side.
 fn binop_provable_raise(
@@ -5455,6 +5462,80 @@ fn binop_provable_raise(
     None
 }
 
+/// Whether `expression` (or a sub-expression `provable_raise`'s own
+/// pre-order walk already cleared) has a SOMETIMES-raising corner: some
+/// admitted operand values raise, the rest still produce a value this
+/// file determines. A DIFFERENT claim from `provable_raise`'s
+/// all-or-nothing one, and a DIFFERENT sink discipline follows from it
+/// — the finding and the value both stand at whatever sink this
+/// expression flows into; the sink decides how to combine them
+/// (`check.rs`'s own wiring, not this file's). `Some((range, message))`
+/// names the escaping expression's own range and the sentence
+/// `diagnostic_sentences.rs` builds for it; `None` when no recognized
+/// sometimes-raising shape applies.
+///
+/// Recognized rows, each cited in the function that decides it: a `/`
+/// divisor set that ADMITS zero without being entirely zero
+/// (`binop_possible_raise`).
+pub fn possible_raise(
+    expression: &Expr,
+    environment: &Environment,
+    kernel: &Arc<RefinedTSKernel>,
+) -> Option<(TextRange, String)> {
+    match expression {
+        Expr::BinOp(binop) => binop_possible_raise(binop, environment, kernel),
+        _ => None,
+    }
+}
+
+/// `x / d` where `d`'s set ADMITS zero without being entirely zero
+/// (e.g. `[0.0, 2.0]`) — a SOMETIMES-raises divisor: most real
+/// executions clear it, and `split_divisor_transfer`
+/// (`transfer_over_sets`) already determines the value question over
+/// the divisor's zero-excluded halves for exactly this shape. This row
+/// states the corner that determination cannot speak to as its own
+/// escape, the same claim strength this file's other escape fires
+/// carry — the finding and the split value both stand; neither
+/// withdraws the other. `divisor_provably_excludes_zero` gates the
+/// value question's OWN silence for this shape (`transfer_over_sets`);
+/// this row asks the same membership question this file already asks
+/// there, so the two never disagree about which windows admit zero.
+/// `binop_provable_raise`'s own always-zero rows are excluded by
+/// construction: a divisor this function reads as NOT provably
+/// excluding zero is either always-zero (that row's own claim, made
+/// there) or sometimes-zero (this row's claim) — the caller decides
+/// which question it is asking by which function it calls.
+///
+/// `split_divisor_transfer` is `/`'s own fix, and only `/`'s
+/// (`transfer_over_sets`'s own gate, `op == Operator::Div`) — `//` and
+/// `%` still ask the kernel over the WHOLE zero-admitting window, so a
+/// zero-admitting divisor already declines their value question
+/// outright rather than determine through a split. Firing this row for
+/// `//`/`%` would describe a split that does not run for them; it
+/// stays `/`-only until they gain their own.
+fn binop_possible_raise(
+    binop: &ruff_python_ast::ExprBinOp,
+    environment: &Environment,
+    kernel: &Arc<RefinedTSKernel>,
+) -> Option<(TextRange, String)> {
+    if binop.op != Operator::Div {
+        return None;
+    }
+    let right = evaluate_expression(&binop.right, environment, kernel);
+    if right.kind != Kind::Set {
+        return None;
+    }
+    if divisor_is_provably_always_zero(&right.set, kernel) {
+        // `binop_provable_raise`'s own row already speaks this window
+        // as an unconditional raise — not this function's claim to make.
+        return None;
+    }
+    if divisor_provably_excludes_zero(&right.set, kernel) {
+        return None;
+    }
+    Some((binop.range(), diagnostic_sentences::division_by_a_set_that_admits_zero()))
+}
+
 /// Whether a divisor SET's entire real range is nothing but zero — a
 /// nonempty subset of `{0.0}` (`kernel.scalar_subset`, guarded by
 /// `kernel.scalar_empty` since the empty set is vacuously a subset of
@@ -5464,11 +5545,11 @@ fn binop_provable_raise(
 /// containment ask keep), so there is no refusal to catch here.
 fn divisor_is_provably_always_zero(divisor: &RefinedSet, kernel: &Arc<RefinedTSKernel>) -> bool {
     let zero = make_refined_set(vec![one_of(&[0.0])]);
-    let empty = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (kernel.scalar_empty)(divisor)));
+    let empty = crate::kernel_ask::ask_kernel(|| (kernel.scalar_empty)(divisor));
     if matches!(empty, Ok(true)) || empty.is_err() {
         return false;
     }
-    let subset = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (kernel.scalar_subset)(divisor, &zero)));
+    let subset = crate::kernel_ask::ask_kernel(|| (kernel.scalar_subset)(divisor, &zero));
     matches!(subset, Ok(true))
 }
 
@@ -8607,7 +8688,9 @@ mod tests {
     /// never hit the zero corner, so an unconditional raise finding here
     /// would be a false positive. The VALUE question still declines
     /// (pinned above); this only confirms the RAISE question stays
-    /// silent rather than overreaching.
+    /// silent rather than overreaching. `binop_possible_raise` is this
+    /// window's own row (pinned below) — a DIFFERENT function, a
+    /// DIFFERENT claim, never this one's.
     #[test]
     fn test_provable_raise_stays_silent_for_a_set_divisor_that_only_sometimes_admits_zero() {
         let Some(kernel) = loaded_kernel() else { return };
@@ -8628,6 +8711,148 @@ mod tests {
             binop_provable_raise(&binop, &environment, &kernel).is_none(),
             "a sometimes-zero divisor window must not fire an unconditional raise"
         );
+    }
+
+    // --- `possible_raise` at a SET-SHAPED divisor ---
+
+    /// The escape row: a divisor set that only SOMETIMES admits zero
+    /// (`[0.0, 2.0]`) fires `binop_possible_raise`'s own sentence — a
+    /// DIFFERENT claim from `binop_provable_raise`'s unconditional
+    /// wording, and pinned against a DIFFERENT function: most real
+    /// executions never hit the zero corner, so an unconditional raise
+    /// finding would be a false positive, but the corner itself is a
+    /// real escape `split_divisor_transfer`'s own value determination
+    /// cannot speak to. Unguarded `1.0 / d` over this exact window still
+    /// DERIVES the split value: confirmed directly against
+    /// `binary_arithmetic_value_with_kernel` in the same test, so the
+    /// fire and the determination are pinned together rather than in
+    /// isolation — both stand; this row never withdraws the value, and
+    /// which sink decides how to combine the two is `check.rs`'s own
+    /// wiring, not this function's.
+    #[test]
+    fn test_possible_raise_fires_the_escape_sentence_for_a_set_divisor_that_only_sometimes_admits_zero() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let mut environment = empty_environment();
+        let denominator = AbstractValue {
+            kind_tag: Some(PrimitiveKind::Float),
+            ..known_set(
+                make_refined_set(vec![at_least(0.0), refined_sets::refinement_forms::at_most(2.0)]),
+                None,
+                TrustProved,
+                SetKindTag::None,
+            )
+        };
+        environment.bind("denominator", denominator.clone());
+        let parsed = parse_expression("1.0 / denominator").expect("test source must parse");
+        let Expr::BinOp(binop) = parsed.into_expr() else { panic!("expected a BinOp") };
+        let found = binop_possible_raise(&binop, &environment, &kernel);
+        let Some((_, message)) = found else {
+            panic!("a sometimes-zero divisor window must fire the escape sentence, not stay silent");
+        };
+        assert!(message.contains("admits 0"), "{message}");
+        assert!(message.contains("ZeroDivisionError"), "{message}");
+        assert!(
+            !message.contains("this expression provably raises"),
+            "the sometimes-zero row must not speak the always-zero rows' unconditional wording: {message}"
+        );
+
+        // the value side is not withdrawn: the same window still
+        // determines through `split_divisor_transfer`, unaffected by
+        // the new fire above
+        let one = known_values(vec![1.0], PrimitiveKind::Float, TrustProved);
+        let value = binary_arithmetic_value_with_kernel(Operator::Div, &one, &denominator, &kernel);
+        assert_eq!(
+            value.kind,
+            Kind::Set,
+            "the split value must still determine (never decline) alongside the fire: {value:?}"
+        );
+    }
+
+    /// The always-zero row must not ALSO fire `possible_raise` — the two
+    /// functions' claims are disjoint, keyed by `divisor_is_provably_
+    /// always_zero` on one side and its negation on the other, so an
+    /// always-zero window belongs to `binop_provable_raise` alone.
+    #[test]
+    fn test_possible_raise_stays_silent_for_a_divisor_that_is_always_zero() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let mut environment = empty_environment();
+        let always_zero = AbstractValue {
+            kind_tag: Some(PrimitiveKind::Float),
+            ..known_set(make_refined_set(vec![one_of(&[0.0])]), None, TrustProved, SetKindTag::None)
+        };
+        environment.bind("difference", always_zero);
+        let parsed = parse_expression("1 / difference").expect("test source must parse");
+        let Expr::BinOp(binop) = parsed.into_expr() else { panic!("expected a BinOp") };
+        assert!(
+            binop_possible_raise(&binop, &environment, &kernel).is_none(),
+            "an always-zero divisor is binop_provable_raise's own claim, not this row's"
+        );
+    }
+
+    /// The narrowing-interaction row: a divisor already narrowed AWAY
+    /// from zero (the shape `if divisor != 0:` leaves bound in
+    /// `environment` once the walk consumes that guard) must NOT fire —
+    /// `binop_possible_raise` reads `right` fresh off `environment` at
+    /// the ask (`evaluate_expression(&binop.right, environment, kernel)`
+    /// above), so a zero-excluding narrowed set is exactly what
+    /// `divisor_provably_excludes_zero` already reports `true` for, the
+    /// same gate the VALUE side reads in `transfer_over_sets` — the two
+    /// never disagree about which windows still admit zero.
+    #[test]
+    fn test_possible_raise_stays_silent_for_a_divisor_narrowed_away_from_zero() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let mut environment = empty_environment();
+        // the narrowed shape a consumed `if divisor != 0:` (or an
+        // equivalent guard) leaves behind: the zero-excluding POSITIVE
+        // half of the same window the fire test above admits zero over
+        let narrowed = AbstractValue {
+            kind_tag: Some(PrimitiveKind::Float),
+            ..known_set(
+                make_refined_set(vec![
+                    refined_sets::refinement_forms::above(0.0),
+                    refined_sets::refinement_forms::at_most(2.0),
+                ]),
+                None,
+                TrustProved,
+                SetKindTag::None,
+            )
+        };
+        environment.bind("denominator", narrowed);
+        let parsed = parse_expression("1.0 / denominator").expect("test source must parse");
+        let Expr::BinOp(binop) = parsed.into_expr() else { panic!("expected a BinOp") };
+        assert!(
+            binop_possible_raise(&binop, &environment, &kernel).is_none(),
+            "a divisor narrowed away from zero must not fire — the ask reads the narrowed set, not the pre-guard one"
+        );
+    }
+
+    /// `//` and `%` keep their EXISTING silence for a sometimes-zero
+    /// divisor: `split_divisor_transfer` is `/`'s own fix, not theirs,
+    /// so this escape row must not fire where no split runs — firing it
+    /// there would describe a value determination that does not happen
+    /// for these two operators.
+    #[test]
+    fn test_possible_raise_stays_silent_for_floordiv_and_mod_over_a_sometimes_zero_divisor() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let mut environment = empty_environment();
+        let denominator = AbstractValue {
+            kind_tag: Some(PrimitiveKind::Float),
+            ..known_set(
+                make_refined_set(vec![at_least(0.0), refined_sets::refinement_forms::at_most(2.0)]),
+                None,
+                TrustProved,
+                SetKindTag::None,
+            )
+        };
+        for source in ["1.0 // denominator", "1.0 % denominator"] {
+            environment.bind("denominator", denominator.clone());
+            let parsed = parse_expression(source).expect("test source must parse");
+            let Expr::BinOp(binop) = parsed.into_expr() else { panic!("expected a BinOp") };
+            assert!(
+                binop_possible_raise(&binop, &environment, &kernel).is_none(),
+                "{source}: `//`/`%` have no zero-excluded split, so the escape row must stay silent"
+            );
+        }
     }
 
     // --- string_set_concatenation / string_shaped_set ---

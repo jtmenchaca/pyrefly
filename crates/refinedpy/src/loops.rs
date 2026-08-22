@@ -658,13 +658,11 @@ fn written_names(body: &[Stmt], names: &mut std::collections::HashSet<String>) {
 /// the same posture every other refused containment ask in this crate
 /// already takes.
 fn stable_by_containment(narrower: &RefinedSet, wider: &RefinedSet, kernel: &Arc<RefinedTSKernel>) -> bool {
-    let scalar_asked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        (kernel.scalar_subset)(narrower, wider)
-    }));
+    let scalar_asked = crate::kernel_ask::ask_kernel(|| (kernel.scalar_subset)(narrower, wider));
     if let Ok(subset) = scalar_asked {
         return subset;
     }
-    let seq_asked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (kernel.seq_subset)(narrower, wider)));
+    let seq_asked = crate::kernel_ask::ask_kernel(|| (kernel.seq_subset)(narrower, wider));
     matches!(seq_asked, Ok(true))
 }
 
