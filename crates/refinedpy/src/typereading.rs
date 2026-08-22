@@ -1418,7 +1418,10 @@ mod tests {
 
     /// `Annotated[int, Field(ge=0)] | None` — the recursion into the
     /// non-None side of a `| None` union reaches an inline `Annotated`
-    /// form exactly as it would reach a bare alias name.
+    /// form exactly as it would reach a bare alias name. The compiled
+    /// forms arrive in `surface::canonical_scalar_form_order`'s order
+    /// (rays, then `Integer`), not the source's own `int`-then-`ge`
+    /// reading order.
     #[test]
     fn annotated_or_none_reads_with_admits_none_true() {
         let module = ruff_python_parser::parse_module(
@@ -1436,12 +1439,14 @@ mod tests {
         let got = declared_refinement(annotation, &aliases, &imports, &environment)
             .expect("Annotated[int, Field(ge=0)] | None resolves");
         assert!(got.admits_none);
-        assert_eq!(got.set, make_refined_set(vec![refined_sets::refinement_forms::integer(), at_least(0.0)]));
+        assert_eq!(got.set, make_refined_set(vec![at_least(0.0), refined_sets::refinement_forms::integer()]));
     }
 
     /// `Optional[Annotated[int, Field(ge=0)]]` — the recursion into
     /// `Optional[...]`'s inner expression reaches the same inline
-    /// `Annotated` form.
+    /// `Annotated` form. The compiled forms arrive in
+    /// `surface::canonical_scalar_form_order`'s order (rays, then
+    /// `Integer`), not the source's own `int`-then-`ge` reading order.
     #[test]
     fn optional_of_annotated_reads_with_admits_none_true() {
         let module = ruff_python_parser::parse_module(
@@ -1459,7 +1464,7 @@ mod tests {
         let got = declared_refinement(annotation, &aliases, &imports, &environment)
             .expect("Optional[Annotated[int, Field(ge=0)]] resolves");
         assert!(got.admits_none);
-        assert_eq!(got.set, make_refined_set(vec![refined_sets::refinement_forms::integer(), at_least(0.0)]));
+        assert_eq!(got.set, make_refined_set(vec![at_least(0.0), refined_sets::refinement_forms::integer()]));
     }
 
     /// `"Sequence[Age]"` — a quoted forward reference to

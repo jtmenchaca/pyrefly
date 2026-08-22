@@ -306,7 +306,40 @@ pub enum ForeignEdgeOutcome {
     /// The crossing escapes what the target states it admits: an
     /// RTS7001 the caller reports at `range` (the payload), never a
     /// decline — the call is wrong, so there is no fact to attach.
-    Fired { message: String, range: TextRange },
+    ///
+    /// An outbound fire and a bound return fact are INDEPENDENT truths
+    /// (the TypeScript checker's own ruled convention: `d-data-legs.ts`
+    /// measures exactly one fire with the return fact still bound) —
+    /// `consumer`, when `Some`, carries the return leg's own consumer
+    /// node AND its bound value, built the SAME way `return_leg_outcome`
+    /// builds `Override`'s own value (`foreign_return_value_or_
+    /// undetermined`, never re-derived), so the caller publishes that
+    /// REAL fact at the consumer node instead of leaving it opaque — the
+    /// consumer then judges the return against that determined value
+    /// (a refusal there is its own genuine fire, not this one repeated).
+    ///
+    /// `Some` ONLY for `ResultRead::FileRead` (`os.system`'s own
+    /// `json.load(<handle>)` read of a plain `open()` result, a shape
+    /// `expressions.rs` never models at all: an ordinary walk of that
+    /// node produces a bare opaque value with nothing else to say, so
+    /// binding the real fact there adds a determination, never removes
+    /// one). For every OTHER shape (`ResultRead::StdoutAttribute`/`Bare`
+    /// — an ordinary `json.loads(...)` call), `consumer` is
+    /// UNCONDITIONALLY `None`: an ordinary walk of that SAME node, left
+    /// unbound, reaches `expressions.rs`'s own `json.loads`-of-an-
+    /// untracked-operand model (`json_loads_value_space`, the full
+    /// None|bool|str|int|float|list|dict union), whose `None` arm the
+    /// return's declared type then genuinely refuses — a second,
+    /// DETERMINED RTS7001 this field must never replace with a narrower
+    /// bound value (`b-runners.py:159`, `c-reference-shapes.py:104`/
+    /// `:146`, `d-data-legs.py:184`'s own designed fires, each: "the
+    /// outbound refutation is trailed by the return judge's own union-
+    /// `None`-arm fire, since the return leg is never served once the
+    /// call itself is refused" — a narrower bound value there would
+    /// replace that determined union fire with a judge against a set
+    /// the corpus never designed this row to carry, possibly answering
+    /// determined-silent where the design calls for a second fire).
+    Fired { message: String, range: TextRange, consumer: Option<(TextRange, AbstractValue)> },
     /// The sentence naming the premise that stopped the edge (an
     /// RTS7002 the caller records as this body's blocker), and where it
     /// points.
@@ -382,6 +415,20 @@ pub fn foreign_edge_at_walrus_call(
     finish_recognized_edge_from_start(edge, arm_body, environment, kernel, entry_directory)
 }
 
+/// `discharge_edge_premises`'s own error: a `Decline` never had a
+/// consumer scan to run (the edge itself is not returned, since no
+/// caller needs it — a decline names a premise no later statement's
+/// walk can complete around); a `Fired` DOES need both `edge` AND
+/// `artifact` back — the caller (which alone holds `statements`) finds
+/// the return leg's sole consumer through `edge`, then builds that
+/// consumer's own bound value through `artifact`, the SAME two inputs
+/// `return_leg_outcome`'s own `Override` arm already needs for the
+/// identical build.
+enum EdgeDischargeError {
+    Fired { outcome: ForeignEdgeOutcome, edge: ForeignEdge, artifact: ForeignTsArtifact },
+    Decline(ForeignEdgeOutcome),
+}
+
 /// The post-recognition premises every recognized edge shares, whichever
 /// syntactic shape (`Stmt::Assign`, `Stmt::With`, or a walrus-bound call
 /// inside an `if` test) supplied it: resolve a relative target path,
@@ -399,11 +446,14 @@ fn discharge_edge_premises(
     environment: &Environment,
     kernel: &Arc<RefinedTSKernel>,
     entry_directory: Option<&std::path::Path>,
-) -> Result<(ForeignEdge, ForeignTsArtifact), ForeignEdgeOutcome> {
+) -> Result<(ForeignEdge, ForeignTsArtifact), EdgeDischargeError> {
     let mut edge = match edge {
         Ok(edge) => edge,
         Err(decline) => {
-            return Err(ForeignEdgeOutcome::Decline { message: decline.message, range: decline.range });
+            return Err(EdgeDischargeError::Decline(ForeignEdgeOutcome::Decline {
+                message: decline.message,
+                range: decline.range,
+            }));
         }
     };
     // A relative argv entry is relative to the FILE that wrote it, never
@@ -418,10 +468,10 @@ fn discharge_edge_premises(
     let artifact = match read_foreign_ts_artifact(&edge.target_path) {
         Ok(artifact) => artifact,
         Err(reason) => {
-            return Err(ForeignEdgeOutcome::Decline {
+            return Err(EdgeDischargeError::Decline(ForeignEdgeOutcome::Decline {
                 message: "the target ".to_owned() + &edge.target_path + " states no fact for this edge — " + &reason,
                 range: edge.call,
-            });
+            }));
         }
     };
     // RUNTIME IDENTITY: the artifact's own band names an ECMA-262 spec
@@ -434,22 +484,28 @@ fn discharge_edge_premises(
     // the target's surface states the one it actually reads — a JSON
     // transport model applies only when both name the SAME carrier.
     if let Some(mismatch) = channel_mismatch_decline(edge.channel, &artifact.surface) {
-        return Err(ForeignEdgeOutcome::Decline { message: mismatch, range: edge.call });
+        return Err(EdgeDischargeError::Decline(ForeignEdgeOutcome::Decline { message: mismatch, range: edge.call }));
     }
     // the OUTBOUND leg: every premise about what crosses out, discharged
-    // against the value the walk holds for it
+    // against the value the walk holds for it — a `Fired` outcome here
+    // carries `edge` AND `artifact` back out too, so the caller can
+    // still find the return leg's sole consumer and bind its own real
+    // fact under the fire, the same two inputs the green path needs.
     if let Some(outcome) = check_outbound_leg(&edge, &artifact, environment, kernel) {
-        return Err(outcome);
+        return Err(match outcome {
+            ForeignEdgeOutcome::Fired { .. } => EdgeDischargeError::Fired { outcome, edge, artifact },
+            other => EdgeDischargeError::Decline(other),
+        });
     }
     // CHANNEL PURITY: the wire is stdout, and the claim assumes stdout
     // carries exactly the serialized result
     if !artifact.called.stdout_pure {
-        return Err(ForeignEdgeOutcome::Decline {
+        return Err(EdgeDischargeError::Decline(ForeignEdgeOutcome::Decline {
             message: "the target ".to_owned() + &artifact.called.name + " does not state that it writes "
                 + "nothing else to stdout, and this edge reads its result off stdout — "
                 + "the channel-purity premise is undischarged",
             range: edge.call,
-        });
+        }));
     }
     Ok((edge, artifact))
 }
@@ -481,15 +537,75 @@ fn return_leg_outcome(consumer: ParseConsumer, artifact: &ForeignTsArtifact, cal
     }
 }
 
-/// `discharge_edge_premises` plus the return-leg scan — `sole_parse_
-/// consumer_of`'s bound-name scan (which skips past the call's own
-/// statement at `edge.consumer_scan_from`) for every ORDINARY shape, or
-/// `os_system_return_read_of`'s literal-outfile scan for `os.system`'s
-/// own `ResultRead::FileRead` shape, which has no bound name at all to
-/// scan for — the call's own captured target is the process's exit
-/// status, never the crossing's value. The `Stmt::Assign`/`Stmt::With`
-/// callers' own finish, unchanged from before the walrus entry point
-/// existed except for this one dispatch.
+/// The return leg's sole-consumer scan, run over the statements AFTER
+/// `edge.consumer_scan_from` — `os_system_return_read_of`'s literal-
+/// outfile scan for `os.system`'s own `ResultRead::FileRead` shape
+/// (which has no bound name to scan for at all: the call's own captured
+/// target is the process's exit status, never the crossing's value), or
+/// `sole_parse_consumer_of`'s bound-name scan for every ordinary shape.
+fn scan_sole_consumer(statements: &[Stmt], edge: &ForeignEdge) -> ParseConsumer {
+    match &edge.result_read {
+        ResultRead::FileRead { outfile } => match os_system_return_read_of(statements, edge.consumer_scan_from, outfile) {
+            Some(parse_range) => ParseConsumer::Found(parse_range),
+            None => ParseConsumer::Blocked(diagnostic_sentences::os_system_missing_return_read(outfile)),
+        },
+        _ => sole_parse_consumer_of(statements, edge.consumer_scan_from, &edge.result_name, &edge.result_read),
+    }
+}
+
+/// Fills a `Fired` outcome's `consumer` field from the scan the caller
+/// already ran (the SAME scan the green path reuses), building the
+/// consumer's own bound value through `foreign_return_value_or_
+/// undetermined(artifact)` — the IDENTICAL call `return_leg_outcome`'s
+/// own `Override` arm makes, never re-derived. The found range and
+/// value survive into `consumer` ONLY when `edge.result_read` is
+/// `ResultRead::FileRead` (`os.system`'s own `json.load(<handle>)` read,
+/// a shape `expressions.rs` never models at all: binding the real fact
+/// there adds a determination, never removes one). Every OTHER
+/// `result_read` shape (`StdoutAttribute`/`Bare` — an ordinary `json.
+/// loads(...)` call) has its own real fallback: left unbound, that node
+/// reaches `expressions.rs`'s `json.loads`-of-an-untracked-operand
+/// model, whose `None` arm the return's declared type genuinely
+/// refuses — a second, DETERMINED fire this function must never
+/// replace with a narrower bound value (`ForeignEdgeOutcome::Fired`'s
+/// own doc names the four corpus rows this exact confusion broke). A
+/// `FileRead` scan that comes back `NoneFound`/`Blocked`, or whose own
+/// return value itself degrades to a named undetermined (`Err` from
+/// `foreign_return_value_or_undetermined`), leaves `consumer` `None` —
+/// nothing real to bind. A `StdoutAttribute`/`Bare` scan always leaves
+/// `consumer` `None` regardless of its own outcome — the gate is on the
+/// SHAPE, never on whether a consumer or a value happens to exist.
+fn attach_consumer_to_fire(
+    outcome: ForeignEdgeOutcome,
+    edge: &ForeignEdge,
+    artifact: &ForeignTsArtifact,
+    consumer: ParseConsumer,
+) -> ForeignEdgeOutcome {
+    match outcome {
+        ForeignEdgeOutcome::Fired { message, range, .. } => {
+            let consumer = match (&edge.result_read, consumer) {
+                (ResultRead::FileRead { .. }, ParseConsumer::Found(parse_range)) => {
+                    foreign_return_value_or_undetermined(artifact).ok().map(|value| (parse_range, value))
+                }
+                _ => None,
+            };
+            ForeignEdgeOutcome::Fired { message, range, consumer }
+        }
+        other => other,
+    }
+}
+
+/// `discharge_edge_premises` plus the return-leg scan — the
+/// `Stmt::Assign`/`Stmt::With` callers' own finish, unchanged from
+/// before the walrus entry point existed except for this one dispatch.
+/// A `Fired` outbound leg still runs this SAME scan (`scan_sole_
+/// consumer`) before answering — `attach_consumer_to_fire` then binds
+/// the found consumer to its own real return-leg value ONLY for
+/// `os.system`'s own `FileRead` shape, whose consumer node has no
+/// fallback fact of its own; every other shape's found consumer is left
+/// unbound, since THAT node's own unbound walk is where the union-
+/// `None`-arm fire this edge's outbound refusal used to trail still
+/// needs to run.
 fn finish_recognized_edge(
     edge: Result<ForeignEdge, RecognitionDecline>,
     statements: &[Stmt],
@@ -499,15 +615,13 @@ fn finish_recognized_edge(
 ) -> Option<ForeignEdgeOutcome> {
     let (edge, artifact) = match discharge_edge_premises(edge, environment, kernel, entry_directory) {
         Ok(discharged) => discharged,
-        Err(outcome) => return Some(outcome),
+        Err(EdgeDischargeError::Fired { outcome, edge, artifact }) => {
+            let consumer = scan_sole_consumer(statements, &edge);
+            return Some(attach_consumer_to_fire(outcome, &edge, &artifact, consumer));
+        }
+        Err(EdgeDischargeError::Decline(outcome)) => return Some(outcome),
     };
-    let consumer = match &edge.result_read {
-        ResultRead::FileRead { outfile } => match os_system_return_read_of(statements, edge.consumer_scan_from, outfile) {
-            Some(parse_range) => ParseConsumer::Found(parse_range),
-            None => ParseConsumer::Blocked(diagnostic_sentences::os_system_missing_return_read(outfile)),
-        },
-        _ => sole_parse_consumer_of(statements, edge.consumer_scan_from, &edge.result_name, &edge.result_read),
-    };
+    let consumer = scan_sole_consumer(statements, &edge);
     return_leg_outcome(consumer, &artifact, edge.call)
 }
 
@@ -515,7 +629,14 @@ fn finish_recognized_edge(
 /// (`sole_parse_consumer_from`, over the whole of `statements` — no call
 /// statement to skip past) — `foreign_edge_at_walrus_call`'s own finish,
 /// since its recognized call sits inside the `if` TEST rather than as a
-/// member of `statements` at all.
+/// member of `statements` at all. `foreign_edge_at_walrus_call` only
+/// ever reaches `recognize_subprocess_callee` (never `recognize_os_
+/// system`), so a `Fired` outbound leg here can never carry `ResultRead
+/// ::FileRead` — `attach_consumer_to_fire` always answers `consumer:
+/// None` on this path, the same as `finish_recognized_edge`'s own
+/// non-`FileRead` shapes, for the identical reason: the found consumer
+/// belongs to an ordinary `json.loads(...)` node whose own union-`None`
+/// -arm fire must still run unbound.
 fn finish_recognized_edge_from_start(
     edge: Result<ForeignEdge, RecognitionDecline>,
     statements: &[Stmt],
@@ -525,7 +646,11 @@ fn finish_recognized_edge_from_start(
 ) -> Option<ForeignEdgeOutcome> {
     let (edge, artifact) = match discharge_edge_premises(edge, environment, kernel, entry_directory) {
         Ok(discharged) => discharged,
-        Err(outcome) => return Some(outcome),
+        Err(EdgeDischargeError::Fired { outcome, edge, artifact }) => {
+            let consumer = sole_parse_consumer_from(statements, &edge.result_name, &edge.result_read);
+            return Some(attach_consumer_to_fire(outcome, &edge, &artifact, consumer));
+        }
+        Err(EdgeDischargeError::Decline(outcome)) => return Some(outcome),
     };
     let consumer = sole_parse_consumer_from(statements, &edge.result_name, &edge.result_read);
     return_leg_outcome(consumer, &artifact, edge.call)
@@ -3196,6 +3321,11 @@ fn foreign_scalar_subset(kernel: &Arc<RefinedTSKernel>, a: &RefinedSet, b: &Refi
 
 /// Builds the `Fired` outcome: an RTS7001 sentence with the target's own
 /// provenance appended, the way the Go twin's `foreignMessage` does.
+/// `consumer` always starts `None` here — `fire_at` runs from inside the
+/// OUTBOUND leg's own check, before the return leg's consumer scan has
+/// run at all; `finish_recognized_edge`/`finish_recognized_edge_from_start`
+/// fill it in once discharge answers `Fired`, running that scan the same
+/// way they would for a green crossing.
 fn fire_at(range: TextRange, said: String, artifact: &ForeignTsArtifact) -> ForeignEdgeOutcome {
     ForeignEdgeOutcome::Fired {
         message: diagnostic_sentences::foreign_crossing_refusal(
@@ -3205,6 +3335,7 @@ fn fire_at(range: TextRange, said: String, artifact: &ForeignTsArtifact) -> Fore
             &artifact.called.provenance_said,
         ),
         range,
+        consumer: None,
     }
 }
 
@@ -5006,11 +5137,14 @@ mod tests {
     /// `None` arm. The fold now recognizes `runner` as `Runner::Node`, so
     /// the call proceeds to the OUTBOUND-LEG fit ask — and THAT fires
     /// too, at the payload, since an unbounded float list genuinely
-    /// escapes `audio_level.ts`'s stated `[-2, 2]` entry (a `Fired`
-    /// outcome publishes no override, so the return statement still
-    /// reads `result.stdout` generically afterward — the fixture's own
-    /// row now names TWO findings where it used to name one, not a
-    /// silence flip).
+    /// escapes `audio_level.ts`'s stated `[-2, 2]` entry. `consumer` stays
+    /// `None` here: this is `ResultRead::StdoutAttribute` (an ordinary
+    /// `json.loads(result.stdout)` call), whose own unbound walk still
+    /// reaches `expressions.rs`'s union-of-the-full-JSON-value-space
+    /// model and fires its OWN determined `None`-arm RTS7001 at the
+    /// return — the corpus's own designed SECOND finding for this exact
+    /// row, which a bound `consumer` here would have wrongly replaced
+    /// with a judge against a narrower set the row never claims.
     #[test]
     fn a_runner_held_in_a_variable_with_an_unbounded_element_fires_at_the_outbound_leg() {
         register_fixture_artifact("./audio_level.ts", audio_level_ts_artifact());
@@ -5033,8 +5167,14 @@ mod tests {
         };
         let environment = env_with(&[("boosted", unbounded_boosted), ("runner", string_literal_value_for_test("node"))]);
         match foreign_edge_at(&body, 1, &environment, &kernel, None).expect("the runner-variable call still recognizes") {
-            ForeignEdgeOutcome::Fired { message, .. } => {
+            ForeignEdgeOutcome::Fired { message, consumer, .. } => {
                 assert!(message.contains("outside the target's stated entry set"), "{message}");
+                assert!(
+                    consumer.is_none(),
+                    "an ordinary json.loads(result.stdout) consumer must stay unbound — its own \
+                     union-None-arm fire is the row's designed second finding, not a value to replace it with: \
+                     {consumer:?}"
+                );
             }
             ForeignEdgeOutcome::Override { .. } => panic!("wanted a fire — an unbounded float list must not fit [-2, 2]"),
             ForeignEdgeOutcome::Decline { message, .. } => panic!("wanted a fire, got a decline: {message}"),
@@ -5113,6 +5253,49 @@ mod tests {
             ForeignEdgeOutcome::Override { .. } => {}
             ForeignEdgeOutcome::Decline { message, .. } => panic!("wanted an override, got a decline: {message}"),
             ForeignEdgeOutcome::Fired { message, .. } => panic!("wanted an override, got a fire: {message}"),
+        }
+    }
+
+    /// `a-invocation-functions.py`'s own `level_via_os_system` shape,
+    /// EXACTLY: an UNBOUNDED `boosted` element escapes `audio_level.ts`'s
+    /// stated `[-2, 2]` entry, so the outbound leg fires before the
+    /// return leg's own `os_system_return_read_of` scan would otherwise
+    /// run. `finish_recognized_edge` runs that SAME scan under the fire
+    /// (`scan_sole_consumer`'s `FileRead` arm), so `consumer` binds the
+    /// `json.load(handle)` node inside the trailing `with open("out.json")`
+    /// block to `audio_level.ts`'s own stated return set — the SAME
+    /// value `foreign_return_value_or_undetermined` builds for the green
+    /// `Override` path, built here from the SAME artifact even though
+    /// the outbound leg refused. The fire and the bound return fact are
+    /// independent truths: this row reports one fire, and the consumer
+    /// judges the real fact rather than falling to an unbound catch-all.
+    #[test]
+    fn os_system_with_an_unbounded_element_fires_and_still_binds_the_file_read_consumer() {
+        let source = concat!(
+            "def f(boosted):\n",
+            "    with open(\"in.json\", \"w\") as infile:\n",
+            "        json.dump(boosted, infile)\n",
+            "    exit_code = os.system(\"node ./audio_level.ts < in.json > out.json\")\n",
+            "    with open(\"out.json\") as handle:\n",
+            "        return json.load(handle)\n",
+        );
+        let body = def_body(source);
+        register_fixture_artifact("./audio_level.ts", audio_level_ts_artifact());
+        let unbounded_boosted = AbstractValue {
+            kind_tag: Some(PrimitiveKind::Float),
+            ..known_set(repetition(make_refined_set(vec![at_least(f64::NEG_INFINITY)]), 1, None), None, TrustProved, SetKindTag::None)
+        };
+        let environment = env_with(&[("boosted", unbounded_boosted)]);
+        let Some(kernel) = loaded_kernel() else { return };
+        match foreign_edge_at(&body, 1, &environment, &kernel, None).expect("os.system's file legs are still recognized") {
+            ForeignEdgeOutcome::Fired { message, consumer, .. } => {
+                assert!(message.contains("outside the target's stated entry set"), "{message}");
+                let (_, value) = consumer.expect("the fired edge's sole json.load(handle) consumer must be bound");
+                assert_eq!(value.kind, Kind::Set);
+                assert_eq!(value.kind_tag, Some(PrimitiveKind::Integer));
+            }
+            ForeignEdgeOutcome::Override { .. } => panic!("wanted a fire — an unbounded float list must not fit [-2, 2]"),
+            ForeignEdgeOutcome::Decline { message, .. } => panic!("wanted a fire, got a decline: {message}"),
         }
     }
 

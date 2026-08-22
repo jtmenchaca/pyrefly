@@ -626,8 +626,20 @@ fn serve_foreign_edge_at(
                 foreign_edge_overrides.insert(consumer_position, (parse_range, value));
             }
         }
-        foreign_edge::ForeignEdgeOutcome::Fired { message, range } => {
+        foreign_edge::ForeignEdgeOutcome::Fired { message, range, consumer } => {
             out.push(Finding { range, code: "RTS7001", message });
+            // The TS convention taken literally: an outbound fire and a
+            // bound return fact are independent truths, so the sole
+            // consumer of a fired FileRead edge still binds the
+            // artifact's own return-leg value (carried on the Fired
+            // outcome, built by the same reader the serving path uses)
+            // and judges it for real — one edge, its fire, and a
+            // determined read.
+            if let Some((consumer_range, value)) = consumer {
+                if let Some(consumer_position) = foreign_edge_consumer_position(body, position, consumer_range) {
+                    foreign_edge_overrides.insert(consumer_position, (consumer_range, value));
+                }
+            }
         }
         foreign_edge::ForeignEdgeOutcome::Decline { message, range } => {
             record_blocker(blocked, range, message, out);
@@ -856,16 +868,17 @@ fn walk_body_with_self_binding(
         let recognized = match stmt {
             Stmt::For(for_stmt) if for_stmt.orelse.is_empty() => {
                 relational_sum::recognize_accumulation(for_stmt, &environment)
-                    .map(|recognized| (recognized, Some(for_stmt.target.as_ref())))
+                    .map(|recognized| (recognized, Some(for_stmt.target.as_ref()), None))
             }
             Stmt::Assign(assign) => relational_sum::recognize_generator_sum(assign, &environment)
-                .map(|recognized| (recognized, None)),
+                .map(|recognized| (recognized, None, Some(assign.range()))),
             _ => None,
         };
-        if let Some((recognized, loop_target)) = recognized {
+        if let Some((recognized, loop_target, bound_at)) = recognized {
             match walk_relational_sum(
                 recognized,
                 loop_target,
+                bound_at,
                 &body[position + 1..],
                 &mut environment,
             ) {
@@ -2448,8 +2461,22 @@ fn serve_foreign_edge_in_walrus_test(
                 foreign_edge_overrides.insert(consumer_position, (parse_range, value));
             }
         }
-        foreign_edge::ForeignEdgeOutcome::Fired { message, range } => {
+        foreign_edge::ForeignEdgeOutcome::Fired { message, range, consumer } => {
             out.push(Finding { range, code: "RTS7001", message });
+            // The TS convention taken literally: the fired FileRead
+            // edge's sole consumer still binds the artifact's carried
+            // return-leg value and judges it for real — one edge, its
+            // fire, and a determined read.
+            if let Some((consumer_range, value)) = consumer {
+                if let Some(consumer_position) = arm_body
+                    .iter()
+                    .enumerate()
+                    .find(|(_, statement)| statement.range().contains_range(consumer_range))
+                    .map(|(position, _)| position)
+                {
+                    foreign_edge_overrides.insert(consumer_position, (consumer_range, value));
+                }
+            }
         }
         foreign_edge::ForeignEdgeOutcome::Decline { message, range } => {
             record_blocker(blocked, range, message, out);
@@ -2753,6 +2780,7 @@ fn arm_terminates_or_provably_raises(body: &[Stmt], out: &[Finding], findings_be
 fn walk_relational_sum(
     mut recognized: relational_sum::RecognizedAccumulation,
     loop_target: Option<&Expr>,
+    bound_at: Option<TextRange>,
     following: &[Stmt],
     environment: &mut Environment,
 ) -> RelationalSum {
@@ -2838,7 +2866,20 @@ fn walk_relational_sum(
     // enclosure is unbounded (sign-straddling step, unbounded count) is
     // forgotten instead — the ledger's quotient below still stands.
     match answer.total {
-        Some(total) => environment.bind(&recognized.total_name, total),
+        Some(total) => {
+            // The SAME publish an ordinary `total = <value>` gets from
+            // `evaluate_expression`'s own record_evaluation call
+            // (expressions.rs) — this recognizer consumes the whole
+            // Assign statement before that ordinary evaluation ever
+            // runs, so without this the binding's own position answers
+            // no set at `refined_set_at_position` (bound_at is `None`
+            // for the For-loop accumulation shape, which has no single
+            // Assign statement to record against).
+            if let Some(range) = bound_at {
+                environment.record_evaluation(range, total.clone());
+            }
+            environment.bind(&recognized.total_name, total);
+        }
         None => environment.forget(&recognized.total_name),
     }
     // The quotient rides its own slot, so the divided name carries
@@ -6803,6 +6844,39 @@ mod tests {
         let set = refined_set_at_position(&module, no_imports_resolver(), &kernel, position)
             .unwrap_or_else(|| panic!("expected a declared set at the return annotation"));
         assert_eq!(format_for_diagnostics(&set), ">= 0 && <= 1");
+    }
+
+    /// Ledger 260: `total`'s own position in `audio_level_unclamped.py`
+    /// (`total = sum(s * s for s in samples)`) now answers the derived
+    /// total's set — `walk_relational_sum` records the kernel's proved
+    /// total at the Assign statement's own range the same way an
+    /// ordinary assignment's RHS records its evaluated node
+    /// (`expressions.rs::evaluate_expression`'s `record_evaluation`
+    /// call), so `refined_set_at_position` finds it as the smallest
+    /// covering recorded range. Was pinned the other way
+    /// (`the_measured_total_position_answers_no_set_today`,
+    /// refinedpy_lsp/src/lib.rs) before this unit threaded the publish
+    /// through.
+    #[test]
+    fn the_measured_total_position_now_answers_the_derived_set() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let source = concat!(
+            "import math\n",
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "Sample = Annotated[float, Field(ge=-2.0, le=2.0)]\n",
+            "Level = Annotated[float, Field(ge=0.0, le=1.0)]\n",
+            "\n",
+            "def audio_level_unclamped(samples: Annotated[list[Sample], Field(min_length=1)]) -> Level:\n",
+            "    total = sum(s * s for s in samples)\n",
+            "    return math.sqrt(total / len(samples))\n",
+        );
+        let module = parsed(source);
+        let position = offset_of(source, "total = sum");
+        assert!(
+            refined_set_at_position(&module, no_imports_resolver(), &kernel, position).is_some(),
+            "total's own position must answer the kernel's derived set now that the recognizer publishes it"
+        );
     }
 
     /// A position that names neither a parameter's own annotation, a

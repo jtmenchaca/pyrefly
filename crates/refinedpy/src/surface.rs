@@ -21,7 +21,7 @@ use refined_sets::codepoint_sets::{string_tuple, strings, without_string_ground}
 use refined_sets::format_for_diagnostics::format_for_diagnostics;
 use refined_sets::regex_compiler::format_grammar;
 use refined_sets::refinement_forms::{
-    Refinement, RefinedSet, above, at_least, at_most, below, integer, make_refined_set,
+    Form, Refinement, RefinedSet, above, at_least, at_most, below, integer, make_refined_set,
     multiple_of, numbers, one_of, union,
 };
 use refined_sets::repetition_window_forms::repetition;
@@ -461,6 +461,32 @@ fn string_literal_set(members: &[String]) -> RefinedSet {
     set
 }
 
+/// A stable priority for a scalar `Annotated[...]` alias's own compiled
+/// forms, matching the Go adapter's diagnostic formatter convention
+/// (`chain_numeric_method`'s own ordering, e.g. `>= 97 && <= 122 &&
+/// integer`) so the two adapters' compiled sets agree on form order for
+/// the same annotation — the cross-adapter battery's own
+/// `numeric-window-int-multiple-of` row compares them positionally.
+/// Rays first (`atLeast`/`above`, then `atMost`/`below`), then
+/// `Integer`, then `MultipleOf`, then every other form in its existing
+/// relative order (`sort_by_key` is stable, so ties never reorder).
+///
+/// Scoped to THIS function's own two `make_refined_set` call sites only
+/// — never applied inside `refinement_forms::make_refined_set` itself,
+/// which every other caller in the tree also uses to build a
+/// `RefinedSet` from an already-ordered `forms` vec; sorting there would
+/// reorder every compiled artifact's wire form, not just a scalar
+/// `Annotated[...]` alias's.
+fn canonical_scalar_form_order(form: &Refinement) -> u8 {
+    match form.form {
+        Form::AtLeast | Form::Above => 0,
+        Form::AtMost | Form::Below => 1,
+        Form::Integer => 2,
+        Form::MultipleOf => 3,
+        _ => 4,
+    }
+}
+
 /// `Annotated[int|float|str|list[X]|set[X]|Sequence[X], Field(…), …]` →
 /// the stated set, resolved against the module's import identities. The
 /// `Annotated` head name must itself resolve to an import of
@@ -643,6 +669,7 @@ pub fn annotated_expression_set(
         } else {
             None
         };
+        forms.sort_by_key(canonical_scalar_form_order);
         return Some((make_refined_set(forms), length_window));
     }
     if min_length.is_some() || max_length.is_some() {
@@ -660,6 +687,7 @@ pub fn annotated_expression_set(
         forms.retain(|f| f != plain_ground);
         forms.extend(std::mem::take(&mut window.forms));
     }
+    forms.sort_by_key(canonical_scalar_form_order);
     Some((make_refined_set(forms), None))
 }
 
@@ -1292,7 +1320,10 @@ mod tests {
 
     /// `Annotated[int, Ge(0), Le(120)]` compiles the same set
     /// `Annotated[int, Field(ge=0, le=120)]` would — m-pydantic-schema.py's
-    /// `AgeAT` shape.
+    /// `AgeAT` shape. The compiled forms arrive in
+    /// `canonical_scalar_form_order`'s order (rays, then `Integer`)
+    /// rather than the source's own `int`-then-`Ge`-then-`Le` reading
+    /// order.
     #[test]
     fn ge_and_le_constructors_compile_the_same_set_field_kwargs_would() {
         let module = parsed(
@@ -1304,7 +1335,7 @@ mod tests {
         let compiled = out.get("AgeAT").expect("AgeAT compiles");
         assert_eq!(
             compiled.set,
-            make_refined_set(vec![integer(), at_least(0.0), at_most(120.0)])
+            make_refined_set(vec![at_least(0.0), at_most(120.0), integer()])
         );
     }
 
@@ -1329,7 +1360,11 @@ mod tests {
     }
 
     /// `Gt`/`Lt`/`MultipleOf` each recognized by their own import
-    /// identity, matching `Field`'s `gt`/`lt`/`multiple_of` kwargs.
+    /// identity, matching `Field`'s `gt`/`lt`/`multiple_of` kwargs. The
+    /// compiled forms arrive in `canonical_scalar_form_order`'s own
+    /// order (rays, then `Integer`, then `MultipleOf`) rather than the
+    /// source's own `int`-then-`Gt`-then-`Lt`-then-`MultipleOf` reading
+    /// order.
     #[test]
     fn gt_lt_and_multiple_of_constructors_compile_the_matching_forms() {
         let module = parsed(
@@ -1341,7 +1376,29 @@ mod tests {
         let compiled = out.get("EvenAge").expect("EvenAge compiles");
         assert_eq!(
             compiled.set,
-            make_refined_set(vec![integer(), above(0.0), below(120.0), multiple_of(2.0)])
+            make_refined_set(vec![above(0.0), below(120.0), integer(), multiple_of(2.0)])
+        );
+    }
+
+    /// The cross-adapter battery's `numeric-window-int-multiple-of` row:
+    /// `Annotated[int, Field(ge=0, le=100, multiple_of=5)]` compiles its
+    /// four forms in `canonical_scalar_form_order`'s priority — rays
+    /// first (`atLeast`/`above`, `atMost`/`below`), then `Integer`, then
+    /// `MultipleOf` — matching the Go adapter's golden order rather than
+    /// the source's own `int`-then-`ge`-then-`le`-then-`multiple_of`
+    /// reading order.
+    #[test]
+    fn a_numeric_window_with_multiple_of_compiles_in_canonical_form_order() {
+        let module = parsed(
+            "from pydantic import Field\n\
+             from typing import Annotated\n\
+             type Bounded = Annotated[int, Field(ge=0, le=100, multiple_of=5)]\n",
+        );
+        let out = compile_aliases(&module);
+        let compiled = out.get("Bounded").expect("Bounded compiles");
+        assert_eq!(
+            compiled.set,
+            make_refined_set(vec![at_least(0.0), at_most(100.0), integer(), multiple_of(5.0)])
         );
     }
 

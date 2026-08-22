@@ -441,6 +441,87 @@ fn narrow_scalar_subject(
     Some(known_values(kept, kind_tag, grade))
 }
 
+/// The bare name a `case x:` capture binds — a `Pattern::MatchAs` with
+/// no inner sub-pattern and a real (non-wildcard) name. `None` for a
+/// wildcard `case _:` (`as_pattern.name` is itself `None` there), an
+/// `as`-wrapped sub-pattern (`case <pattern> as x:` — the SUBPATTERN
+/// decides this arm, not a bare capture), or any other pattern shape.
+/// This is the ONLY pattern shape the guard-narrowing split below reads:
+/// a guard on a literal/or/sequence/mapping/class pattern keeps today's
+/// binary semantics, exactly as `narrow_scalar_subject` already declines
+/// (returns `None`) for every one of those shapes too.
+fn bare_capture_name(pattern: &Pattern) -> Option<&str> {
+    let Pattern::MatchAs(as_pattern) = pattern else {
+        return None;
+    };
+    if as_pattern.pattern.is_some() {
+        return None;
+    }
+    Some(as_pattern.name.as_ref()?.id.as_str())
+}
+
+/// The guarded twin of `narrow_scalar_subject`, for the one pattern
+/// shape that function's own scalar-literal proof cannot read at all: a
+/// BARE CAPTURE (`case x:`) whose arm carries a GUARD that is itself a
+/// comparison `narrowing.rs`'s own reader already proves
+/// (`narrowing::guard_narrowed_values`, which runs the guard through
+/// `assume` — the SAME comparison-narrowing leaf every `if`/`elif`
+/// condition in this checker already reads, never reimplemented here).
+/// `case x if x == 1: / case x if x == 2: / case _:` over `oneOf(1, 2,
+/// 4)` splits identically to the literal spelling `case 1: / case 2:
+/// / case _:` through this same function, called the same way
+/// `match_taken_environment` already calls `narrow_scalar_subject` for a
+/// literal pattern's own split. A guard `assume`'s own channels do not
+/// read at all (`x in (2, 4)` — membership over a `Kind::Values`
+/// binding is the SET channel's own leaf, which needs `Kind::Set`) is
+/// `guard_narrowed_values`'s own decline, not this function's — it never
+/// widens the comparison reader's own coverage to match the literal
+/// pattern's OR/membership vocabulary.
+///
+/// `keep_matched: true` asks the guard's OWN admitted values (`assume`'s
+/// `truth: true`) — the arm's narrowed walk, intersected with
+/// `remaining_subject` so a guard that (wrongly, or by construction)
+/// admits values the subject never carried is never widened past what
+/// the subject already stated. `keep_matched: false` asks the guard's
+/// OWN excluded values (`truth: false`) — the difference every LATER arm
+/// and the wildcard must still see, the same DIFFERENCE role
+/// `narrow_scalar_subject`'s own `false` arm plays for a literal
+/// pattern's split.
+///
+/// `None` when the pattern is not a bare capture, there is no guard, the
+/// subject does not enumerate, or `guard_narrowed_values` itself declines
+/// (a guard shape `narrowing.rs`'s comparison reader does not prove) —
+/// the caller's own job to fall back to today's binary guard semantics
+/// for that arm, never to guess a split the guard's own reader could not
+/// prove. This function answers each `keep_matched` side independently;
+/// `match_taken_environment`'s own caller requires BOTH the
+/// `keep_matched: true` and `keep_matched: false` calls to answer `Some`
+/// before treating the arm as split — a lone side is never enough (see
+/// that function's own doc).
+fn guarded_bare_capture_narrowed(
+    subject: &AbstractValue,
+    pattern: &Pattern,
+    guard: Option<&Expr>,
+    keep_matched: bool,
+    kernel: &Arc<RefinedTSKernel>,
+) -> Option<AbstractValue> {
+    let name = bare_capture_name(pattern)?;
+    let guard = guard?;
+    enumerable_numeric_members(subject)?;
+    let subject_kind_tag = subject.kind_tag?;
+    let narrowed = crate::narrowing::guard_narrowed_values(guard, name, subject, kernel, keep_matched)?;
+    if narrowed.kind_tag != Some(subject_kind_tag) {
+        return None;
+    }
+    let subject_members = enumerable_numeric_members(subject).expect("checked Some above");
+    let kept: Vec<f64> = subject_members
+        .into_iter()
+        .filter(|member| narrowed.values.contains(member))
+        .collect();
+    let grade = min_trust_level(trust_level_of(subject), TrustProved);
+    Some(known_values(kept, subject_kind_tag, grade))
+}
+
 /// The code-point vector an AbstractValue carries, if it is a known
 /// exact string (`Kind::Values` tagged `PrimitiveKind::String`) —
 /// `expressions.rs::exact_string_values`'s own twin, reimplemented
@@ -1075,6 +1156,27 @@ fn rebind_split_subject(
 ///   scalar-decidable even though the subject is, so this arm keeps
 ///   TODAY'S binary semantics: unconditional Taken, no split.
 ///
+/// A GUARDED BARE CAPTURE (`case x if <condition>:`) is tried BEFORE
+/// `arm_outcome` is ever called for that arm: `guarded_bare_capture_
+/// narrowed` asks `narrowing::guard_narrowed_values` — the SAME
+/// comparison-narrowing reader `assume` gives every `if`/`elif` — for
+/// the guard's own admitted (`keep_matched: true`) AND excluded
+/// (`keep_matched: false`) values, and this path is taken only when BOTH
+/// answer `Some` (a lone proved side is never enough — reading the
+/// unproved side as "admits/excludes everything" would manufacture a
+/// claim the guard's own reader never made); it then supersedes
+/// `arm_outcome`'s own binary evaluation, which would otherwise run the
+/// guard against a single arm environment holding the WHOLE
+/// `remaining_subject` and decline (`Undecidable`) the moment that
+/// evaluation is not a single known boolean. `case x if x == 1: / case x
+/// if x == 2: / case _:` over `oneOf(1, 2, 4)` therefore splits
+/// IDENTICALLY to the literal spelling `case 1: / case 2: / case _:`
+/// through this same intersection/difference/full-overlap reading. A
+/// guard the reader cannot prove both sides of (both calls answer `None`
+/// — e.g. `x in (2, 4)`, membership over a `Kind::Values` binding, which
+/// is the SET channel's own leaf and needs `Kind::Set`) falls through to
+/// `arm_outcome`'s existing binary semantics unchanged.
+///
 /// An `Undecidable` arm still poisons every LATER arm exactly as
 /// before — this file cannot rule out that arm having actually run.
 /// When no EARLIER arm's body has walked yet, the whole match declines
@@ -1110,6 +1212,74 @@ pub fn match_taken_environment(
         // ever see, so its body never walks and it never joins.
         if enumerable_numeric_members(&remaining_subject).is_some_and(|members| members.is_empty()) {
             continue;
+        }
+        // GUARDED BARE-CAPTURE SPLIT: `case x if <condition>:` over a
+        // multi-valued `remaining_subject` — `arm_outcome`'s own
+        // `apply_guard` evaluates the guard against a SINGLE arm
+        // environment where `x` is bound to the WHOLE remaining subject,
+        // so a guard like `x == 1` evaluates to a multi-valued/unknown
+        // boolean there and `known_boolean` declines, poisoning every
+        // later arm through the `Undecidable` branch below — exactly the
+        // binary reading a decidable scalar subject must NOT get, the
+        // same problem a literal pattern's own split
+        // (`narrow_scalar_subject`) already solves for `case 1:`. Tried
+        // BEFORE `arm_outcome`, so a guard the reader proves something
+        // about never reaches that binary evaluation at all: the guard's
+        // own admitted values (`keep_matched: true`) decide this arm's
+        // split exactly like a literal pattern's intersection would, and
+        // its excluded values (`keep_matched: false`) become the
+        // difference threaded onward.
+        //
+        // BOTH calls must answer `Some` before this path is taken — a
+        // lone `Some` (one direction proved, the other not) is never
+        // enough: reading the UNPROVED side as "the guard admits/excludes
+        // everything" would silently manufacture a claim the guard's own
+        // reader never made, exactly the unsoundness a decline exists to
+        // prevent. `narrow_name_against_literal`'s own `filter` runs on
+        // both `truth` values together for every comparison this reader
+        // recognizes, so a genuinely provable guard always answers both;
+        // requiring both costs nothing on the shapes this file actually
+        // proves and closes the asymmetric gap on every shape it does
+        // not. `None` from either call (the guard is not one shape
+        // `narrowing::guard_narrowed_values` proves) falls through to
+        // `arm_outcome`'s own binary reading unchanged.
+        if case.guard.is_some() {
+            let guarded_intersection =
+                guarded_bare_capture_narrowed(&remaining_subject, &case.pattern, case.guard.as_deref(), true, kernel);
+            let guarded_difference =
+                guarded_bare_capture_narrowed(&remaining_subject, &case.pattern, case.guard.as_deref(), false, kernel);
+            if let (Some(intersected), Some(difference)) = (guarded_intersection, guarded_difference) {
+                if intersected.values.is_empty() {
+                    // the guard admits none of what remains: this arm is
+                    // a dead arm, the same NotTaken every other
+                    // unreachable arm answers — thread the difference
+                    // onward and keep scanning.
+                    remaining_subject = difference;
+                    continue;
+                }
+                let mut arm_env = environment.fork();
+                if let Some(name) = bare_capture_name(&case.pattern) {
+                    arm_env.bind(name, intersected.clone());
+                }
+                if is_full_overlap(&intersected, &remaining_subject) {
+                    // the guard admits every remaining value: unconditional
+                    // Taken, no later arm is ever reached, mirroring the
+                    // literal-pattern full-overlap reading above.
+                    if let Some(name) = subject_name {
+                        arm_env.bind(name, intersected.clone());
+                    }
+                    let survives = walk_arm_body(&case.body, &mut arm_env)?;
+                    return Some((arm_env, survives));
+                }
+                any_arm_walked = true;
+                rebind_split_subject(&mut arm_env, subject_name, &case.pattern, &intersected);
+                let survives = walk_arm_body(&case.body, &mut arm_env)?;
+                if survives {
+                    survivors.push(arm_env);
+                }
+                remaining_subject = difference;
+                continue;
+            }
         }
         match arm_outcome(&case.pattern, case.guard.as_deref(), &remaining_subject, environment, kernel) {
             ArmOutcome::Taken(mut arm_env) => {
@@ -1390,6 +1560,73 @@ mod tests {
         assert_eq!(values, vec![2.0, 4.0], "{{1, 2, 4}} minus {{1}} is exactly {{2, 4}}");
     }
 
+    /// `guarded_bare_capture_narrowed`'s own direct pin — the guarded
+    /// twin of `narrow_scalar_subject_keeps_the_intersection_for_a_
+    /// literal_arm` above: `case x if x == 1:` over `{1, 2, 4}` narrows
+    /// `x`'s own intersection to exactly `{1}`, through
+    /// `narrowing::guard_narrowed_values`'s comparison reader rather than
+    /// a pattern's own literal proof.
+    #[test]
+    fn guarded_bare_capture_narrowed_keeps_the_intersection_for_a_comparison_guard() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let cases = match_cases("match x:\n    case a if a == 1:\n        pass\n");
+        let subject = known_values(vec![1.0, 2.0, 4.0], PrimitiveKind::Integer, TrustProved);
+        let narrowed =
+            guarded_bare_capture_narrowed(&subject, &cases[0].pattern, cases[0].guard.as_deref(), true, &kernel)
+                .expect("`a == 1` is a comparison narrowing.rs's reader proves both directions of");
+        assert_eq!(narrowed.values, vec![1.0], "`case a if a == 1:` over {{1, 2, 4}} narrows to exactly {{1}}");
+    }
+
+    /// The DIFFERENCE half of the same guarded pair: `case x if x == 1:`
+    /// being NOT-TAKEN leaves exactly `{2, 4}` — the same remainder
+    /// `narrow_scalar_subject_keeps_the_difference_for_a_not_taken_arm`
+    /// gives the literal spelling `case 1:`.
+    #[test]
+    fn guarded_bare_capture_narrowed_keeps_the_difference_for_a_comparison_guard() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let cases = match_cases("match x:\n    case a if a == 1:\n        pass\n");
+        let subject = known_values(vec![1.0, 2.0, 4.0], PrimitiveKind::Integer, TrustProved);
+        let remainder =
+            guarded_bare_capture_narrowed(&subject, &cases[0].pattern, cases[0].guard.as_deref(), false, &kernel)
+                .expect("`a == 1` is a comparison narrowing.rs's reader proves both directions of");
+        let mut values = remainder.values.clone();
+        values.sort_by(f64::total_cmp);
+        assert_eq!(values, vec![2.0, 4.0], "{{1, 2, 4}} minus {{1}} (the guard's own excluded value) is exactly {{2, 4}}");
+    }
+
+    /// A pattern with no bare capture at all (`case 1 if a > 0:` — the
+    /// pattern is a LITERAL, not a capture) declines: this file's own
+    /// scope is a bare capture's own guard, never a literal pattern's.
+    #[test]
+    fn guarded_bare_capture_narrowed_declines_for_a_non_capture_pattern() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let cases = match_cases("match x:\n    case 1 if x > 0:\n        pass\n");
+        let subject = known_values(vec![1.0, 2.0, 4.0], PrimitiveKind::Integer, TrustProved);
+        assert!(
+            guarded_bare_capture_narrowed(&subject, &cases[0].pattern, cases[0].guard.as_deref(), true, &kernel)
+                .is_none(),
+            "a literal pattern's own guard is out of this function's scope"
+        );
+    }
+
+    /// A guard shape `narrowing::guard_narrowed_values` cannot prove
+    /// (`x in (2, 4)` — membership over a `Kind::Values` binding narrows
+    /// on neither channel: the SET channel needs `Kind::Set`, and the
+    /// VALUES channel has no `in`/`not in` leaf) declines both
+    /// directions — this arm keeps today's binary `arm_outcome` semantics
+    /// rather than a guessed split.
+    #[test]
+    fn guarded_bare_capture_narrowed_declines_for_an_unproved_guard_shape() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let cases = match_cases("match x:\n    case a if a in (2, 4):\n        pass\n");
+        let subject = known_values(vec![1.0, 2.0, 4.0], PrimitiveKind::Integer, TrustProved);
+        assert!(
+            guarded_bare_capture_narrowed(&subject, &cases[0].pattern, cases[0].guard.as_deref(), true, &kernel)
+                .is_none(),
+            "membership over a Kind::Values binding is not a shape this reader proves"
+        );
+    }
+
     /// The visible per-arm split the ledger construct names: a
     /// multi-valued `{1, 2, 4}` subject through `case 1 as a: / case 2 |
     /// 4 as b: / case _ as c:` — arm one's body walks with `a` bound to
@@ -1434,6 +1671,73 @@ mod tests {
         assert_eq!(second_arm_b, vec![2.0, 4.0], "arm two's body sees `b` narrowed to exactly {{2, 4}}, the intersection");
 
         assert!(joined.read("c").is_none(), "the wildcard's own capture `c` never binds — its body never walked");
+    }
+
+    /// MATCH-GUARD INTEGRATION's own pin: the GUARDED twin of
+    /// `match_taken_environment_splits_a_multi_valued_subject_across_its_
+    /// arms` above — `case x if x == 1: / case x if x == 2: / case _:`
+    /// over the same `{1, 2, 4}` subject splits IDENTICALLY to that
+    /// test's literal spelling. Each guard is a single comparison
+    /// `narrowing::guard_narrowed_values` proves both directions of
+    /// (`narrow_compare`'s single-op path, reused rather than
+    /// reimplemented): arm one's own `x` narrows to exactly `{1}` (the
+    /// guard's admitted value, intersected with the remaining subject),
+    /// arm two's own `x` narrows to exactly `{2}` (the guard's admitted
+    /// value intersected with the DIFFERENCE `{2, 4}` arm one leaves
+    /// behind), and the wildcard's own remaining subject is `{4}` — NOT
+    /// empty, since neither guard excludes 4 the way `case 2 | 4:` would
+    /// have — so the wildcard's body DOES walk, unlike the literal
+    /// pattern's twin above where the wildcard's remainder was exhausted.
+    /// This is the guarded arm behaving exactly like an `if`/`elif`
+    /// chain over the same conditions: every reached arm's own capture
+    /// sees only the slice of the subject its own guard actually proves.
+    #[test]
+    fn match_taken_environment_splits_a_multi_valued_subject_across_guarded_bare_capture_arms() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let cases = match_cases(concat!(
+            "match x:\n",
+            "    case a if a == 1:\n",
+            "        pass\n",
+            "    case b if b == 2:\n",
+            "        pass\n",
+            "    case _ as c:\n",
+            "        pass\n",
+        ));
+        let subject = known_values(vec![1.0, 2.0, 4.0], PrimitiveKind::Integer, TrustProved);
+        let environment = empty_environment();
+        let mut walked_bodies: Vec<Environment> = Vec::new();
+        let (joined, falls_through) = match_taken_environment(&subject, None, &cases, &environment, &kernel, &mut |_body, arm_env| {
+            walked_bodies.push(arm_env.fork());
+            Some(true)
+        })
+        .expect("a multi-valued {1, 2, 4} subject through three guarded arms is decided");
+        assert!(falls_through, "every walked arm survives, so the whole match falls through");
+        assert_eq!(walked_bodies.len(), 3, "all three arms walk; the wildcard's own remainder {{4}} is not empty");
+
+        let mut first_arm_a = walked_bodies[0].read("a").expect("arm one's own capture binds `a`").values.clone();
+        first_arm_a.sort_by(f64::total_cmp);
+        assert_eq!(first_arm_a, vec![1.0], "arm one's body sees `a` narrowed to exactly {{1}}, the guard's own intersection");
+
+        let mut second_arm_b = walked_bodies[1].read("b").expect("arm two's own capture binds `b`").values.clone();
+        second_arm_b.sort_by(f64::total_cmp);
+        assert_eq!(
+            second_arm_b,
+            vec![2.0],
+            "arm two's body sees `b` narrowed to exactly {{2}}, the guard's own intersection with the {{2, 4}} difference"
+        );
+
+        let mut wildcard_c = walked_bodies[2].read("c").expect("the wildcard's own capture binds `c`").values.clone();
+        wildcard_c.sort_by(f64::total_cmp);
+        assert_eq!(
+            wildcard_c,
+            vec![4.0],
+            "the wildcard's own remaining subject is exactly {{4}} — neither guard excludes it"
+        );
+        // three survivors join left-to-right (`finalize_survivors`); the
+        // joined environment carries whichever binding each contributing
+        // arm's own name held, so `a`/`b`/`c` all read back from `joined`
+        // too, not only from each arm's own pre-join fork.
+        assert_eq!(joined.read("c").map(|v| v.values.clone()), Some(vec![4.0]));
     }
 
     /// The dead-arm half of the same construct, pinned directly:

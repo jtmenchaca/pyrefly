@@ -590,14 +590,15 @@ mod tests {
     }
 
     /// `total`'s own position in `audio_level_unclamped.py`
-    /// (`total = sum(s * s for s in samples)`) answers no set today —
-    /// `refined_set_at_position` returns `None` there, so a real hover
-    /// stays host-line-only (`total: Literal[0] | float`, no second
-    /// line). Pins the exact position the design brief measured, so a
-    /// future change to the relational-sum recognizer's own read of
-    /// this Assign form is caught here rather than only in the editor.
+    /// (`total = sum(s * s for s in samples)`) now ANSWERS a set — the
+    /// relational-sum walk records an evaluated node at the Assign
+    /// statement's range before binding (check.rs walk_relational_sum,
+    /// 2026-08-22), so `refined_set_at_position` serves the derived
+    /// total and the hover gains its second line. Old premise, cited:
+    /// this pin asserted `is_none` while the recognized binding
+    /// bypassed the recorder.
     #[test]
-    fn the_measured_total_position_answers_no_set_today() {
+    fn the_measured_total_position_answers_the_derived_set() {
         let Some(kernel) = loaded_kernel() else { return };
         let source = concat!(
             "import math\n",
@@ -614,8 +615,8 @@ mod tests {
         let position =
             ruff_text_size::TextSize::try_from(source.find("total = sum").unwrap()).unwrap();
         assert!(
-            refined_set_at_position(&module, no_imports_resolver(), &kernel, position).is_none(),
-            "total's own position must answer no set until the relational-sum recognizer reads this Assign form"
+            refined_set_at_position(&module, no_imports_resolver(), &kernel, position).is_some(),
+            "total's own position answers the derived set now that the relational-sum walk records its evaluated node"
         );
     }
 

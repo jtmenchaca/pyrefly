@@ -98,6 +98,7 @@ use refined_sets::refinement_forms::at_most;
 use refined_sets::refinement_forms::integer;
 use refined_sets::refinement_forms::make_refined_set;
 use refined_sets::refinement_forms::one_of;
+use refined_sets::refinement_forms::Form;
 use refined_sets::refinement_forms::RefinedSet;
 use refined_sets::repetition_window_forms::as_repetition;
 use ruff_python_ast::Expr;
@@ -144,6 +145,18 @@ pub struct RecognizedAccumulation {
     /// the elements' sort could go either way and no correct
     /// per-element sort survives the repetition-window read.
     pub total_kind_tag: Option<PrimitiveKind>,
+    /// Names proved to equal `len(<sequence_name>)` by a plain
+    /// assignment sitting between the accumulation and the division —
+    /// `count = len(samples)`, then `total / count` — keyed by the
+    /// alias name, every value the accumulation's OWN `sequence_name`
+    /// (there is only ever one sequence per accumulation, so the value
+    /// is redundant with the key's own binding, but is spelled out
+    /// rather than implied, matching `same_length_as`'s own spelling).
+    /// `is_len_of` consults this for a bare-name numerator's divisor;
+    /// `record_length_alias` is the only writer. Populated by the
+    /// caller's own one-hop scan (`is_length_alias_assignment`) — this
+    /// module never walks a statement list itself to fill it.
+    pub length_aliases: std::collections::HashMap<String, String>,
 }
 
 /// Recognizes `for <var> in <name>: <total> += <expr over var>` as a
@@ -366,6 +379,7 @@ fn accumulation_program(
         }],
         grade: trust_level_of(sequence_value),
         total_kind_tag,
+        length_aliases: std::collections::HashMap::new(),
     })
 }
 
@@ -379,7 +393,10 @@ fn accumulation_program(
 /// Recognizes `<total> / len(<sequence>)` for exactly the accumulator
 /// and sequence this accumulation named — OR a sequence a comprehension
 /// built 1:1 over it with no filter (`AbstractValue::same_length_as`,
-/// `is_len_of`'s own doc). `false` — leaving the program as the
+/// `is_len_of`'s own doc) — or a bare name the caller already recorded
+/// in `recognized.length_aliases` as equal to `len(<sequence>)` by a
+/// plain `count = len(samples)` assignment (`is_length_alias_assignment`,
+/// `record_length_alias`). `false` — leaving the program as the
 /// accumulation alone — for any other shape: a different, unlinked name
 /// on either side, a length taken of some other sequence, an operator
 /// that is not true division.
@@ -422,6 +439,99 @@ fn division_statement() -> IrStatement {
 /// rather than being that expression.
 pub fn fold_located_division(recognized: &mut RecognizedAccumulation) {
     recognized.statements.push(division_statement());
+}
+
+/// Whether a statement is exactly `<name> = len(<sequence>)` for THIS
+/// accumulation's own sequence — the plain assignment that binds a
+/// count alias the way `count = len(samples)` does, one hop before a
+/// later `total / count`. The caller is responsible for the guard this
+/// function does not itself see: the assignment must sit in the SAME
+/// body, immediately (or with only intervening statements the caller
+/// has itself checked do not reassign `<name>` or the sequence), between
+/// the accumulation and the division — this function answers only
+/// whether the ONE statement handed to it has the count-alias shape,
+/// never whether it is safe to trust across the statements around it.
+///
+/// `None` — not this shape — when: the statement is not a single-name
+/// assignment; the value is not a call to a name `len` no local binding
+/// shadows; the call carries a keyword argument or an argument count
+/// other than one; or the argument is not a plain name equal to this
+/// accumulation's own `sequence_name`. Returns the bound name (`<name>`)
+/// on a match, for the caller to pass to `record_length_alias`.
+pub fn is_length_alias_assignment(
+    assign: &StmtAssign,
+    recognized: &RecognizedAccumulation,
+    environment: &Environment,
+) -> Option<String> {
+    let [Expr::Name(target)] = assign.targets.as_slice() else {
+        return None;
+    };
+    let Expr::Call(call) = assign.value.as_ref() else {
+        return None;
+    };
+    let Expr::Name(callee) = call.func.as_ref() else {
+        return None;
+    };
+    if callee.id.as_str() != "len" || environment.read(callee.id.as_str()).is_some() {
+        return None;
+    }
+    if !call.arguments.keywords.is_empty() {
+        return None;
+    }
+    let [Expr::Name(argument)] = call.arguments.args.as_ref() else {
+        return None;
+    };
+    if argument.id.as_str() != recognized.sequence_name {
+        return None;
+    }
+    Some(target.id.as_str().to_owned())
+}
+
+/// Records that `alias` is proved equal to `len(<sequence_name>)` — the
+/// one writer of `RecognizedAccumulation::length_aliases`, called by the
+/// caller after `is_length_alias_assignment` matched AND the caller's
+/// own reassignment guard held over every statement between the
+/// assignment and the division.
+pub fn record_length_alias(recognized: &mut RecognizedAccumulation, alias: String) {
+    let sequence_name = recognized.sequence_name.clone();
+    recognized.length_aliases.insert(alias, sequence_name);
+}
+
+/// Whether a statement WRITES either `alias` or `recognized.sequence_name`
+/// — the reassignment guard `is_length_alias_assignment`'s own doc
+/// requires the caller to hold over every statement between the count
+/// alias's own assignment and the division that reads it. No general
+/// rebind detector exists for this shape (`rebinds_relational_name` in
+/// `check.rs` is walrus-only, and this guard is over a PLAIN statement,
+/// not an expression), so this is the smallest check sufficient for the
+/// one hop the count-alias fold needs: an assignment target, an
+/// augmented-assignment target, or a `for` loop target naming either
+/// watched name — the shapes an ordinary statement uses to rebind a
+/// plain name. A `del` of either name, a nonlocal/global rebinding, or
+/// any other statement kind this checker does not itself special-case
+/// for rebinding a bare name is deliberately NOT read here: the caller's
+/// own one-hop scan only ever advances past statements it already
+/// trusts not to touch either name, and a statement kind so unusual it
+/// falls outside this list should stop the scan by not being tried
+/// against this guard, never pass through it silently.
+pub fn reassigns_alias_or_sequence(stmt: &Stmt, alias: &str, sequence_name: &str) -> bool {
+    fn names_target(target: &Expr, watched: &[&str]) -> bool {
+        match target {
+            Expr::Name(name) => watched.contains(&name.id.as_str()),
+            Expr::Tuple(tuple) => tuple.elts.iter().any(|element| names_target(element, watched)),
+            Expr::List(list) => list.elts.iter().any(|element| names_target(element, watched)),
+            Expr::Starred(starred) => names_target(starred.value.as_ref(), watched),
+            _ => false,
+        }
+    }
+    let watched = [alias, sequence_name];
+    match stmt {
+        Stmt::Assign(assign) => assign.targets.iter().any(|target| names_target(target, &watched)),
+        Stmt::AugAssign(assign) => names_target(assign.target.as_ref(), &watched),
+        Stmt::AnnAssign(assign) => names_target(assign.target.as_ref(), &watched),
+        Stmt::For(for_stmt) => names_target(for_stmt.target.as_ref(), &watched),
+        _ => false,
+    }
 }
 
 /// The range of the ONE `<total> / len(<sequence>)` division inside
@@ -563,8 +673,9 @@ fn find_divisions(
 /// Whether an expression is exactly `<total> / len(<sequence>)` for the
 /// accumulator and sequence this accumulation named — or `len` of a
 /// DIFFERENT name whose value the environment holds with
-/// `same_length_as` proved equal to the accumulation's own sequence
-/// (`is_len_of`'s own doc).
+/// `same_length_as` proved equal to the accumulation's own sequence, or
+/// a bare name proved by a plain assignment to equal `len(<sequence>)`
+/// (`is_len_of`'s own doc, both links).
 fn is_relational_division(
     expression: &Expr,
     recognized: &RecognizedAccumulation,
@@ -579,8 +690,7 @@ fn is_relational_division(
     let Expr::Name(numerator) = binop.left.as_ref() else {
         return false;
     };
-    numerator.id.as_str() == recognized.total_name
-        && is_len_of(binop.right.as_ref(), &recognized.sequence_name, environment)
+    numerator.id.as_str() == recognized.total_name && is_len_of(binop.right.as_ref(), recognized, environment)
 }
 
 /// What the kernel answered: the accumulated total, and the quotient
@@ -657,18 +767,58 @@ pub fn walk_accumulation(recognized: &RecognizedAccumulation) -> Option<Accumula
 /// One exit state as a value this checker can bind, or `None` when the
 /// kernel claimed nothing about that slot. The sort tag is the caller's
 /// claim about the slot's language-level sort; `None` states no sort.
+///
+/// Three shapes answer `None`, all for the same reason — the exit state
+/// states nothing an ordinary unnarrowed read did not already have:
+/// `state.top` (no knowledge at all), an empty form list (the void, not
+/// a claim), and a non-empty form list that nonetheless admits every
+/// finite float plus both infinities (`full_float_range`'s own doc) —
+/// a set spanning ℝ̄ in its entirety is exactly as uninformative as top,
+/// just spelled with forms instead of the top flag.
 fn bindable_state(
     state: &KnownStateWire,
     grade: TrustLevel,
     kind_tag: Option<PrimitiveKind>,
 ) -> Option<AbstractValue> {
-    if state.top || state.set.forms.is_empty() {
+    if state.top || state.set.forms.is_empty() || full_float_range(&state.set) {
         return None;
     }
     Some(AbstractValue {
         kind_tag,
         ..known_set(state.set.clone(), None, grade, SetKindTag::None)
     })
+}
+
+/// Whether a set's forms admit every element of ℝ̄ — no finite float
+/// excluded, and both infinities included. Read straight off the forms'
+/// own canonical spelling rather than asking the kernel a subset
+/// question: the lower ray reaches exactly `-inf` through a NON-STRICT
+/// `AtLeast` (an `Above(-inf)` excludes the single point `-inf` and so
+/// is NOT the full range), the upper ray reaches exactly `+inf` through
+/// a non-strict `AtMost` OR is absent entirely (no `AtMost`/`Below` form
+/// at all also states no upper bound — `refinement_forms::numbers`'s own
+/// spelling of ℝ̄ is the lone form `at_least(NEG_INFINITY)`, with no
+/// paired upper form), and no OTHER form rides alongside those two —
+/// an `Integer`/`MultipleOf`/`OneOf`/etc. alongside a full ray still
+/// excludes something, so is not this shape.
+///
+/// Every ray candidate is read directly rather than through
+/// `fold_ray_forms`'s tightest-wins fold: a set built from more than one
+/// ray per side is not the shape either bound-set builder in this module
+/// or the kernel's own division exit state produces, so reading the
+/// forms as given (no fold) states exactly what is there.
+fn full_float_range(set: &RefinedSet) -> bool {
+    let mut reaches_below = false;
+    for form in &set.forms {
+        match form.form {
+            Form::AtLeast if form.a == f64::NEG_INFINITY => reaches_below = true,
+            // present or absent, an at-most-infinity upper form states no
+            // ceiling either way — it is simply not read as a constraint
+            Form::AtMost if form.a == f64::INFINITY => {}
+            _ => return false,
+        }
+    }
+    reaches_below
 }
 
 /// The element set and the count set of a sequence value, read off the
@@ -848,10 +998,21 @@ fn is_same_name_square(binop: &ruff_python_ast::ExprBinOp, loop_variable: &str) 
 /// with no filter, which proves `len(<other name>) == len(sequence_name)`
 /// exactly (`comprehension_star_elements`'s own soundness-line comment,
 /// expressions.rs — the same fact stated there as a window bound, here
-/// read back as a name link). A name with no recorded link, or one
-/// linked to some THIRD sequence, still declines: only an exact proof
-/// of equal length licenses folding the division into this program.
-fn is_len_of(expression: &Expr, sequence_name: &str, environment: &Environment) -> bool {
+/// read back as a name link) — OR a bare `Expr::Name` recorded in
+/// `recognized.length_aliases` as equal to `len(sequence_name)` by a
+/// plain `<name> = len(<sequence>)` assignment the caller's own one-hop
+/// scan found (`is_length_alias_assignment`, `record_length_alias`): the
+/// COUNT-ALIAS shape (`count = len(samples)`, then `total / count`), a
+/// different link from the comprehension one above — the aliased name
+/// there is not itself a `len(...)` call, it IS the count. A name with
+/// no recorded link either way, or one linked to some THIRD sequence,
+/// still declines: only an exact proof of equal length licenses folding
+/// the division into this program.
+fn is_len_of(expression: &Expr, recognized: &RecognizedAccumulation, environment: &Environment) -> bool {
+    let sequence_name = recognized.sequence_name.as_str();
+    if let Expr::Name(bare) = expression {
+        return recognized.length_aliases.get(bare.id.as_str()).map(String::as_str) == Some(sequence_name);
+    }
     let Expr::Call(call) = expression else {
         return false;
     };
@@ -972,6 +1133,7 @@ mod tests {
             statements: Vec::new(),
             grade: TrustProved,
             total_kind_tag: None,
+            length_aliases: std::collections::HashMap::new(),
         };
         let expression = division_expression("total", "samples");
         assert!(
@@ -997,6 +1159,7 @@ mod tests {
             statements: Vec::new(),
             grade: TrustProved,
             total_kind_tag: None,
+            length_aliases: std::collections::HashMap::new(),
         };
         let expression = division_expression("total", "others");
         assert!(
@@ -1006,6 +1169,119 @@ mod tests {
         assert!(
             recognized.statements.is_empty(),
             "a declined division must leave the program alone"
+        );
+    }
+
+    #[test]
+    fn is_length_alias_assignment_recognizes_count_equals_len_of_the_sequence() {
+        let recognized = recognized_over_samples();
+        let assign = parsed_assignment("count = len(samples)\n");
+        assert_eq!(
+            is_length_alias_assignment(&assign, &recognized, &environment_with_samples()),
+            Some("count".to_owned()),
+            "a plain `count = len(samples)` must be read as the count-alias shape"
+        );
+    }
+
+    #[test]
+    fn is_length_alias_assignment_declines_a_different_sequences_length() {
+        let recognized = recognized_over_samples();
+        let assign = parsed_assignment("count = len(others)\n");
+        assert_eq!(
+            is_length_alias_assignment(&assign, &recognized, &environment_with_samples()),
+            None,
+            "a length taken of a different sequence is not this accumulation's count"
+        );
+    }
+
+    // PIN (ledger 218): the aliased spelling — `count = len(samples)`
+    // then `total / count` — folds to the IDENTICAL division statement
+    // `total / len(samples)` folds to. This test drives `relational_sum`'s
+    // own API (`is_length_alias_assignment`, `record_length_alias`,
+    // `fold_division`) directly; wiring `check.rs`'s own statement scan to
+    // call that API — the one-hop loop over `following` that currently
+    // inspects only `following.first()` (check.rs:2778-2787) — is the
+    // dependency this pin does not itself exercise. See the report for
+    // the exact check.rs change.
+    #[test]
+    fn the_count_alias_shape_folds_identically_to_the_direct_spelling() {
+        let mut aliased = recognized_over_samples();
+        let alias_assignment = parsed_assignment("count = len(samples)\n");
+        let alias = is_length_alias_assignment(&alias_assignment, &aliased, &environment_with_samples())
+            .expect("count = len(samples) is the count-alias shape");
+        record_length_alias(&mut aliased, alias);
+        let aliased_expression = bare_division_expression("total", "count");
+        assert!(
+            fold_division(&mut aliased, &aliased_expression, &environment_with_samples()),
+            "fold_division declined the recorded count alias"
+        );
+
+        let mut direct = recognized_over_samples();
+        let direct_expression = division_expression("total", "samples");
+        assert!(
+            fold_division(&mut direct, &direct_expression, &environment_with_samples()),
+            "fold_division declined the direct len() spelling"
+        );
+
+        let [aliased_statement] = aliased.statements.as_slice() else {
+            panic!("want exactly the division statement, got {:?}", aliased.statements.len());
+        };
+        let [direct_statement] = direct.statements.as_slice() else {
+            panic!("want exactly the division statement, got {:?}", direct.statements.len());
+        };
+        assert_eq!(
+            stmt_wire(aliased_statement),
+            stmt_wire(direct_statement),
+            "the aliased spelling must lower to the same statement the direct spelling does"
+        );
+    }
+
+    #[test]
+    fn an_unrecorded_alias_still_declines() {
+        // `record_length_alias` never ran — the same name with no
+        // recorded link must decline exactly as an unrelated name does
+        let mut recognized = recognized_over_samples();
+        let expression = bare_division_expression("total", "count");
+        assert!(
+            !fold_division(&mut recognized, &expression, &environment_with_samples()),
+            "an alias with no recorded link must not fold"
+        );
+    }
+
+    #[test]
+    fn reassigns_alias_or_sequence_catches_an_assign_augassign_and_for_target() {
+        let assign = parsed_assignment("count = 0\n");
+        assert!(
+            reassigns_alias_or_sequence(&Stmt::Assign(assign), "count", "samples"),
+            "an Assign target naming the alias must be caught"
+        );
+        let module = ruff_python_parser::parse_module("samples += extra\n")
+            .expect("the test's own source parses")
+            .into_syntax();
+        let aug = module.body.into_iter().next().expect("one statement");
+        assert!(
+            reassigns_alias_or_sequence(&aug, "count", "samples"),
+            "an AugAssign target naming the sequence must be caught"
+        );
+        let module = ruff_python_parser::parse_module("for samples in other:\n    pass\n")
+            .expect("the test's own source parses")
+            .into_syntax();
+        let for_stmt = module.body.into_iter().next().expect("one statement");
+        assert!(
+            reassigns_alias_or_sequence(&for_stmt, "count", "samples"),
+            "a for-loop target naming the sequence must be caught"
+        );
+    }
+
+    #[test]
+    fn reassigns_alias_or_sequence_ignores_an_unrelated_statement() {
+        let module = ruff_python_parser::parse_module("other = 0\n")
+            .expect("the test's own source parses")
+            .into_syntax();
+        let unrelated = module.body.into_iter().next().expect("one statement");
+        assert!(
+            !reassigns_alias_or_sequence(&unrelated, "count", "samples"),
+            "a statement touching neither watched name must not be caught"
         );
     }
 
@@ -1021,6 +1297,7 @@ mod tests {
             statements: Vec::new(),
             grade: TrustProved,
             total_kind_tag: None,
+            length_aliases: std::collections::HashMap::new(),
         };
         let mut environment = environment_with_samples();
         environment.bind(
@@ -1057,6 +1334,7 @@ mod tests {
             statements: Vec::new(),
             grade: TrustProved,
             total_kind_tag: None,
+            length_aliases: std::collections::HashMap::new(),
         };
         let mut environment = environment_with_samples();
         environment.bind(
@@ -1086,6 +1364,16 @@ mod tests {
     // reads through, so a parsed expression is the honest input.
     fn division_expression(numerator: &str, sequence: &str) -> Expr {
         let source = format!("{numerator} / len({sequence})");
+        let parsed = ruff_python_parser::parse_expression(&source)
+            .expect("the test's own source parses");
+        *parsed.into_syntax().body
+    }
+
+    // `<numerator> / <divisor>`, with the divisor a BARE name — the
+    // count-alias shape (`total / count`), never wrapped in `len(...)`
+    // the way `division_expression` always wraps its second argument.
+    fn bare_division_expression(numerator: &str, divisor: &str) -> Expr {
+        let source = format!("{numerator} / {divisor}");
         let parsed = ruff_python_parser::parse_expression(&source)
             .expect("the test's own source parses");
         *parsed.into_syntax().body
@@ -1233,6 +1521,7 @@ mod tests {
             statements: Vec::new(),
             grade: TrustProved,
             total_kind_tag: None,
+            length_aliases: std::collections::HashMap::new(),
         }
     }
 
@@ -1364,6 +1653,61 @@ mod tests {
         assert!(
             element_and_count_sets(&empty).is_none(),
             "an element set stating nothing must decline"
+        );
+    }
+
+    // A state carrying the given forms — never top, never absent/NaN/thrown —
+    // the shape a kernel exit state answering a plain number takes.
+    fn plain_number_state(forms: Vec<refined_sets::refinement_forms::Refinement>) -> KnownStateWire {
+        number_state(make_refined_set(forms))
+    }
+
+    #[test]
+    fn a_full_range_state_binds_no_answer() {
+        // the lone form `numbers()` itself spells — no lower bound, no
+        // upper form at all — is exactly ℝ̄, no claim over plain top
+        let state = plain_number_state(vec![at_least(f64::NEG_INFINITY)]);
+        assert!(
+            bindable_state(&state, TrustProved, None).is_none(),
+            "a state spanning every float must answer no bindable value"
+        );
+    }
+
+    #[test]
+    fn a_full_range_state_with_an_explicit_positive_infinity_ceiling_binds_no_answer() {
+        let state = plain_number_state(vec![at_least(f64::NEG_INFINITY), at_most(f64::INFINITY)]);
+        assert!(
+            bindable_state(&state, TrustProved, None).is_none(),
+            "an explicit +inf ceiling states no more than the ceiling's own absence"
+        );
+    }
+
+    #[test]
+    fn a_bounded_state_still_binds() {
+        let state = plain_number_state(vec![at_least(0.0), at_most(1.0)]);
+        let bound = bindable_state(&state, TrustProved, None);
+        assert!(bound.is_some(), "a genuinely bounded state must still bind");
+    }
+
+    #[test]
+    fn a_state_excluding_only_negative_infinity_is_not_the_full_range() {
+        // `above(-inf)` is `x > -inf`, which excludes the single point
+        // -inf — narrower than ℝ̄, so this must still bind
+        let state = plain_number_state(vec![refined_sets::refinement_forms::above(f64::NEG_INFINITY)]);
+        assert!(
+            bindable_state(&state, TrustProved, None).is_some(),
+            "excluding the point -inf is a real claim, not the full range"
+        );
+    }
+
+    #[test]
+    fn a_full_ray_alongside_another_form_is_not_the_full_range() {
+        // an Integer form riding alongside the full range still excludes
+        // every non-integer float
+        let state = plain_number_state(vec![at_least(f64::NEG_INFINITY), integer()]);
+        assert!(
+            bindable_state(&state, TrustProved, None).is_some(),
+            "an Integer form alongside a full ray still states a real claim"
         );
     }
 }

@@ -16,6 +16,7 @@ pub mod builtin_models;
 pub mod bytes_models;
 pub mod check;
 pub mod collection_models;
+pub mod cross_adapter_twins;
 pub mod cross_module;
 pub mod diagnostic_sentences;
 pub mod env;

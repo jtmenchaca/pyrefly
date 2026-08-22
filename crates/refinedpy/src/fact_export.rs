@@ -76,6 +76,7 @@ use crate::surface::surface_imports;
 use crate::typereading::DeclaredRefinement;
 use crate::typereading::base_sort_return_refinement;
 use crate::typereading::declared_refinement;
+use crate::typereading::typed_dict_return_refinement;
 
 /// One admitted return/entry shape, the RULED cases schema's own unit
 /// (CROSS-LANGUAGE-EDGE.md's fact-artifact cases design, JT-approved
@@ -321,6 +322,12 @@ pub fn export_module(
 ) -> Export {
     let aliases = compile_aliases(module);
     let imports = surface_imports(module);
+    // The same per-class member table `check.rs::findings_for_module_
+    // with_resolver` builds (`instances::typed_dict_table`) — read here
+    // too so a parameter annotated with a TypedDict class name reaches
+    // the object case exactly as a TypedDict-declared RETURN already
+    // does (`entry_rows`'s own three-reader fallback chain).
+    let typed_dicts = crate::instances::typed_dict_table(module, &aliases, &imports);
     // ONE walk of the whole module answers every def's derived return:
     // the shared context (imports resolved, function/class tables built)
     // costs the same whether one def asks or all of them do.
@@ -331,7 +338,16 @@ pub fn export_module(
 
     for def in top_level_defs(module) {
         let name = def.name.id.as_str().to_owned();
-        match export_function(def, module, &module_line_starts, &aliases, &imports, &derived_returns.values, &derived_returns.blockers) {
+        match export_function(
+            def,
+            module,
+            &module_line_starts,
+            &aliases,
+            &imports,
+            &typed_dicts,
+            &derived_returns.values,
+            &derived_returns.blockers,
+        ) {
             Ok(entry) => {
                 functions.insert(name, entry);
             }
@@ -386,18 +402,25 @@ pub fn has_exportable_defs(module: &ModModule) -> bool {
     let aliases = compile_aliases(module);
     let imports = surface_imports(module);
     let environment = Environment::new(HashSet::new());
-    top_level_defs(module).any(|def| def_has_a_declared_entry(def, &aliases, &imports, &environment))
+    let typed_dicts = crate::instances::typed_dict_table(module, &aliases, &imports);
+    top_level_defs(module)
+        .any(|def| def_has_a_declared_entry(def, &aliases, &imports, &environment, &typed_dicts))
 }
 
 /// Whether `def` states at least one parameter this table can read a
 /// refinement from, and carries no `*args`/`**kwargs` tail — the same
 /// two obstacles `entry_rows` declines on, checked here without building
-/// the `EntryRow` vector or reading `entry_shape`.
+/// the `EntryRow` vector or reading `entry_shape`. `typed_dicts` is read
+/// the same way `entry_rows` reads it — a bare name naming a recorded
+/// TypedDict class counts as a declared entry here too, so this cheap
+/// gate never skips a module whose only exportable def takes a
+/// TypedDict-typed parameter.
 fn def_has_a_declared_entry(
     def: &StmtFunctionDef,
     aliases: &HashMap<String, AliasEntry>,
     imports: &SurfaceImports,
     environment: &Environment,
+    typed_dicts: &HashMap<String, Vec<(String, DeclaredRefinement)>>,
 ) -> bool {
     if def.parameters.vararg.is_some() || def.parameters.kwarg.is_some() {
         return false;
@@ -418,6 +441,7 @@ fn def_has_a_declared_entry(
         };
         declared_refinement(annotation, aliases, imports, environment).is_some()
             || base_sort_return_refinement(annotation).is_some()
+            || typed_dict_return_refinement(annotation, typed_dicts).is_some()
     })
 }
 
@@ -465,10 +489,11 @@ fn export_function(
     line_starts: &[usize],
     aliases: &HashMap<String, AliasEntry>,
     imports: &SurfaceImports,
+    typed_dicts: &HashMap<String, Vec<(String, DeclaredRefinement)>>,
     derived_returns: &HashMap<String, AbstractValue>,
     derived_blockers: &HashMap<String, String>,
 ) -> Result<Value, String> {
-    let entry = entry_rows(def, aliases, imports)?;
+    let entry = entry_rows(def, aliases, imports, typed_dicts)?;
     let name = def.name.id.as_str();
     let returned = derived_returns.get(name).ok_or_else(|| {
         // A body whose own walk hit an unwalkable construct names THAT
@@ -529,15 +554,20 @@ enum EntryShape {
 /// `def`'s parameters read into exported entry rows, or the reason the
 /// whole def cannot be exported.
 ///
-/// Reads each parameter through the SAME two-step `seed_parameters`
-/// takes — `declared_refinement`, falling back to the bare
-/// `int`/`float`/`str` sort reading — so a parameter the walk seeds is a
-/// parameter this export can state, and a parameter the walk leaves
-/// unseeded omits the def rather than crossing an unfounded set.
+/// Reads each parameter through the SAME three-step fallback chain
+/// `check.rs::walk_function_def` runs to build a return refinement —
+/// `declared_refinement`, then the bare `int`/`float`/`str` sort
+/// reading, then `typed_dict_return_refinement` against `typed_dicts`
+/// (built once by the caller, `instances::typed_dict_table`) — so a
+/// parameter annotated with a recorded TypedDict class name reaches the
+/// object case exactly as a TypedDict-declared RETURN already does.
+/// A parameter the walk leaves unseeded by all three readers omits the
+/// def rather than crossing an unfounded set.
 fn entry_rows(
     def: &StmtFunctionDef,
     aliases: &HashMap<String, AliasEntry>,
     imports: &SurfaceImports,
+    typed_dicts: &HashMap<String, Vec<(String, DeclaredRefinement)>>,
 ) -> Result<Vec<EntryRow>, String> {
     // A variadic tail has no fixed arity and therefore no entry row a
     // caller on the other side of the wire could fill — checked before
@@ -563,6 +593,7 @@ fn entry_rows(
         };
         let Some(declared) = declared_refinement(annotation, aliases, imports, &environment)
             .or_else(|| base_sort_return_refinement(annotation))
+            .or_else(|| typed_dict_return_refinement(annotation, typed_dicts))
         else {
             return Err(format!(
                 "parameter '{parameter_name}' carries no refinement this checker reads"
@@ -586,7 +617,12 @@ fn entry_rows(
 /// `admits_none` (`X | None`, `Optional[X]`) appends the null case to a
 /// SCALAR declaration's own cases — the container arm has no `None`
 /// reading of its own to extend (a `dict[str, X] | None` still routes
-/// through `element`, unaffected by this function's scalar branch).
+/// through `element`, unaffected by this function's scalar branch). A
+/// TypedDict declaration (`declared.members` Some) reads as a single
+/// OBJECT case through `declared_object_case`, mirroring the RETURN
+/// side's own `object_case_of` — a parameter's declared member table
+/// crosses exactly the same `{"sort":"object","members":...}` shape a
+/// derived TypedDict return already does.
 fn entry_shape(declared: &DeclaredRefinement) -> Result<EntryShape, String> {
     let is_sequence_container = declared.spelling.starts_with("list[")
         || declared.spelling.starts_with("set[")
@@ -610,9 +646,16 @@ fn entry_shape(declared: &DeclaredRefinement) -> Result<EntryShape, String> {
             length_at_least: lo,
         });
     }
+    if let Some(members) = &declared.members {
+        let mut cases = vec![declared_object_case(members)?];
+        if declared.admits_none {
+            cases.push(Case::Null);
+        }
+        return Ok(EntryShape::Scalar(cases));
+    }
     if declared.set.forms.is_empty() {
         return Err(format!(
-            "'{}' states a shape (a dict, a tuple, a TypedDict, a generator) that crosses no single set",
+            "'{}' states a shape (a dict, a tuple, a generator) that crosses no single set",
             declared.spelling
         ));
     }
@@ -621,6 +664,50 @@ fn entry_shape(declared: &DeclaredRefinement) -> Result<EntryShape, String> {
         cases.push(Case::Null);
     }
     Ok(EntryShape::Scalar(cases))
+}
+
+/// A TypedDict declaration's own member table read into ONE object
+/// case — the entry-side twin of `object_case_of`, reading a per-field
+/// `DeclaredRefinement` instead of a derived `AbstractValue`. Each
+/// declared member recurses through `entry_shape` so a nested
+/// TypedDict-typed field becomes its own nested object case, exactly as
+/// a nested member does on the return side. `closed: true`
+/// unconditionally: a `class X(TypedDict): ...` declaration states its
+/// complete key set by construction (this table reads no
+/// `NotRequired`/`total=False` relaxation), unlike the return side's
+/// `closed` (read off a runtime value's own `complete` bit) — there is
+/// no literal here to read completeness FROM, so the class declaration
+/// itself is the fact this case states. A member whose own declared
+/// refinement has no crossable shape (a plain `dict`, a generator, a
+/// bare tuple — a nested TypedDict member recurses through
+/// `entry_shape` instead of hitting this case) stops the WHOLE object
+/// case, naming that member — the same all-or-nothing rule
+/// `object_case_of` already applies to a derived member.
+fn declared_object_case(members: &[(String, DeclaredRefinement)]) -> Result<Case, String> {
+    let mut cases = Vec::with_capacity(members.len());
+    for (name, declared) in members {
+        let shape = entry_shape(declared).map_err(|reason| {
+            format!("its member '{name}' is {reason}, which has no faithful cases reading")
+        })?;
+        let member_cases = match shape {
+            EntryShape::Scalar(cases) => cases,
+            // A sequence-shaped member states its own element cases plus
+            // its length floor — neither of which this object case's
+            // recursive cases list can carry (a `Case` states one value's
+            // own shape, not a repetition window), so a container-typed
+            // TypedDict member is not yet a shape this table crosses.
+            EntryShape::Sequence { .. } => {
+                return Err(format!(
+                    "its member '{name}' is a container, which crosses no single cases reading"
+                ));
+            }
+        };
+        cases.push((name.clone(), member_cases));
+    }
+    Ok(Case::Object {
+        members: cases,
+        closed: true,
+    })
 }
 
 /// One entry row as the artifact spells it.
@@ -2533,6 +2620,58 @@ mod tests {
         assert_eq!(cases[0]["closed"], true, "a dict literal's own completeness states every key it has");
         let members = cases[0]["members"].as_object().expect("the object case states its members");
         assert_eq!(members.len(), 1, "the literal states exactly one key: {members:?}");
+        let age_cases = members["age"].as_array().expect("'age' states its own cases list");
+        assert_eq!(age_cases.len(), 1, "'age' is a plain Age-declared int, one case");
+        assert_eq!(age_cases[0]["sort"], "number");
+        assert!(
+            age_cases[0].get("set").is_some(),
+            "'age' carries the full kernel wire set for its Age declaration"
+        );
+    }
+
+    /// A `TypedDict`-declared PARAMETER exports an entry object case with
+    /// the members the class states — the entry-side twin of
+    /// `a_typed_dict_return_exports_one_object_case_with_its_members_and_
+    /// closed_true`. Ledger 210: a TypedDict-annotated parameter never
+    /// reached an object case before `entry_rows` threaded `typed_dicts`
+    /// through the same three-reader fallback chain the return side
+    /// already ran.
+    #[test]
+    fn a_typed_dict_parameter_exports_an_entry_object_case_with_its_members() {
+        let Some(kernel) = loaded_kernel() else {
+            return;
+        };
+        let source = concat!(
+            "from typing import Annotated, TypedDict\n",
+            "from pydantic import Field\n",
+            "type Age = Annotated[int, Field(ge=0, le=120)]\n",
+            "class PersonDict(TypedDict):\n",
+            "    age: Age\n",
+            "def person_age(person: PersonDict) -> Age:\n",
+            "    return person[\"age\"]\n",
+        );
+        let module = ruff_python_parser::parse_module(source).expect("the fixture parses").into_syntax();
+        let no_imports: ModuleResolver = &|_: &str| None;
+        let export = export_module(&module, source.as_bytes(), "person_age.py", no_imports, &kernel, None);
+        for omission in &export.omissions {
+            eprintln!("omission: '{}' — {}", omission.function, omission.reason);
+        }
+        let artifact = export.artifact.as_object().expect("the artifact is an object");
+        let rendered = serde_json::to_string_pretty(&Value::Object(artifact.clone())).expect("the artifact renders");
+        eprintln!("emitted artifact for a TypedDict parameter:\n{rendered}");
+        let entry = artifact["functions"]["person_age"]["entry"]
+            .as_array()
+            .unwrap_or_else(|| panic!("person_age must export an entry list, artifact: {rendered}"));
+        assert_eq!(entry.len(), 1, "person_age states one parameter: {entry:?}");
+        assert_eq!(entry[0]["name"], "person");
+        let cases = entry[0]["cases"]
+            .as_array()
+            .unwrap_or_else(|| panic!("'person' must state its own cases list, entry: {entry:?}"));
+        assert_eq!(cases.len(), 1, "a single-shape TypedDict parameter states exactly one object case: {cases:?}");
+        assert_eq!(cases[0]["sort"], "object");
+        assert_eq!(cases[0]["closed"], true, "a TypedDict declaration states its complete key set");
+        let members = cases[0]["members"].as_object().expect("the object case states its members");
+        assert_eq!(members.len(), 1, "the class declares exactly one member: {members:?}");
         let age_cases = members["age"].as_array().expect("'age' states its own cases list");
         assert_eq!(age_cases.len(), 1, "'age' is a plain Age-declared int, one case");
         assert_eq!(age_cases[0]["sort"], "number");

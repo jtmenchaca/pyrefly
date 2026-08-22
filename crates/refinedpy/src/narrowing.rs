@@ -114,6 +114,69 @@ pub fn assume(
     environment
 }
 
+/// A match arm's GUARD (`case x if <condition>:`), read as a narrowing
+/// of `name` — the bare capture the arm's own pattern bound to
+/// `subject` — through the SAME comparison-narrowing reader `assume`
+/// already runs, rather than a second implementation of the same leaf
+/// vocabulary. Built the same sandbox way `narrow_type_guard_call`
+/// proves a `TypeGuard` predicate's own body: `name` is bound to
+/// `subject` in a fresh `Environment`, `assume(condition, sandbox,
+/// kernel, truth)` runs, and whatever `name` ends up bound to is read
+/// back — `None` when the guard's shape is not one `assume`'s narrowing
+/// channels read at all (the binding never changed, or the name never
+/// rebinds because the leaf declined), matching every other "narrows
+/// nothing" default this file gives. `truth: true` is the guard's own
+/// admitted values (the intersection `match_taken_environment`'s Taken
+/// arm needs); `truth: false` is the values the guard rules OUT for this
+/// arm (the difference every LATER arm and the wildcard must still see),
+/// mirroring the two `narrow_scalar_subject` calls a literal pattern's
+/// split already makes with `keep_matched: true`/`false`.
+///
+/// Only a Values-kind result that GENUINELY narrowed is read back — a
+/// guard that seeds a Set-kind binding (an `isinstance` sort proof), or
+/// whose own condition shape none of `assume`'s narrowing channels
+/// recognize (an unrecognized leaf leaves the binding byte-for-byte the
+/// SAME `subject` that went in, `assume`'s own "the honest default
+/// narrows nothing" contract), declines to `None` here — an unchanged
+/// binding is never read as a PROOF that every member survives; it is
+/// the absence of a proof either way, and the caller's job is to keep
+/// today's binary guard semantics for that arm rather than treat
+/// "unproved" as "proved to admit everything." Membership admits genuine
+/// but exact-full-width narrowings too (a guard proving every member
+/// still satisfies it) missing this reader's coverage — an acceptable
+/// gap matching this file's own scope, not a soundness hole, since the
+/// caller only ever reads this as the intersection/difference of a
+/// SPLIT it independently confirms is non-trivial.
+pub fn guard_narrowed_values(
+    condition: &Expr,
+    name: &str,
+    subject: &AbstractValue,
+    kernel: &Arc<RefinedTSKernel>,
+    truth: bool,
+) -> Option<AbstractValue> {
+    let mut sandbox = Environment::new(std::collections::HashSet::new());
+    sandbox.bind(name, subject.clone());
+    let narrowed = assume(condition, sandbox, kernel, truth);
+    let bound = narrowed.read(name)?;
+    if bound.kind != Kind::Values || bound.kind_tag != subject.kind_tag {
+        return None;
+    }
+    if subject.kind == Kind::Values && same_members(&bound.values, &subject.values) {
+        // unchanged: `assume` declined this condition's own shape rather
+        // than proving anything about it — never read as a proof.
+        return None;
+    }
+    Some(bound.clone())
+}
+
+/// Whether two Values bindings admit the SAME set of members, order- and
+/// duplicate-insensitive — the identity test `guard_narrowed_values`
+/// uses to tell "genuinely narrowed" apart from "passed through
+/// untouched."
+fn same_members(a: &[f64], b: &[f64]) -> bool {
+    a.len() == b.len() && a.iter().all(|value| b.contains(value)) && b.iter().all(|value| a.contains(value))
+}
+
 /// Whether `condition` being `truth`, under `environment` (already
 /// narrowed by `assume`), is PROVEN IMPOSSIBLE for this call's own
 /// concrete arguments — every name the condition names (`collect_names`)
@@ -1239,6 +1302,55 @@ mod tests {
         };
         let x = narrowed.read("x").expect("x still bound");
         assert_eq!(x.values, vec![40.0]);
+    }
+
+    /// `guard_narrowed_values`'s own pin — a match arm's guard read as a
+    /// narrowing through the SAME `assume` machinery
+    /// `test_equality_against_literal_keeps_only_that_value` above
+    /// exercises directly, but through the sandbox-and-read-back path
+    /// `match_arms.rs`'s guarded bare-capture split calls: `x == 1` over
+    /// `{1, 2, 4}` narrows to exactly `{1}` on the admitted (`truth:
+    /// true`) side.
+    #[test]
+    fn test_guard_narrowed_values_keeps_the_admitted_side() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let subject = known_values(vec![1.0, 2.0, 4.0], PrimitiveKind::Integer, TrustProved);
+        let parsed = parse_expression("x == 1").expect("test source must parse");
+        let narrowed = guard_narrowed_values(&parsed.into_expr(), "x", &subject, &kernel, true)
+            .expect("a single equality comparison is a guard shape this reader proves");
+        assert_eq!(narrowed.values, vec![1.0]);
+    }
+
+    /// The excluded (`truth: false`) side of the same guard: `x == 1`
+    /// being false over `{1, 2, 4}` leaves exactly `{2, 4}`.
+    #[test]
+    fn test_guard_narrowed_values_keeps_the_excluded_side() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let subject = known_values(vec![1.0, 2.0, 4.0], PrimitiveKind::Integer, TrustProved);
+        let parsed = parse_expression("x == 1").expect("test source must parse");
+        let narrowed = guard_narrowed_values(&parsed.into_expr(), "x", &subject, &kernel, false)
+            .expect("a single equality comparison is a guard shape this reader proves");
+        let mut values = narrowed.values.clone();
+        values.sort_by(f64::total_cmp);
+        assert_eq!(values, vec![2.0, 4.0]);
+    }
+
+    /// A guard shape `assume` narrows nothing for (`x in (2, 4)` over a
+    /// `Kind::Values` binding — membership is the SET channel's own leaf,
+    /// which requires `Kind::Set`, never `Kind::Values`) leaves the
+    /// binding UNCHANGED, so `guard_narrowed_values` declines outright —
+    /// an unchanged binding is never read as a proof every member
+    /// survives; it is the absence of a proof.
+    #[test]
+    fn test_guard_narrowed_values_declines_when_assume_narrows_nothing() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let subject = known_values(vec![1.0, 2.0, 4.0], PrimitiveKind::Integer, TrustProved);
+        let parsed = parse_expression("x in (2, 4)").expect("test source must parse");
+        let narrowed = guard_narrowed_values(&parsed.into_expr(), "x", &subject, &kernel, true);
+        assert!(
+            narrowed.is_none(),
+            "an unproved guard shape leaves the binding unchanged — never read as a genuine narrowing"
+        );
     }
 
     #[test]

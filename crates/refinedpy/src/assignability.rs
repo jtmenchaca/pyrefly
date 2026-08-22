@@ -554,7 +554,7 @@ pub fn judge(
     }
     if value.kind == Kind::Set {
         let is_string_sorted_set = value.kind_tag == Some(PrimitiveKind::String)
-            || (value.kind_tag.is_none() && sequence_shaped(&value.set));
+            || (value.kind_tag.is_none() && sequence_shaped_safely(&value.set, kernel));
         let is_numeric_sorted_set = matches!(
             value.kind_tag,
             Some(PrimitiveKind::Integer) | Some(PrimitiveKind::Float) | Some(PrimitiveKind::Number)
@@ -658,7 +658,8 @@ pub fn judge(
         // scalar right side) — tried first, with the same fallback-to-
         // `scalar_subset`-on-refusal discipline as the sequence_question
         // gate above.
-        let sequence_question = sequence_shaped(&value.set) || sequence_shaped(&declared.set);
+        let sequence_question =
+            sequence_shaped_safely(&value.set, kernel) || sequence_shaped_safely(&declared.set, kernel);
         let numeric_repetition_into_scalar =
             states_sequence(&value.set) && on_one_tuple_layer(&declared.set);
         if sequence_question || numeric_repetition_into_scalar {
@@ -810,6 +811,41 @@ pub(crate) fn sequence_shaped(set: &refined_sets::refinement_forms::RefinedSet) 
             | Form::MultipleOf
             | Form::OneOf => false,
         })
+}
+
+/// `sequence_shaped`'s own reread-safety gate, asked of the kernel FIRST
+/// — the determination parity `seq_no_scalar_reread`
+/// (`refined_seq_no_scalar_reread`, proved by `noScalarRereadF_sound`)
+/// exists for: the kernel's own recursion requires BOTH of a
+/// `Concatenation`'s operands to themselves recurse-prove reread-safe
+/// (`noScalarRereadFormF`'s `.Concatenation A B => noScalarRereadF A &&
+/// noScalarRereadF B`, `set_functions/no_scalar_reread.lean`), while
+/// `sequence_shaped`'s own `Form::Concatenation => true` arm above admits
+/// ANY concatenation outright, without inspecting operands — the same
+/// gap refined-ts-go's `noScalarReread`
+/// (`abstractdomain/lattice_operations.go`) already asks the kernel
+/// ahead of its own `statesOnlyLongSequences` fallback to close: a
+/// kernel `true` is a proved theorem for a shape the LOCAL recursion may
+/// have reached through a path the kernel's own recursion also walks (a
+/// union of concatenations, the kernel's everyday shape per that file's
+/// own doc), trusted outright here. The kernel's own `false` is a
+/// DECLINE, never a proof of unsafety (`seq_no_scalar_reread`'s own doc:
+/// "a decline that proves nothing, and the caller keeps its own
+/// conservative answer there") — including for a genuine unsafe 1-tuple
+/// concatenation the kernel recursed into and rejected, which is why a
+/// kernel `false`/refusal falls through to `sequence_shaped` unchanged
+/// rather than being read as "unsafe," exactly the same non-strengthening
+/// fallback refined-ts-go's own `noScalarReread` takes on its own `ok:
+/// false` branch. The two judgment sites in this file that classify an
+/// untagged Set's own sort (the `is_string_sorted_set` law and the
+/// `sequence_question` routing gate) ask the same kernel question
+/// refined-ts-go already asks there, rather than trusting the local
+/// recursion alone.
+fn sequence_shaped_safely(set: &refined_sets::refinement_forms::RefinedSet, kernel: &Arc<RefinedTSKernel>) -> bool {
+    if let Ok(true) = crate::kernel_ask::ask_kernel(|| (kernel.seq_no_scalar_reread)(set)) {
+        return true;
+    }
+    sequence_shaped(set)
 }
 
 /// Whether a set's OWN top-level forms DEMONSTRABLY state a sequence —
@@ -1736,6 +1772,49 @@ mod tests {
         assert!(
             matches!(judge(&value, &declared, &kernel), Verdict::Silent),
             "a narrowed string-literal union wholly inside a wider one must be Silent, not Undetermined"
+        );
+    }
+
+    /// SEQ_NO_SCALAR_REREAD PARITY (ledger 315): `sequence_shaped_safely`
+    /// asks `kernel.seq_no_scalar_reread` before falling back to
+    /// `sequence_shaped`'s own local recursion — the same kernel-first
+    /// order refined-ts-go's `noScalarReread`
+    /// (`abstractdomain/lattice_operations.go`) already takes. This pins
+    /// the wiring at both judgment sites the ask now reaches: an untagged
+    /// Set whose only form is a UNION of two multi-character string
+    /// tuples (`Union(Concatenation..., Concatenation...)`, a shape the
+    /// kernel's own `noScalarRereadF` recursion proves reread-safe by
+    /// walking into each concatenation's own operands) is read as
+    /// string-sorted at the `is_string_sorted_set` law, and the same
+    /// shape drives the `sequence_question` routing gate to `seq_subset`
+    /// rather than `scalar_subset` — both routes this pin already covers
+    /// via `judge`'s own observable verdict, now proved through the
+    /// kernel ask rather than the local recursion alone. A member wholly
+    /// inside a wider declared union of the same shape is Silent.
+    #[test]
+    fn seq_no_scalar_reread_parity_string_union_is_silent_through_the_kernel_ask() {
+        let Some(kernel) = loaded_kernel() else { return };
+        use refined_sets::codepoint_sets::string_tuple;
+        use refined_sets::refinement_forms::union;
+        let narrowed = make_refined_set(vec![union(string_tuple("insideStart"), string_tuple("insideEnd"))]);
+        let wider = make_refined_set(vec![union(
+            make_refined_set(vec![union(string_tuple("insideStart"), string_tuple("insideEnd"))]),
+            string_tuple("end"),
+        )]);
+        let declared = DeclaredRefinement {
+            set: wider,
+            spelling: "PositionLabel".to_owned(),
+            admits_none: false,
+            element: None,
+            element_length: None,
+            generator: None,
+            members: None,
+            positions: None,
+        };
+        let value = known_set(narrowed, None, TrustProved, SetKindTag::None);
+        assert!(
+            matches!(judge(&value, &declared, &kernel), Verdict::Silent),
+            "a string-tuple union wholly inside a wider one must be Silent through the kernel-first reread-safety ask"
         );
     }
 

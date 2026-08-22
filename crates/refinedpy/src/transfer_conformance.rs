@@ -84,7 +84,14 @@
 //! own wiring. `test_a_zero_admitting_divisor_
 //! fires_and_still_determines_with_no_infinity_row` and
 //! `test_a_zero_excluding_divisor_fires_nothing` below pin both halves
-//! of that pair.
+//! of that pair, for `/`. `binop_possible_raise` fires the same
+//! sentence for `//` and `%` too (`expressions.rs`'s own tests) — those
+//! two operators have no zero-excluded split, so their value question
+//! keeps declining outright over the same window; only the fire is new
+//! for them, pinned in `expressions.rs` rather than repeated here since
+//! this file's own G1–G5 ledger only tracks the concrete-vs-kernel VALUE
+//! path, and `//`/`%`'s value path over a zero-admitting range was
+//! already an agreed decline before this fire existed.
 //!
 //! Rows G1/G2 are the audit's own "the exact `int` theory serves them"
 //! observation seen from the concrete side: the f64 carrier is what
@@ -619,8 +626,14 @@ mod tests {
         assert_eq!(adapter.kind_tag, Some(PrimitiveKind::Float));
 
         // confirmed directly: the kernel's OWN answer on the zero-
-        // excluded positive half alone is Unknown — the adapter's
-        // determination traces to a real kernel answer, not a guess
+        // excluded positive half is now the TIGHT enclosure — the
+        // open-window division rule (theories/binary64/div.lean's
+        // openZeroDivisorEncl, proofs/div_open_zero.lean, 2026-08-22)
+        // answers 1.0 / (0, 2] as [0.5, +inf]: the closed corner gives
+        // the floor and the excluded-zero end is unbounded (denormal
+        // overflow reaches +inf). Old premise, cited: this pin asserted
+        // Unknown while the kernel's div dispatch widened every
+        // zero-boundary OPEN window to the ground.
         let positive_half = make_refined_set(vec![refined_sets::refinement_forms::above(0.0), at_most(2.0)]);
         let asked = (kernel.transfer)(&TransferQuestion {
             op: TransferQuestionOp::Div,
@@ -632,9 +645,12 @@ mod tests {
         });
         assert_eq!(
             asked.kind,
-            TransferAnswerKind::Unknown,
-            "the split's own positive half must ask the kernel and read its honest Unknown, or this row \
-             proves the wrong thing: {asked:?}"
+            TransferAnswerKind::Set,
+            "the split's own positive half now determines the open-window enclosure: {asked:?}"
+        );
+        assert!(
+            asked.set.forms.iter().any(|form| form.form == refined_sets::refinement_forms::Form::AtLeast && form.a == 0.5),
+            "the enclosure's floor is the closed corner 1.0/2.0 = 0.5: {asked:?}"
         );
     }
 

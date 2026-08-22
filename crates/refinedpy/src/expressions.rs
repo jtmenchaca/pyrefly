@@ -5474,9 +5474,9 @@ fn binop_provable_raise(
 /// `diagnostic_sentences.rs` builds for it; `None` when no recognized
 /// sometimes-raising shape applies.
 ///
-/// Recognized rows, each cited in the function that decides it: a `/`
-/// divisor set that ADMITS zero without being entirely zero
-/// (`binop_possible_raise`).
+/// Recognized rows, each cited in the function that decides it: a `/`,
+/// `//`, or `%` divisor set that ADMITS zero without being entirely
+/// zero (`binop_possible_raise`).
 pub fn possible_raise(
     expression: &Expr,
     environment: &Environment,
@@ -5488,37 +5488,43 @@ pub fn possible_raise(
     }
 }
 
-/// `x / d` where `d`'s set ADMITS zero without being entirely zero
-/// (e.g. `[0.0, 2.0]`) — a SOMETIMES-raises divisor: most real
-/// executions clear it, and `split_divisor_transfer`
-/// (`transfer_over_sets`) already determines the value question over
-/// the divisor's zero-excluded halves for exactly this shape. This row
-/// states the corner that determination cannot speak to as its own
-/// escape, the same claim strength this file's other escape fires
-/// carry — the finding and the split value both stand; neither
-/// withdraws the other. `divisor_provably_excludes_zero` gates the
-/// value question's OWN silence for this shape (`transfer_over_sets`);
-/// this row asks the same membership question this file already asks
-/// there, so the two never disagree about which windows admit zero.
-/// `binop_provable_raise`'s own always-zero rows are excluded by
-/// construction: a divisor this function reads as NOT provably
-/// excluding zero is either always-zero (that row's own claim, made
-/// there) or sometimes-zero (this row's claim) — the caller decides
-/// which question it is asking by which function it calls.
+/// `x / d`, `x // d`, `x % d` where `d`'s set ADMITS zero without being
+/// entirely zero (e.g. `[0.0, 2.0]`) — a SOMETIMES-raises divisor: most
+/// real executions clear it, and CPython raises `ZeroDivisionError` on
+/// the zero arm of the window for all three operators alike
+/// (expressions.rst, "Binary arithmetic operations": "Division by zero
+/// raises the ZeroDivisionError exception" for `/`/`//`, "A zero right
+/// argument raises the ZeroDivisionError exception" for `%`).
+/// `divisor_provably_excludes_zero` gates the value question's OWN
+/// silence for `/`'s shape (`transfer_over_sets`); this row asks the
+/// same membership question this file already asks there, so the two
+/// never disagree about which windows admit zero. `binop_provable_
+/// raise`'s own always-zero rows are excluded by construction: a
+/// divisor this function reads as NOT provably excluding zero is
+/// either always-zero (that row's own claim, made there) or
+/// sometimes-zero (this row's claim) — the caller decides which
+/// question it is asking by which function it calls.
 ///
-/// `split_divisor_transfer` is `/`'s own fix, and only `/`'s
-/// (`transfer_over_sets`'s own gate, `op == Operator::Div`) — `//` and
-/// `%` still ask the kernel over the WHOLE zero-admitting window, so a
-/// zero-admitting divisor already declines their value question
-/// outright rather than determine through a split. Firing this row for
-/// `//`/`%` would describe a split that does not run for them; it
-/// stays `/`-only until they gain their own.
+/// The three operators diverge only on the VALUE side of this same
+/// corner, never on the RAISE side this function speaks to:
+/// `split_divisor_transfer` is `/`'s own fix (`transfer_over_sets`'s own
+/// gate, `op == Operator::Div`) — it determines a value over the
+/// divisor's zero-excluded halves, so `/`'s fire here rides alongside a
+/// determined value. `//` and `%` still ask the kernel over the WHOLE
+/// zero-admitting window, which the kernel declines for a non-singleton
+/// divisor (`admitted_int_transfer_op`'s row only ever answers over two
+/// exact singletons) — so their fire here rides alongside a silent
+/// value question, the value side wholly unchanged by this row.
+/// `diagnostic_sentences::division_by_a_set_that_admits_zero` already
+/// speaks generically to "this expression's divisor set" without
+/// naming `/` specifically, so the one sentence serves all three
+/// operators without inventing a sibling.
 fn binop_possible_raise(
     binop: &ruff_python_ast::ExprBinOp,
     environment: &Environment,
     kernel: &Arc<RefinedTSKernel>,
 ) -> Option<(TextRange, String)> {
-    if binop.op != Operator::Div {
+    if !matches!(binop.op, Operator::Div | Operator::FloorDiv | Operator::Mod) {
         return None;
     }
     let right = evaluate_expression(&binop.right, environment, kernel);
@@ -8826,13 +8832,16 @@ mod tests {
         );
     }
 
-    /// `//` and `%` keep their EXISTING silence for a sometimes-zero
-    /// divisor: `split_divisor_transfer` is `/`'s own fix, not theirs,
-    /// so this escape row must not fire where no split runs — firing it
-    /// there would describe a value determination that does not happen
-    /// for these two operators.
+    /// `//` and `%` fire the SAME escape sentence `/` does over a
+    /// sometimes-zero divisor: CPython raises `ZeroDivisionError` on the
+    /// zero arm of the window for all three operators alike
+    /// (expressions.rst, "Binary arithmetic operations"). `//`/`%` have
+    /// no zero-excluded split (`split_divisor_transfer` is `/`'s own
+    /// fix), so their VALUE question keeps declining outright over this
+    /// same window — only the fire is new here, the value side
+    /// unchanged.
     #[test]
-    fn test_possible_raise_stays_silent_for_floordiv_and_mod_over_a_sometimes_zero_divisor() {
+    fn test_possible_raise_fires_for_floordiv_and_mod_over_a_sometimes_zero_divisor() {
         let Some(kernel) = loaded_kernel() else { return };
         let mut environment = empty_environment();
         let denominator = AbstractValue {
@@ -8848,9 +8857,22 @@ mod tests {
             environment.bind("denominator", denominator.clone());
             let parsed = parse_expression(source).expect("test source must parse");
             let Expr::BinOp(binop) = parsed.into_expr() else { panic!("expected a BinOp") };
-            assert!(
-                binop_possible_raise(&binop, &environment, &kernel).is_none(),
-                "{source}: `//`/`%` have no zero-excluded split, so the escape row must stay silent"
+            let found = binop_possible_raise(&binop, &environment, &kernel);
+            let Some((_, message)) = found else {
+                panic!("{source}: a sometimes-zero divisor window must fire the escape sentence, not stay silent");
+            };
+            assert!(message.contains("admits 0"), "{source}: {message}");
+            assert!(message.contains("ZeroDivisionError"), "{source}: {message}");
+
+            // the value side is unchanged: `//`/`%` still decline outright
+            // over this same window, because no split runs for them
+            let one = known_values(vec![1.0], PrimitiveKind::Float, TrustProved);
+            let op = if source.contains("//") { Operator::FloorDiv } else { Operator::Mod };
+            let value = binary_arithmetic_value_with_kernel(op, &one, &denominator, &kernel);
+            assert_eq!(
+                value.kind,
+                Kind::Unknown,
+                "{source}: the value question must keep declining outright — no split runs for `//`/`%`: {value:?}"
             );
         }
     }

@@ -337,18 +337,20 @@ pub fn unhonorable_annotation(spelling: &str) -> String {
     format!("this annotation '{spelling}' is recognized as a refinement statement but this table could not compile it")
 }
 
-/// The zero-admitting-divisor fire — `binop_possible_raise`'s own
-/// row for a divisor window that ADMITS zero without being entirely
-/// zero (`expressions.rs`'s `split_divisor_transfer`, which asks the
-/// value question over the divisor's zero-excluded halves). The value
-/// side keeps determining through that split; this sentence names the
-/// escape the split's own value answer cannot speak to: the divisor's
-/// set admits `0`, and CPython raises `ZeroDivisionError` there
-/// (`expressions.rst` §6.7, arith.10 — Python `/`, `//`, and `%` each
-/// raise on a zero right operand, the divergence from ECMA's own
-/// determined `±Infinity`/NaN answer at that same corner). Names the
-/// guard that discharges it, the same teaching move
-/// `os_system_no_stdout_capture` makes for its own fixable respelling.
+/// The zero-admitting-divisor fire — `binop_possible_raise`'s own row
+/// for a `/`, `//`, or `%` divisor window that ADMITS zero without
+/// being entirely zero: the divisor's set admits `0`, and CPython
+/// raises `ZeroDivisionError` there for all three operators alike
+/// (`expressions.rst` §6.7, arith.10 — the divergence from ECMA's own
+/// determined `±Infinity`/NaN answer at that same corner for `/`). For
+/// `/`, `expressions.rs`'s `split_divisor_transfer` keeps determining
+/// the value question over the divisor's zero-excluded halves
+/// alongside this fire; `//` and `%` have no such split, so their
+/// value question keeps declining outright over the same window — this
+/// sentence names the escape neither value path can speak to, in one
+/// wording shared by all three. Names the guard that discharges it, the
+/// same teaching move `os_system_no_stdout_capture` makes for its own
+/// fixable respelling.
 pub fn division_by_a_set_that_admits_zero() -> String {
     "this expression's divisor set admits 0 — CPython raises ZeroDivisionError there (expressions.rst \
     §6.7); a zero guard on the divisor (for example `if divisor != 0:`) discharges this before the \
