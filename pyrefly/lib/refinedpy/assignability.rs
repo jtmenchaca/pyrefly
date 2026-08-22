@@ -762,17 +762,35 @@ fn scalar_or_string_shaped(set: &refined_sets::refinement_forms::RefinedSet) -> 
 }
 
 /// A `Star`/`Repeat`/`RepeatWord` form's own element sits inside the
-/// codepoint alphabet — the same gate `is_character` (`refined_sets::
-/// format_string_shapes`) checks for the identical reason there: this
-/// crate's grammar reuses `Star` for a NUMERIC element too
-/// (`check.rs::seed_parameters`'s `list[int]`/`set[int]`/`Sequence[int]`
-/// parameter seed, `Form::Star(int's own set)`), so a bare repetition
-/// form is string-shaped only when its element demonstrably IS
-/// codepoints, never merely because it wears one of these forms.
+/// codepoint alphabet — this crate's grammar reuses `Star`/`Repeat` for a
+/// NUMERIC element too (`check.rs::seed_parameters`'s `list[int]`/
+/// `set[int]`/`Sequence[int]` parameter seed, `Form::Star(int's own
+/// set)`), so a bare repetition form is string-shaped only when its
+/// element demonstrably IS codepoints, never merely because it wears one
+/// of these forms.
+///
+/// Two spellings pass: `is_character` — the element IS the whole
+/// alphabet exactly (a plain `list[str]`/`Sequence[str]` element seed) —
+/// or `within_codepoint_door` — the element is a NARROWER codepoint-only
+/// subset, the shape a `.regex(...)`-compiled character class actually
+/// produces (`regex_compiler.rs`'s `code_range`/`character_class`:
+/// `[a-z]` compiles to `Integer ∧ AtLeast(0x61) ∧ AtMost(0x7A)`, an
+/// `Integer`-window wholly inside the codepoint alphabet, never the full
+/// alphabet itself). Before this second spelling, a `Repeat`/`Star` over
+/// a narrowed class (`LabelPattern = Annotated[str,
+/// Field(pattern=r"^[a-z]{3,8}$")]`'s own compiled `Repeat`) read as
+/// NEITHER string- nor number-shaped by this file's own two tests, so
+/// `judge`'s `sequence_question` gate never tried `seq_subset` at all and
+/// fell straight to `scalar_subset`, which the kernel refuses outright
+/// for a non-1-tuple shape — the undetermined `g-strings-and-formats.py`
+/// row this fixes (`kernel_declined_containment`, RTS7002).
 fn repetition_element_is_codepoints(form: &refined_sets::refinement_forms::Refinement) -> bool {
     let one = refined_sets::refinement_forms::make_refined_set(vec![form.clone()]);
     match refined_sets::repetition_window_forms::as_repetition(&one) {
-        Some(repeated) => refined_sets::format_string_shapes::is_character(&repeated.element),
+        Some(repeated) => {
+            refined_sets::format_string_shapes::is_character(&repeated.element)
+                || within_codepoint_door(&repeated.element, false)
+        }
         None => false,
     }
 }

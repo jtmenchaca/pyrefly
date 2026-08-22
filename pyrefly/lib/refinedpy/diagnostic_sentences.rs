@@ -235,23 +235,6 @@ pub fn foreign_edge_double_channel_declared() -> String {
         .to_owned()
 }
 
-/// The return-leg corner decline: the target's declared return admits
-/// an infinite corner (+Infinity or -Infinity) that the TypeScript
-/// producer's own serializer does not carry faithfully — `JSON.stringify`
-/// serializes a non-finite Number as the bare token `null`
-/// (ECMA-262's `SerializeJSONProperty`, the finiteness check on a Number
-/// value; RFC 8259 legal JSON text itself has no numeral for ±Infinity,
-/// but that is not why this fires — `1e999` is legal JSON and parses to
-/// Infinity in both runtimes), a value outside the claimed set landing
-/// at this call's own consumer. Named per corner so the reader sees
-/// WHICH end escapes, never a category.
-pub fn foreign_edge_return_admits_uncarriable_corner(function_name: &str, corner: &str) -> String {
-    format!(
-        "the target {function_name}'s stated return admits {corner}, which JSON.stringify serializes as \
-        null on this leg — the crossing cannot be trusted at that corner"
-    )
-}
-
 /// A cross-language crossing's refutation: the reason the value cannot
 /// cross, with the target's own provenance appended — the second step
 /// of the two-language explanation, in the message-text form
@@ -519,18 +502,6 @@ mod tests {
         let message = foreign_edge_double_channel_declared();
         assert!(message.contains("argv element"), "{message}");
         assert!(message.contains("input=json.dumps"), "{message}");
-    }
-
-    /// The uncarriable-corner sentence names the function, the corner,
-    /// and the serializer mechanism that loses it.
-    #[test]
-    fn the_uncarriable_corner_sentence_names_the_function_and_the_corner() {
-        let message = foreign_edge_return_admits_uncarriable_corner("audioLevel", "+Infinity");
-        assert!(message.contains("audioLevel"), "{message}");
-        assert!(message.contains("+Infinity"), "{message}");
-        assert!(message.contains("JSON.stringify"), "{message}");
-        assert!(message.contains("null"), "{message}");
-        assert!(message.contains("cannot be trusted"), "{message}");
     }
 
     /// A crossing refusal appends the target's own located provenance.

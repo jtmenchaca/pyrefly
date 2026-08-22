@@ -58,14 +58,19 @@
 //! only the IEEE-754 float theorem). Serving that pair as the Python
 //! answer would be unsound; the decline is the day-one-correct verdict,
 //! not a gap the adapter should ever close by asking harder. A WIDE
-//! zero-admitting range (e.g. `[0.0, 2.0]`) is a weaker version of the
-//! same hazard the kernel's own general-interval branch already refuses
-//! outright (`divisorMayBeZero`) before any adapter relabeling could
-//! occur — G5's premise is the SINGLETON-shaped Set specifically,
-//! because that is the one shape where the kernel actually answers a
-//! value to relabel.
+//! zero-admitting range (e.g. `[0.0, 2.0]`) is a DIFFERENT shape from
+//! G5's degenerate singleton: it has non-zero members too, so it is not
+//! an always-raises divisor — `split_divisor_transfer` (2026-08-22) asks
+//! the kernel on the divisor's zero-excluded halves and unions the
+//! answers, so this shape now DETERMINES a value (sort-known, at
+//! minimum) rather than declining. `test_div_over_a_wide_zero_admitting_
+//! window_determines_via_the_split` pins that below. G5's premise stays
+//! the SINGLETON-shaped Set specifically — the one shape with no
+//! non-raising half to split into at all, so it is still the shape
+//! where the kernel's own answer would have to be relabeled wholesale
+//! to serve it, which the gate still refuses.
 //! `test_div_by_a_set_admitting_zero_diverges_from_the_kernel_by_design`
-//! asserts this divergence directly, with its own message rather than
+//! asserts G5's divergence directly, with its own message rather than
 //! `compare_row`'s "gap" framing.
 //!
 //! Rows G1/G2 are the audit's own "the exact `int` theory serves them"
@@ -500,13 +505,17 @@ mod tests {
     /// whose "adapter declines, kernel answers" verdict reads as a
     /// determination GAP; this row is the opposite, a decline the
     /// adapter must NEVER close by asking harder). A WIDE zero-admitting
-    /// range (`[0.0, 2.0]`) is a weaker version of the same hazard: the
-    /// kernel's own general-interval branch (`divisorMayBeZero`) already
-    /// refuses it before any adapter-side relabeling could occur, so it
-    /// is not this row's witness — `test_div_by_a_set_that_may_admit_
-    /// zero_declines_rather_than_answering_ecma_infinity` (expressions.rs)
-    /// still pins the adapter's decline there, belt-and-braces with the
-    /// kernel's own refusal.
+    /// range (`[0.0, 2.0]`) is a DIFFERENT shape from this degenerate
+    /// singleton: it has non-zero members too, so it is no longer the
+    /// always-raises window this row's `divisor_is_provably_always_zero`
+    /// gate protects — `split_divisor_transfer`'s own fix (2026-08-22)
+    /// asks the kernel on the divisor's zero-excluded halves instead of
+    /// declining outright, and `test_div_by_a_set_that_may_admit_zero_
+    /// determines_the_float_sort_over_the_zero_excluded_split`
+    /// (expressions.rs) pins that split now DETERMINES a value there —
+    /// see `test_div_over_a_wide_zero_admitting_window_determines_via_
+    /// the_split` below for this file's own conformance pin of the same
+    /// shape.
     #[test]
     fn test_div_by_a_set_admitting_zero_diverges_from_the_kernel_by_design() {
         let Some(kernel) = loaded_kernel() else { return };
@@ -559,6 +568,84 @@ mod tests {
         let want = make_refined_set(vec![at_least(0.5), at_most(1.0)]);
         assert!((kernel.scalar_subset)(&adapter.set, &want), "adapter {:?} not ⊆ want {:?}", adapter.set, want);
         assert!((kernel.scalar_subset)(&want, &adapter.set), "want {:?} not ⊆ adapter {:?}", want, adapter.set);
+    }
+
+    /// The zero-divisor unit's own pin: `1.0 / denominator` where
+    /// `denominator` is the WIDE window `[0.0, 2.0]` (`edge_infinity.py`'s
+    /// own `max(0.0, sample)` shape, `sample ∈ [-2.0, 2.0]` clamped) —
+    /// admits zero at its lower bound, but is NOT the degenerate `{0.0}`
+    /// singleton G5 pins. Before `split_divisor_transfer`, this row
+    /// declined outright (`test_div_by_a_set_that_may_admit_zero_
+    /// determines_the_float_sort_over_the_zero_excluded_split`'s own
+    /// prior name, expressions.rs). The split reads this window's
+    /// negative half (`< 0.0`) as EMPTY and skips it, asks `binary64.div`
+    /// on the positive half alone (`(0.0, 2.0]`), and that ask itself
+    /// answers `Unknown` — the kernel's own general-interval branch
+    /// cannot narrow `1.0 / (0.0, 2.0]` to a tight enclosure even with
+    /// zero excluded — so the adapter now DETERMINES the float sort
+    /// (`float_sorted_unknown()`), never the full `Kind::Unknown` decline
+    /// this row used to answer.
+    #[test]
+    fn test_div_over_a_wide_zero_admitting_window_determines_via_the_split() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let denominator = AbstractValue {
+            kind_tag: Some(PrimitiveKind::Float),
+            ..known_set(make_refined_set(vec![at_least(0.0), at_most(2.0)]), None, TrustProved, SetKindTag::None)
+        };
+        let one = float_operand(1.0);
+        let adapter = binary_arithmetic_value_with_kernel(Operator::Div, &one, &denominator, &kernel);
+        assert_eq!(
+            adapter.kind,
+            Kind::Set,
+            "the zero-excluded split must determine the float sort, never decline outright: {adapter:?}"
+        );
+        assert_eq!(adapter.kind_tag, Some(PrimitiveKind::Float));
+
+        // confirmed directly: the kernel's OWN answer on the zero-
+        // excluded positive half alone is Unknown — the adapter's
+        // determination traces to a real kernel answer, not a guess
+        let positive_half = make_refined_set(vec![refined_sets::refinement_forms::above(0.0), at_most(2.0)]);
+        let asked = (kernel.transfer)(&TransferQuestion {
+            op: TransferQuestionOp::Div,
+            a: singleton(1.0),
+            b: positive_half,
+            c: 0.0,
+            base: PowOperandWire { kind: PowOperandKind::NaN, set: make_refined_set(vec![]) },
+            exp: PowOperandWire { kind: PowOperandKind::NaN, set: make_refined_set(vec![]) },
+        });
+        assert_eq!(
+            asked.kind,
+            TransferAnswerKind::Unknown,
+            "the split's own positive half must ask the kernel and read its honest Unknown, or this row \
+             proves the wrong thing: {asked:?}"
+        );
+    }
+
+    /// The split's UNION arm: `1.0 / denominator` where `denominator` is
+    /// `[-2.0, 2.0]` — a window straddling zero with BOTH a genuine
+    /// negative half (`[-2.0, 0.0)`) and a genuine positive half
+    /// (`(0.0, 2.0]`), unlike the wide-window row above (whose negative
+    /// half is empty). Both halves are non-empty, so `split_divisor_
+    /// transfer` asks the kernel on EACH and unions the two answers
+    /// (`union_transfer_answers`) — pinned here so the union arm itself
+    /// (not just the single-nonempty-half arm the wide-window row
+    /// exercises) is asked of the real kernel at least once.
+    #[test]
+    fn test_div_over_a_window_straddling_zero_unions_both_split_halves() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let denominator = AbstractValue {
+            kind_tag: Some(PrimitiveKind::Float),
+            ..known_set(make_refined_set(vec![at_least(-2.0), at_most(2.0)]), None, TrustProved, SetKindTag::None)
+        };
+        let one = float_operand(1.0);
+        let adapter = binary_arithmetic_value_with_kernel(Operator::Div, &one, &denominator, &kernel);
+        assert_eq!(
+            adapter.kind,
+            Kind::Set,
+            "a window straddling zero, split into two non-empty halves, must still determine the float \
+             sort: {adapter:?}"
+        );
+        assert_eq!(adapter.kind_tag, Some(PrimitiveKind::Float));
     }
 
     /// LEDGER ROW G4: the brief asks for NaN-operand arithmetic rows.

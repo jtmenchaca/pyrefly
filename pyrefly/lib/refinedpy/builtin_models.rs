@@ -20,7 +20,7 @@
 
 use std::sync::Arc;
 
-use refined_domain::abstract_value::{known_set, known_values, opaque_value, AbstractValue, Kind, PrimitiveKind, SetKindTag};
+use refined_domain::abstract_value::{float_sorted_unknown, known_set, known_values, opaque_value, AbstractValue, Kind, PrimitiveKind, SetKindTag};
 use refined_domain::known_constructors::known_list;
 use refined_domain::trust_grades::{derived_trust_level, TrustSpec};
 use refined_kernel::kernel_interface::RefinedTSKernel;
@@ -684,14 +684,46 @@ fn parse_base_ten_int_string(text: &str) -> Option<f64> {
 
 /// `float(x)` on a single known numeric — library/functions.html#float:
 /// "Return a floating-point number constructed from a number or a
-/// string." Restricted here to the numeric argument: a string argument
-/// is never a `single_known_numeric`, so `float(str)` declines rather
-/// than being answered by this row.
+/// string." A STRING-sorted argument (`is_string_sorted_argument`'s own
+/// doc — a plain str ground with no exact text this file can parse, e.g.
+/// a captured subprocess `.stdout` read: `expressions.rs`'s own
+/// `subprocess_run_construction_value`) still determines a SORT: the
+/// same clause states `float`'s return is always a `float` regardless of
+/// which of the two argument forms produced it, so `float(<any string>)`
+/// answers `float_sorted_unknown()` — sort-known, value-unknown, the
+/// same posture every other sort-only row in this file takes rather than
+/// decline outright. An EXACT string's own numeric text is not parsed
+/// here (this row answers the sort every string takes, never attempts
+/// CPython's float-literal grammar) — only a NUMERIC argument answers an
+/// exact value, unchanged from before this row grew the string case.
 fn float_call(arguments: &[AbstractValue]) -> Option<AbstractValue> {
     let [only] = arguments else { return None };
-    let (value, _sort) = single_known_numeric(only)?;
-    let grade = derived_trust_level(TrustSpec, arguments);
-    Some(known_values(vec![value], PrimitiveKind::Float, grade))
+    if let Some((value, _sort)) = single_known_numeric(only) {
+        let grade = derived_trust_level(TrustSpec, arguments);
+        return Some(known_values(vec![value], PrimitiveKind::Float, grade));
+    }
+    if is_string_sorted_argument(only) {
+        return Some(float_sorted_unknown());
+    }
+    None
+}
+
+/// Whether `argument` is a STRING-sorted value: an exact `Kind::Values`
+/// tagged `PrimitiveKind::String`, or a `Kind::Set` that is either
+/// explicitly tagged String or untagged with a sequence-shaped own set
+/// (`assignability.rs`'s own `sequence_shaped` — the SAME "untagged set,
+/// sequence-shaped forms read as string-sorted" convention that file's
+/// containment law already applies, e.g. `__name__`'s own untagged
+/// `strings()` ground in `expressions.rs`).
+fn is_string_sorted_argument(argument: &AbstractValue) -> bool {
+    if argument.kind == Kind::Values {
+        return argument.kind_tag == Some(PrimitiveKind::String);
+    }
+    if argument.kind != Kind::Set {
+        return false;
+    }
+    argument.kind_tag == Some(PrimitiveKind::String)
+        || (argument.kind_tag.is_none() && crate::refinedpy::assignability::sequence_shaped(&argument.set))
 }
 
 /// `chr(i)` on a known Integer code point — library/functions.html#chr:

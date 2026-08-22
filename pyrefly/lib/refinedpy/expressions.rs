@@ -33,13 +33,16 @@ use refined_domain::trust_grades::TrustProved;
 use refined_domain::trust_grades::TrustSpec;
 use refined_kernel::kernel_interface::RefinedTSKernel;
 use refined_sets::codepoint_sets::strings;
+use refined_sets::refinement_forms::above;
 use refined_sets::refinement_forms::at_least;
+use refined_sets::refinement_forms::below;
 use refined_sets::refinement_forms::integer;
 use refined_sets::refinement_forms::make_refined_set;
 use refined_sets::refinement_forms::Form;
 use refined_sets::refinement_forms::one_of;
 use refined_sets::refinement_forms::repeat_of;
 use refined_sets::refinement_forms::requires_integer;
+use refined_sets::refinement_forms::union;
 use refined_sets::refinement_forms::RefinedSet;
 use refined_sets::repetition_window_forms::as_repetition;
 use refined_sets::repetition_window_forms::repetition;
@@ -61,6 +64,7 @@ use crate::refinedpy::bytes_models::BytesAnswer;
 use crate::refinedpy::collection_models;
 use crate::refinedpy::env;
 use crate::refinedpy::env::Environment;
+use crate::refinedpy::foreign_edge;
 use crate::refinedpy::instances;
 use crate::refinedpy::math_models;
 use crate::refinedpy::narrowing;
@@ -1980,6 +1984,66 @@ fn datetime_field_argument(expr: &Expr, environment: &Environment, kernel: &Arc<
     Some(number as i64)
 }
 
+/// `subprocess.run([...], ..., capture_output=True, text=True)` —
+/// library/subprocess.rst, `class:: CompletedProcess`: "args, returncode,
+/// stdout, stderr" are the instance's own attributes, and `run`'s own
+/// entry states `capture_output=True` sets `stdout`/`stderr` to
+/// `PIPE`, while `text=True` (an alias for `universal_newlines`) makes
+/// every captured stream "opened in text mode" — a `str`, never `bytes`.
+/// Modeled ONLY as far as `.stdout`'s own SORT: an OBJECT (`Kind::Object`,
+/// untagged `source` — the same untagged shape `cross_module.rs`'s own
+/// module object carries, so `evaluate_attribute_read`'s tail falls
+/// straight to the plain `instances::field_read` linear scan) with one
+/// `ObjectKey` named `stdout`, holding the whole-strings ground
+/// (`codepoint_sets::strings()`, `C*`) — the same untagged String-sorted
+/// `Kind::Set` `__name__` reads (this file's own `Expr::Name` arm). No
+/// OTHER `CompletedProcess` field (`returncode`, `stderr`, `args`) is
+/// modeled: this row exists to give `.stdout` a SORT for a body that
+/// reads it some other way than `json.loads(...)` (`foreign_edge.rs`'s
+/// own `json.loads(result.stdout)` consumer path owns that shape
+/// separately, and runs BEFORE this construction ever matters — a
+/// recognized foreign edge overrides its own consumer node directly;
+/// this row only affects `result` itself and every OTHER read of it,
+/// `d-data-legs.py`'s own `level_via_raw_stdout`: `float(result.stdout)`,
+/// never parsed as JSON).
+///
+/// Declines (`None`) unless the module name is `subprocess` (not locally
+/// shadowed — the same check every other `subprocess`/module recognizer
+/// in this crate applies), the attribute called is `run`, and BOTH
+/// `capture_output=True` and `text=True` appear among the call's
+/// keywords: away from that exact pair, `.stdout` is not provably a
+/// `str` at all (no `capture_output=True` leaves stdout un-captured
+/// entirely; no `text=True` leaves it `bytes`), so the whole construction
+/// declines rather than guess the sort.
+fn subprocess_run_construction_value(attribute: &ruff_python_ast::ExprAttribute, call: &ruff_python_ast::ExprCall, environment: &Environment) -> Option<AbstractValue> {
+    let Expr::Name(module_name) = attribute.value.as_ref() else {
+        return None;
+    };
+    if module_name.id.as_str() != "subprocess" || environment.read("subprocess").is_some() {
+        return None;
+    }
+    if attribute.attr.as_str() != "run" {
+        return None;
+    }
+    let mut capture_output_true = false;
+    let mut text_true = false;
+    for keyword in call.arguments.keywords.iter() {
+        let Some(name) = keyword.arg.as_ref() else {
+            return None;
+        };
+        match name.as_str() {
+            "capture_output" => capture_output_true = foreign_edge::literal_true(&keyword.value),
+            "text" => text_true = foreign_edge::literal_true(&keyword.value),
+            _ => {}
+        }
+    }
+    if !capture_output_true || !text_true {
+        return None;
+    }
+    let keys = vec![ObjectKey { name: "stdout".to_owned(), numeric: false, value: known_set(strings(), None, TrustSpec, SetKindTag::None) }];
+    Some(known_object(keys, None, true, TrustSpec, false))
+}
+
 /// Whether `expr` is exactly `datetime.timezone.utc` or `datetime.UTC`
 /// — the two spellings datetime.rst documents for the UTC singleton
 /// (`datetime_construction_value`'s own doc). Read SYNTACTICALLY (the
@@ -2614,6 +2678,19 @@ fn evaluate_call(call: &ruff_python_ast::ExprCall, environment: &Environment, ke
                     return unknown();
                 }
             }
+        }
+        // `subprocess.run([...], ..., capture_output=True, text=True)` —
+        // tried here, alongside `array.array`, so `result`'s own binding
+        // carries a `.stdout` field sort even when no `json.loads(...)`
+        // consumer exists for `foreign_edge.rs` to recognize
+        // (`subprocess_run_construction_value`'s own doc). A call this
+        // row does not recognize (a different callee, a missing
+        // `capture_output=True`/`text=True` pair) falls through to the
+        // ordinary keyword-gated dispatch below unchanged — this row
+        // only ever ADDS a sort to `result`, never removes one the
+        // generic path would have given.
+        if let Some(value) = subprocess_run_construction_value(attribute, call, environment) {
+            return value;
         }
     }
     if !call.arguments.keywords.is_empty() {
@@ -4774,6 +4851,142 @@ fn divisor_provably_excludes_zero(divisor: &RefinedSet, kernel: &Arc<RefinedTSKe
     matches!(asked, Ok(false))
 }
 
+/// `a / b` for a divisor window `b` that ADMITS zero (`0.0 ∈ b`) but is
+/// not itself always zero (`divisor_is_provably_always_zero` already owns
+/// the always-zero case as an unconditional raise, in `binop_provable_raise`
+/// below). CPython's `/` still raises `ZeroDivisionError` on the zero arm
+/// of such a window (arith.10), so this never asks the kernel with `b`
+/// itself — that would ask `binary64.div` a question the divisor's own
+/// zero member makes unsound for a Python `/`. Instead it splits `b`
+/// around zero into its strictly-negative half (`b ∩ below(0)`) and its
+/// strictly-positive half (`b ∩ above(0)`) — each half PROVABLY excludes
+/// zero by construction — asks `binary64.div` on `a` against each half
+/// separately, and unions whichever halves answer into one `RefinedSet`.
+/// A half whose intersection with `b` is empty (`kernel.scalar_empty`,
+/// e.g. `b` is entirely negative so its positive half is vacuous) is
+/// skipped rather than asked, matching `divisor_is_provably_always_zero`'s
+/// own empty-set guard.
+///
+/// This determines the VALUE question on every path that does not raise;
+/// the zero arm itself is a MAY-RAISE this function does not speak to —
+/// `binop_provable_raise` only fires an unconditional raise when the
+/// entire divisor window is zero, so a window that merely ADMITS zero
+/// alongside other values raises on SOME inputs and returns a value on
+/// others. Reporting that raise arm as its own diagnostic (rather than
+/// leaving it to CPython at runtime) is future work; no existing
+/// possibly-raising expression in this file reports a partial-raise
+/// arm alongside its value determination, so this function returns only
+/// the sound value binding over the non-raising split, exactly as every
+/// other admitted transfer answer already does.
+fn split_divisor_transfer(
+    left_set: RefinedSet,
+    right_set: &RefinedSet,
+    kernel: &Arc<RefinedTSKernel>,
+) -> Option<refined_kernel::transfer_questions::TransferAnswer> {
+    use refined_kernel::transfer_questions::TransferAnswerKind;
+    use refined_kernel::transfer_questions::TransferQuestion;
+    use refined_kernel::transfer_questions::TransferQuestionOp;
+
+    let ask_half = |divisor_half: RefinedSet| -> Option<refined_kernel::transfer_questions::TransferAnswer> {
+        let empty = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (kernel.scalar_empty)(&divisor_half)));
+        if matches!(empty, Ok(true)) || empty.is_err() {
+            return None;
+        }
+        let asked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            (kernel.transfer)(&TransferQuestion {
+                op: TransferQuestionOp::Div,
+                a: left_set.clone(),
+                b: divisor_half,
+                c: 0.0,
+                base: refined_kernel::transfer_questions::PowOperandWire {
+                    kind: refined_kernel::transfer_questions::PowOperandKind::NaN,
+                    set: make_refined_set(vec![]),
+                },
+                exp: refined_kernel::transfer_questions::PowOperandWire {
+                    kind: refined_kernel::transfer_questions::PowOperandKind::NaN,
+                    set: make_refined_set(vec![]),
+                },
+            })
+        }));
+        asked.ok()
+    };
+
+    let negative_half = make_refined_set({
+        let mut forms = right_set.forms.clone();
+        forms.push(below(0.0));
+        forms
+    });
+    let positive_half = make_refined_set({
+        let mut forms = right_set.forms.clone();
+        forms.push(above(0.0));
+        forms
+    });
+
+    let negative_answer = ask_half(negative_half);
+    let positive_answer = ask_half(positive_half);
+
+    // A may-be-NaN answer on either half must never masquerade as a
+    // NaN-free result — the whole split declines rather than silently
+    // drop the NaN-carrying half's values.
+    if matches!(negative_answer.as_ref().map(|a| a.kind), Some(TransferAnswerKind::NaN))
+        || matches!(positive_answer.as_ref().map(|a| a.kind), Some(TransferAnswerKind::NaN))
+    {
+        return None;
+    }
+
+    match (negative_answer, positive_answer) {
+        (None, None) => None,
+        (Some(only), None) | (None, Some(only)) => Some(only),
+        (Some(neg), Some(pos)) => Some(union_transfer_answers(neg, pos)),
+    }
+}
+
+/// Unions two `TransferAnswer`s of the SAME kind family into one answer:
+/// `Values` concatenates (both sides are exact singleton sets); `Set`
+/// unions the two enclosures via the grammar's own `Union` form; either
+/// side reading `Unknown` widens the whole union to `Unknown` (an
+/// enclosure the kernel could not narrow on one half narrows nothing
+/// once joined with the other). NaN is never passed here —
+/// `split_divisor_transfer` already declines before this is called.
+fn union_transfer_answers(
+    a: refined_kernel::transfer_questions::TransferAnswer,
+    b: refined_kernel::transfer_questions::TransferAnswer,
+) -> refined_kernel::transfer_questions::TransferAnswer {
+    use refined_kernel::transfer_questions::TransferAnswer;
+    use refined_kernel::transfer_questions::TransferAnswerKind;
+    match (a.kind, b.kind) {
+        (TransferAnswerKind::Values, TransferAnswerKind::Values) => {
+            let mut values = a.values;
+            values.extend(b.values);
+            TransferAnswer {
+                kind: TransferAnswerKind::Values,
+                values,
+                set: make_refined_set(vec![]),
+            }
+        }
+        (TransferAnswerKind::Unknown, _) | (_, TransferAnswerKind::Unknown) => TransferAnswer {
+            kind: TransferAnswerKind::Unknown,
+            values: vec![],
+            set: make_refined_set(vec![]),
+        },
+        _ => {
+            let a_set = match a.kind {
+                TransferAnswerKind::Values => make_refined_set(vec![one_of(&a.values)]),
+                _ => a.set,
+            };
+            let b_set = match b.kind {
+                TransferAnswerKind::Values => make_refined_set(vec![one_of(&b.values)]),
+                _ => b.set,
+            };
+            TransferAnswer {
+                kind: TransferAnswerKind::Set,
+                values: vec![],
+                set: make_refined_set(vec![union(a_set, b_set)]),
+            }
+        }
+    }
+}
+
 fn transfer_over_sets(
     op: Operator,
     left: &AbstractValue,
@@ -4809,18 +5022,6 @@ fn transfer_over_sets(
         }
     }
     let transfer_op = admitted_transfer_op(op)?;
-    // arith.10's carve-out: `/` at a divisor whose set may admit zero
-    // diverges from `binary64.div` — ECMA answers a determined
-    // `±Infinity`/NaN there, Python raises `ZeroDivisionError`. Asking
-    // the kernel would relabel ECMA's correct answer to the WRONG
-    // question as Python's; the value question declines instead
-    // (`provable_raise`'s `binop_provable_raise` is where the raise
-    // itself gets named, for the operand shapes it can read). Every
-    // other admitted op (Add/Sub/Mult) has no such divisor and asks
-    // unconditionally.
-    if op == Operator::Div && !divisor_provably_excludes_zero(&right_set, kernel) {
-        return None;
-    }
     // `Div`'s always-float override (arith.9: "the type is widened even
     // when the arguments are exact integers") beats the both_int rule
     // outright — Python `/` never stays Integer-sorted regardless of
@@ -4830,23 +5031,40 @@ fn transfer_over_sets(
     // Integer-sorted.
     let both_int = op != Operator::Div && left_sort == PrimitiveKind::Integer && right_sort == PrimitiveKind::Integer;
     let result_sort = if both_int { PrimitiveKind::Integer } else { PrimitiveKind::Float };
-    let asked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        (kernel.transfer)(&refined_kernel::transfer_questions::TransferQuestion {
-            op: transfer_op,
-            a: left_set,
-            b: right_set,
-            c: 0.0,
-            base: refined_kernel::transfer_questions::PowOperandWire {
-                kind: refined_kernel::transfer_questions::PowOperandKind::NaN,
-                set: make_refined_set(vec![]),
-            },
-            exp: refined_kernel::transfer_questions::PowOperandWire {
-                kind: refined_kernel::transfer_questions::PowOperandKind::NaN,
-                set: make_refined_set(vec![]),
-            },
-        })
-    }));
-    let answer = asked.ok()?;
+    // arith.10's carve-out: a divisor whose set admits zero diverges from
+    // `binary64.div` asked directly — ECMA answers a determined
+    // `±Infinity`/NaN at zero, Python raises `ZeroDivisionError`
+    // (`divisor_is_provably_always_zero`'s window owns the unconditional
+    // raise, named in `binop_provable_raise`). A window that admits zero
+    // WITHOUT being entirely zero raises only on its zero arm and
+    // determines a value on every other input — `split_divisor_transfer`
+    // asks `binary64.div` on the zero-excluded negative and positive
+    // halves of the divisor separately and unions the two answers, so the
+    // value question determines on the non-raising split rather than
+    // decline outright. An always-zero divisor has no non-raising half at
+    // all (both halves are empty), so it still declines here exactly as
+    // before — the raise is the whole answer for that window.
+    let answer = if op == Operator::Div && !divisor_provably_excludes_zero(&right_set, kernel) {
+        split_divisor_transfer(left_set, &right_set, kernel)?
+    } else {
+        let asked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            (kernel.transfer)(&refined_kernel::transfer_questions::TransferQuestion {
+                op: transfer_op,
+                a: left_set,
+                b: right_set,
+                c: 0.0,
+                base: refined_kernel::transfer_questions::PowOperandWire {
+                    kind: refined_kernel::transfer_questions::PowOperandKind::NaN,
+                    set: make_refined_set(vec![]),
+                },
+                exp: refined_kernel::transfer_questions::PowOperandWire {
+                    kind: refined_kernel::transfer_questions::PowOperandKind::NaN,
+                    set: make_refined_set(vec![]),
+                },
+            })
+        }));
+        asked.ok()?
+    };
     use refined_kernel::transfer_questions::TransferAnswerKind;
     match answer.kind {
         TransferAnswerKind::Values => {
@@ -8157,22 +8375,24 @@ mod tests {
     // --- `/` at a SET-SHAPED divisor that may admit zero ---
 
     /// `1.0 / denominator` where `denominator` is a seeded Float-sorted
-    /// SET `[0.0, 2.0]` — a WIDE window admitting zero. Before this
-    /// gate, `transfer_over_sets` asked `binary64.div` unconditionally
-    /// for `Div`; the kernel's own general-interval branch
-    /// (`divisorMayBeZero`, `theories/binary64/div.lean`) already
-    /// refuses a range this wide on its own, so this row was always
-    /// safe by the kernel's own refusal even before the adapter-side
-    /// gate landed — the adapter's decline here is belt-and-braces, not
-    /// the sole guard. The sole-guard row is a DEGENERATE zero-only Set
-    /// (`{0.0}`, `Kind::Set` built from a single `one_of`), where the
-    /// kernel's `bothSingle` branch DOES answer a determined `±Infinity`
-    /// pair (see `transfer_conformance.rs`'s ledger row G5, which pins
-    /// that shape and the real divergence directly). `divisor_provably_
-    /// excludes_zero` gates both shapes uniformly through `kernel.member`
-    /// rather than special-casing either.
+    /// SET `[0.0, 2.0]` — a WIDE window admitting zero, but NOT entirely
+    /// zero (`divisor_is_provably_always_zero` is false — the window
+    /// has non-zero members too). `split_divisor_transfer`'s own fix:
+    /// the value question no longer declines outright at this shape —
+    /// it splits the divisor into its zero-excluded halves (`(0.0, 2.0]`
+    /// here; the negative half, `< 0.0`, is empty and skipped) and asks
+    /// `binary64.div` on the non-empty half. The kernel's OWN general-
+    /// interval branch (`divisorMayBeZero`, `theories/binary64/div.lean`)
+    /// still cannot narrow `1.0 / (0.0, 2.0]` to a tight enclosure even
+    /// with zero excluded, so the split's own answer is `Unknown` —
+    /// which this function reads as `float_sorted_unknown()` (sort-
+    /// known, value-unknown), never `Kind::Unknown` outright. The value
+    /// question DETERMINES a sort here, on the non-raising split, exactly
+    /// as every other admitted transfer answer already does — the raise
+    /// arm at `x == 0.0` itself is a separate, unaddressed question
+    /// (`binop_provable_raise` only fires when the WHOLE window is zero).
     #[test]
-    fn test_div_by_a_set_that_may_admit_zero_declines_rather_than_answering_ecma_infinity() {
+    fn test_div_by_a_set_that_may_admit_zero_determines_the_float_sort_over_the_zero_excluded_split() {
         let Some(kernel) = loaded_kernel() else { return };
         let denominator = AbstractValue {
             kind_tag: Some(PrimitiveKind::Float),
@@ -8187,9 +8407,10 @@ mod tests {
         let result = binary_arithmetic_value_with_kernel(Operator::Div, &one, &denominator, &kernel);
         assert_eq!(
             result.kind,
-            Kind::Unknown,
-            "a divisor window admitting zero must decline the value question, never answer ECMA's ±Infinity: {result:?}"
+            Kind::Set,
+            "the zero-excluded split must determine a value (sort-only, at minimum), never decline outright: {result:?}"
         );
+        assert_eq!(result.kind_tag, Some(PrimitiveKind::Float));
     }
 
     /// The SOLE-GUARD row: `1.0 / denominator` where `denominator` is a
