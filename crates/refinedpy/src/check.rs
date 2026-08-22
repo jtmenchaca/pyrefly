@@ -353,21 +353,47 @@ pub fn refined_set_at_position(
 
 /// A declared refinement stated exactly AT `position`: a function
 /// parameter's own annotation (`declared_refinement`, the same read
-/// `check.rs::seed_parameters` uses to seed it), or a function's own
+/// `check.rs::seed_parameters` uses to seed it), a function's own
 /// `-> Annotation` when `position` sits inside the `returns` node
 /// (`declared_refinement`, falling back to `base_sort_return_refinement`
-/// and `typed_dict_return_refinement` — the same three-reader fallback
-/// chain `walk_function_def` already runs to build a body's own
-/// `return_refinement`). Recurses into every nested `def`/`class` body
-/// so the INNERMOST enclosing function's own parameter/return wins —
-/// the same "innermost node" preference the derived-flow fallback
-/// keeps for a recorded range.
+/// — the same two-reader fallback chain `walk_function_def` already
+/// runs to build a body's own `return_refinement`, minus the
+/// `typed_dict_return_refinement` arm, which needs `context.typed_dicts`
+/// and is not in scope here), a `def`'s own NAME (`declared_refinement`
+/// on `def.returns` ALONE — no `base_sort_return_refinement` fallback,
+/// so a bare `-> float`/`-> int`/`-> str` answers nothing at the name,
+/// exactly as `declared_refinement`'s own doc says a base sort states
+/// nothing this table reads — the same reader `return_refinement`
+/// itself is built from at every `walk_function_def`/`walk_method_def`
+/// call site), or a module-level ALIAS DECLARATION's own name (`type X
+/// = …`, `X = Annotated[…]`, `X: TypeAlias = Annotated[…]` — the three
+/// spellings `compile_aliases` already reads): the alias's own compiled
+/// set from `aliases`, the SAME table `declared_refinement`'s own
+/// `Expr::Name` arm consults for a parameter spelled with that alias —
+/// one resolution mechanism, not a re-read of the RHS. Recurses into
+/// every nested `def`/`class` body so the INNERMOST enclosing
+/// construct's own name/parameter/return wins — the same "innermost
+/// node" preference the derived-flow fallback keeps for a recorded
+/// range.
 fn stated_refinement_at(
     module: &ModModule,
     aliases: &HashMap<String, AliasEntry>,
     imports: &crate::surface::SurfaceImports,
     position: TextSize,
 ) -> Option<RefinedSet> {
+    // Alias-declaration names are read ONLY at the module's own top
+    // level — the same scope `compile_aliases` reads them from. A
+    // function body statement of the same shape (`Age = 40` inside a
+    // `def`, rebinding a name that happens to match a module-level
+    // alias) is a LOCAL rebinding, not a declaration, and must not
+    // answer the alias's set — the same rebinding hazard
+    // `declared_refinement`'s own `Expr::Name` arm guards against via
+    // `environment.alias_is_visible`.
+    for stmt in &module.body {
+        if let Some(set) = alias_declaration_set_at(stmt, aliases, position) {
+            return Some(set);
+        }
+    }
     stated_refinement_in_body(&module.body, aliases, imports, position)
 }
 
@@ -387,6 +413,16 @@ fn stated_refinement_in_body(
                     return Some(inner);
                 }
                 let outer_environment = Environment::new(HashSet::new());
+                if def.name.range.contains_inclusive(position) {
+                    // the def's own name: what a call to it yields, when
+                    // that is readable at all — never the base-sort
+                    // fallback, so a bare `-> float` states nothing here
+                    return def
+                        .returns
+                        .as_deref()
+                        .and_then(|returns| declared_refinement(returns, aliases, imports, &outer_environment))
+                        .map(|declared| declared.set);
+                }
                 for parameter in def
                     .parameters
                     .posonlyargs
@@ -418,6 +454,39 @@ fn stated_refinement_in_body(
         }
     }
     None
+}
+
+/// `stmt`'s own alias-declaration NAME, when it is one of the three
+/// spellings `compile_aliases` reads (`type X = …`, `X = Annotated[…]`,
+/// `X: TypeAlias = Annotated[…]`) AND `position` sits exactly on that
+/// name AND `aliases` actually compiled an entry for it — reads
+/// `aliases[name].set` directly rather than re-lowering the RHS, so
+/// this answers the IDENTICAL set a parameter annotated with the same
+/// alias name already gets from `declared_refinement`'s own
+/// `Expr::Name` arm. `None` for every other statement shape, a
+/// position elsewhere on the line, or a name `compile_aliases` could
+/// not lower (the declaration states nothing this table reads, same as
+/// any other unlowerable alias).
+fn alias_declaration_set_at(stmt: &Stmt, aliases: &HashMap<String, AliasEntry>, position: TextSize) -> Option<RefinedSet> {
+    let name = match stmt {
+        Stmt::TypeAlias(alias) => match alias.name.as_ref() {
+            Expr::Name(name) => name,
+            _ => return None,
+        },
+        Stmt::Assign(assign) => match assign.targets.as_slice() {
+            [Expr::Name(name)] => name,
+            _ => return None,
+        },
+        Stmt::AnnAssign(annotated) => match annotated.target.as_ref() {
+            Expr::Name(name) => name,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    if !name.range().contains_inclusive(position) {
+        return None;
+    }
+    aliases.get(name.id.as_str()).map(|entry| entry.set.clone())
 }
 
 /// The smallest recorded `(range, value)` whose range contains
@@ -6937,6 +7006,140 @@ mod tests {
         let set = refined_set_at_position(&module, no_imports_resolver(), &kernel, position)
             .unwrap_or_else(|| panic!("expected a declared set at the return annotation"));
         assert_eq!(format_for_diagnostics(&set), ">= 0 && <= 1");
+    }
+
+    /// The hover CLI's own pair — `refined_set_at_position` then
+    /// `format_for_hover` — read at the RETURN annotation's own `Level`
+    /// spells the same facts `format_for_diagnostics` reads above, in
+    /// the hover vocabulary rather than the diagnostic one. Pins that
+    /// `refinedpy-check --hover` prints what this seam pair actually
+    /// answers, since the bin crate has no test convention of its own
+    /// (`src/bin/refinedpy_check.rs` carries no `#[cfg(test)]`) and this
+    /// is where every other `refined_set_at_position` position test
+    /// already lives.
+    #[test]
+    fn the_hover_seam_pair_spells_a_declared_alias_at_a_usage_site() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let source = concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Level = Annotated[float, Field(ge=0.0, le=1.0)]\n",
+            "\n",
+            "def audio_level(x: float) -> Level:\n",
+            "    return x\n",
+        );
+        let module = parsed(source);
+        let position = offset_of(source, "Level:\n    return");
+        let set = refined_set_at_position(&module, no_imports_resolver(), &kernel, position)
+            .unwrap_or_else(|| panic!("expected a declared set at the return annotation"));
+        let spelled = refined_sets::format_for_hover::format_for_hover(&set)
+            .unwrap_or_else(|| panic!("expected a hover spelling for Level"));
+        assert_eq!(spelled, "{0 ≤ 𝑥 ≤ 1}");
+    }
+
+    /// A position at the ALIAS DECLARATION's own name (`type Level =
+    /// Annotated[...]`, the `Level` before `=`) answers the alias's own
+    /// compiled set — the SAME set a parameter annotated `x: Level`
+    /// gets. Glyph spelling copied from `format_for_hover.rs`'s own
+    /// fixtures (`"{0 ≤ 𝑥 ≤ 100}"`), never from memory.
+    #[test]
+    fn an_alias_declarations_own_name_answers_its_compiled_set() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let source = concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Level = Annotated[float, Field(ge=0.0, le=1.0)]\n",
+            "\n",
+            "def audio_level(x: float) -> Level:\n",
+            "    return x\n",
+        );
+        let module = parsed(source);
+        let position = offset_of(source, "Level = Annotated");
+        let set = refined_set_at_position(&module, no_imports_resolver(), &kernel, position)
+            .unwrap_or_else(|| panic!("expected the alias's own compiled set at its declaration name"));
+        let spelled = refined_sets::format_for_hover::format_for_hover(&set)
+            .unwrap_or_else(|| panic!("expected a hover spelling for Level's declaration"));
+        assert_eq!(spelled, "{0 ≤ 𝑥 ≤ 1}");
+    }
+
+    /// The `X = Annotated[...]` (no `type` keyword) and `X: TypeAlias =
+    /// Annotated[...]` spellings answer identically at their own name —
+    /// the other two of the three spellings `compile_aliases` reads,
+    /// alongside the `type X = ...` spelling pinned above.
+    #[test]
+    fn the_plain_and_annotated_alias_spellings_answer_at_their_own_name_too() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let plain_source = concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "Level = Annotated[float, Field(ge=0.0, le=1.0)]\n",
+        );
+        let plain = parsed(plain_source);
+        let plain_position = offset_of(plain_source, "Level = Annotated");
+        let plain_set = refined_set_at_position(&plain, no_imports_resolver(), &kernel, plain_position)
+            .unwrap_or_else(|| panic!("expected the plain-assignment alias's own set at its name"));
+        assert_eq!(format_for_diagnostics(&plain_set), ">= 0 && <= 1");
+
+        let annotated_source = concat!(
+            "from typing import Annotated, TypeAlias\n",
+            "from pydantic import Field\n",
+            "Level: TypeAlias = Annotated[float, Field(ge=0.0, le=1.0)]\n",
+        );
+        let annotated = parsed(annotated_source);
+        let annotated_position = offset_of(annotated_source, "Level: TypeAlias");
+        let annotated_set = refined_set_at_position(&annotated, no_imports_resolver(), &kernel, annotated_position)
+            .unwrap_or_else(|| panic!("expected the `: TypeAlias =` spelling's own set at its name"));
+        assert_eq!(format_for_diagnostics(&annotated_set), ">= 0 && <= 1");
+    }
+
+    /// A `def`'s own name answers its return refinement, when one is
+    /// readable — the same claim a call to it yields.
+    #[test]
+    fn a_defs_own_name_answers_its_declared_return_set() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let source = concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Level = Annotated[float, Field(ge=0.0, le=1.0)]\n",
+            "\n",
+            "def audio_level(x: float) -> Level:\n",
+            "    return x\n",
+        );
+        let module = parsed(source);
+        let position = offset_of(source, "audio_level(x: float)");
+        let set = refined_set_at_position(&module, no_imports_resolver(), &kernel, position)
+            .unwrap_or_else(|| panic!("expected the def's own declared return set at its name"));
+        assert_eq!(format_for_diagnostics(&set), ">= 0 && <= 1");
+    }
+
+    /// A `def` with a BARE base-sort return annotation (`-> float`, no
+    /// `Annotated`/alias) answers NOTHING at its own name —
+    /// `declared_refinement` alone is read there, with no
+    /// `base_sort_return_refinement` fallback, exactly matching
+    /// `declared_refinement`'s own doc: a base sort states nothing this
+    /// table reads. The module still carries an `Annotated` import (on
+    /// an unrelated parameter) so the engagement gate is passed for the
+    /// same reason the walk reaches this module at all — the point
+    /// pinned here is the def-name branch's own decline, not the
+    /// module-level early exit `a_position_naming_neither_a_declaration_
+    /// nor_a_recorded_expression_answers_nothing` already covers.
+    #[test]
+    fn a_defs_own_name_with_a_bare_sort_return_answers_nothing() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let source = concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "Sample = Annotated[float, Field(ge=-2.0, le=2.0)]\n",
+            "\n",
+            "def audio_level(x: float) -> float:\n",
+            "    return x\n",
+        );
+        let module = parsed(source);
+        let position = offset_of(source, "audio_level(x: float)");
+        assert!(
+            refined_set_at_position(&module, no_imports_resolver(), &kernel, position).is_none(),
+            "a bare `-> float` must not fabricate a claim at the def's own name"
+        );
     }
 
     /// Ledger 260: `total`'s own position in `audio_level_unclamped.py`

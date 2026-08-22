@@ -468,10 +468,18 @@ fn discharge_edge_premises(
     let artifact = match read_foreign_ts_artifact(&edge.target_path) {
         Ok(artifact) => artifact,
         Err(reason) => {
-            return Err(EdgeDischargeError::Decline(ForeignEdgeOutcome::Decline {
-                message: "the target ".to_owned() + &edge.target_path + " states no fact for this edge — " + &reason,
-                range: edge.call,
-            }));
+            let message = if edge.runner == Runner::CompiledBinary {
+                // The artifact reader's own sentence names a missing
+                // TypeScript-fact file and the `-export-fact` command
+                // that writes one — neither applies here: the target is
+                // a compiled binary, and no producer in this checker
+                // exports a fact for one. Name the construct that
+                // actually blocks, not the generic no-fact sentence.
+                diagnostic_sentences::compiled_binary_no_fact(&edge.target_path)
+            } else {
+                "the target ".to_owned() + &edge.target_path + " states no fact for this edge — " + &reason
+            };
+            return Err(EdgeDischargeError::Decline(ForeignEdgeOutcome::Decline { message, range: edge.call }));
         }
     };
     // RUNTIME IDENTITY: the artifact's own band names an ECMA-262 spec
@@ -973,6 +981,14 @@ enum Runner {
     Deno,
     Bun,
     NpxTsx,
+    /// argv holds exactly one element, a path-shaped literal with no
+    /// runner word at all (`["./targets/cpp_level"]`) — the script IS
+    /// argv[0]; there is no separate interpreter. This checker's own
+    /// TypeScript-artifact reader has no producer for a compiled
+    /// binary, so every recognized row of this shape reaches the
+    /// artifact lookup and declines there, naming the compiled-binary
+    /// construct rather than the generic no-fact sentence.
+    CompiledBinary,
 }
 
 impl Runner {
@@ -985,6 +1001,7 @@ impl Runner {
             Runner::Deno => "deno",
             Runner::Bun => "bun",
             Runner::NpxTsx => "npx tsx",
+            Runner::CompiledBinary => "the compiled binary",
         }
     }
 }
@@ -1051,12 +1068,38 @@ fn argv_runner_and_script(
             };
             Some(script_text_of(script, environment, kernel).map(|script_text| ArgvReading { runner, script_text }))
         }
+        [only_element] => match compiled_binary_path_of(only_element, environment, kernel) {
+            Some(script_text) => Some(Ok(ArgvReading { runner: Runner::CompiledBinary, script_text })),
+            None => Some(Err(RecognitionDecline {
+                message: "this call's argv does not hold exactly [\"node\", \"<script>.ts\"] (or a recognized \
+                    deno/bun/npx-tsx runner row, or a bare compiled-binary path), so the checker cannot name the \
+                    code that runs next"
+                    .to_owned(),
+                range: call_range,
+            })),
+        },
         _ => Some(Err(RecognitionDecline {
             message: "this call's argv does not hold exactly [\"node\", \"<script>.ts\"] (or a recognized \
                 deno/bun/npx-tsx runner row), so the checker cannot name the code that runs next"
                 .to_owned(),
             range: call_range,
         })),
+    }
+}
+
+/// A single-element argv's own text, when it is PATH-shaped (`./`,
+/// `../`, or `/`) — the compiled-binary row (`["./targets/cpp_level"]`):
+/// argv[0] IS the script, since there is no runner word at all. Not
+/// path-shaped (a bare word with no leading path marker, which is not a
+/// recognized runner word either at this length) answers `None`, so the
+/// caller's own "not this shape" decline still names the true absence
+/// rather than misreading an arbitrary one-word argv as a binary path.
+fn compiled_binary_path_of(element: &Expr, environment: &Environment, kernel: &Arc<RefinedTSKernel>) -> Option<String> {
+    let text = const_folded_text_of(element, environment, kernel)?;
+    if text.starts_with("./") || text.starts_with("../") || text.starts_with('/') {
+        Some(text)
+    } else {
+        None
     }
 }
 
@@ -2650,9 +2693,13 @@ fn is_subprocess_run_call(call: &ExprCall, environment: &Environment) -> bool {
 }
 
 /// Whether the script text names a `.ts` file — the one extension this
-/// edge models a fact for.
+/// edge models a fact for. A compiled-binary row names no TypeScript
+/// source at all (the argv's own text names the compiled binary
+/// itself), so this extension premise does not apply to it — its own
+/// artifact-lookup decline (`compiled_binary_no_fact_sentence`) is the
+/// construct this shape blocks on, never a wrong-extension sentence.
 fn script_extension_decline(script_text: &str, runner: Runner, call_range: TextRange) -> Option<RecognitionDecline> {
-    if script_text.ends_with(".ts") {
+    if runner == Runner::CompiledBinary || script_text.ends_with(".ts") {
         return None;
     }
     Some(RecognitionDecline {
@@ -4992,6 +5039,101 @@ mod tests {
             foreign_edge_at(&body, 0, &environment, &kernel, None).is_none(),
             "an unrecognized two-word runner is some other program, nothing owed"
         );
+    }
+
+    /* ── the compiled-binary argv row ─────────────────────────────────── */
+
+    /// A single-element, path-shaped argv (`["./targets/cpp_level"]`)
+    /// recognizes as a compiled-binary invocation and reaches the
+    /// artifact lookup exactly as a `node` row does: registering a
+    /// fixture artifact under the binary's own path serves the crossing
+    /// (`Override`), the same as any other recognized runner row.
+    #[test]
+    fn a_bare_binary_argv_recognizes_and_reaches_the_artifact_lookup() {
+        register_fixture_artifact("./targets/cpp_level", audio_level_ts_artifact());
+        let Some(kernel) = loaded_kernel() else { return };
+        let source = concat!(
+            "def f(boosted):\n",
+            "    result = subprocess.run(\n",
+            "        [\"./targets/cpp_level\"],\n",
+            "        input=json.dumps(boosted),\n",
+            "        capture_output=True,\n",
+            "        text=True,\n",
+            "    )\n",
+            "    return json.loads(result.stdout)\n",
+        );
+        let body = def_body(source);
+        let environment = env_with(&[("boosted", boosted_sequence_value())]);
+        match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("a bare-binary argv recognizes") {
+            ForeignEdgeOutcome::Override { value, .. } => {
+                assert_eq!(value.kind, Kind::Set);
+                assert_eq!(value.kind_tag, Some(PrimitiveKind::Integer));
+            }
+            ForeignEdgeOutcome::Decline { message, .. } => panic!("wanted an override, got a decline: {message}"),
+            ForeignEdgeOutcome::Fired { message, .. } => panic!("wanted an override, got a fire: {message}"),
+        }
+    }
+
+    /// The SAME bare-binary argv with no fixture artifact registered:
+    /// recognition still reaches the artifact lookup (the call is not
+    /// declined as an unrecognized shape), and the lookup's own decline
+    /// names the compiled-binary construct — never the generic "there is
+    /// no <path>.refined.json; write it with -export-fact" sentence,
+    /// which names a command that has no meaning for a target that is
+    /// not TypeScript source.
+    #[test]
+    fn a_bare_binary_argv_with_no_artifact_declines_naming_the_compiled_binary() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let source = concat!(
+            "def f(boosted):\n",
+            "    result = subprocess.run(\n",
+            "        [\"./targets/cpp_level\"],\n",
+            "        input=json.dumps(boosted),\n",
+            "        capture_output=True,\n",
+            "        text=True,\n",
+            "    )\n",
+            "    return json.loads(result.stdout)\n",
+        );
+        let body = def_body(source);
+        let environment = env_with(&[("boosted", boosted_sequence_value())]);
+        match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("a bare-binary argv recognizes") {
+            ForeignEdgeOutcome::Decline { message, .. } => {
+                assert!(message.contains("./targets/cpp_level"), "{message}");
+                assert!(message.contains("compiled binary"), "{message}");
+                assert!(!message.contains("-export-fact"), "{message}");
+            }
+            ForeignEdgeOutcome::Override { .. } => panic!("wanted a decline, got an override"),
+            ForeignEdgeOutcome::Fired { message, .. } => panic!("wanted a decline, got a fire: {message}"),
+        }
+    }
+
+    /// A bare WORD with no leading path marker (`["cpp_level"]`, no
+    /// `./`/`../`/`/` prefix) is not path-shaped — the compiled-binary
+    /// row does not claim it, so this one-element argv is the ordinary
+    /// "not this shape" decline, naming the same absence a two-or-three-
+    /// element argv with an unrecognized runner word already names.
+    #[test]
+    fn a_bare_word_with_no_path_marker_is_not_the_compiled_binary_shape() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let source = concat!(
+            "def f(boosted):\n",
+            "    result = subprocess.run(\n",
+            "        [\"cpp_level\"],\n",
+            "        input=json.dumps(boosted),\n",
+            "        capture_output=True,\n",
+            "        text=True,\n",
+            "    )\n",
+            "    return json.loads(result.stdout)\n",
+        );
+        let body = def_body(source);
+        let environment = env_with(&[("boosted", boosted_sequence_value())]);
+        match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("the shape recognizes as a decline") {
+            ForeignEdgeOutcome::Decline { message, .. } => {
+                assert!(message.contains("cannot name the code that runs next"), "{message}");
+            }
+            ForeignEdgeOutcome::Override { .. } => panic!("wanted a decline, got an override"),
+            ForeignEdgeOutcome::Fired { message, .. } => panic!("wanted a decline, got a fire: {message}"),
+        }
     }
 
     /* ── the const-held literal path ──────────────────────────────────── */

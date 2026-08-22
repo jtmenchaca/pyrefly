@@ -27,6 +27,17 @@
 //! fully declared refined entry and a derivable return set is carried;
 //! every def that is not is named on stderr with the construct that
 //! stopped it. Exit 0 when the artifact was written.
+//!
+//! `--hover <file.py> [name ...]` is the THIRD mode: what the editor's
+//! hover would show, from the terminal — the twin of refined-ts-go's
+//! own `refinedts-hover.ts`. It drives the same two seams the LSP
+//! splice drives (`refined_set_at_position` then `format_for_hover`,
+//! `refinedpy_lsp::splice_refinedpy_hover`'s own pair), never a
+//! reimplementation of the rendering. With names given, every
+//! occurrence of each name is hovered; with no names, every
+//! module-level alias name (`compile_aliases`'s own three spellings)
+//! and every `def` name is hovered. Exit 0 always — a position with
+//! nothing to say prints "(no refinement hover)" rather than failing.
 
 use std::path::Path;
 use std::path::PathBuf;
@@ -34,6 +45,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use refinedpy::check::findings_for_module_at;
+use refinedpy::check::refined_set_at_position;
 use refinedpy::cross_module::disk_resolver;
 use refinedpy::fact_export::export_module;
 use refinedpy::foreign_edge_artifact::cache_artifact_path;
@@ -42,8 +54,15 @@ use refinedpy::kernel_path::resolve_kernel_dylib;
 use refinedpy::markers::line_col;
 use refinedpy::markers::line_starts_of;
 use refinedpy::markers::markers_of;
+use refinedpy::surface::compile_aliases;
 use refined_kernel::kernel_bridge::load_kernel;
 use refined_kernel::kernel_interface::RefinedTSKernel;
+use refined_sets::format_for_hover::format_for_hover;
+use ruff_python_ast::Expr;
+use ruff_python_ast::ModModule;
+use ruff_python_ast::Stmt;
+use ruff_text_size::Ranged;
+use ruff_text_size::TextSize;
 
 fn check_file(path: &str, kernel: &Arc<RefinedTSKernel>) -> (usize, Vec<String>) {
     let Ok(source) = std::fs::read_to_string(path) else {
@@ -110,6 +129,176 @@ fn check_file(path: &str, kernel: &Arc<RefinedTSKernel>) -> (usize, Vec<String>)
     }
 
     (printed, lines_output)
+}
+
+/// One name to hover, at one byte offset — `label` is what prints in
+/// the `=== label (file:line:col) ===` header (the queried name, or
+/// the alias/def name discovered without one).
+struct HoverQuery {
+    label: String,
+    position: TextSize,
+}
+
+/// Every module-level alias name's own name-node position (the three
+/// spellings `compile_aliases` reads: `type X = …`, `X = Annotated[…]`,
+/// `X: TypeAlias = Annotated[…]`) plus every `def` name's own position,
+/// walked recursively so a nested `def` is hovered too. Only names
+/// `compile_aliases` actually compiled are included in the alias half —
+/// a plain assignment whose RHS is not an alias shape carries no
+/// refinement vocabulary, so hovering it would only ever print "(no
+/// refinement hover)" and add noise no editor tooltip would show.
+///
+/// Both halves genuinely serve their own declaration position:
+/// `refined_set_at_position`'s stated branch
+/// (`check.rs::stated_refinement_at`) reads an alias declaration's own
+/// name against `compile_aliases`' own table, and a `def`'s own name
+/// against `declared_refinement` on its `-> Annotation` (no base-sort
+/// fallback, so a bare `-> float`/`-> int`/`-> str` still answers
+/// nothing at the name — that claim is not readable, not fabricated).
+fn default_queries(module: &ModModule) -> Vec<HoverQuery> {
+    let aliases = compile_aliases(module);
+    let mut queries = Vec::new();
+    for stmt in &module.body {
+        let alias_name = match stmt {
+            Stmt::TypeAlias(alias) => match alias.name.as_ref() {
+                Expr::Name(name) => Some((name.id.as_str(), name.range())),
+                _ => None,
+            },
+            Stmt::Assign(assign) => match assign.targets.as_slice() {
+                [Expr::Name(name)] => Some((name.id.as_str(), name.range())),
+                _ => None,
+            },
+            Stmt::AnnAssign(annotated) => match annotated.target.as_ref() {
+                Expr::Name(name) => Some((name.id.as_str(), name.range())),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some((id, range)) = alias_name {
+            if aliases.contains_key(id) {
+                queries.push(HoverQuery { label: id.to_owned(), position: range.start() });
+            }
+        }
+    }
+    collect_def_queries(&module.body, &mut queries);
+    queries
+}
+
+/// Every `def` name's own position in `body`, recursing into each
+/// def's own body so a nested `def` is named too — the hover twin of
+/// `collect_bound_names_stmt`'s own `Stmt::FunctionDef` recursion.
+fn collect_def_queries(body: &[Stmt], queries: &mut Vec<HoverQuery>) {
+    for stmt in body {
+        if let Stmt::FunctionDef(def) = stmt {
+            queries.push(HoverQuery {
+                label: def.name.id.to_string(),
+                position: def.name.range.start(),
+            });
+            collect_def_queries(&def.body, queries);
+        }
+    }
+}
+
+/// Every occurrence of `name` as a whole-word identifier in `source` —
+/// a text scan, not an AST resolution: adjacent characters must not
+/// themselves be identifier characters, so `level` does not match
+/// inside `samples_level`. Acceptable for position discovery per the
+/// hover CLI's own brief; the AST is still used for `default_queries`,
+/// where a spelled `kind` label matters.
+fn find_name_positions(source: &str, name: &str) -> Vec<TextSize> {
+    if name.is_empty() {
+        return Vec::new();
+    }
+    let bytes = source.as_bytes();
+    let is_ident_byte = |b: u8| b == b'_' || b.is_ascii_alphanumeric();
+    let mut positions = Vec::new();
+    let mut start = 0;
+    while let Some(found) = source[start..].find(name) {
+        let offset = start + found;
+        let before_ok = offset == 0 || !is_ident_byte(bytes[offset - 1]);
+        let after = offset + name.len();
+        let after_ok = after >= bytes.len() || !is_ident_byte(bytes[after]);
+        if before_ok && after_ok {
+            positions.push(TextSize::try_from(offset).expect("fixture offsets fit in TextSize"));
+        }
+        start = offset + 1;
+    }
+    positions
+}
+
+/// The composed hover line at `position` — the exact seams the LSP
+/// splice drives (`splice_refinedpy_hover` in refinedpy_lsp/src/lib.rs):
+/// `refined_set_at_position` for the stated-or-derived set, then
+/// `format_for_hover` for its spelling. `None` where either seam
+/// answers nothing — never a reimplementation of the rendering, and
+/// never an invented fallback spelling.
+fn hover_at(module: &ModModule, resolver: &dyn Fn(&str) -> Option<ModModule>, kernel: &Arc<RefinedTSKernel>, position: TextSize) -> Option<String> {
+    let set = refined_set_at_position(module, resolver, kernel, position)?;
+    format_for_hover(&set)
+}
+
+/// Prints one `=== label (path:line:col) ===` section: the composed
+/// hover line, or "(no refinement hover)" where the seams answered
+/// nothing. The CLI has no host type line to splice a suffix onto (the
+/// LSP's own `replaces_host_type` branch only matters where one
+/// exists), so the spelling alone prints either way — verbatim what
+/// `format_for_hover` returned, never reformatted.
+fn print_hover_section(
+    path: &str,
+    label: &str,
+    line_starts: &[usize],
+    module: &ModModule,
+    resolver: &dyn Fn(&str) -> Option<ModModule>,
+    kernel: &Arc<RefinedTSKernel>,
+    position: TextSize,
+) {
+    let (line, col) = line_col(line_starts, usize::from(position));
+    println!("\n=== {label} ({path}:{line}:{col}) ===");
+    match hover_at(module, resolver, kernel, position) {
+        Some(spelled) => println!("{spelled}"),
+        None => println!("(no refinement hover)"),
+    }
+}
+
+/// `--hover <file.py> [name ...]` mode: with names, every occurrence of
+/// each name (whole-word text scan); with none, every alias name and
+/// every def name (`default_queries`). A name with zero occurrences
+/// prints "(not found)", matching `refinedts-hover.ts`'s own shape.
+/// Always exits 0 — a hover dump reports what the seams say, it never
+/// judges the file.
+fn hover_file(path: &str, names: &[String], kernel: &Arc<RefinedTSKernel>) -> ExitCode {
+    let Ok(source) = std::fs::read_to_string(path) else {
+        eprintln!("{path}: the entry file could not be read");
+        return ExitCode::from(2);
+    };
+    let Ok(parsed) = ruff_python_parser::parse_module(&source) else {
+        eprintln!("{path}: the entry file did not parse");
+        return ExitCode::from(2);
+    };
+    let module = parsed.into_syntax();
+    let entry_directory = Path::new(path).parent().filter(|dir| !dir.as_os_str().is_empty());
+    let resolver = disk_resolver(entry_directory.unwrap_or_else(|| Path::new(".")).to_path_buf());
+    let line_starts = line_starts_of(&source);
+
+    if names.is_empty() {
+        println!("# RefinedPy hovers — {path}");
+        for query in default_queries(&module) {
+            print_hover_section(path, &query.label, &line_starts, &module, &resolver, kernel, query.position);
+        }
+        return ExitCode::SUCCESS;
+    }
+    for name in names {
+        let positions = find_name_positions(&source, name);
+        if positions.is_empty() {
+            println!("\n=== {name} ===");
+            println!("(not found)");
+            continue;
+        }
+        for position in positions {
+            print_hover_section(path, name, &line_starts, &module, &resolver, kernel, position);
+        }
+    }
+    ExitCode::SUCCESS
 }
 
 /// Writes `path`'s fact artifact to `output` (the path `-o` named, or
@@ -185,18 +374,22 @@ fn export_file(path: &str, output: &Path, kernel: &Arc<RefinedTSKernel>) -> Exit
     ExitCode::SUCCESS
 }
 
-/// The command line read into one of the two modes: `--export-fact
-/// <file.py> [-o <path>]`, or the ordinary list of files to judge. A
-/// command line that is neither answers `None` and the caller prints the
-/// usage line. `--project-root <path>`, when given, is read here and
-/// applied via `set_project_root_override` before either mode runs.
+/// The command line read into one of the three modes: `--export-fact
+/// <file.py> [-o <path>]`, `--hover <file.py> [name ...]`, or the
+/// ordinary list of files to judge. A command line that is none of
+/// these answers `None` and the caller prints the usage line.
+/// `--project-root <path>`, when given, is read here and applied via
+/// `set_project_root_override` before any mode runs.
 enum Invocation {
     Judge(Vec<String>),
     Export { file: String, output: PathBuf },
+    Hover { file: String, names: Vec<String> },
 }
 
 fn read_invocation(arguments: &[String]) -> Option<Invocation> {
     let mut export_target: Option<String> = None;
+    let mut hover_target: Option<String> = None;
+    let mut hover_names: Vec<String> = Vec::new();
     let mut output: Option<PathBuf> = None;
     let mut project_root: Option<PathBuf> = None;
     let mut files: Vec<String> = Vec::new();
@@ -206,6 +399,14 @@ fn read_invocation(arguments: &[String]) -> Option<Invocation> {
             "--export-fact" => {
                 export_target = Some(arguments.get(index + 1)?.clone());
                 index += 2;
+            }
+            "--hover" => {
+                hover_target = Some(arguments.get(index + 1)?.clone());
+                index += 2;
+                while index < arguments.len() && !arguments[index].starts_with("--") && arguments[index] != "-o" {
+                    hover_names.push(arguments[index].clone());
+                    index += 1;
+                }
             }
             "-o" => {
                 output = Some(PathBuf::from(arguments.get(index + 1)?));
@@ -227,6 +428,14 @@ fn read_invocation(arguments: &[String]) -> Option<Invocation> {
     if let Some(root) = &project_root {
         set_project_root_override(Some(root.clone()));
     }
+    if let Some(file) = hover_target {
+        // --hover owns the whole line; --export-fact/-o/extra files
+        // alongside it would be silently ignored otherwise
+        if export_target.is_some() || output.is_some() || !files.is_empty() {
+            return None;
+        }
+        return Some(Invocation::Hover { file, names: hover_names });
+    }
     if let Some(file) = export_target {
         // extra positional files alongside --export-fact would be
         // silently ignored, which is worse than refusing the line
@@ -247,6 +456,7 @@ fn main() -> ExitCode {
     let Some(invocation) = read_invocation(&arguments) else {
         eprintln!("usage: refinedpy-check <file.py> [...] [--project-root <path>]");
         eprintln!("       refinedpy-check --export-fact <file.py> [-o <path>] [--project-root <path>]");
+        eprintln!("       refinedpy-check --hover <file.py> [name ...]");
         return ExitCode::from(2);
     };
     let Some(dylib) = resolve_kernel_dylib() else {
@@ -264,6 +474,7 @@ fn main() -> ExitCode {
 
     let files = match invocation {
         Invocation::Export { file, output } => return export_file(&file, &output, &kernel),
+        Invocation::Hover { file, names } => return hover_file(&file, &names, &kernel),
         Invocation::Judge(files) => files,
     };
 

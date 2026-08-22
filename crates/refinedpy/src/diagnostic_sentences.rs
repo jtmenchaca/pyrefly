@@ -148,6 +148,22 @@ pub fn script_path_not_a_literal() -> String {
     "the script path is computed; spell it as a written string literal".to_owned()
 }
 
+/// A single-element, path-shaped argv (`["./targets/cpp_level"]`) names
+/// the code that runs next — the compiled binary at that path — so the
+/// recognizer reaches the artifact lookup exactly as a `node`/`deno`/
+/// `bun`/`npx tsx` row does. No producer in this checker exports a fact
+/// for a compiled binary, so the lookup always declines; this sentence
+/// names that true construct rather than the generic "there is no
+/// <path>.refined.json; write it with -export-fact" sentence, which
+/// names a command that has no meaning for a target that is not
+/// TypeScript source.
+pub fn compiled_binary_no_fact(target_path: &str) -> String {
+    format!(
+        "{target_path} is a compiled binary, and this checker has no producer that exports a fact for one — \
+        the checker can name the code that runs next but cannot state what it does"
+    )
+}
+
 /// `os.system`'s file-legs decline when the redirected IN-FILE has no
 /// recognized write preceding the call in the same body: the runner,
 /// script, and both redirections read cleanly, but there is no

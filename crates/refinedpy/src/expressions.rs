@@ -2529,6 +2529,57 @@ fn date_isocalendar_value(instance: &AbstractValue, kernel: &Arc<RefinedTSKernel
     Some(collection_models::tuple_literal_value(&elements))
 }
 
+/// date.12 STAGE 1 — the ISO-equivalent directive subset of
+/// `datetime.strptime(date_string, format)` (datetime.rst,
+/// `classmethod:: datetime.strptime(date_string, format)`: "Return a
+/// datetime corresponding to date_string, parsed according to format").
+/// Modeled ONLY for the exact literal format `"%Y-%m-%d"` — the ISO
+/// `YYYY-MM-DD` directive sequence date.3's grammar already commits to
+/// (`%Y` datetime.rst:2413-2415, `%m` :2407-2409, `%d` :2394-2396, each
+/// a zero-padded decimal field) — lowered to EXACTLY the same value
+/// `date_fromisoformat_value` binds for the identical text: this
+/// function reuses that function outright rather than re-deriving its
+/// parse or its two kernel asks (`pyYearInRange` then `validDate`), so
+/// `strptime(text, "%Y-%m-%d")` and `date.fromisoformat(text)` produce
+/// the SAME `AbstractValue` for the same `text` — a `datetime_date`-
+/// tagged instance, not a `datetime_datetime` one: the format carries
+/// no time-of-day directive, so the honest value this file can prove is
+/// calendar-date-shaped, even though CPython's real return type is
+/// `datetime`. EXCLUDED from this stage: any `"%H:%M:%S"`-composite
+/// format (`"%Y-%m-%d %H:%M:%S"` and similar) — datetime.rst's own
+/// `strftime`/`strptime` directive table gives each of `%H`/`%M`/`%S`
+/// (:2416-2430) no existing kernel-crossed bind this file's
+/// `datetime_datetime` construction path reads FROM a string (only
+/// FROM already-known Integer arguments,
+/// `datetime_construction_value`'s own doc), so composing them here
+/// would invent a new value shape this stage does not build; a non-ISO
+/// literal format or a non-literal (computed) format both decline
+/// through this function's own caller, never reaching here.
+fn strptime_iso_date_value(text: &str, kernel: &Arc<RefinedTSKernel>) -> Option<AbstractValue> {
+    date_fromisoformat_value(text, kernel)
+}
+
+/// date.12 STAGE 1 — `date.strftime(format)` (datetime.rst, `method::
+/// date.strftime(format)`: "Return a string representing the date,
+/// controlled by an explicit format string"). Modeled ONLY for the
+/// exact literal format `"%Y-%m-%d"` on a tagged `datetime_date`
+/// instance whose OWN `year`/`month`/`day` fields are already known —
+/// the ISO rendering `date.isoformat()` also produces (datetime.rst:725,
+/// "ISO 8601 format, YYYY-MM-DD"). Declines (`None`) rather than binds
+/// an exact string: the kernel's `isoDate` op (`exports_calendar.lean`'s
+/// `"isoDate"` arm) answers `{year, month, day, dayOfWeek}` — four
+/// INTEGER fields, no rendered string field of any kind — so there is
+/// no kernel ask this function can pose for the digit-string render the
+/// way `strptime_iso_date_value` poses one for the parse direction. The
+/// render direction needs either a kernel export of the zero-padded
+/// `YYYY-MM-DD` string form (a NEW `isoDate`/`epochDays` answer field,
+/// or a dedicated render op) or an adapter-local zero-pad composition
+/// of the three already-known integer fields — out of this stage's
+/// scope, which reuses existing kernel asks only.
+fn strftime_iso_date_value(_instance: &AbstractValue) -> Option<AbstractValue> {
+    None
+}
+
 /// `date1 ± timedelta` — datetime.rst's operation table (date.7's own
 /// row): shifts by `timedelta.days` (the only field
 /// `timedelta_construction_value` ever populates) and answers a NEW
@@ -3887,6 +3938,42 @@ fn evaluate_attribute_call(
         if is_datetime_datetime_attribute(inner, environment) && attribute.attr.as_str() == "now" {
             return opaque_value("the current datetime");
         }
+        // `datetime.datetime.strptime(date_string, format)` — date.12
+        // STAGE 1, the SAME two-level attribute chain shape `.now()`
+        // reads just above. Modeled ONLY when BOTH arguments are known
+        // exact strings AND `format` is EXACTLY the literal `"%Y-%m-%d"`
+        // (`strptime_iso_date_value`'s own doc — the ISO date-only
+        // directive sequence date.3's grammar already commits to). A
+        // NON-literal `format` (a parameter, a computed expression, an
+        // f-string) is not a string this file can read the DIRECTIVES
+        // of at all — this file has no format-code mini-language reader
+        // for anything but the exact `"%Y-%m-%d"` spelling — so it
+        // declines the same way `date_fromisoformat_value`'s own
+        // non-literal-argument row does: no sentence-carrying channel
+        // exists on this dispatch path (`evaluate_attribute_call`
+        // returns a plain `AbstractValue`, never a message), so the
+        // decline is named here, in this comment, the same way every
+        // other declining recognizer in this file states its reason in
+        // prose beside its own `return unknown()`. A literal format
+        // OTHER than `"%Y-%m-%d"` (`"%d/%m/%Y"`, any other directive
+        // sequence) names date.12 STAGE 2 — the directive-grammar
+        // kernel theory this stage does not build — as its own reason,
+        // by the identical convention.
+        if is_datetime_datetime_attribute(inner, environment) && attribute.attr.as_str() == "strptime" {
+            if let [text, format] = arguments {
+                if let (Some(text_points), Some(format_points)) = (exact_string_values(text), exact_string_values(format)) {
+                    if let (Some(text_spelling), Some(format_spelling)) = (code_points_to_string(text_points), code_points_to_string(format_points)) {
+                        if format_spelling == "%Y-%m-%d" {
+                            return match strptime_iso_date_value(&text_spelling, kernel) {
+                                Some(value) => value,
+                                None => unknown(),
+                            };
+                        }
+                    }
+                }
+            }
+            return unknown();
+        }
     }
     let receiver = evaluate_expression(&attribute.value, environment, kernel);
     // A tagged `datetime_datetime` instance's own METHODS —
@@ -3937,6 +4024,34 @@ fn evaluate_attribute_call(
                 Some(value) => value,
                 None => unknown(),
             };
+        }
+        // `.strftime(format)` — date.12 STAGE 1. Recognized (the method
+        // NAME matches, `format` is a known exact string) so a
+        // non-`"%Y-%m-%d"` literal or a computed format can each name
+        // their own reason below rather than fall through unrecognized;
+        // `strftime_iso_date_value`'s own doc states why even the exact
+        // `"%Y-%m-%d"` literal still declines today — the kernel's
+        // `isoDate` op answers no rendered-string field, only integers.
+        if attribute.attr.as_str() == "strftime" {
+            if let [format] = arguments {
+                if let Some(format_points) = exact_string_values(format) {
+                    if let Some(format_spelling) = code_points_to_string(format_points) {
+                        if format_spelling == "%Y-%m-%d" {
+                            return match strftime_iso_date_value(&receiver) {
+                                Some(value) => value,
+                                None => unknown(),
+                            };
+                        }
+                        // a literal format that is not `"%Y-%m-%d"` —
+                        // date.12 STAGE 2's own directive-grammar
+                        // kernel theory, not built by this stage
+                    }
+                }
+                // a non-literal (computed) format — this file cannot
+                // read the directive sequence of an expression it
+                // cannot fold to an exact string at all
+            }
+            return unknown();
         }
     }
     if exact_string_values(&receiver).is_some() {
@@ -9210,6 +9325,89 @@ mod tests {
     #[test]
     fn test_date_plus_timedelta_past_maxyear_declines_via_the_kernel_year_range_ask() {
         let Some(value) = eval("datetime.date(9999, 12, 31) + datetime.timedelta(days=1)") else { return };
+        assert_eq!(value.kind, Kind::Unknown);
+    }
+
+    // --- j-stdlib-surfaces.py: strftime/strptime STAGE 1 (date.12) ---
+
+    /// `datetime.datetime.strptime("2024-03-01", "%Y-%m-%d")` binds the
+    /// EXACT SAME value `datetime.date.fromisoformat("2024-03-01")`
+    /// does — `strptime_iso_date_value`'s own doc: one recognition, the
+    /// existing `date_fromisoformat_value` machinery, no new kernel
+    /// question. Asserts equality of the two paths' values directly,
+    /// not just their shape.
+    #[test]
+    fn test_strptime_iso_date_agrees_with_fromisoformat() {
+        let Some(via_strptime) = eval("datetime.datetime.strptime(\"2024-03-01\", \"%Y-%m-%d\")") else { return };
+        let Some(via_fromisoformat) = eval("datetime.date.fromisoformat(\"2024-03-01\")") else { return };
+        assert_eq!(via_strptime, via_fromisoformat);
+        assert_eq!(via_strptime.kind, Kind::Object);
+        assert_eq!(via_strptime.source.as_str(), "datetime_date");
+    }
+
+    /// `datetime.datetime.strptime("2023-02-30", "%Y-%m-%d")` — a
+    /// calendrically invalid date (February has 28 days in 2023);
+    /// declines through the SAME `validDate` kernel ask
+    /// `date.fromisoformat("2023-02-30")` declines through, since
+    /// `strptime_iso_date_value` reuses `date_fromisoformat_value`
+    /// outright.
+    #[test]
+    fn test_strptime_of_an_invalid_date_declines_identically_to_fromisoformat() {
+        let Some(via_strptime) = eval("datetime.datetime.strptime(\"2023-02-30\", \"%Y-%m-%d\")") else { return };
+        let Some(via_fromisoformat) = eval("datetime.date.fromisoformat(\"2023-02-30\")") else { return };
+        assert_eq!(via_strptime.kind, Kind::Unknown);
+        assert_eq!(via_fromisoformat.kind, Kind::Unknown);
+    }
+
+    /// `datetime.datetime.strptime("2024-03-01", fmt)` where `fmt` is a
+    /// PARAMETER (a computed format the source cannot name, never a
+    /// written literal) — declines; this file has no format-code
+    /// mini-language reader for an expression it cannot fold to an
+    /// exact string at all.
+    #[test]
+    fn test_strptime_with_a_computed_format_declines() {
+        let Some(value) = eval("datetime.datetime.strptime(\"2024-03-01\", fmt)") else { return };
+        assert_eq!(value.kind, Kind::Unknown);
+    }
+
+    /// `datetime.datetime.strptime("01/03/2024", "%d/%m/%Y")` — a
+    /// LITERAL format, but not the ISO `"%Y-%m-%d"` sequence this stage
+    /// builds; names date.12 STAGE 2 (the directive-grammar kernel
+    /// theory) as the reason, per `strptime_iso_date_value`'s own doc.
+    #[test]
+    fn test_strptime_with_a_non_iso_literal_format_declines() {
+        let Some(value) = eval("datetime.datetime.strptime(\"01/03/2024\", \"%d/%m/%Y\")") else { return };
+        assert_eq!(value.kind, Kind::Unknown);
+    }
+
+    /// `datetime.date(2024, 3, 1).strftime("%Y-%m-%d")` — the exact
+    /// ISO literal format on a known date; still declines today, per
+    /// `strftime_iso_date_value`'s own doc: the kernel's `isoDate` op
+    /// answers no rendered-string field, only the four integer fields
+    /// `year`/`month`/`day`/`dayOfWeek`.
+    #[test]
+    fn test_strftime_iso_format_on_a_known_date_declines_pending_a_render_export() {
+        let Some(value) = eval("datetime.date(2024, 3, 1).strftime(\"%Y-%m-%d\")") else { return };
+        assert_eq!(value.kind, Kind::Unknown);
+    }
+
+    /// `datetime.date(2024, 3, 1).strftime(fmt)` where `fmt` is a
+    /// PARAMETER — declines, the same computed-format reason
+    /// `test_strptime_with_a_computed_format_declines` states for the
+    /// parse direction.
+    #[test]
+    fn test_strftime_with_a_computed_format_declines() {
+        let Some(value) = eval("datetime.date(2024, 3, 1).strftime(fmt)") else { return };
+        assert_eq!(value.kind, Kind::Unknown);
+    }
+
+    /// `datetime.date(2024, 3, 1).strftime("%d/%m/%Y")` — a non-ISO
+    /// literal directive sequence; names date.12 STAGE 2, the same
+    /// reason `test_strptime_with_a_non_iso_literal_format_declines`
+    /// states for the parse direction.
+    #[test]
+    fn test_strftime_with_a_non_iso_literal_format_declines() {
+        let Some(value) = eval("datetime.date(2024, 3, 1).strftime(\"%d/%m/%Y\")") else { return };
         assert_eq!(value.kind, Kind::Unknown);
     }
 
