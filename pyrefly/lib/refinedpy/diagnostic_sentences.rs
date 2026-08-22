@@ -148,6 +148,33 @@ pub fn script_path_not_a_literal() -> String {
     "the script path is computed; spell it as a written string literal".to_owned()
 }
 
+/// `os.system`'s file-legs decline when the redirected IN-FILE has no
+/// recognized write preceding the call in the same body: the runner,
+/// script, and both redirections read cleanly, but there is no
+/// `with open("<infile>", "w") as <handle>: json.dump(<payload>, <handle>)`
+/// this checker can find, so no entry fact has anything to attach to.
+pub fn os_system_missing_entry_write(infile: &str) -> String {
+    format!(
+        "this call redirects stdin from {infile}, but no `with open(\"{infile}\", \"w\") as <name>: \
+        json.dump(<payload>, <name>)` precedes it in this body — the checker cannot find the value written \
+        to the in-file"
+    )
+}
+
+/// `os.system`'s file-legs decline when the redirected OUT-FILE has no
+/// recognized read following the call in the same body: the runner,
+/// script, both redirections, and the entry write all read cleanly, but
+/// there is no `with open("<outfile>") as <handle>: ... json.load(<handle>)`
+/// this checker can find, so the return leg has no consumer to attach a
+/// fact to.
+pub fn os_system_missing_return_read(outfile: &str) -> String {
+    format!(
+        "this call redirects stdout to {outfile}, but no `with open(\"{outfile}\") as <name>: ... \
+        json.load(<name>)` follows it in this body — the checker cannot find the value read back from the \
+        out-file"
+    )
+}
+
 /// The channel-mismatch decline when the call sends its payload on
 /// stdin but the target's own fact serves JSON on an argv element — the
 /// reverse of `foreign_edge_channel_mismatch_argv_at_stdin_target`.

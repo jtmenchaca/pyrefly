@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 
-use refined_sets::codepoint_sets::{string_tuple, strings};
+use refined_sets::codepoint_sets::{string_tuple, strings, without_string_ground};
 use refined_sets::format_for_diagnostics::format_for_diagnostics;
 use refined_sets::regex_compiler::format_grammar;
 use refined_sets::refinement_forms::{
@@ -574,6 +574,28 @@ pub fn annotated_expression_set(
                             return None;
                         }
                         forms.extend(std::mem::take(&mut grammar.set.forms));
+                        // `forms` up to here still carries the bare `str`
+                        // base's own C* ground (`strings()`, seeded at this
+                        // function's top) STACKED beside the pattern's own
+                        // compiled concatenation/repeat forms — a language
+                        // over C either way, so the ground conjunct adds
+                        // nothing to the claim, but the kernel's aligned-
+                        // segment pattern prover (alignedSegSubsetB) reads
+                        // ONE shape, never a stack, and refuses the pair the
+                        // moment a second, unrelated top-level form rides
+                        // alongside the pattern's own chain (the redundant
+                        // ground blinds it exactly the way TS's own
+                        // `.regex()` compilation already documents and
+                        // strips — chain_method.go's `WithoutStringGround`
+                        // call, mirrored here). Dropping it is the same
+                        // `without_string_ground` this file's `min_length`/
+                        // `max_length` branch below already applies for the
+                        // identical reason; unlike that branch this one does
+                        // not need the "keep the ground when it is the only
+                        // form" carve-out spelled out by hand, since `without_
+                        // string_ground` already keeps it when nothing else
+                        // remains.
+                        forms = without_string_ground(&forms);
                     }
                     other if INERT_FIELD_KWARGS.contains(&other) => {}
                     _ => return None,
@@ -1101,6 +1123,35 @@ mod tests {
         assert!(
             compiled.set.forms.iter().any(|f| direct.set.forms.contains(f)),
             "the anchored pattern's own compiled form must appear in Hex's forms"
+        );
+    }
+
+    /// `Timestamp`'s own shape (g-strings-and-formats.py): `pattern`
+    /// ALONE, no `min_length`/`max_length` — the ONE path that used to
+    /// leave the bare `str` base's own C* ground (`strings()`) stacked
+    /// beside the pattern's own compiled forms, unlike the length-window
+    /// branch below, which already strips it. A stray ground conjunct
+    /// blinds the kernel's aligned-segment pattern prover
+    /// (`alignedSegSubsetB`, `boundary/exports_sets.lean`) exactly the way
+    /// TS's own `.regex()` compilation already documents and strips
+    /// (`chain_method.go`'s `WithoutStringGround` call) — the compiled
+    /// alias must carry ONLY the pattern's own forms, matching
+    /// `format_grammar`'s own direct output exactly.
+    #[test]
+    fn pattern_only_alias_drops_the_redundant_string_ground() {
+        let module = parsed(
+            "from pydantic import Field\n\
+             from typing import Annotated\n\
+             type Timestamp = Annotated[str, Field(pattern=r\"^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$\")]\n",
+        );
+        let out = compile_aliases(&module);
+        let compiled = out.get("Timestamp").expect("Timestamp compiles");
+        let direct = format_grammar(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$", "");
+        assert!(direct.ok);
+        assert_eq!(
+            compiled.set.forms, direct.set.forms,
+            "a pattern-only alias's compiled forms must be EXACTLY the grammar's own forms, with no \
+             redundant C* ground riding alongside them"
         );
     }
 

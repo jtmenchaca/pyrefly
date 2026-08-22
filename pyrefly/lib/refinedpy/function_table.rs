@@ -23,7 +23,10 @@
 //! (`summaries::summary_key`).
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 
+use ruff_python_ast::visitor::{walk_expr, Visitor};
+use ruff_python_ast::Expr;
 use ruff_python_ast::ModModule;
 use ruff_python_ast::Stmt;
 use ruff_python_ast::StmtFunctionDef;
@@ -130,6 +133,122 @@ pub fn merged(base: &FunctionTable, imported: &FunctionTable) -> FunctionTable {
         defs.insert(name.clone(), entry.clone());
     }
     FunctionTable { defs }
+}
+
+/// Every module-level def's own direct callers, keyed by the def's name —
+/// each entry is one call's own positional argument list, in call order.
+/// Built once per module (`caller_argument_positions`) so a parameter seed
+/// (`check.rs::seed_parameters`) can join every caller's bound argument at
+/// one position without re-scanning the module per parameter.
+pub type CallerArguments = HashMap<String, Vec<Vec<Expr>>>;
+
+/// A single pass over every statement/expression in `module`, recording,
+/// for each bare name that names a module-level `def`: every DIRECT call
+/// site (`name(...)` — `name` read exactly as the call's own `func`,
+/// never through an attribute or a subscript) and, separately, whether
+/// the name shows up ANYWHERE else — passed as a value, rebound, read as
+/// a bare expression, aliased. A name with any non-call occurrence does
+/// not qualify at all (`None` from `caller_argument_positions`, never a
+/// partial answer): the parameter-seed join this table feeds trusts that
+/// EVERY use of the name is a call it can see, the same escape discipline
+/// refined-ts-go's own def→callers reach keeps for a same-module function
+/// value — a name that ever escapes as a value is not provably called
+/// only from the sites this pass found, so no caller of it is safe to
+/// join at all.
+///
+/// A qualifying call site itself must be a plain, fully positional call
+/// (no `*args` spread, no keyword argument) to be worth recording: a
+/// starred or keyword-passed call cannot be matched to the callee's
+/// parameter POSITIONS by this table alone, so it is dropped from the
+/// call list rather than mismatched against the wrong position. This
+/// narrows which callers a later join sees; it never widens a name's own
+/// qualification (a def can still qualify with zero recorded calls, which
+/// `seed_parameters` reads as "zero callers," the same as a genuinely
+/// uncalled def).
+pub fn caller_argument_positions(module: &ModModule) -> CallerArguments {
+    let def_names: HashSet<String> = module
+        .body
+        .iter()
+        .filter_map(|stmt| match stmt {
+            Stmt::FunctionDef(def) => Some(def.name.id.as_str().to_owned()),
+            _ => None,
+        })
+        .collect();
+    let mut collector = CallSiteCollector {
+        def_names,
+        call_sites: HashMap::new(),
+        other_occurrences: HashSet::new(),
+    };
+    for stmt in &module.body {
+        collector.visit_stmt(stmt);
+    }
+    collector
+        .call_sites
+        .into_iter()
+        .filter(|(name, _)| !collector.other_occurrences.contains(name))
+        .collect()
+}
+
+/// The `Visitor` state `caller_argument_positions` drives: `def_names` is
+/// read-only (which bare names are tracked at all), `call_sites` grows one
+/// entry per direct, fully-positional call of a tracked name, and
+/// `other_occurrences` grows on every OTHER appearance of a tracked name
+/// (a bare read, a keyword/starred call, anything the direct-call check
+/// below does not recognize) — the disqualifying set the caller filters
+/// on afterward.
+struct CallSiteCollector {
+    def_names: HashSet<String>,
+    call_sites: HashMap<String, Vec<Vec<Expr>>>,
+    other_occurrences: HashSet<String>,
+}
+
+impl<'a> Visitor<'a> for CallSiteCollector {
+    /// Intercepts `Expr::Call` before the generic walk would visit its own
+    /// `func` as an ordinary expression (which would otherwise count a
+    /// direct call's own callee name as a disqualifying bare occurrence).
+    /// A call whose `func` is a tracked bare name records one caller entry
+    /// when the call is plain positional (no keywords, no starred
+    /// argument); a keyword/starred call on a tracked name instead marks
+    /// the name as disqualified, since this table cannot place its
+    /// arguments at the callee's own positions. Every other expression
+    /// shape — including a tracked name read anywhere else, and every
+    /// argument/receiver nested inside this same call — still walks
+    /// through the ordinary default, so a name passed AS an argument
+    /// (`other(f)`) is still caught as an escaping occurrence.
+    fn visit_expr(&mut self, expr: &'a Expr) {
+        if let Expr::Call(call) = expr {
+            if let Expr::Name(name) = call.func.as_ref() {
+                if self.def_names.contains(name.id.as_str()) {
+                    let has_keywords = !call.arguments.keywords.is_empty();
+                    let has_starred = call.arguments.args.iter().any(|arg| matches!(arg, Expr::Starred(_)));
+                    if has_keywords || has_starred {
+                        self.other_occurrences.insert(name.id.as_str().to_owned());
+                    } else {
+                        self.call_sites
+                            .entry(name.id.as_str().to_owned())
+                            .or_default()
+                            .push(call.arguments.args.to_vec());
+                    }
+                    // `func` itself is consumed here, never re-visited as a
+                    // bare name; every argument still walks normally so a
+                    // nested call/escape inside an argument is still found.
+                    for argument in &call.arguments.args {
+                        self.visit_expr(argument);
+                    }
+                    for keyword in &call.arguments.keywords {
+                        self.visit_expr(&keyword.value);
+                    }
+                    return;
+                }
+            }
+        }
+        if let Expr::Name(name) = expr {
+            if self.def_names.contains(name.id.as_str()) {
+                self.other_occurrences.insert(name.id.as_str().to_owned());
+            }
+        }
+        walk_expr(self, expr);
+    }
 }
 
 #[cfg(test)]

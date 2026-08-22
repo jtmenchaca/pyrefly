@@ -754,11 +754,12 @@ fn harness_surface_of(parsed: &Value, artifact_path_words: &str) -> Result<(Fore
 /// malformed form is a decline here, never a crash.
 fn function_fact_of(parsed: &Value, name: &str, artifact_path_words: &str) -> Result<ForeignTsFunctionFact, String> {
     let Some(functions) = parsed.get("functions").and_then(Value::as_object) else {
-        return Err(format!("{artifact_path_words} carries no functions, so it states no fact about {name}"));
+        return Err(format!("{artifact_path_words} carries no \"functions\" object at all"));
     };
     let Some(row) = functions.get(name).and_then(Value::as_object) else {
         return Err(format!(
-            "{artifact_path_words} names {name} as the harness's called function and then states no fact for it"
+            "{artifact_path_words} names {name} as the harness's called function, but \"functions\" carries no \
+             row for it"
         ));
     };
     let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| function_fact_of_row(row, name)));
@@ -777,7 +778,7 @@ fn function_fact_of(parsed: &Value, name: &str, artifact_path_words: &str) -> Re
 fn function_fact_of_row(row: &serde_json::Map<String, Value>, name: &str) -> Result<ForeignTsFunctionFact, String> {
     let entries = artifact_entries_of(row, name)?;
     let Some(returned) = row.get("return").and_then(Value::as_object) else {
-        return Err(format!("states no return fact for {name}, so nothing crosses back from this call"));
+        return Err(format!("carries no \"return\" object for {name}, so nothing crosses back from this call"));
     };
     let return_cases = cases_of(returned, &format!("the return for {name}"))?;
     let stdout_pure = returned.get("stdoutPure").and_then(Value::as_bool).unwrap_or(false);

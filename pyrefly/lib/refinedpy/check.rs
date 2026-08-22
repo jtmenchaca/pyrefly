@@ -114,6 +114,15 @@ struct WalkContext<'a> {
     /// against it is judged member-by-member (`typed_dict_return_
     /// refinement`) instead of reading as unrefined.
     typed_dicts: Arc<HashMap<String, Vec<(String, DeclaredRefinement)>>>,
+    /// Every module-level def's own direct callers' positional argument
+    /// lists, keyed by the def's name (`function_table::
+    /// caller_argument_positions`) — a def missing from this table either
+    /// has no module-level definition or does not qualify (some
+    /// occurrence of its name is not a plain positional call, so no
+    /// caller of it is safe to join). `seed_parameters` reads this to
+    /// fold an UNANNOTATED parameter's every caller argument at that
+    /// position into a literal-union seed.
+    caller_arguments: Arc<crate::refinedpy::function_table::CallerArguments>,
     /// The checked file's own directory, when the caller knows it — a
     /// foreign edge's relative argv entry (`"./audio_level.ts"`) is
     /// relative to the file that wrote it, never to the eventual
@@ -237,6 +246,7 @@ pub fn findings_for_module_at(
     let module_callable_returns = Arc::new(module_level_callable_returns(module, &aliases, &imports));
     let strict_int_aliases = strict_int_alias_names(module);
     let typed_dicts = Arc::new(instances::typed_dict_table(module, &aliases, &imports));
+    let caller_arguments = Arc::new(crate::refinedpy::function_table::caller_argument_positions(module));
     let context = WalkContext {
         aliases: &aliases,
         imports: &imports,
@@ -247,6 +257,7 @@ pub fn findings_for_module_at(
         module_callable_returns,
         strict_int_aliases: &strict_int_aliases,
         typed_dicts,
+        caller_arguments,
         entry_directory: entry_directory.map(|dir| dir.to_path_buf()),
         evaluations_recorder: None,
     };
@@ -315,6 +326,7 @@ pub fn refined_set_at_position(
     let module_callable_returns = Arc::new(module_level_callable_returns(module, &aliases, &imports));
     let strict_int_aliases = strict_int_alias_names(module);
     let typed_dicts = Arc::new(instances::typed_dict_table(module, &aliases, &imports));
+    let caller_arguments = Arc::new(crate::refinedpy::function_table::caller_argument_positions(module));
     let recorder = Arc::new(Mutex::new(Vec::new()));
     let context = WalkContext {
         aliases: &aliases,
@@ -326,6 +338,7 @@ pub fn refined_set_at_position(
         module_callable_returns,
         strict_int_aliases: &strict_int_aliases,
         typed_dicts,
+        caller_arguments,
         entry_directory: None,
         evaluations_recorder: Some(recorder.clone()),
     };
@@ -542,7 +555,7 @@ fn walk_body(
     context: &WalkContext,
     out: &mut Vec<Finding>,
 ) {
-    walk_body_with_self_binding(body, parameters, return_refinement, None, self_model, None, None, context, out);
+    walk_body_with_self_binding(body, parameters, return_refinement, None, self_model, None, None, None, None, context, out);
 }
 
 /// The statement position whose walk must publish a recognized foreign
@@ -641,6 +654,29 @@ fn serve_foreign_edge_at(
 /// judges, recorded through `env::collect_returned_values` rather than
 /// re-derived. `fact_export` is the only caller that asks; every walk in
 /// the checker itself passes `None` and behaves exactly as before.
+///
+/// `enclosing_def_name`, when `Some`, is the MODULE-LEVEL def this body
+/// belongs to — `seed_parameters`'s own key into `context.caller_arguments`
+/// for an unannotated-parameter caller join. `None` for the module body
+/// itself and for a nested/method def (neither is a module-level def
+/// `function_table::caller_argument_positions` ever indexes), which
+/// simply seeds no caller-joined parameter, matching today's plain
+/// Unknown behavior.
+///
+/// `bare_sort_return_refinement`, when `Some`, is `typereading::
+/// base_sort_return_refinement` read off this def's own `-> Annotation`
+/// (a bare `int`/`float`/`str`, no `Annotated[...]` refinement) —
+/// `None` for every other return shape, including no annotation at all.
+/// This is NEVER `return_refinement` itself (a bare-sort return still
+/// judges nothing at an ORDINARY return, exactly as today — widening
+/// that would turn every unreadable `-> int` helper body into a new
+/// undetermined blocker, `typereading::base_sort_return_refinement`'s own
+/// doc). It exists ONLY so the per-statement loop below can judge a
+/// RECOGNIZED foreign-edge crossing's return leg against the sort even
+/// when no refinement narrows it — the one place a bare sort is worth
+/// something (sort admission and refinement wideness against a fact the
+/// crossing itself proved), read at exactly the position `foreign_edge_
+/// overrides` already names, never at any other return in this body.
 fn walk_body_with_self_binding(
     body: &[Stmt],
     parameters: Option<&Parameters>,
@@ -649,6 +685,8 @@ fn walk_body_with_self_binding(
     self_model: Option<&ClassModel>,
     self_binding: Option<&AbstractValue>,
     returned_values_out: Option<&mut Vec<AbstractValue>>,
+    enclosing_def_name: Option<&str>,
+    bare_sort_return_refinement: Option<&DeclaredRefinement>,
     context: &WalkContext,
     out: &mut Vec<Finding>,
 ) {
@@ -703,7 +741,7 @@ fn walk_body_with_self_binding(
         }
     }
     if let Some(parameters) = parameters {
-        seed_parameters(parameters, context, &mut environment);
+        seed_parameters(parameters, enclosing_def_name, context, &mut environment);
         // `*args`/`**kwargs`'s own names — a bare-Name forward of either
         // (`f(*args)`, `f(**kwargs)`) hands CPython exactly what THIS
         // body itself received, never an independently-grown collection
@@ -848,6 +886,7 @@ fn walk_body_with_self_binding(
         // whichever position matches). A different pending entry, keyed
         // under a different position, is untouched here — each entry is
         // published only at its own consumer, never at another one's.
+        let at_recognized_crossing = foreign_edge_overrides.contains_key(&position);
         if let Some((parse_range, value)) = foreign_edge_overrides.get(&position) {
             environment.set_evaluated_node(Some((*parse_range, value.clone())));
         }
@@ -860,9 +899,27 @@ fn walk_body_with_self_binding(
         if let Stmt::Return(ret) = stmt {
             publish_relational_sum_return(ret, &mut environment);
         }
+        // BARE-SORT RETURN AT A RECOGNIZED CROSSING: `return_refinement`
+        // stays `None` for every ORDINARY bare-sort return (unchanged —
+        // the general table deliberately does not read base sorts), but
+        // THIS statement is the one a recognized foreign edge just
+        // published its own proved fact onto (`at_recognized_crossing`),
+        // so the sort itself is worth judging here: a declared `-> float`
+        // still refuses a value the crossing's own fact places outside
+        // the float ray (there is none — `numbers()` is the whole real
+        // line — but `-> int`/`-> str` genuinely narrow), and a widened
+        // corner the crossing's own `Optional` fact admits still passes.
+        // No other return in this body is affected: the fallback applies
+        // ONLY at this one position, and ONLY when `return_refinement`
+        // itself named nothing.
+        let effective_return_refinement = if at_recognized_crossing && return_refinement.is_none() {
+            bare_sort_return_refinement
+        } else {
+            return_refinement
+        };
         let terminates = walk_statement(
             stmt,
-            return_refinement,
+            effective_return_refinement,
             yield_refinement,
             context,
             &mut environment,
@@ -1011,6 +1068,7 @@ fn walk_method_def(def: &StmtFunctionDef, class: &ClassModel, context: &WalkCont
             .or_else(|| typed_dict_return_refinement(annotation, &context.typed_dicts))
     });
     let (return_refinement, yield_refinement) = generator_body_refinements(def, return_refinement);
+    let bare_sort_return_refinement = def.returns.as_deref().and_then(base_sort_return_refinement);
     let self_instance = judge_construction(class, &[], &[], context.kernel).instance;
     walk_body_with_self_binding(
         &def.body,
@@ -1020,6 +1078,8 @@ fn walk_method_def(def: &StmtFunctionDef, class: &ClassModel, context: &WalkCont
         None,
         Some(&self_instance),
         None,
+        None,
+        bare_sort_return_refinement.as_ref(),
         context,
         out,
     );
@@ -1080,15 +1140,38 @@ fn is_generator_shaped(body: &[Stmt]) -> bool {
 /// `declared_refinement`: bind the name to a set-kind AbstractValue
 /// holding the declared set (`known_set`, TrustSpec — the annotation is
 /// read, not proved by execution). A parameter whose annotation states
-/// nothing this table reads is left unbound (ordinary Python, no seed).
-fn seed_parameters(parameters: &Parameters, context: &WalkContext, environment: &mut Environment) {
-    for parameter in parameters
+/// nothing this table reads instead tries the CALLER-JOINED seed
+/// (`unannotated_parameter_caller_seed`) — this def's own recorded direct
+/// callers (`enclosing_def_name`'s lookup in `context.caller_arguments`),
+/// each contributing whatever exact string its own bound argument at this
+/// SAME position folds to; joining every caller's fold is what lets
+/// `c-reference-shapes.py`'s `level_via_parameter_path` carry its
+/// caller's literal script path onto `script_path` with no annotation at
+/// all. Left unbound (ordinary Python, no seed) when no caller-joined
+/// value applies either — unannotated, uncalled, or a caller whose own
+/// argument does not fold.
+fn seed_parameters(parameters: &Parameters, enclosing_def_name: Option<&str>, context: &WalkContext, environment: &mut Environment) {
+    // Position, when `Some`, is this parameter's own index among
+    // POSITIONAL parameters only (`posonlyargs` then `args`, in the
+    // exact order a plain positional call's own `call.arguments.args`
+    // fills them) — `CallerArguments`'s own indexing convention. A
+    // keyword-only parameter (chained last, always `None` here) can
+    // never be filled by a positional call at all, so it carries no
+    // position for a caller-joined seed to read.
+    let ordered = parameters
         .posonlyargs
         .iter()
         .chain(parameters.args.iter())
-        .chain(parameters.kwonlyargs.iter())
-    {
+        .enumerate()
+        .map(|(position, parameter)| (Some(position), parameter))
+        .chain(parameters.kwonlyargs.iter().map(|parameter| (None, parameter)));
+    for (position, parameter) in ordered {
         let Some(annotation) = parameter.parameter.annotation.as_deref() else {
+            if let Some(position) = position {
+                if let Some(seed) = unannotated_parameter_caller_seed(enclosing_def_name, position, context) {
+                    environment.bind(parameter.parameter.name.id.as_str(), seed);
+                }
+            }
             continue;
         };
         // A bare CLASS-NAME parameter (`request: AudioRequest`, the class
@@ -1256,6 +1339,99 @@ fn seed_parameters(parameters: &Parameters, context: &WalkContext, environment: 
         };
         environment.bind(parameter.parameter.name.id.as_str(), seeded);
     }
+}
+
+/// The caller-joined seed for one UNANNOTATED parameter at `position`
+/// (among positional parameters only) in the def named `enclosing_def_
+/// name`: `None` when there is no def name (a nested/method body, or the
+/// module body itself), the def does not qualify at all (missing from
+/// `context.caller_arguments` — some occurrence of its name was not a
+/// plain positional call), it has zero recorded callers, some caller's
+/// own call is shorter than `position` (an argument this position was
+/// never even passed at that site), some caller's own argument does not
+/// fold to an exact string (`caller_argument_exact_string`), or two
+/// callers fold to DIFFERENT exact strings (a real disagreement — no
+/// single literal is true of every call, so this scalar seed cannot
+/// state one without inventing a value no caller actually passed).
+/// `Some` only when EVERY recorded caller's argument at this position
+/// folds to the identical exact string, the one case where "this
+/// parameter always holds this text" is something the checker actually
+/// proved from the call sites it can see.
+fn unannotated_parameter_caller_seed(
+    enclosing_def_name: Option<&str>,
+    position: usize,
+    context: &WalkContext,
+) -> Option<AbstractValue> {
+    let def_name = enclosing_def_name?;
+    let calls = context.caller_arguments.get(def_name)?;
+    if calls.is_empty() {
+        return None;
+    }
+    let module_environment = module_scope_environment(context);
+    let mut agreed_text: Option<String> = None;
+    for call_arguments in calls {
+        let argument = call_arguments.get(position)?;
+        let text = caller_argument_exact_string(argument, &module_environment, context.kernel)?;
+        match &agreed_text {
+            None => agreed_text = Some(text),
+            Some(existing) if *existing == text => {}
+            Some(_) => return None,
+        }
+    }
+    Some(crate::refinedpy::string_models::string_literal_value(&agreed_text?))
+}
+
+/// A fresh, empty-locally-bound `Environment` seeded with every MODULE-
+/// LEVEL binding this walk already exposes to every ordinary body
+/// (`context.module_bindings` — the exact table `walk_body_with_self_
+/// binding` layers onto each body's own environment). A caller's argument
+/// expression is read in THIS scope, never the calling body's own live
+/// one: the escape discipline this whole join rests on only trusts a
+/// module-level constant or a written literal, precisely because a
+/// caller's own LOCAL variable is not something a def-name-keyed,
+/// built-once-per-module table could ever resolve safely.
+fn module_scope_environment(context: &WalkContext) -> Environment {
+    let mut environment = Environment::new(HashSet::new());
+    for (name, value) in &context.module_bindings {
+        environment.bind(name, value.clone());
+    }
+    environment
+}
+
+/// The same three const-fold tiers `foreign_edge.rs::const_folded_text_of`
+/// reads (a written string literal; a bare `Name` resolving, through
+/// `environment`, to a known exact string; or any other expression
+/// `evaluate_expression` folds to an exact string — an f-string composed
+/// entirely of consts, a `+` concatenation of known exact strings),
+/// reimplemented here per this crate's own no-shared-private-helper
+/// convention (`foreign_edge.rs::exact_string_text`'s own doc states the
+/// identical precedent against `string_models.rs`). `None` on any tier
+/// that does not fold — a caller's argument that is itself a local
+/// variable, a call, or any other non-exact expression.
+fn caller_argument_exact_string(argument: &Expr, environment: &Environment, kernel: &Arc<RefinedTSKernel>) -> Option<String> {
+    if let Expr::StringLiteral(literal) = argument {
+        return Some(literal.value.to_str().to_owned());
+    }
+    if let Expr::Name(name) = argument {
+        if let Some(bound) = environment.read(name.id.as_str()) {
+            if let Some(text) = caller_exact_string_text(bound) {
+                return Some(text);
+            }
+        }
+    }
+    let folded = evaluate_expression(argument, environment, kernel);
+    caller_exact_string_text(&folded)
+}
+
+/// The exact text an `AbstractValue` carries, if it is a `Kind::Values`
+/// state sorted `PrimitiveKind::String` — `string_models.rs::
+/// exact_string_text`'s own exact twin, reimplemented locally per this
+/// crate's convention (see `caller_argument_exact_string`'s own doc).
+fn caller_exact_string_text(value: &AbstractValue) -> Option<String> {
+    if value.kind != Kind::Values || value.kind_tag != Some(PrimitiveKind::String) {
+        return None;
+    }
+    Some(value.values.iter().filter_map(|c| char::from_u32(*c as i64 as u32)).collect())
 }
 
 /// A CLASS-NAME parameter's own instance value: a `Kind::Object` tagged
@@ -1883,6 +2059,7 @@ fn walk_function_def(def: &StmtFunctionDef, context: &WalkContext, out: &mut Vec
             .or_else(|| typed_dict_return_refinement(annotation, &context.typed_dicts))
     });
     let (return_refinement, yield_refinement) = generator_body_refinements(def, return_refinement);
+    let bare_sort_return_refinement = def.returns.as_deref().and_then(base_sort_return_refinement);
     walk_body_with_self_binding(
         &def.body,
         Some(def.parameters.as_ref()),
@@ -1891,6 +2068,8 @@ fn walk_function_def(def: &StmtFunctionDef, context: &WalkContext, out: &mut Vec
         None,
         None,
         None,
+        Some(def.name.id.as_str()),
+        bare_sort_return_refinement.as_ref(),
         context,
         out,
     );
@@ -1987,6 +2166,7 @@ pub fn derived_return_values_at(
     let module_callable_returns = Arc::new(module_level_callable_returns(module, &aliases, &imports));
     let strict_int_aliases = strict_int_alias_names(module);
     let typed_dicts = Arc::new(instances::typed_dict_table(module, &aliases, &imports));
+    let caller_arguments = Arc::new(crate::refinedpy::function_table::caller_argument_positions(module));
     let context = WalkContext {
         aliases: &aliases,
         imports: &imports,
@@ -1997,6 +2177,7 @@ pub fn derived_return_values_at(
         module_callable_returns,
         strict_int_aliases: &strict_int_aliases,
         typed_dicts,
+        caller_arguments,
         entry_directory: entry_directory.map(|dir| dir.to_path_buf()),
         evaluations_recorder: None,
     };
@@ -2012,6 +2193,7 @@ pub fn derived_return_values_at(
                 .or_else(|| typed_dict_return_refinement(annotation, &context.typed_dicts))
         });
         let (return_refinement, yield_refinement) = generator_body_refinements(def, return_refinement);
+        let bare_sort_return_refinement = def.returns.as_deref().and_then(base_sort_return_refinement);
         let mut returned_values: Vec<AbstractValue> = Vec::new();
         let mut findings = Vec::new();
         walk_body_with_self_binding(
@@ -2022,6 +2204,8 @@ pub fn derived_return_values_at(
             None,
             None,
             Some(&mut returned_values),
+            Some(def.name.id.as_str()),
+            bare_sort_return_refinement.as_ref(),
             &context,
             &mut findings,
         );
@@ -7357,6 +7541,7 @@ mod tests {
             module_callable_returns: Arc::new(HashMap::new()),
             strict_int_aliases: &HashSet::new(),
             typed_dicts: Arc::new(instances::typed_dict_table(&module, &aliases, &imports)),
+            caller_arguments: Arc::new(HashMap::new()),
             entry_directory: None,
             evaluations_recorder: None,
         };

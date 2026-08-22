@@ -544,6 +544,17 @@ fn sequence_prefix_slice(
     environment: &Environment,
     kernel: &Arc<RefinedTSKernel>,
 ) -> Option<AbstractValue> {
+    // An exact literal (`Kind::Values`) is already answered exactly by
+    // `evaluate_slice`'s own Values arm below; asking the kernel's
+    // window-shaped `seq_prefix` for it would answer a WIDER claim (a
+    // shape over an unstated member) in place of the exact slice this
+    // domain already has, so this arm only reads a genuine window
+    // receiver — `string_shaped_set`'s `Kind::Set` branch, never its
+    // exact-literal branch (that branch exists for `string_set_concatenation`,
+    // not this caller).
+    if container.kind != Kind::Set {
+        return None;
+    }
     let receiver_set = string_shaped_set(container)?;
     if let Some(expr) = &slice.lower {
         if slice_bound_index(expr, environment, kernel) != Some(0) {
@@ -789,11 +800,16 @@ fn compare_pair(op: CmpOp, left: &AbstractValue, right: &AbstractValue) -> Optio
 /// the window is a claim over an unstated member, never a promise about
 /// which one, so a partial overlap must stay `None` rather than guess.
 /// `numeric_side`/`window_side` name which of `compare_pair`'s two
-/// operands is being read here; `swapped` is `true` when `window_side`
-/// is actually `compare_pair`'s LEFT operand (`op` is then read as if
-/// its operands had traded places — `window >= 3` reverses to `3 <=
-/// window`, the ordering a caller swaps by trying both operand
-/// orientations rather than this function inverting `op` itself).
+/// operands is being read here. The per-op bodies below read literally
+/// as `window_side <op> target` (`Lt` means "every admitted value is
+/// below target," matching a name like `low_window` at the call site).
+/// `swapped` is `true` when `window_side` is actually `compare_pair`'s
+/// LEFT operand, i.e. the original claim already reads `window_side
+/// <op> numeric_side` — the same direction the bodies compute, so `op`
+/// passes through unchanged. When `swapped` is `false`, the original
+/// claim reads `numeric_side <op> window_side` — the mirror of what the
+/// bodies compute — so `op` is inverted first (`x < y` read as `y > x`)
+/// rather than this function reversing the arithmetic itself.
 fn numeric_value_vs_window_compare(
     op: CmpOp,
     numeric_side: &AbstractValue,
@@ -803,11 +819,9 @@ fn numeric_value_vs_window_compare(
     let (target, _) = single_numeric_value(numeric_side)?;
     let (lo, hi) = integer_set_bounds(window_side)?;
     let (lo, hi) = (lo as f64, hi as f64);
-    // `op` as read named `numeric_side <op> window_side`; `swapped`
-    // means the true operands were `window_side <op> numeric_side`, so
-    // the ordering direction is mirrored before the window/target
-    // arithmetic below (`x < y` read as `y > x`).
     let effective_op = if swapped {
+        op
+    } else {
         match op {
             CmpOp::Lt => CmpOp::Gt,
             CmpOp::LtE => CmpOp::GtE,
@@ -815,8 +829,6 @@ fn numeric_value_vs_window_compare(
             CmpOp::GtE => CmpOp::LtE,
             other => other,
         }
-    } else {
-        op
     };
     match effective_op {
         // every admitted value equals target only when the window is
@@ -8829,26 +8841,36 @@ mod tests {
     /// without panicking and keeps the length-based fallback exactly as
     /// if the `[:n]` arm had never matched.
     ///
-    /// The kernel extension (`seqWindowOf`, set_functions/prefix_read.lean)
-    /// now folds a `Concatenation` whose operand is itself a nested
-    /// sequence shape (the `text_label.py` shape this arm was built
-    /// for), but its own doc names the one operand it still refuses: a
-    /// `Union`. The receiver here is a `Concatenation` whose right
-    /// operand is a `Union` of two scalar sets — the top-level form is
-    /// still `Concatenation` (so `string_shaped_set`'s own
-    /// `states_sequence` gate admits it, same as `text_label.py`'s
-    /// receiver does), but `seqWindowOf`'s `Concatenation` arm recurses
-    /// into that operand and gets `none` back, so the whole ask still
-    /// declines — pinning that the non-panic path stays exercised now
-    /// that the ORIGINAL concatenation-with-a-leading-window shape has
-    /// moved to the admit test above.
+    /// This test's original premise (before this rewrite) built the
+    /// declining operand as a `Union` of two SCALAR string tuples
+    /// (`string_tuple("a")`, `string_tuple("b")`), citing
+    /// `prefix_read.lean`'s doc that "a Union operand is not read." That
+    /// doc names `seqWindowOf`'s own top-level match on `R = Union A B`
+    /// — it does not cover a Union appearing as a `Concatenation`
+    /// operand. `Refinement.Union A B => A.scalarB && B.scalarB`
+    /// (`emptiness.lean`) makes a Union of two scalar sets itself
+    /// scalar, so `seqWindowOf`'s `if R.scalarB then some (R, 1, some 1)`
+    /// fast path recognized that operand directly — the kernel measured
+    /// `Some(...)`, not `None`, so the original premise was stale, not a
+    /// regression (`packages/refinedpy/rust/refined_sets/src/../.. /
+    /// set_functions/emptiness.lean:40`, `prefix_read.lean:238-252`).
+    ///
+    /// The genuinely-declining shape is a Union of two NON-scalar
+    /// window operands (two `Repeat`s over different alphabets):
+    /// `Refinement.Union`'s scalar check fails (neither side is
+    /// scalar), so the bare `Union` never matches `seqWindowOf`'s
+    /// `if R.scalarB` fast path, and `seqWindowOf`'s own `match R with`
+    /// has no arm for a bare `Union` at all — it falls to the wildcard
+    /// `_ => none`. Nested as the `Concatenation`'s left operand, the
+    /// recursive `seqWindowOf A` call on that Union gets `none` back,
+    /// so the whole ask still declines.
     #[test]
     fn test_slice_prefix_completes_without_panic_when_the_kernel_itself_declines() {
         let Some(kernel) = loaded_kernel() else { return };
-        let unrecognized_union_operand = make_refined_set(vec![refined_sets::refinement_forms::union(
-            refined_sets::codepoint_sets::string_tuple("a"),
-            refined_sets::codepoint_sets::string_tuple("b"),
-        )]);
+        let window_a = make_refined_set(vec![repeat_of(one_char_of("ab"), 1, Some(4))]);
+        let window_b = make_refined_set(vec![repeat_of(one_char_of("cd"), 1, Some(4))]);
+        let unrecognized_union_operand =
+            make_refined_set(vec![refined_sets::refinement_forms::union(window_a, window_b)]);
         let literal = refined_sets::codepoint_sets::string_tuple("xxxxxxxx");
         let concatenation_with_a_union_operand = make_refined_set(vec![
             refined_sets::refinement_forms::concatenation(unrecognized_union_operand, literal),
@@ -8859,7 +8881,7 @@ mod tests {
         assert_eq!(
             (kernel.seq_prefix)(&concatenation_with_a_union_operand, 3),
             None,
-            "a Concatenation over a Union operand must still decline (seqWindowOf's own named edge)"
+            "a Concatenation over a Union of non-scalar window operands must still decline (seqWindowOf's own named edge)"
         );
         let receiver = AbstractValue {
             kind_tag: None,
