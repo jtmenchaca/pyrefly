@@ -66,6 +66,7 @@ use std::panic::catch_unwind;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
+use refined_domain::abstract_value::kind_union_of;
 use refined_domain::abstract_value::known_set;
 use refined_domain::abstract_value::known_values;
 use refined_domain::abstract_value::AbstractValue;
@@ -646,6 +647,34 @@ fn narrow_isinstance_call(call: &ruff_python_ast::ExprCall, environment: &mut En
         return;
     }
     let current = current.expect("checked Some above");
+    // A KindUnion binding (json.loads's own honest return space,
+    // `expressions.rs::json_loads_value_space`) narrows arm-by-arm: each
+    // arm already carries the `kind_tag` an ordinary Values/Set binding
+    // does, so `isinstance(x, float)` keeps only the arms whose tag
+    // matches (`truth`) or excludes them (`!truth`) — the same filter
+    // this function already runs on a single Values binding, applied
+    // per arm instead of once. An arm with no `kind_tag` at all (the
+    // list/dict arms, built via `opaque_value` on `Kind::Object`) never
+    // matches a primitive tag either way, so it survives a `truth` test
+    // only when the test is proving the union does NOT hold that sort
+    // (`!truth` keeps it) and is dropped when `truth` asks for a sort it
+    // cannot be. `kind_union_of` collapses the result: one surviving arm
+    // answers bare, and no dropped arm decides the fold "no member
+    // left standing" — that reading belongs to `arm_is_infeasible`
+    // (Values-only today), not to this narrowing.
+    if current.kind == Kind::KindUnion {
+        let kept: Vec<AbstractValue> = current
+            .arms
+            .iter()
+            .filter(|arm| {
+                let matches_tag = arm.kind_tag.is_some_and(|tag| tags.contains(&tag));
+                matches_tag == truth
+            })
+            .cloned()
+            .collect();
+        environment.bind(name, kind_union_of(kept));
+        return;
+    }
     if current.kind != Kind::Values {
         return;
     }
@@ -1678,6 +1707,53 @@ mod tests {
         let mut values = value.values.clone();
         values.sort_by(f64::total_cmp);
         assert_eq!(values, vec![0.0, 1.0]);
+    }
+
+    /// `isinstance(value, float)` on a `Kind::KindUnion` binding (the
+    /// honest JSON-union `json.loads` answers over an opaque string,
+    /// `expressions.rs::json_loads_value_space`) keeps ONLY the
+    /// Float-tagged arm — the gain the ledger names: a downstream guard
+    /// must still narrow the union rather than reading it as
+    /// unnarrowable. Built inline here (rather than reaching into
+    /// `expressions.rs`'s private constructor) with the same seven arms
+    /// that function builds.
+    #[test]
+    fn test_isinstance_float_narrows_a_json_loads_union_to_its_float_arm() {
+        use refined_domain::abstract_value::float_sorted_unknown;
+        use refined_domain::abstract_value::null_value;
+        use refined_domain::abstract_value::opaque_value;
+        use refined_domain::abstract_value::AbstractValue;
+        use refined_sets::codepoint_sets::strings;
+        use refined_sets::refinement_forms::at_least;
+
+        let integer_arm = AbstractValue {
+            kind_tag: Some(PrimitiveKind::Integer),
+            ..known_set(make_refined_set(vec![integer(), at_least(f64::NEG_INFINITY)]), None, TrustProved, SetKindTag::None)
+        };
+        let float_arm = float_sorted_unknown();
+        let union = kind_union_of(vec![
+            null_value(),
+            known_values(vec![0.0, 1.0], PrimitiveKind::Boolean, TrustProved),
+            known_set(strings(), None, TrustProved, SetKindTag::None),
+            integer_arm,
+            float_arm.clone(),
+            opaque_value("a list"),
+            opaque_value("a dict"),
+        ]);
+        assert_eq!(union.kind, Kind::KindUnion, "the seven distinct-kind arms must not collapse");
+
+        let mut locally_bound = HashSet::new();
+        locally_bound.insert("value".to_owned());
+        let mut environment = Environment::new(locally_bound);
+        environment.bind("value", union);
+
+        let Some(narrowed) = assumed("isinstance(value, float)", environment, true) else {
+            return;
+        };
+        let value = narrowed.read("value").expect("value still bound");
+        assert_eq!(value.kind, Kind::Set, "only the float arm should survive, unwrapped from the union");
+        assert_eq!(value.kind_tag, Some(PrimitiveKind::Float));
+        assert_eq!(value.set, float_arm.set);
     }
 
     /// `isinstance(value, int)` proving FALSE seeds nothing — a

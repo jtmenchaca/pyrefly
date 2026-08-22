@@ -219,7 +219,28 @@ pub fn recognize_generator_sum(
     let [Expr::Name(total)] = assign.targets.as_slice() else {
         return None;
     };
-    let Expr::Call(call) = assign.value.as_ref() else {
+    recognize_generator_sum_call(assign.value.as_ref(), total.id.as_str().to_owned(), environment)
+}
+
+/// Recognizes `sum(<elt> for <var> in <name>)` at a position with no
+/// naming target of its own — a bare `return sum(...)`, where the total
+/// is never bound to a name and instead routes straight to the return
+/// sink. `total_name` still fills `RecognizedAccumulation`'s own field
+/// (`accumulation_program`'s distinctness guard, and a division-folding
+/// match neither caller of this function exercises for an unnamed
+/// total), but nothing here binds it — the caller decides what a
+/// synthetic name should be.
+///
+/// The recognition rules are exactly `recognize_generator_sum`'s own —
+/// this is the shared body both the assignment and the return spelling
+/// call, split out so a return position never has to synthesize a
+/// `StmtAssign` it does not have.
+fn recognize_generator_sum_call(
+    value: &Expr,
+    total_name: String,
+    environment: &Environment,
+) -> Option<RecognizedAccumulation> {
+    let Expr::Call(call) = value else {
         return None;
     };
     let Expr::Name(callee) = call.func.as_ref() else {
@@ -258,7 +279,7 @@ pub fn recognize_generator_sum(
         return None;
     };
     accumulation_program(
-        total.id.as_str().to_owned(),
+        total_name,
         sequence.id.as_str(),
         loop_variable.id.as_str(),
         generator.elt.as_ref(),
@@ -266,6 +287,28 @@ pub fn recognize_generator_sum(
         // sum() has no seed binding to read a sort off
         None,
     )
+}
+
+/// Recognizes a bare `return sum(<elt> for <var> in <name>)` — the same
+/// generator-sum shape `recognize_generator_sum` reads at an
+/// assignment, at the return position instead. There is no assignment
+/// target to read a total's name from, since the total is never bound —
+/// it routes straight to the return sink (`check.rs`'s own
+/// `Environment::set_evaluated_node` seam, the same one a folded
+/// division's quotient already rides in return position). `total_name`
+/// carries a placeholder no real Python identifier can equal (Python
+/// identifiers hold no `$`, `identifiers.rst`), since nothing reads it
+/// as a name to bind here — it exists only to satisfy
+/// `accumulation_program`'s distinctness guard against the sequence and
+/// loop-variable names.
+///
+/// `None` under the exact same conditions `recognize_generator_sum`
+/// declines under.
+pub fn recognize_generator_sum_in_return(
+    value: &Expr,
+    environment: &Environment,
+) -> Option<RecognizedAccumulation> {
+    recognize_generator_sum_call(value, "$return".to_owned(), environment)
 }
 
 /// The program both recognized forms build: the four entry states and

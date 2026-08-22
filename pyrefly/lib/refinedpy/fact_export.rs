@@ -131,7 +131,7 @@ pub fn export_module(
 
     for def in top_level_defs(module) {
         let name = def.name.id.as_str().to_owned();
-        match export_function(def, module, &module_line_starts, &aliases, &imports, &derived_returns) {
+        match export_function(def, module, &module_line_starts, &aliases, &imports, &derived_returns.values, &derived_returns.blockers) {
             Ok(entry) => {
                 functions.insert(name, entry);
             }
@@ -267,12 +267,24 @@ fn export_function(
     aliases: &HashMap<String, AliasEntry>,
     imports: &SurfaceImports,
     derived_returns: &HashMap<String, AbstractValue>,
+    derived_blockers: &HashMap<String, String>,
 ) -> Result<Value, String> {
     let entry = entry_rows(def, aliases, imports)?;
     let name = def.name.id.as_str();
-    let returned = derived_returns
-        .get(name)
-        .ok_or_else(|| "the body's returns derived no value the walk could read".to_owned())?;
+    let returned = derived_returns.get(name).ok_or_else(|| {
+        // A body whose own walk hit an unwalkable construct names THAT
+        // construct — the same RTS7002 sentence `findings_for_module`
+        // would report for this body, independent of whether `->
+        // Annotation` itself read (`derived_return_values`'s own doc:
+        // an unreadable return annotation must never leave this body's
+        // omission unnamed). Falls back to the generic sentence only
+        // for a body the walk ran cleanly through with no blocker and
+        // no `return` at all — genuinely nothing to name.
+        derived_blockers
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| "the body's returns derived no value the walk could read".to_owned())
+    })?;
     let return_set = faithful_return_set(returned)?;
     let stdout_pure = writes_nothing_to_stdout(def, module);
     // The def's own NAME identifier, not the statement range: a
@@ -1783,6 +1795,61 @@ mod tests {
             .as_array()
             .expect("the derived return states its forms");
         assert_eq!(return_forms.len(), 2, "the derived return is the two-sided [0, 1] window");
+    }
+
+    /// UNIT 2 (ISSUES.md: "Py: loop blockers unnamed when return
+    /// annotation unreadable — bare `-> float` never judged;
+    /// undetermined bodies must name their blocker regardless"). Two
+    /// defs, identical bodies (`while True: pass`, no `return`
+    /// anywhere — an unwalkable construct with nothing for the walk to
+    /// derive), differing ONLY in their return annotation's own
+    /// readability: `readable_return`'s `-> Age` is `declared_refinement`'s
+    /// own vocabulary; `unreadable_return`'s `-> float` is a bare sort
+    /// name `declared_refinement` states nothing about
+    /// (`typereading.rs`'s `Expr::Name` arm requires a declared alias).
+    /// Both omissions must name the SAME blocker — the `while` statement
+    /// — never a named reason for one and the generic "derived no
+    /// value" placeholder for the other.
+    #[test]
+    fn an_unreadable_return_annotation_still_names_its_bodys_blocker() {
+        let Some(kernel) = loaded_kernel() else {
+            return;
+        };
+        let source = concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Age = Annotated[int, Field(ge=0, le=120)]\n",
+            "def readable_return(n: Age) -> Age:\n",
+            "    while True:\n",
+            "        pass\n",
+            "def unreadable_return(n: Age) -> float:\n",
+            "    while True:\n",
+            "        pass\n",
+        );
+        let module = ruff_python_parser::parse_module(source)
+            .expect("the fixture parses")
+            .into_syntax();
+        let no_imports: ModuleResolver = &|_: &str| None;
+        let export = export_module(&module, source.as_bytes(), "loop_blocker.py", no_imports, &kernel);
+        let reason_for = |name: &str| {
+            export
+                .omissions
+                .iter()
+                .find(|omission| omission.function == name)
+                .unwrap_or_else(|| panic!("'{name}' must be named in an omission, got: {:?}", export.omissions.iter().map(|o| (&o.function, &o.reason)).collect::<Vec<_>>()))
+                .reason
+                .clone()
+        };
+        let readable_reason = reason_for("readable_return");
+        let unreadable_reason = reason_for("unreadable_return");
+        assert!(
+            readable_reason.contains("while"),
+            "the readable-annotation twin must name the while loop: {readable_reason}"
+        );
+        assert_eq!(
+            readable_reason, unreadable_reason,
+            "an unreadable return annotation must name the identical blocker its readable twin does"
+        );
     }
 
     /// The main-block reader recognizes the file shape spelled exactly

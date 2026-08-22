@@ -786,6 +786,15 @@ fn walk_body_with_self_binding(
                 environment.set_evaluated_node(Some((*parse_range, value.clone())));
             }
         }
+        // RELATIONAL SUM AT A BARE RETURN: `return sum(<elt> for <var>
+        // in <seq>)` with no assignment in the body at all — the
+        // generator-sum recognizer above only ever reads an `Assign`, so
+        // this single-statement spelling needs its own publish before
+        // the return walks. A decline publishes nothing and the return
+        // below evaluates exactly as it already did.
+        if let Stmt::Return(ret) = stmt {
+            publish_relational_sum_return(ret, &mut environment);
+        }
         let terminates = walk_statement(
             stmt,
             return_refinement,
@@ -1751,6 +1760,24 @@ fn delegated_generator_yields(
     let outer_environment = Environment::new(HashSet::new());
     let declared = declared_refinement(def.returns.as_deref()?, context.aliases, context.imports, &outer_environment)?;
     let yield_type = declared.generator?.yield_type;
+    // Tags the numeric sort `min_max_scalar_operand`/`star_numeric_hull`/
+    // `sum_call_over_star` (builtin_models.rs) read, the same guarded
+    // rule `seed_parameters` applies to a declared set: numeric-ground
+    // only (`on_one_tuple_layer` alone also reads a `Literal["A", "B"]`
+    // string-tuple union as "on the one-tuple layer", so `states_sequence`
+    // must be false too, ruling out that pun). A string/sequence-shaped
+    // yield type is left untagged, unchanged from today.
+    if on_one_tuple_layer(&yield_type.set) && !states_sequence(&yield_type.set) {
+        let sort = if requires_integer(&yield_type.set) {
+            PrimitiveKind::Integer
+        } else {
+            PrimitiveKind::Float
+        };
+        return Some(vec![AbstractValue {
+            kind_tag: Some(sort),
+            ..known_set(yield_type.set, None, TrustSpec, SetKindTag::None)
+        }]);
+    }
     Some(vec![known_set(yield_type.set, None, TrustSpec, SetKindTag::None)])
 }
 
@@ -1793,21 +1820,43 @@ fn walk_function_def(def: &StmtFunctionDef, context: &WalkContext, out: &mut Vec
 /// and every def walks against it, so an N-def module resolves its
 /// imports once rather than N times.
 ///
-/// An empty map when the module states no `type` alias AND no recognized
-/// `Annotated` import (the same early exit `findings_for_module_at`
-/// takes). A def whose body produced no `return` value this walk could
-/// read is simply absent from the map — never an entry holding a guessed
-/// value. The findings the walks produce are discarded here: the export
-/// judges nothing; it reports what the walk derived.
+/// `derived_return_values`'s own answer: every def's derived return
+/// value, keyed by name, PLUS — for a def with no entry in that map —
+/// the first blocker sentence its own walk recorded, keyed the same way.
+/// A def absent from both is a body this walk ran cleanly with no
+/// blocker and no `return` statement at all (a bare `pass`, an `if`
+/// with no branch reaching a return) — genuinely nothing to name,
+/// distinct from a def the walk COULD NOT get through.
+pub struct DerivedReturns {
+    pub values: HashMap<String, AbstractValue>,
+    pub blockers: HashMap<String, String>,
+}
+
+/// An empty answer when the module states no `type` alias AND no
+/// recognized `Annotated` import (the same early exit
+/// `findings_for_module_at` takes). A def whose body produced no
+/// `return` value this walk could read is simply absent from `values`
+/// — never an entry holding a guessed value. `blockers` names the FIRST
+/// construct that stopped a def's own walk (the same RTS7002 sentence
+/// `findings_for_module` would report for this body), independent of
+/// whether the def's `-> Annotation` was itself readable: an unreadable
+/// return annotation gives `return_refinement` as `None`, which is
+/// `walk_return`'s own signal to skip JUDGING a return value — it does
+/// not, and must not, silence the blocker this body's own walk hit on
+/// the way to that return (`walk_loop`/`walk_statement`'s
+/// `record_blocker` calls are unconditional on `return_refinement`
+/// already; what this function fixes is that its OWN discarded-findings
+/// walk used to drop that recorded blocker on the floor rather than
+/// handing it back to a caller that needs it).
 pub fn derived_return_values(
     module: &ModModule,
     resolver: ModuleResolver,
     kernel: &Arc<RefinedTSKernel>,
-) -> HashMap<String, AbstractValue> {
+) -> DerivedReturns {
     let aliases = compile_aliases(module);
     let imports = surface_imports(module);
     if aliases.is_empty() && imports.annotated_names.is_empty() {
-        return HashMap::new();
+        return DerivedReturns { values: HashMap::new(), blockers: HashMap::new() };
     }
     let surface = module_surface(module, resolver, kernel, IMPORT_DEPTH_CAP);
     let own_functions = function_table(module);
@@ -1844,7 +1893,8 @@ pub fn derived_return_values(
         entry_directory: None,
         evaluations_recorder: None,
     };
-    let mut derived = HashMap::new();
+    let mut values = HashMap::new();
+    let mut blockers = HashMap::new();
     for def in module.body.iter().filter_map(|stmt| match stmt {
         Stmt::FunctionDef(def) => Some(def),
         _ => None,
@@ -1856,7 +1906,7 @@ pub fn derived_return_values(
         });
         let (return_refinement, yield_refinement) = generator_body_refinements(def, return_refinement);
         let mut returned_values: Vec<AbstractValue> = Vec::new();
-        let mut discarded_findings = Vec::new();
+        let mut findings = Vec::new();
         walk_body_with_self_binding(
             &def.body,
             Some(def.parameters.as_ref()),
@@ -1866,18 +1916,28 @@ pub fn derived_return_values(
             None,
             Some(&mut returned_values),
             &context,
-            &mut discarded_findings,
+            &mut findings,
         );
         let mut answers = returned_values.into_iter();
         let Some(first) = answers.next() else {
+            // No `return` this walk could read a value from — named
+            // here, independent of whether `-> Annotation` itself read
+            // (a bare `-> float` leaves `return_refinement` `None`, but
+            // `record_blocker`'s own call sites never gate on that: the
+            // FIRST unwalkable construct this body's walk hit is still
+            // right here in `findings`, exactly the RTS7002 sentence
+            // `findings_for_module` would report for the same body).
+            if let Some(blocker) = findings.iter().find(|finding| finding.code == "RTS7002") {
+                blockers.insert(def.name.id.as_str().to_owned(), blocker.message.clone());
+            }
             continue;
         };
-        derived.insert(
+        values.insert(
             def.name.id.as_str().to_owned(),
             answers.fold(first, refined_domain::lattice_operations::join_known),
         );
     }
-    derived
+    DerivedReturns { values, blockers }
 }
 
 /// LOCAL DEFS: this body's own top-level `def`s (not a nested body's —
@@ -2417,6 +2477,52 @@ fn walk_relational_sum(
         environment.forget(loop_variable.id.as_str());
     }
     outcome
+}
+
+/// RELATIONAL SUM AT A BARE RETURN: `return sum(<elt> for <var> in
+/// <seq>)` with no assignment anywhere in sight — the whole body is one
+/// statement. `recognize_generator_sum` only ever reads an `Assign`, so
+/// this exact expression, spelled `total = sum(...); return total`,
+/// already recognizes and judges; spelled as a direct `return`, it fell
+/// through to the ordinary evaluator's `sum_call_over_star` row, which
+/// needs a known-sign hull and declines on a sign-straddling element.
+///
+/// There is no name to bind the total into — it routes straight to the
+/// return's own evaluated-node seam (`Environment::set_evaluated_node`),
+/// the same publish `walk_relational_sum`'s return-with-division arm
+/// already uses, except the published range is the WHOLE returned
+/// expression rather than a division nested inside it, since the call
+/// to `sum` IS the returned expression here. `walk_return` (called by
+/// the ordinary `walk_statement` dispatch right after this) then reads
+/// the publish at `evaluate_expression`'s own dispatch head and judges
+/// it against the declared return set exactly as any other value would
+/// be.
+///
+/// A kernel refusal, or a total the kernel could not bind, publishes
+/// nothing: `evaluate_expression` then runs unchanged and the ordinary
+/// `sum_call_over_star` row answers whatever it already would.
+fn publish_relational_sum_return(ret: &StmtReturn, environment: &mut Environment) {
+    let Some(value) = ret.value.as_deref() else {
+        return;
+    };
+    let Some(recognized) = relational_sum::recognize_generator_sum_in_return(value, environment) else {
+        return;
+    };
+    if std::env::var("REFINEDPY_DEBUG_RELATIONAL").is_ok() {
+        eprintln!(
+            "relational_sum: (bare return) sequence={} entry_states={:?} statements={:?}",
+            recognized.sequence_name, recognized.entry_states, recognized.statements
+        );
+    }
+    let Some(answer) = relational_sum::walk_accumulation(&recognized) else {
+        if std::env::var("REFINEDPY_DEBUG_RELATIONAL").is_ok() {
+            eprintln!("relational_sum: (bare return) declined (walk_accumulation answered None)");
+        }
+        return;
+    };
+    if let Some(total) = answer.total {
+        environment.set_evaluated_node(Some((value.range(), total)));
+    }
 }
 
 /// What `walk_relational_sum` did with a recognized accumulation.
@@ -3215,7 +3321,24 @@ fn judge_and_bind(
                 code: "RTS7001",
                 message,
             });
-            let refused_slot = known_set(declared.set.clone(), None, TrustSpec, SetKindTag::None);
+            // Tags the numeric sort onward flow needs (the same guarded
+            // rule `seed_parameters` applies to a declared set:
+            // numeric-ground only, never the `Literal["A", "B"]`
+            // string-tuple pun `on_one_tuple_layer` alone would also
+            // admit).
+            let refused_slot = if on_one_tuple_layer(&declared.set) && !states_sequence(&declared.set) {
+                let sort = if requires_integer(&declared.set) {
+                    PrimitiveKind::Integer
+                } else {
+                    PrimitiveKind::Float
+                };
+                AbstractValue {
+                    kind_tag: Some(sort),
+                    ..known_set(declared.set.clone(), None, TrustSpec, SetKindTag::None)
+                }
+            } else {
+                known_set(declared.set.clone(), None, TrustSpec, SetKindTag::None)
+            };
             environment.bind(name, refused_slot);
             None
         }
@@ -3446,7 +3569,24 @@ fn walk_subscript_aug_assign(
                     code: "RTS7001",
                     message,
                 });
-                known_set(element_declared.set.clone(), None, TrustSpec, SetKindTag::None)
+                // Tags the numeric sort onward flow needs (the same
+                // guarded rule `seed_parameters` applies to a declared
+                // set: numeric-ground only, never the
+                // `Literal["A", "B"]` string-tuple pun
+                // `on_one_tuple_layer` alone would also admit).
+                if on_one_tuple_layer(&element_declared.set) && !states_sequence(&element_declared.set) {
+                    let sort = if requires_integer(&element_declared.set) {
+                        PrimitiveKind::Integer
+                    } else {
+                        PrimitiveKind::Float
+                    };
+                    AbstractValue {
+                        kind_tag: Some(sort),
+                        ..known_set(element_declared.set.clone(), None, TrustSpec, SetKindTag::None)
+                    }
+                } else {
+                    known_set(element_declared.set.clone(), None, TrustSpec, SetKindTag::None)
+                }
             }
             Verdict::Silent => updated,
             Verdict::Undetermined(_) => {
@@ -4545,6 +4685,21 @@ fn callable_variable_call_result(
     if context.classes.contains_key(name) {
         return None;
     }
+    // Tags the numeric sort onward flow needs (the same guarded rule
+    // `seed_parameters` applies to a declared set: numeric-ground only,
+    // never the `Literal["A", "B"]` string-tuple pun `on_one_tuple_layer`
+    // alone would also admit).
+    if on_one_tuple_layer(&declared.set) && !states_sequence(&declared.set) {
+        let sort = if requires_integer(&declared.set) {
+            PrimitiveKind::Integer
+        } else {
+            PrimitiveKind::Float
+        };
+        return Some(AbstractValue {
+            kind_tag: Some(sort),
+            ..known_set(declared.set.clone(), None, TrustSpec, SetKindTag::None)
+        });
+    }
     Some(known_set(declared.set.clone(), None, TrustSpec, SetKindTag::None))
 }
 
@@ -4988,7 +5143,7 @@ fn adapter_alias_verdict(
             // SECOND time against that identical declaration; handing
             // back the raw out-of-set value would fire there again for
             // the one refusal this function already reported.
-            instance: known_set(declared.set.clone(), None, TrustSpec, SetKindTag::None),
+            instance: declared_set_instance(&declared),
         }),
         Verdict::Silent => Some(ConstructionVerdict {
             fires: Vec::new(),
@@ -5002,9 +5157,32 @@ fn adapter_alias_verdict(
             // against the SAME declaration (e.g. the function's own `->
             // Age` return annotation) sees a trivial self-match rather
             // than staying stuck on a value this table could not read.
-            instance: known_set(declared.set.clone(), None, TrustSpec, SetKindTag::None),
+            instance: declared_set_instance(&declared),
         }),
     }
+}
+
+/// A declared set as a bound value, tagged with its numeric sort when
+/// the ground is provably numeric — the same guarded rule
+/// `seed_parameters` applies to a declared set: `on_one_tuple_layer`
+/// alone also reads a `Literal["A", "B"]` string-tuple union as "on the
+/// one-tuple layer", so `states_sequence` must be false too, ruling out
+/// that pun. Shared by `adapter_alias_verdict`'s Fire and Undetermined
+/// arms, which both keep the declared set rather than the value this
+/// table refused or could not read.
+fn declared_set_instance(declared: &DeclaredRefinement) -> AbstractValue {
+    if on_one_tuple_layer(&declared.set) && !states_sequence(&declared.set) {
+        let sort = if requires_integer(&declared.set) {
+            PrimitiveKind::Integer
+        } else {
+            PrimitiveKind::Float
+        };
+        return AbstractValue {
+            kind_tag: Some(sort),
+            ..known_set(declared.set.clone(), None, TrustSpec, SetKindTag::None)
+        };
+    }
+    known_set(declared.set.clone(), None, TrustSpec, SetKindTag::None)
 }
 
 /// A plain base-10 digit string's codepoints (optional leading `-`,
@@ -6572,6 +6750,43 @@ mod tests {
         );
     }
 
+    /// UNIT 3, site 4 (`walk_subscript_aug_assign`'s element Fire arm):
+    /// the refused element write keeps `Age`'s own numeric-ground set,
+    /// tagged with its sort — a later `ages[0]` read reaches
+    /// `math.sqrt` (a sort-gated consumer, `sqrt_call_over_set`,
+    /// math_models.rs) and derives a value instead of leaving the
+    /// return undetermined.
+    #[test]
+    fn a_refused_element_writes_declared_set_reaches_sqrt_tagged() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "import math\n",
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Age = Annotated[int, Field(ge=0, le=120)]\n",
+            "type Root = Annotated[float, Field(ge=0.0, le=20.0)]\n",
+            "def rows() -> Root:\n",
+            "    ages: list[Age] = [10, 20]\n",
+            "    ages[0] //= 5\n",
+            "    ages[0] += 190\n",
+            "    return math.sqrt(ages[0])\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        let fires: Vec<&Finding> = findings.iter().filter(|f| f.code == "RTS7001").collect();
+        let blockers: Vec<&Finding> = findings.iter().filter(|f| f.code == "RTS7002").collect();
+        assert_eq!(
+            fires.len(),
+            1,
+            "the 192 write still fires once: {:?}",
+            findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+        );
+        assert!(
+            blockers.is_empty(),
+            "the tagged element set must let math.sqrt derive rather than blocking: {:?}",
+            findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn a_list_element_compound_write_inside_the_declared_ceiling_stays_silent() {
         let Some(kernel) = loaded_kernel() else { return };
@@ -6707,6 +6922,42 @@ mod tests {
         assert!(fires[0].message.contains("'200'"), "{}", fires[0].message);
     }
 
+    /// UNIT 1 (fully diagnosed, runtime-verified): a bare `return
+    /// sum(<generator>)` with no assignment anywhere in the body used to
+    /// fall through to the ordinary evaluator's `sum_call_over_star` row
+    /// (`builtin_models.rs`), which needs a known-sign element hull and
+    /// declines outright on a sign-straddling `[-1, 1]` element — even
+    /// though the byte-identical computation, spelled `total =
+    /// sum(...); return total`, already recognized and judged through
+    /// `recognize_generator_sum`'s own Assign-only reader. Both spellings
+    /// here run over `samples: list[Sample]` with `Sample`'s own hull
+    /// straddling zero, and both must derive the SAME silent verdict
+    /// against `-> Total` (`[-10, 10]`, the relational ledger's own tight
+    /// total for up to 10 elements each in `[-1, 1]`, with no
+    /// `min_length` stated so the count's own lower bound is 0) — never
+    /// a blocker for one and a judged silence for the other.
+    #[test]
+    fn a_bare_return_of_a_generator_sum_judges_identically_to_its_assign_then_return_twin() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Sample = Annotated[float, Field(ge=-1.0, le=1.0)]\n",
+            "type Total = Annotated[float, Field(ge=-10.0, le=10.0)]\n",
+            "def bare_return(samples: Annotated[list[Sample], Field(max_length=10)]) -> Total:\n",
+            "    return sum(s for s in samples)\n",
+            "def assign_then_return(samples: Annotated[list[Sample], Field(max_length=10)]) -> Total:\n",
+            "    total = sum(s for s in samples)\n",
+            "    return total\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        assert!(
+            findings.is_empty(),
+            "both spellings derive the same silent [-10, 10] verdict, want no findings: {:?}",
+            findings.iter().map(|f| (&f.code, &f.message)).collect::<Vec<_>>()
+        );
+    }
+
     // --- yield/return inside a Generator[...]-annotated body ---
 
     /// i-more-expressions.py's own `yield_expression` shape:
@@ -6803,6 +7054,76 @@ mod tests {
             findings.is_empty(),
             "an entirely in-set generator body must stay silent: {:?}",
             findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// UNIT 3, site 2 (`delegated_generator_yields`'s declared-annotation
+    /// fallback): a delegate whose body-walk `instances::generator_yields`
+    /// permanently declines (a CONDITIONAL yield, `if flag: yield <expr>`
+    /// — that function's own doc names this the deliberate boundary) falls
+    /// to its bare `-> Generator[Age, None, None]` annotation instead.
+    /// `Age`'s own set is numeric-ground, so the delegated value must
+    /// carry `kind_tag: Some(Integer)` — the tag `min_max_scalar_operand`/
+    /// `star_numeric_hull`/`sum_call_over_star` (builtin_models.rs) read,
+    /// and the sort-gated consumers that used to refuse an untagged set.
+    #[test]
+    fn a_delegates_declared_yield_annotation_is_tagged_when_its_body_walk_declines() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "from typing import Generator\n",
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Age = Annotated[int, Field(ge=0, le=120)]\n",
+            "def conditional_gen(flag: bool) -> Generator[Age, None, None]:\n",
+            "    if flag:\n",
+            "        yield 40\n",
+        ));
+        let def = module
+            .body
+            .iter()
+            .find_map(|stmt| match stmt {
+                Stmt::FunctionDef(def) if def.name.id.as_str() == "conditional_gen" => Some(def),
+                _ => None,
+            })
+            .expect("the fixture's own def");
+        // `instances::generator_yields` must genuinely decline this body
+        // (the conditional yield) so the call below exercises the
+        // fallback this test pins, not the body-walked route.
+        assert!(
+            instances::generator_yields(def, &[], None, &kernel, 0).is_none(),
+            "a conditional yield must decline the body-walked route (this test's own premise)"
+        );
+        let aliases = compile_aliases(&module);
+        let imports = surface_imports(&module);
+        let functions = Arc::new(function_table(&module));
+        let classes = Arc::new(class_table(&module, &aliases, &imports, &kernel));
+        let context = WalkContext {
+            aliases: &aliases,
+            imports: &imports,
+            kernel: &kernel,
+            functions,
+            classes,
+            module_bindings: HashMap::new(),
+            module_callable_returns: Arc::new(HashMap::new()),
+            strict_int_aliases: &HashSet::new(),
+            typed_dicts: Arc::new(instances::typed_dict_table(&module, &aliases, &imports)),
+            entry_directory: None,
+            evaluations_recorder: None,
+        };
+        let environment = Environment::new(HashSet::new());
+        let delegate = ruff_python_parser::parse_expression("conditional_gen(True)")
+            .expect("the delegate call parses")
+            .into_syntax();
+        let delegate = *delegate.body;
+        let yields = delegated_generator_yields(&delegate, &context, &environment)
+            .expect("the declared annotation fallback must still answer");
+        let [value] = yields.as_slice() else {
+            panic!("want exactly the one declared yield-type reading, got {}", yields.len());
+        };
+        assert_eq!(
+            value.kind_tag,
+            Some(PrimitiveKind::Integer),
+            "Age's own numeric-ground set must tag the delegated value"
         );
     }
 
@@ -6959,6 +7280,41 @@ mod tests {
             findings.iter().map(|f| &f.message).collect::<Vec<_>>()
         );
         assert!(fires[0].message.contains("'200'"), "{}", fires[0].message);
+    }
+
+    /// UNIT 3, site 3 (`judge_and_bind`'s Fire arm): the refused-but-
+    /// declared slot `a` carries `Age`'s own numeric-ground set, tagged
+    /// with its sort — so `math.sqrt(a)`, a sort-gated consumer
+    /// (`sqrt_call_over_set`, math_models.rs) that refuses an untagged
+    /// set, now derives a value instead of leaving the return
+    /// undetermined.
+    #[test]
+    fn a_refused_writes_declared_set_reaches_sqrt_tagged() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "import math\n",
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Age = Annotated[int, Field(ge=0, le=120)]\n",
+            "type Root = Annotated[float, Field(ge=0.0, le=20.0)]\n",
+            "def f() -> Root:\n",
+            "    a: Age\n",
+            "    a = 200\n",
+            "    return math.sqrt(a)\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        // the assign's own refusal fires once; the sqrt-derived return
+        // must stay SILENT (Root's own [0, 20] window covers sqrt(Age)'s
+        // [0, sqrt(120)] range) rather than adding an undetermined
+        // blocker for a return this fix now derives.
+        let fires: Vec<&Finding> = findings.iter().filter(|f| f.code == "RTS7001").collect();
+        let blockers: Vec<&Finding> = findings.iter().filter(|f| f.code == "RTS7002").collect();
+        assert_eq!(fires.len(), 1, "{:?}", findings.iter().map(|f| &f.message).collect::<Vec<_>>());
+        assert!(
+            blockers.is_empty(),
+            "the tagged slot must let math.sqrt derive rather than blocking: {:?}",
+            findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -9031,6 +9387,38 @@ mod tests {
         );
     }
 
+    /// UNIT 3, site 5 (`callable_variable_call_result`): `Age`'s own
+    /// declared set is numeric-ground, so the callable's return must
+    /// carry `kind_tag: Some(Integer)` once bound to `year` — piping
+    /// `year` through `math.sqrt` (a sort-gated consumer,
+    /// `sqrt_call_over_set`, math_models.rs) derives a value instead of
+    /// leaving the return undetermined. The call sits at its own DIRECT
+    /// sink (`year: Age = next_year(40)`) — `callable_variable_call_
+    /// result` only reads a call at `sink_value`'s own value-expression
+    /// position (this file's own doc: "5. The CALLEE-EFFECTS CHANNEL"),
+    /// never a call nested as another call's argument.
+    #[test]
+    fn a_callable_variable_call_results_declared_set_reaches_sqrt_tagged() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "import math\n",
+            "from typing import Annotated, Callable\n",
+            "from pydantic import Field\n",
+            "type Age = Annotated[int, Field(ge=0, le=120)]\n",
+            "type Root = Annotated[float, Field(ge=0.0, le=20.0)]\n",
+            "next_year: Callable[[int], Age] | None = None\n",
+            "def f() -> Root:\n",
+            "    year: Age = next_year(40)\n",
+            "    return math.sqrt(year)\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        assert!(
+            findings.is_empty(),
+            "the tagged callable return must let math.sqrt derive rather than blocking: {:?}",
+            findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+        );
+    }
+
     /// b-body-expressions.py:38/79's own shape verbatim, EXCEPT the call
     /// sits at a DIRECT sink (no ternary): `maybe_next_year(40)` read
     /// straight into a `return -> Age`. This is the shape this unit's
@@ -9627,6 +10015,83 @@ mod tests {
             findings.iter().map(|f| &f.message).collect::<Vec<_>>()
         );
         assert!(fires[0].message.contains("'200'"), "{}", fires[0].message);
+    }
+
+    /// UNIT 3, sites 6 and 7 (`adapter_alias_verdict`'s Fire and
+    /// Undetermined arms, both built through the shared
+    /// `declared_set_instance`): `Age`'s own declared set is
+    /// numeric-ground, so the kept instance must carry `kind_tag:
+    /// Some(Integer)` in EITHER arm — bound at its own direct sink
+    /// (`year: Age = TypeAdapter(Age).validate_python(...)`, since
+    /// `construction_call_verdict`, like `callable_variable_call_
+    /// result`, only reads a call at `sink_value`'s own value-expression
+    /// position), then piped through `math.sqrt` (a sort-gated
+    /// consumer, `sqrt_call_over_set`, math_models.rs), which now
+    /// derives a value instead of leaving the return undetermined.
+    #[test]
+    fn adapter_alias_verdicts_fire_arm_kept_instance_reaches_sqrt_tagged() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "import math\n",
+            "from typing import Annotated\n",
+            "from pydantic import Field, TypeAdapter\n",
+            "type Age = Annotated[int, Field(ge=0, le=120)]\n",
+            "type Root = Annotated[float, Field(ge=0.0, le=20.0)]\n",
+            "def over() -> Root:\n",
+            "    year: Age = TypeAdapter(Age).validate_python(200)\n",
+            "    return math.sqrt(year)\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        let fires: Vec<&Finding> = findings.iter().filter(|f| f.code == "RTS7001").collect();
+        let blockers: Vec<&Finding> = findings.iter().filter(|f| f.code == "RTS7002").collect();
+        assert_eq!(
+            fires.len(),
+            1,
+            "the out-of-set validate_python(200) still fires once: {:?}",
+            findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+        );
+        assert!(
+            blockers.is_empty(),
+            "the tagged kept instance must let math.sqrt derive rather than blocking: {:?}",
+            findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// `adapter_alias_verdict`'s Undetermined arm itself records no
+    /// finding of its own (only the Fire arm carries one, via
+    /// `ConstructionVerdict.fires`) — it keeps `Age`'s own declared set
+    /// as the instance, which the enclosing `year: Age = …` AnnAssign
+    /// then judges a second time and finds a trivial self-match
+    /// (Silent). This test pins that the WHOLE statement stays exactly
+    /// as silent as it already was before this unit's tag — the
+    /// observable difference the tag makes is downstream, at
+    /// `math.sqrt(year)`: an untagged kept instance would leave that
+    /// call's own return undetermined; the tagged one lets it derive.
+    #[test]
+    fn adapter_alias_verdicts_undetermined_arm_kept_instance_reaches_sqrt_tagged() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "import math\n",
+            "from typing import Annotated\n",
+            "from pydantic import Field, TypeAdapter\n",
+            "type Age = Annotated[int, Field(ge=0, le=120)]\n",
+            "type Root = Annotated[float, Field(ge=0.0, le=20.0)]\n",
+            "class AudioRequest:\n",
+            "    def __init__(self, level) -> None:\n",
+            "        self.level = level\n",
+            "def f(request: AudioRequest) -> Root:\n",
+            // request.level reads back as unknown() — an unmodeled field —
+            // so validate_python's own argument judges Undetermined, the
+            // arm this test pins.
+            "    year: Age = TypeAdapter(Age).validate_python(request.level)\n",
+            "    return math.sqrt(year)\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        assert!(
+            findings.is_empty(),
+            "the tagged kept instance must let math.sqrt derive with no fire and no blocker: {:?}",
+            findings.iter().map(|f| (&f.code, &f.message)).collect::<Vec<_>>()
+        );
     }
 
     /// m-pydantic-schema.py's `parse_string_chain_over_length` shape: a

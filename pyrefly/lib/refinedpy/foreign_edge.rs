@@ -2398,6 +2398,36 @@ mod tests {
         }
     }
 
+    /// The recognized foreign-edge shape's `json.loads(result.stdout)`
+    /// node is never read through `expressions.rs::
+    /// json_loads_value_space` — the honest JSON-union built for an
+    /// OPAQUE operand this file holds no fact about
+    /// (ISSUES.md, b-runners:124). `foreign_edge_at` builds this
+    /// `Override` value directly from the target's own kernel-derived
+    /// return fact (this file's own `foreign_return_value`), entirely
+    /// separate from `expressions.rs`'s generic `json.loads` handler —
+    /// `check.rs`'s `Environment::set_evaluated_node` publishes this
+    /// value at the parse node BEFORE any generic evaluation reaches
+    /// it, so a recognized target never falls to the union answer this
+    /// row's own sibling test (`test_json_loads_of_an_opaque_operand_
+    /// answers_the_full_json_union`, expressions.rs) pins for the
+    /// UNrecognized case.
+    #[test]
+    fn a_recognized_target_never_answers_the_generic_json_union() {
+        register_fixture_artifact("./audio_level.ts", audio_level_ts_artifact());
+        let Some(kernel) = loaded_kernel() else { return };
+        let body = def_body(FIXTURE_SOURCE);
+        let environment = env_with(&[("boosted", boosted_sequence_value())]);
+        let outcome = foreign_edge_at(&body, 0, &environment, &kernel, None).expect("the shape recognizes");
+        match outcome {
+            ForeignEdgeOutcome::Override { value, .. } => {
+                assert_ne!(value.kind, Kind::KindUnion, "the recognized edge's own fact must win, not the opaque union");
+            }
+            ForeignEdgeOutcome::Decline { message, .. } => panic!("wanted an override, got a decline: {message}"),
+            ForeignEdgeOutcome::Fired { message, .. } => panic!("wanted an override, got a fire: {message}"),
+        }
+    }
+
     #[test]
     fn a_shadowed_subprocess_name_is_not_recognized() {
         let body = def_body(FIXTURE_SOURCE);

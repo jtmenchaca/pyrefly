@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use refined_domain::abstract_value::float_sorted_unknown;
+use refined_domain::abstract_value::kind_union_of;
 use refined_domain::abstract_value::known_set;
 use refined_domain::abstract_value::known_values;
 use refined_domain::abstract_value::null_value;
@@ -2639,6 +2640,41 @@ fn json_scalar_literal_value(text: &str) -> Option<AbstractValue> {
     None
 }
 
+/// `json.loads`'s full return space over an operand this file holds no
+/// fact about (ISSUES.md, "generic json.loads of an opaque string
+/// answers bare unknown") — library/json.rst's own conversion table,
+/// read as ONE honest claim rather than the narrower Float-sorted guess
+/// the survey rejected as unsound (a real payload can land on any of
+/// the table's rows, and a Float-only claim is false on every other
+/// row). `PrimitiveKind::Integer`/`Float` split the JSON `number`
+/// production (CPython: `json.loads("1")` is `int`, `json.loads("1.5")`
+/// is `float` — `json_scalar_literal_value`'s own doc), so each numeric
+/// sort narrows on its own via the ordinary Integer/Float narrowing and
+/// judging paths, rather than folding both under the sort-unknown
+/// `PrimitiveKind::Number` tag that `isinstance`/`judge` cannot yet
+/// place on either side of a test. `str`/`list`/`dict`/`bool`/`None`
+/// each carry their own sort, so a downstream `isinstance` or judge
+/// call can still tell them apart from the numeric arms — a `list`/
+/// `dict` arm is built via `opaque_value` (this file's own established
+/// "the kind of thing is known, its contents are not" shape, e.g. the
+/// `re.match` result above) rather than an exact-arity `known_list([])`/
+/// `known_object([])`, which would falsely claim the parsed value is
+/// EMPTY.
+fn json_loads_value_space() -> AbstractValue {
+    kind_union_of(vec![
+        null_value(),
+        known_values(vec![0.0, 1.0], PrimitiveKind::Boolean, TrustSpec),
+        known_set(strings(), None, TrustSpec, SetKindTag::None),
+        AbstractValue {
+            kind_tag: Some(PrimitiveKind::Integer),
+            ..known_set(eval_whole_integers(), None, TrustSpec, SetKindTag::None)
+        },
+        float_sorted_unknown(),
+        opaque_value("a list"),
+        opaque_value("a dict"),
+    ])
+}
+
 /// `json.dumps(obj)`'s exact serialized text — library/json.rst's own
 /// Python-to-JSON conversion table, default `separators = (', ', ':
 /// ')` (`evaluate_attribute_call`'s `dumps` call site doc). Recurses
@@ -2775,11 +2811,17 @@ fn evaluate_attribute_call(
         // `json.loads(s)` — library/json.rst, `function:: loads(s, ...)`:
         // "deserialize s... to a Python object using this conversion
         // table" (the JSON-to-Python table this function's own doc
-        // cites). Modeled ONLY for a known exact-string `s` whose text
-        // is one of the JSON SCALAR productions this file parses by hand
+        // cites). Modeled for a known exact-string `s` whose text is one
+        // of the JSON SCALAR productions this file parses by hand
         // (`json_scalar_literal_value`'s own doc: an integer, a float, a
         // quoted string, `true`/`false`/`null`) — the corpus's own rows
         // never need array/object parsing, so that grammar is not built.
+        // An `s` this file holds no fact about (an opaque string — the
+        // ISSUES.md b-runners:124 row) answers `json_loads_value_space`
+        // instead of bare `unknown()`: every shape `loads` can return is
+        // ONE determined claim, never a narrower guess this file cannot
+        // back (a Float-sorted answer would be false whenever the real
+        // payload is a dict/list/str/bool/None).
         if module_name.id.as_str() == "json" && environment.read("json").is_none() {
             if attribute.attr.as_str() == "loads" {
                 if let [text] = arguments {
@@ -2789,7 +2831,7 @@ fn evaluate_attribute_call(
                         }
                     }
                 }
-                return unknown();
+                return json_loads_value_space();
             }
             // `json.dumps(obj)` — library/json.rst, `function::
             // dumps(obj, ...)`: "Serialize obj to a JSON formatted str
@@ -7246,6 +7288,50 @@ mod tests {
         let Some(value) = eval("json.loads(\"200\")") else { return };
         assert_eq!(value.values, vec![200.0]);
         assert_eq!(value.kind_tag, Some(PrimitiveKind::Integer));
+    }
+
+    /// `json.loads(x)` over an operand this file holds no fact about (an
+    /// unbound name, so `exact_string_values` reads nothing) answers the
+    /// full JSON-union — every arm of `json_loads_value_space` — rather
+    /// than bare `unknown()` (ISSUES.md, "generic json.loads of an
+    /// opaque string answers bare unknown"). All seven shapes
+    /// library/json.rst's conversion table admits ride as arms: None,
+    /// bool, an unbounded string set, an unbounded int-sorted set, a
+    /// value-unknown float-sorted set, and the two opaque list/dict
+    /// arms.
+    #[test]
+    fn test_json_loads_of_an_opaque_operand_answers_the_full_json_union() {
+        let Some(value) = eval("json.loads(x)") else { return };
+        assert_eq!(value.kind, Kind::KindUnion);
+        assert!(value.arms.iter().any(|arm| arm.kind == Kind::Null), "missing the None arm: {value:?}");
+        assert!(
+            value.arms.iter().any(|arm| arm.kind == Kind::Values && arm.kind_tag == Some(PrimitiveKind::Boolean)),
+            "missing the bool arm: {value:?}"
+        );
+        // the str arm is untagged (kind_tag: None), matching the same
+        // convention `__name__`'s own read builds (assignability.rs's
+        // doc: an untagged Set whose own set is sequence-shaped reads
+        // as string-sorted) — its own set is the full codepoint ground.
+        assert!(
+            value.arms.iter().any(|arm| arm.kind == Kind::Set && arm.kind_tag.is_none() && arm.set == strings()),
+            "missing the str arm: {value:?}"
+        );
+        assert!(
+            value.arms.iter().any(|arm| arm.kind == Kind::Set && arm.kind_tag == Some(PrimitiveKind::Integer)),
+            "missing the int arm: {value:?}"
+        );
+        assert!(
+            value.arms.iter().any(|arm| arm.kind == Kind::Set && arm.kind_tag == Some(PrimitiveKind::Float)),
+            "missing the float arm: {value:?}"
+        );
+        assert!(
+            value.arms.iter().any(|arm| arm.kind == Kind::Object && arm.kind_word == Some("a list")),
+            "missing the list arm: {value:?}"
+        );
+        assert!(
+            value.arms.iter().any(|arm| arm.kind == Kind::Object && arm.kind_word == Some("a dict")),
+            "missing the dict arm: {value:?}"
+        );
     }
 
     #[test]

@@ -208,9 +208,16 @@ pub enum Verdict {
 /// `None` is silent, a `None` against a plain (non-`Optional`)
 /// declared set fires the same as Object/List.
 ///
-/// Anything else (`Kind::Unknown`, `Kind::KindUnion`, and every other
-/// not-yet-known shape) is undetermined with a sentence the caller may
-/// adopt as the body's blocker.
+/// `Kind::KindUnion` (a sort union — `json.loads`'s own honest return
+/// space over an opaque string is the one producer today) judges each
+/// arm against `declared` through this same function and takes the
+/// first Fire; every arm Silent is Silent; any arm Undetermined makes
+/// the whole judgment Undetermined. See the function body's own comment
+/// at that arm for the full rule.
+///
+/// Anything else (`Kind::Unknown`, and every other not-yet-known shape)
+/// is undetermined with a sentence the caller may adopt as the body's
+/// blocker.
 pub fn judge(
     value: &AbstractValue,
     declared: &DeclaredRefinement,
@@ -692,6 +699,30 @@ pub fn judge(
             "a value of type '{value_word}' is not assignable to type {} — the position states {position_said}, and {value_word} is not allowed here",
             required_words(&declared.spelling, &declared.set),
         ));
+    }
+    // A KindUnion (json.loads's own honest return space over an opaque
+    // string, `expressions.rs::json_loads_value_space` — every JSON
+    // shape rides as one arm) judges EACH ARM against the same
+    // `declared` refinement, recursively through this same seam: the
+    // union claims the runtime value is SOME arm, never which one, so a
+    // declared numeric position is escaped the moment ANY arm is not a
+    // number — the first Fire among the arms is the verdict, naming
+    // that arm's own word (the None/list/dict/str arms already fire via
+    // the Null/Object/scalar-ground laws above; a numeric arm is
+    // Silent). Any Undetermined arm makes the whole judgment
+    // Undetermined, matching the ELEMENT/MEMBERS/POSITIONS laws' own
+    // "cannot claim more than the least-determined part knows" rule.
+    // All arms Silent (every possible shape fits the declared set) is
+    // Silent.
+    if value.kind == Kind::KindUnion {
+        for arm in &value.arms {
+            match judge(arm, declared, kernel) {
+                Verdict::Fire(message) => return Verdict::Fire(message),
+                Verdict::Undetermined(sentence) => return Verdict::Undetermined(sentence),
+                Verdict::Silent => {}
+            }
+        }
+        return Verdict::Silent;
     }
     Verdict::Undetermined(SENTENCE.value_not_readable.to_owned())
 }
@@ -1327,6 +1358,44 @@ mod tests {
         let value = refined_domain::abstract_value::opaque_value("a function value");
         let message = fire_message(judge(&value, &declared, &kernel));
         assert!(message.contains("a function value"), "{message}");
+        assert!(message.contains("'Age'"), "{message}");
+    }
+
+    /// The honest JSON-union `json.loads` answers over an opaque string
+    /// (`expressions.rs::json_loads_value_space`, ISSUES.md b-runners:124)
+    /// judged against a numeric-ground alias FIRES, naming the first
+    /// non-numeric arm (`None`, this union's own first arm) — the
+    /// honest verdict for an opaque payload, since the union claims the
+    /// runtime value is SOME arm and a JSON `null` genuinely escapes an
+    /// `int`-sorted position. Built inline with the same seven arms
+    /// `json_loads_value_space` builds, mirroring the isinstance
+    /// narrowing test's own construction (narrowing.rs).
+    #[test]
+    fn a_json_loads_union_into_a_numeric_ground_alias_fires_naming_the_non_numeric_arm() {
+        use refined_domain::abstract_value::float_sorted_unknown;
+        use refined_domain::abstract_value::kind_union_of;
+        use refined_domain::abstract_value::null_value;
+        use refined_domain::abstract_value::opaque_value;
+        use refined_sets::codepoint_sets::strings;
+
+        let Some(kernel) = loaded_kernel() else { return };
+        let declared = age_refinement();
+        let integer_arm = AbstractValue {
+            kind_tag: Some(PrimitiveKind::Integer),
+            ..known_set(make_refined_set(vec![integer(), at_least(f64::NEG_INFINITY)]), None, TrustProved, SetKindTag::None)
+        };
+        let union = kind_union_of(vec![
+            null_value(),
+            known_values(vec![0.0, 1.0], PrimitiveKind::Boolean, TrustProved),
+            known_set(strings(), None, TrustProved, SetKindTag::None),
+            integer_arm,
+            float_sorted_unknown(),
+            opaque_value("a list"),
+            opaque_value("a dict"),
+        ]);
+        assert_eq!(union.kind, Kind::KindUnion);
+        let message = fire_message(judge(&union, &declared, &kernel));
+        assert!(message.contains("None"), "{message}");
         assert!(message.contains("'Age'"), "{message}");
     }
 
