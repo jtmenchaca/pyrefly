@@ -260,6 +260,7 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    refinedpy::kernel_ask::install_kernel_seams(&kernel);
 
     let files = match invocation {
         Invocation::Export { file, output } => return export_file(&file, &output, &kernel),

@@ -95,7 +95,13 @@ fn kernel() -> Option<Arc<RefinedTSKernel>> {
     if let Some(loaded) = kernel_if_loaded() {
         return Some(loaded);
     }
-    load_kernel(kernel_dylib()?).ok()
+    let loaded = load_kernel(kernel_dylib()?).ok()?;
+    // The one-time seam installation (a OnceLock — repeat calls are
+    // no-ops): crates below the kernel dependency, refined_domain's
+    // join-time no-scalar-reread gate today, receive their kernel asks
+    // as injected closures routed through the engine's catch discipline.
+    refinedpy::kernel_ask::install_kernel_seams(&loaded);
+    Some(loaded)
 }
 
 /// Append RefinedPy refinement diagnostics for one open handle. Both

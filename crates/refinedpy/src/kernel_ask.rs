@@ -84,6 +84,20 @@ where
     catch_unwind(AssertUnwindSafe(f))
 }
 
+/// Installs every kernel-ask seam the crates BELOW the kernel dependency
+/// expose — today the one slot: `refined_domain`'s join-time
+/// no-scalar-reread gate, which cannot name the kernel's types itself
+/// (it sits under `refined_kernel` in the dependency graph) and so
+/// receives its ask as an injected closure routed through this module's
+/// own catch discipline. Both binaries call this once right after the
+/// kernel loads; installing twice is a no-op (the slot is a OnceLock).
+pub fn install_kernel_seams(kernel: &std::sync::Arc<refined_kernel::kernel_interface::RefinedTSKernel>) {
+    let kernel = kernel.clone();
+    refined_domain::kernel_seam::install_no_scalar_reread_ask(move |set| {
+        ask_kernel(|| (kernel.seq_no_scalar_reread)(set)).ok()
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

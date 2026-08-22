@@ -802,10 +802,12 @@ fn walk_body_with_self_binding(
     // loop seeing it directly, so the set only ever names a name that is
     // PROVABLY still unbound along the one path CPython actually ran.
     let mut provably_unbound: HashSet<String> = HashSet::new();
-    // The position of a division statement a relational sum already
-    // folded into its kernel program — `usize::MAX` while there is
-    // none, since no statement ever sits there.
-    let mut folded_division_at = usize::MAX;
+    // The positions of the statements a relational sum already folded
+    // into its kernel program — the division alone, or a count-alias
+    // assignment plus the division that reads it — as a half-open
+    // range. `position+1..position+1` (empty) while there is none,
+    // since no statement position falls inside an empty range.
+    let mut folded_division_at = usize::MAX..usize::MAX;
     // Every foreign-edge return fact still waiting to be published,
     // keyed by the POSITION of the statement holding its own
     // `json.loads(...)` node — never a single slot. Unlike a relational
@@ -847,7 +849,7 @@ fn walk_body_with_self_binding(
         // A folded division was already walked as part of the kernel
         // program, so the statement itself is skipped rather than
         // re-walked into a second, weaker binding of the same name.
-        if position == folded_division_at {
+        if folded_division_at.contains(&position) {
             continue;
         }
         // FOREIGN EDGE: `<name> = subprocess.run(["node", "<script>.ts"],
@@ -884,8 +886,8 @@ fn walk_body_with_self_binding(
             ) {
                 RelationalSum::Declined => {}
                 RelationalSum::Consumed => continue,
-                RelationalSum::ConsumedWithDivision => {
-                    folded_division_at = position + 1;
+                RelationalSum::ConsumedWithDivision { skip_statements } => {
+                    folded_division_at = (position + 1)..(position + 1 + skip_statements);
                     continue;
                 }
             }
@@ -2754,10 +2756,11 @@ fn arm_terminates_or_provably_raises(body: &[Stmt], out: &[Finding], findings_be
 ///
 /// `Consumed` means the accumulation was walked here and the
 /// accumulator holds the kernel's total; the following statement, if
-/// any, still walks. `ConsumedWithDivision` means the FOLLOWING
-/// statement was an assignment whose division was folded into the same
-/// program, so the caller skips that statement rather than walking it a
-/// second time. `Declined` leaves everything to `walk_statement`,
+/// any, still walks. `ConsumedWithDivision` means one or two FOLLOWING
+/// statements — the division alone, or a count-alias assignment plus
+/// the division that reads it — were folded into the same program, so
+/// the caller skips exactly that many statements rather than walking
+/// them a second time. `Declined` leaves everything to `walk_statement`,
 /// exactly as before. Recognition — both spellings, and the
 /// `for`/`else` gate — happens at the caller; this function receives an
 /// already-recognized accumulation.
@@ -2771,12 +2774,14 @@ fn arm_terminates_or_provably_raises(body: &[Stmt], out: &[Finding], findings_be
 /// Conservative declines, each one because the fact it would state is
 /// not the fact the kernel proved: any statement other than a division-
 /// carrying assignment or return sitting immediately after the
-/// accumulation (a statement in between could rebind either name, so
-/// nothing further is folded and the division walks ordinarily); a
-/// walrus rebinding either name anywhere in that expression; a return
-/// whose expression holds the division zero times or more than once
-/// (with two, one published answer cannot say which node it belongs
-/// to); and a kernel refusal.
+/// accumulation, OR after a single count-alias assignment
+/// (`count = len(samples)`) immediately after the accumulation (a
+/// statement in either of those positions that is not one of these
+/// shapes could rebind either name, so nothing further is folded and
+/// the division walks ordinarily); a walrus rebinding either name
+/// anywhere in that expression; a return whose expression holds the
+/// division zero times or more than once (with two, one published
+/// answer cannot say which node it belongs to); and a kernel refusal.
 fn walk_relational_sum(
     mut recognized: relational_sum::RecognizedAccumulation,
     loop_target: Option<&Expr>,
@@ -2784,32 +2789,57 @@ fn walk_relational_sum(
     following: &[Stmt],
     environment: &mut Environment,
 ) -> RelationalSum {
-    // The division, when the very next statement holds one. Only the
-    // IMMEDIATELY following statement is read: anything between the
-    // accumulation and the division could rebind either name, and this
-    // pass never reasons about what it did not look at.
+    // The division, when it sits at the very next statement OR one hop
+    // later behind a count-alias assignment. Only that immediate
+    // lookahead is read: anything else in between could rebind either
+    // name, and this pass never reasons about what it did not look at.
     //
-    // Two shapes carry it. An ASSIGNMENT divides at its top level and
-    // names the quotient, so the answer binds to that name and the
-    // statement is consumed whole. A RETURN may nest the division
-    // anywhere inside the returned expression — the fixture's own
-    // `return math.sqrt(total / len(samples))` — so the return is still
-    // walked ordinarily, with the quotient published for exactly that
-    // one division node (`Environment::set_evaluated_node`) and the
-    // surrounding call evaluated around it as usual.
+    // The count-alias hop: `following.first()` is tried first as the
+    // division-carrying statement itself (the direct spelling); when it
+    // is instead a plain `<name> = len(<sequence>)` naming THIS
+    // accumulation's own sequence (`is_length_alias_assignment`), the
+    // alias is recorded (`record_length_alias`) and the division/return
+    // match re-runs against `following.get(1)` instead. With the alias
+    // at `following.first()` and the division at `following.get(1)`,
+    // there is no statement BETWEEN them for
+    // `reassigns_alias_or_sequence` to guard — that guard is for a wider
+    // gap than this exact one-hop lookahead ever opens.
+    //
+    // Two shapes carry the division itself. An ASSIGNMENT divides at
+    // its top level and names the quotient, so the answer binds to that
+    // name and the statement is consumed whole. A RETURN may nest the
+    // division anywhere inside the returned expression — the fixture's
+    // own `return math.sqrt(total / len(samples))` — so the return is
+    // still walked ordinarily, with the quotient published for exactly
+    // that one division node (`Environment::set_evaluated_node`) and
+    // the surrounding call evaluated around it as usual.
     //
     // A walrus rebinding either name anywhere in the expression
     // declines both shapes: the rebinding happens mid-expression, so
     // the division would be over a value the kernel never tied.
     let mut divided_into = None;
     let mut published_division = None;
-    match following.first() {
+    // How many of `following`'s leading statements this walk consumed:
+    // 1 for the division alone, 2 when a count-alias assignment was
+    // consumed ahead of it. Stays 0 on a decline, so the caller's own
+    // skip bookkeeping only ever advances past what was actually folded.
+    let mut consumed_statements: usize = 0;
+    let mut division_candidate = following.first();
+    if let Some(Stmt::Assign(alias_assign)) = following.first() {
+        if let Some(alias) = relational_sum::is_length_alias_assignment(alias_assign, &recognized, environment) {
+            relational_sum::record_length_alias(&mut recognized, alias);
+            division_candidate = following.get(1);
+            consumed_statements = 1;
+        }
+    }
+    match division_candidate {
         Some(Stmt::Assign(assign)) => {
             if let [Expr::Name(target)] = assign.targets.as_slice() {
                 if !rebinds_relational_name(assign.value.as_ref(), &recognized)
                     && relational_sum::fold_division(&mut recognized, assign.value.as_ref(), environment)
                 {
                     divided_into = Some(target.id.as_str().to_owned());
+                    consumed_statements += 1;
                 }
             }
         }
@@ -2819,11 +2849,19 @@ fn walk_relational_sum(
                     if let Some(range) = relational_sum::division_range_in(value, &recognized, environment) {
                         relational_sum::fold_located_division(&mut recognized);
                         published_division = Some(range);
+                        consumed_statements += 1;
                     }
                 }
             }
         }
         _ => {}
+    }
+    // The alias hop was tentative until the division actually folded —
+    // an alias assignment with nothing behind it to consume must leave
+    // `following.first()` for the ordinary walk, exactly as if the alias
+    // read had never been tried.
+    if divided_into.is_none() && published_division.is_none() {
+        consumed_statements = 0;
     }
     // Plain data dump for the two relational-sum fixtures one exhausted
     // static trace could not tell apart (the const-effect variant
@@ -2885,13 +2923,21 @@ fn walk_relational_sum(
     // The quotient rides its own slot, so the divided name carries
     // exactly what the kernel proved — or, where the kernel answered the
     // total but not the quotient, nothing at all rather than a guess.
+    //
+    // The RETURN itself is never skipped — it always still walks at its
+    // own position, judging against the enclosing annotation — so a
+    // return-with-division fold's own statement does not count toward
+    // `skip_statements`; only a count-alias assignment consumed AHEAD of
+    // that return does. `consumed_statements` counted the return as 1
+    // of its own leading-statement tally, so that one is subtracted back
+    // out here before it becomes a caller-facing skip count.
     let outcome = match (divided_into, published_division) {
         (Some(target), _) => {
             match answer.quotient {
                 Some(quotient) => environment.bind(&target, quotient),
                 None => environment.forget(&target),
             }
-            RelationalSum::ConsumedWithDivision
+            RelationalSum::ConsumedWithDivision { skip_statements: consumed_statements }
         }
         // The return is NOT consumed — it still walks, judging against
         // the enclosing `-> Annotation` as always. What changes is that
@@ -2903,7 +2949,17 @@ fn walk_relational_sum(
             if let Some(quotient) = answer.quotient {
                 environment.set_evaluated_node(Some((range, quotient)));
             }
-            RelationalSum::Consumed
+            // A count-alias assignment sat ahead of this return and was
+            // folded in — that ONE statement still needs skipping, even
+            // though the return itself does not. `consumed_statements`
+            // is exactly 1 (the return alone) when no alias hop ran, and
+            // exactly 2 (alias plus return) when one did.
+            let alias_statements_ahead = consumed_statements.saturating_sub(1);
+            if alias_statements_ahead > 0 {
+                RelationalSum::ConsumedWithDivision { skip_statements: alias_statements_ahead }
+            } else {
+                RelationalSum::Consumed
+            }
         }
         (None, None) => RelationalSum::Consumed,
     };
@@ -2972,9 +3028,19 @@ enum RelationalSum {
     /// total. Whatever follows still walks — including a `return` whose
     /// division was folded, which reads its published quotient.
     Consumed,
-    /// The accumulation AND a following ASSIGNMENT's division were
-    /// walked as one kernel program, so the caller skips that statement.
-    ConsumedWithDivision,
+    /// The accumulation AND one or two of the leading statements of
+    /// `following` were walked as one kernel program, so the caller
+    /// skips exactly that many statements rather than walking them a
+    /// second time. The count is 1 for a division-carrying ASSIGNMENT
+    /// alone, or 2 when a count-alias assignment
+    /// (`count = len(samples)`) was folded ahead of it — the alias
+    /// statement is consumed the same as the division statement it
+    /// feeds, even though neither is a `return` (a `return` is never
+    /// skipped; it always still walks, so a folded return-with-division
+    /// reports `Consumed` for the division itself, with this variant
+    /// used only when a count-alias assignment preceded it — see the
+    /// count-alias-then-return arm below).
+    ConsumedWithDivision { skip_statements: usize },
 }
 
 /// Whether an expression rebinds — through a walrus — either name a
@@ -6877,6 +6943,72 @@ mod tests {
             refined_set_at_position(&module, no_imports_resolver(), &kernel, position).is_some(),
             "total's own position must answer the kernel's derived set now that the recognizer publishes it"
         );
+    }
+
+    /// The count-alias spelling — `count = len(samples)` then
+    /// `mean = total / count` — judges IDENTICALLY to the direct
+    /// spelling `mean = total / len(samples)`, and the statement after
+    /// the consumed alias-and-division pair still walks rather than
+    /// being skipped by stale bookkeeping (`walk_relational_sum`'s own
+    /// `skip_statements` count, threaded through `check.rs`'s
+    /// `folded_division_at` range). Each body assigns the mean into an
+    /// `Age`-typed slot with an out-of-set literal fallback (`over`)
+    /// immediately after, so a wrong skip count — either leaving the
+    /// alias assignment to be walked a second time as an ordinary
+    /// statement, or swallowing `over` into the skipped range — would
+    /// change the finding count or the position `over`'s own fire lands
+    /// at. `mean`'s own position is also read back identically in both
+    /// spellings, pinning that the aliased fold answers the same derived
+    /// set the direct fold does, not merely the same finding count.
+    #[test]
+    fn the_count_alias_spelling_judges_identically_to_the_direct_spelling_and_the_next_statement_still_walks() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let direct_source = concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "Sample = Annotated[float, Field(ge=0.0, le=2.0)]\n",
+            "Age = Annotated[int, Field(ge=0, le=120)]\n",
+            "def f(samples: Annotated[list[Sample], Field(min_length=1)]) -> None:\n",
+            "    total = sum(s for s in samples)\n",
+            "    mean = total / len(samples)\n",
+            "    over: Age = 200\n",
+        );
+        let aliased_source = concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "Sample = Annotated[float, Field(ge=0.0, le=2.0)]\n",
+            "Age = Annotated[int, Field(ge=0, le=120)]\n",
+            "def f(samples: Annotated[list[Sample], Field(min_length=1)]) -> None:\n",
+            "    total = sum(s for s in samples)\n",
+            "    count = len(samples)\n",
+            "    mean = total / count\n",
+            "    over: Age = 200\n",
+        );
+        let direct = parsed(direct_source);
+        let aliased = parsed(aliased_source);
+        let direct_findings = findings_for_module(&direct, &kernel);
+        let aliased_findings = findings_for_module(&aliased, &kernel);
+        let direct_messages: Vec<&str> = direct_findings.iter().map(|f| f.message.as_str()).collect();
+        let aliased_messages: Vec<&str> = aliased_findings.iter().map(|f| f.message.as_str()).collect();
+        // the trailing `over: Age = 200` fires in both spellings — the
+        // statement after the consumed pair (one statement wider in the
+        // aliased body) still walks rather than being skipped
+        assert_eq!(direct_findings.len(), 1, "direct spelling: {direct_messages:?}");
+        assert_eq!(aliased_findings.len(), 1, "aliased spelling: {aliased_messages:?}");
+        assert_eq!(direct_findings[0].code, "RTS7001");
+        assert_eq!(aliased_findings[0].code, "RTS7001");
+        assert!(direct_messages[0].contains("'200'"), "{direct_messages:?}");
+        assert!(aliased_messages[0].contains("'200'"), "{aliased_messages:?}");
+        // The fold's OWN identity (the aliased spelling wiring the same
+        // kernel program as the direct one) is pinned at the API level
+        // by relational_sum.rs's
+        // `the_count_alias_shape_folds_identically_to_the_direct_spelling`
+        // — a folded division records no evaluated node at `mean`'s
+        // position in EITHER spelling (only the recognized sum's own
+        // binding records one), so a position read here would assert a
+        // channel the fold does not publish. This pin holds the two
+        // walk-level truths: identical single designed findings, and
+        // the statement after the consumed pair still walking.
     }
 
     /// A position that names neither a parameter's own annotation, a
