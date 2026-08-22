@@ -31,6 +31,8 @@ use refined_domain::lattice_operations::truthiness;
 use refined_domain::trust_grades::TrustLevel;
 use refined_domain::trust_grades::TrustProved;
 use refined_domain::trust_grades::TrustSpec;
+use refined_kernel::kernel_interface::CalendarQuestion;
+use refined_kernel::kernel_interface::CalendarQuestionOp;
 use refined_kernel::kernel_interface::RefinedTSKernel;
 use refined_sets::codepoint_sets::strings;
 use refined_sets::refinement_forms::above;
@@ -2088,27 +2090,31 @@ fn is_utc_tzinfo_expression(expr: &Expr) -> bool {
 }
 
 /// The proleptic Gregorian day count from the civil (year, month, day)
-/// triple to the POSIX epoch (1970-01-01 = day 0) — Howard Hinnant's
-/// `days_from_civil` algorithm, the same closed-form calendar arithmetic
-/// `date.toordinal()` computes internally (datetime.rst, `method::
-/// date.toordinal()`: "the current proleptic Gregorian ordinal"; day 0
-/// here is ordinal `date(1970, 1, 1).toordinal()`, so the DIFFERENCE
-/// this function returns is exactly `date(y, m, d).toordinal() -
-/// date(1970, 1, 1).toordinal()`, matching `.timestamp()`'s own
-/// documented aware-datetime formula, `(dt - datetime(1970, 1, 1,
-/// tzinfo=timezone.utc)).total_seconds()`, one calendar step earlier
-/// than the seconds-of-day addition `datetime_timestamp_value` performs
-/// next). Execution-verified against installed CPython 3.12 for both
-/// this file's own corpus dates (1970-01-01 -> 0, 2033-05-18 ->
-/// 1999987200.0 once seconds are added) in this wave's own report.
-fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let mp = if month > 2 { month - 3 } else { month + 9 };
-    let doy = (153 * mp + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146097 + doe - 719468
+/// triple to the POSIX epoch (1970-01-01 = day 0), asked of the kernel's
+/// `calendar` seam (`refined_calendar`'s `"epochDays"` op,
+/// `theories/calendar/epoch_days.lean`'s `isoDateToEpochDays`, the SAME
+/// anchor `datetime_timestamp_value`'s own doc already cited: day 0 is
+/// `date(1970, 1, 1).toordinal()`). The kernel validates the date
+/// itself (`isValidISODate`) and the PlainDate day-range limit
+/// (`epochDaysWithinLimits`) before answering, so an out-of-range or
+/// invalid civil date is a caught refusal here (`ask_kernel`'s
+/// `catch_unwind`), not a value this function returns — `None` in that
+/// case, matching every other refused kernel ask in this crate.
+fn epoch_days_of_civil_date(year: i64, month: i64, day: i64, kernel: &Arc<RefinedTSKernel>) -> Option<i64> {
+    let asked = crate::kernel_ask::ask_kernel(|| {
+        (kernel.calendar)(&CalendarQuestion {
+            op: CalendarQuestionOp::EpochDays,
+            year,
+            month,
+            day,
+            days: 0,
+            fields: Vec::new(),
+            a: Vec::new(),
+            b: Vec::new(),
+        })
+    })
+    .ok()?;
+    asked.get("days")?.as_i64()
 }
 
 /// `<an aware-UTC datetime_datetime instance>.timestamp()` — the EXACT
@@ -2116,14 +2122,14 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 /// aware datetime instances, the return value is computed as: `(dt -
 /// datetime(1970, 1, 1, tzinfo=timezone.utc)).total_seconds()`." UTC has
 /// no DST/leap-second adjustment, so that difference reduces to plain
-/// calendar-day arithmetic (`days_from_civil`'s own doc) times 86400,
-/// plus the wall-clock seconds-of-day. Modeled ONLY for a
+/// calendar-day arithmetic (`epoch_days_of_civil_date`'s kernel ask)
+/// times 86400, plus the wall-clock seconds-of-day. Modeled ONLY for a
 /// `datetime_construction_value`-tagged instance whose own `aware_utc`
 /// field is `true` — `None` for a NAIVE instance (datetime.rst's own
 /// note: "Naive datetime instances are assumed to represent local time
 /// and this method relies on the platform C mktime function," a
 /// host-dependent conversion this file does not claim to reproduce).
-fn datetime_timestamp_value(instance: &AbstractValue) -> Option<AbstractValue> {
+fn datetime_timestamp_value(instance: &AbstractValue, kernel: &Arc<RefinedTSKernel>) -> Option<AbstractValue> {
     let aware = datetime_field(instance, "aware_utc")?;
     if aware != 1.0 {
         return None;
@@ -2134,7 +2140,7 @@ fn datetime_timestamp_value(instance: &AbstractValue) -> Option<AbstractValue> {
     let hour = datetime_field(instance, "hour")? as i64;
     let minute = datetime_field(instance, "minute")? as i64;
     let second = datetime_field(instance, "second")? as i64;
-    let days = days_from_civil(year, month, day);
+    let days = epoch_days_of_civil_date(year, month, day, kernel)?;
     let seconds = days * 86400 + hour * 3600 + minute * 60 + second;
     Some(known_values(vec![seconds as f64], PrimitiveKind::Float, TrustProved))
 }
@@ -3413,7 +3419,7 @@ fn evaluate_attribute_call(
     // enough" reasoning for a row with no in-set leg to prove exact).
     if receiver.kind == Kind::Object && receiver.source == "datetime_datetime" {
         if attribute.attr.as_str() == "timestamp" && arguments.is_empty() {
-            return match datetime_timestamp_value(&receiver) {
+            return match datetime_timestamp_value(&receiver, kernel) {
                 Some(value) => value,
                 None => unknown(),
             };
@@ -7991,9 +7997,15 @@ mod tests {
     }
 
     // --- j-stdlib-surfaces.py: datetime family ---
+    // Every `.timestamp()` pin below routes its day-count arithmetic
+    // through the kernel's `calendar` ask (`refined_calendar`'s
+    // `"epochDays"` op, `epoch_days_of_civil_date`) rather than a local
+    // Rust reimplementation — a wrong or refused kernel answer fails
+    // these pins directly, since `eval` loads the real kernel dylib.
 
     /// `datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc).timestamp()`
-    /// is exactly `0.0` — the POSIX epoch itself.
+    /// is exactly `0.0` — the POSIX epoch itself, the kernel's own
+    /// `epochDays` anchor (`theories/calendar/epoch_days_sound.lean`).
     #[test]
     fn test_datetime_timestamp_at_the_epoch_is_zero() {
         let Some(value) = eval("datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc).timestamp()") else { return };
@@ -8008,6 +8020,19 @@ mod tests {
     fn test_datetime_timestamp_of_a_later_aware_utc_date() {
         let Some(value) = eval("datetime.datetime(2033, 5, 18, tzinfo=datetime.timezone.utc).timestamp()") else { return };
         assert_eq!(value.values, vec![1999987200.0]);
+    }
+
+    /// `datetime.datetime(2024, 2, 29, tzinfo=datetime.timezone.utc).timestamp()`
+    /// — a leap-day date (2024 is divisible by 4, not by 100): the day
+    /// count the kernel's `epochDays` ask must cross a Gregorian leap
+    /// boundary to answer, execution-verified against installed CPython
+    /// 3.12 (`(datetime.datetime(2024, 2, 29, tzinfo=datetime.timezone.utc)
+    /// - datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc))
+    /// .total_seconds() == 1709164800.0`).
+    #[test]
+    fn test_datetime_timestamp_of_a_leap_day_crosses_the_kernels_calendar() {
+        let Some(value) = eval("datetime.datetime(2024, 2, 29, tzinfo=datetime.timezone.utc).timestamp()") else { return };
+        assert_eq!(value.values, vec![1709164800.0]);
     }
 
     /// A NAIVE datetime's `.timestamp()` (no `tzinfo=`) declines — this

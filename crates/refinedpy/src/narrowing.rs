@@ -141,12 +141,11 @@ pub fn assume(
 /// binding is never read as a PROOF that every member survives; it is
 /// the absence of a proof either way, and the caller's job is to keep
 /// today's binary guard semantics for that arm rather than treat
-/// "unproved" as "proved to admit everything." Membership admits genuine
-/// but exact-full-width narrowings too (a guard proving every member
-/// still satisfies it) missing this reader's coverage — an acceptable
-/// gap matching this file's own scope, not a soundness hole, since the
-/// caller only ever reads this as the intersection/difference of a
-/// SPLIT it independently confirms is non-trivial.
+/// "unproved" as "proved to admit everything." A guard that genuinely
+/// proves every member survives answers with the full binding rather
+/// than declining: `proves_its_own_shape` tells that decided full-width
+/// answer apart from an untouched binding, which the value list alone
+/// cannot distinguish.
 pub fn guard_narrowed_values(
     condition: &Expr,
     name: &str,
@@ -161,12 +160,40 @@ pub fn guard_narrowed_values(
     if bound.kind != Kind::Values || bound.kind_tag != subject.kind_tag {
         return None;
     }
-    if subject.kind == Kind::Values && same_members(&bound.values, &subject.values) {
-        // unchanged: `assume` declined this condition's own shape rather
-        // than proving anything about it — never read as a proof.
+    if subject.kind == Kind::Values && same_members(&bound.values, &subject.values) && !proves_its_own_shape(condition, name) {
+        // unchanged AND unrecognized: `assume` declined this condition's
+        // own shape rather than proving anything about it — never read as
+        // a proof. A recognized shape that happens to leave every member
+        // standing is a different thing entirely: the reader DID decide
+        // the condition and found it true of the whole binding, so the
+        // answer is that binding, not a decline.
         return None;
     }
     Some(bound.clone())
+}
+
+/// Whether `condition` is a shape this file's own leaves read to a
+/// decision about `name` — asked only to tell a PROVED full-width answer
+/// ("every member satisfies this guard") apart from an unrecognized one
+/// ("no leaf touched the binding"), which an unchanged value list alone
+/// cannot distinguish. Membership against a literal numeric collection is
+/// the shape that reaches full width in practice (`x in (2, 4)` over a
+/// `{2, 4}` binding), so it is the shape recognized here; a comparison
+/// leaf narrows strictly or empties, and never needs this question asked.
+fn proves_its_own_shape(condition: &Expr, name: &str) -> bool {
+    let Expr::Compare(compare) = condition else {
+        return false;
+    };
+    if compare.ops.len() != 1 || compare.comparators.len() != 1 {
+        return false;
+    }
+    if !matches!(compare.ops[0], CmpOp::In | CmpOp::NotIn) {
+        return false;
+    }
+    if name_of(&compare.left) != Some(name) {
+        return false;
+    }
+    literal_numeric_collection(&compare.comparators[0]).is_some()
 }
 
 /// Whether two Values bindings admit the SAME set of members, order- and
@@ -324,8 +351,10 @@ fn narrow(condition: &Expr, environment: &mut Environment, kernel: &Arc<RefinedT
         }
         // Calls other than isinstance, attributes, walrus, string
         // comparisons, and everything else this wave does not read: no
-        // narrowing, the honest default. (`in`/`not in` narrow on the
-        // SET channel, never here.)
+        // narrowing, the honest default. (`Expr::Compare`'s own dispatch
+        // covers `in`/`not in` over a Values binding — `narrow_one_
+        // comparison`'s own membership leaf — and the SET channel narrows
+        // the same operator over a Set binding independently.)
         _ => {}
     }
 }
@@ -384,12 +413,21 @@ fn narrow_compare(compare: &ruff_python_ast::ExprCompare, environment: &mut Envi
 
 /// One comparison pair (`left op right`) as a narrowing leaf: is/is not
 /// None (mission point 5), then numeric literal-side comparisons
-/// (mission point 1), mirrored so the literal may sit on either side.
-/// Anything else — a call, an attribute, a string, two changing names —
-/// narrows nothing.
+/// (mission point 1), mirrored so the literal may sit on either side, then
+/// membership against a literal collection (`in`/`not in` — closes the
+/// match-guard lane's own scope note: `x in (2, 4)` now narrows a
+/// `Kind::Values` binding the same pointwise way a numeric comparison
+/// does). Anything else — a call, an attribute, a string, two changing
+/// names — narrows nothing.
 fn narrow_one_comparison(left: &Expr, op: CmpOp, right: &Expr, environment: &mut Environment, truth: bool) {
     if matches!(op, CmpOp::Is | CmpOp::IsNot) {
         narrow_is_none(left, op, right, environment, truth);
+        return;
+    }
+    if matches!(op, CmpOp::In | CmpOp::NotIn) {
+        if let Some(name) = name_of(left) {
+            narrow_name_against_membership(name, right, environment, op == CmpOp::In, truth);
+        }
         return;
     }
     let Some(numeric_op) = numeric_cmp_op(op) else {
@@ -407,7 +445,8 @@ fn narrow_one_comparison(left: &Expr, op: CmpOp, right: &Expr, environment: &mut
 
 /// The subset of `CmpOp` this wave's numeric side-bounds filter reads:
 /// `< <= > >= == !=`. `is`/`is not` are handled by `narrow_is_none`;
-/// `in`/`not in` by the SET channel's own `membership_leaf_tree_of`.
+/// `in`/`not in` by `narrow_name_against_membership` on a Values binding, and
+/// by the SET channel's own `membership_leaf_tree_of` on a Set binding.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum NumericCmpOp {
     Lt,
@@ -504,6 +543,74 @@ fn is_numeric_or_boolean(kind_tag: PrimitiveKind) -> bool {
         kind_tag,
         PrimitiveKind::Number | PrimitiveKind::Integer | PrimitiveKind::Float | PrimitiveKind::Boolean
     )
+}
+
+/// Narrows a Values-kind binding named `name` by `name in <collection>` (or
+/// `not in`, `is_in: false`) being `truth`: keep exactly the members that
+/// are (`is_in`) or are not (`!is_in`) themselves a member of `collection`'s
+/// own literal elements, mirroring `narrow_name_against_literal`'s pointwise
+/// filter one-for-one — membership is read directly against the collection's
+/// literal numbers here rather than through the kernel's `NarrowTree`/`assume`
+/// ask that channel takes for a `Kind::Set` binding (`membership_leaf_tree_of`
+/// builds that tree for the SET channel; this is the VALUES channel's own
+/// leaf, over an already-enumerated binding, so the members are just read and
+/// filtered, the same way every other Values leaf in this file narrows).
+/// `collection` must be a literal list/tuple/set of plain number literals
+/// (mirroring `membership_leaf_tree_of`'s own numeric half) — anything else
+/// (a name, a comprehension, a mixed or string collection) narrows nothing,
+/// the same "no shape this file reads" default every other declined leaf
+/// gives. Zero survivors bind the empty Values state, the same sound
+/// infeasibility `narrow_name_against_literal` gives.
+fn narrow_name_against_membership(name: &str, collection: &Expr, environment: &mut Environment, is_in: bool, truth: bool) {
+    let Some(current) = environment.read(name).cloned() else {
+        return;
+    };
+    if current.kind != Kind::Values {
+        return;
+    }
+    let Some(kind_tag) = current.kind_tag else {
+        return;
+    };
+    if !is_numeric_or_boolean(kind_tag) {
+        return;
+    }
+    let Some(members) = literal_numeric_collection(collection) else {
+        return;
+    };
+    // `name in <collection>` true, or `name not in <collection>` false,
+    // both mean "keep the members present in the collection"; the other
+    // two combinations keep the members ABSENT from it — the same
+    // `is_in == truth` flip `narrow_name_against_literal`'s own
+    // `satisfies(...) == truth` gives a single predicate.
+    let keep_present = is_in == truth;
+    let grade = trust_level_of(&current);
+    let kept: Vec<f64> = current
+        .values
+        .iter()
+        .copied()
+        .filter(|value| members.contains(value) == keep_present)
+        .collect();
+    environment.bind(name, known_values(kept, kind_tag, grade));
+}
+
+/// A literal list/tuple/set of plain number literals, read as `f64`s — the
+/// numeric half of `membership_leaf_tree_of`'s own element reading, kept as
+/// a separate small reader here since this file's own convention
+/// (`literal_number`'s doc) is a leaf reader per file rather than a shared
+/// cross-file helper. An empty collection, a non-literal collection, or one
+/// with any non-numeric member (a string, a name, a nested expression)
+/// answers `None` — declined, never partially read.
+fn literal_numeric_collection(collection: &Expr) -> Option<Vec<f64>> {
+    let elements: &[Expr] = match collection {
+        Expr::List(list) => &list.elts,
+        Expr::Tuple(tuple) => &tuple.elts,
+        Expr::Set(set) => &set.elts,
+        _ => return None,
+    };
+    if elements.is_empty() {
+        return None;
+    }
+    elements.iter().map(literal_number).collect()
 }
 
 /// `is None` / `is not None` (mission point 5): a Values-kind binding
@@ -1335,17 +1442,17 @@ mod tests {
         assert_eq!(values, vec![2.0, 4.0]);
     }
 
-    /// A guard shape `assume` narrows nothing for (`x in (2, 4)` over a
-    /// `Kind::Values` binding — membership is the SET channel's own leaf,
-    /// which requires `Kind::Set`, never `Kind::Values`) leaves the
-    /// binding UNCHANGED, so `guard_narrowed_values` declines outright —
-    /// an unchanged binding is never read as a proof every member
-    /// survives; it is the absence of a proof.
+    /// A guard shape `assume` narrows nothing for (`x.bit_length() > 0` —
+    /// a method call on the guard's own subject, which none of this
+    /// file's comparison, membership, or type-guard leaves recognize)
+    /// leaves the binding UNCHANGED, so `guard_narrowed_values` declines
+    /// outright — an unchanged binding is never read as a proof every
+    /// member survives; it is the absence of a proof.
     #[test]
     fn test_guard_narrowed_values_declines_when_assume_narrows_nothing() {
         let Some(kernel) = loaded_kernel() else { return };
         let subject = known_values(vec![1.0, 2.0, 4.0], PrimitiveKind::Integer, TrustProved);
-        let parsed = parse_expression("x in (2, 4)").expect("test source must parse");
+        let parsed = parse_expression("x.bit_length() > 0").expect("test source must parse");
         let narrowed = guard_narrowed_values(&parsed.into_expr(), "x", &subject, &kernel, true);
         assert!(
             narrowed.is_none(),

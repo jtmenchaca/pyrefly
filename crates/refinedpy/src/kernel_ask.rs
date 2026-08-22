@@ -92,10 +92,18 @@ where
 /// own catch discipline. Both binaries call this once right after the
 /// kernel loads; installing twice is a no-op (the slot is a OnceLock).
 pub fn install_kernel_seams(kernel: &std::sync::Arc<refined_kernel::kernel_interface::RefinedTSKernel>) {
-    let kernel = kernel.clone();
-    refined_domain::kernel_seam::install_no_scalar_reread_ask(move |set| {
-        ask_kernel(|| (kernel.seq_no_scalar_reread)(set)).ok()
-    });
+    {
+        let kernel = kernel.clone();
+        refined_domain::kernel_seam::install_no_scalar_reread_ask(move |set| {
+            ask_kernel(|| (kernel.seq_no_scalar_reread)(set)).ok()
+        });
+    }
+    {
+        let kernel = kernel.clone();
+        refined_domain::kernel_seam::install_seq_subset_ask(move |a, b| {
+            ask_kernel(|| (kernel.seq_subset)(a, b)).ok()
+        });
+    }
 }
 
 #[cfg(test)]
