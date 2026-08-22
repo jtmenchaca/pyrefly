@@ -431,7 +431,12 @@ fn known_state_of(value: &AbstractValue) -> Option<KnownStateWire> {
 /// string tuple, a window, a star) fails the whole recognition: the
 /// caller must keep the `Kind::Set` form rather than guess at values
 /// that are not actually enumerated.
-fn scalars_of_union_of_singletons(set: &refined_sets::refinement_forms::RefinedSet) -> Option<Vec<f64>> {
+///
+/// `pub(crate)`: `match_arms.rs`'s `MatchValue`/`MatchOr` pattern
+/// outcome reuses this exact reading for a `Kind::Set` match subject
+/// (`case 1:` over a set that enumerates {1, 2, 4}) rather than writing
+/// a second set-enumeration parser.
+pub(crate) fn scalars_of_union_of_singletons(set: &refined_sets::refinement_forms::RefinedSet) -> Option<Vec<f64>> {
     if let Some(values) = refined_sets::refinement_forms::word_of(set) {
         if values.len() == 1 {
             return Some(values);

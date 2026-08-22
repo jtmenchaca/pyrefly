@@ -47,6 +47,26 @@
 //! | G2 | `*` int/int overflowing 2^53 | 2^53, 2 | declines | `int.mul` answers exactly | GAP |
 //! | G3 | `/` by zero | 1, 0 | declines to `unknown()` (no exception channel) | refuses too | agree-on-silence |
 //! | G4 | `+` with a NaN operand | NaN, 1 | never constructed (`RefinedSet` refuses NaN at construction) | n/a | out of the value vocabulary |
+//! | G5 | `/` by a degenerate SET-shaped zero divisor | 1.0, `{0.0}` (`Kind::Set`, not `Kind::Values`) | declines (`divisor_provably_excludes_zero` gate) | `binary64.div`'s `bothSingle` branch answers the determined pair `[-∞, +∞]` | GENUINE DIVERGENCE, correct |
+//!
+//! G5 is NOT a determination gap: it is deliberately excluded from
+//! `compare_row`'s three-verdict frame (which would read "adapter
+//! declines, kernel answers" as the adapter being weaker) because the
+//! kernel's answer here is CORRECT FOR ECMA, not for Python — arith.10
+//! makes Python's `/` raise `ZeroDivisionError` at a zero divisor, an
+//! outcome `binary64.div`'s determined pair cannot speak (it proves
+//! only the IEEE-754 float theorem). Serving that pair as the Python
+//! answer would be unsound; the decline is the day-one-correct verdict,
+//! not a gap the adapter should ever close by asking harder. A WIDE
+//! zero-admitting range (e.g. `[0.0, 2.0]`) is a weaker version of the
+//! same hazard the kernel's own general-interval branch already refuses
+//! outright (`divisorMayBeZero`) before any adapter relabeling could
+//! occur — G5's premise is the SINGLETON-shaped Set specifically,
+//! because that is the one shape where the kernel actually answers a
+//! value to relabel.
+//! `test_div_by_a_set_admitting_zero_diverges_from_the_kernel_by_design`
+//! asserts this divergence directly, with its own message rather than
+//! `compare_row`'s "gap" framing.
 //!
 //! Rows G1/G2 are the audit's own "the exact `int` theory serves them"
 //! observation seen from the concrete side: the f64 carrier is what
@@ -77,7 +97,7 @@
 mod tests {
     use std::sync::Arc;
 
-    use refined_domain::abstract_value::{known_values, AbstractValue, Kind, PrimitiveKind};
+    use refined_domain::abstract_value::{known_set, known_values, AbstractValue, Kind, PrimitiveKind, SetKindTag};
     use refined_domain::trust_grades::TrustProved;
     use refined_kernel::kernel_bridge::{dylib_path, kernel_artifacts_present, load_kernel};
     use refined_kernel::kernel_interface::RefinedTSKernel;
@@ -85,10 +105,11 @@ mod tests {
         PowOperandKind, PowOperandWire, TransferAnswer, TransferAnswerKind, TransferQuestion,
         TransferQuestionOp,
     };
-    use refined_sets::refinement_forms::{make_refined_set, one_of, RefinedSet};
+    use refined_sets::refinement_forms::{at_least, at_most, make_refined_set, one_of, RefinedSet};
     use ruff_python_ast::Operator;
 
     use crate::refinedpy::expressions::binary_arithmetic_value;
+    use crate::refinedpy::expressions::binary_arithmetic_value_with_kernel;
     use crate::refinedpy::math_models::math_call_result;
 
     /// `loaded_kernel` mirrors `lattice_conformance.rs`'s own helper
@@ -460,6 +481,84 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// LEDGER ROW G5, the genuine-divergence row: `1.0 / denominator`
+    /// where `denominator` is a DEGENERATE Float-sorted SET carrying
+    /// nothing but `{0.0}` (`one_of`) — the shape a narrowed range can
+    /// collapse to (still `Kind::Set`, not the ordinary `Kind::Values`
+    /// `binary_arithmetic_value`'s ownknown-values path already reads).
+    /// `theories/binary64/div.lean`'s `transferDiv` takes its
+    /// `bothSingle` branch for this exact shape and answers a
+    /// DETERMINED `±Infinity` pair — correct for ECMA's own `/`, which
+    /// the kernel's transfer proves, but Python raises
+    /// `ZeroDivisionError` at a zero divisor (arith.10), an outcome the
+    /// value pair cannot speak. Serving that pair as the Python answer
+    /// would be unsound, so `transfer_over_sets`'s own
+    /// `divisor_provably_excludes_zero` gate declines the whole call
+    /// instead — asserted here directly (not through `compare_row`,
+    /// whose "adapter declines, kernel answers" verdict reads as a
+    /// determination GAP; this row is the opposite, a decline the
+    /// adapter must NEVER close by asking harder). A WIDE zero-admitting
+    /// range (`[0.0, 2.0]`) is a weaker version of the same hazard: the
+    /// kernel's own general-interval branch (`divisorMayBeZero`) already
+    /// refuses it before any adapter-side relabeling could occur, so it
+    /// is not this row's witness — `test_div_by_a_set_that_may_admit_
+    /// zero_declines_rather_than_answering_ecma_infinity` (expressions.rs)
+    /// still pins the adapter's decline there, belt-and-braces with the
+    /// kernel's own refusal.
+    #[test]
+    fn test_div_by_a_set_admitting_zero_diverges_from_the_kernel_by_design() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let denominator = AbstractValue {
+            kind_tag: Some(PrimitiveKind::Float),
+            ..known_set(make_refined_set(vec![one_of(&[0.0])]), None, TrustProved, SetKindTag::None)
+        };
+        let one = float_operand(1.0);
+        let adapter = binary_arithmetic_value_with_kernel(Operator::Div, &one, &denominator, &kernel);
+        assert_eq!(
+            adapter.kind,
+            Kind::Unknown,
+            "G5: a divisor set that is nothing but zero must decline — never relabel the kernel's \
+             ECMA-correct ±Infinity pair as Python's answer: {adapter:?}"
+        );
+
+        // confirmed the kernel's OWN answer here really is a determined
+        // ±Infinity pair — the divergence is real, not merely asserted
+        let asked = (kernel.transfer)(&TransferQuestion {
+            op: TransferQuestionOp::Div,
+            a: singleton(1.0),
+            b: singleton(0.0),
+            c: 0.0,
+            base: PowOperandWire { kind: PowOperandKind::NaN, set: make_refined_set(vec![]) },
+            exp: PowOperandWire { kind: PowOperandKind::NaN, set: make_refined_set(vec![]) },
+        });
+        assert_eq!(
+            asked.kind,
+            TransferAnswerKind::Values,
+            "G5's premise requires the kernel to answer a determined value here, or the row proves nothing"
+        );
+        assert_eq!(asked.values, vec![f64::NEG_INFINITY, f64::INFINITY]);
+    }
+
+    /// The gate's own pin: a divisor window that PROVABLY EXCLUDES zero
+    /// (`[1.0, 2.0]`, strictly above zero) still lowers through the
+    /// kernel and agrees — the gate only refuses the zero-admitting
+    /// case, it does not disable the SET path for `/` outright.
+    #[test]
+    fn test_div_by_a_set_excluding_zero_still_lowers_and_agrees() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let denominator = AbstractValue {
+            kind_tag: Some(PrimitiveKind::Float),
+            ..known_set(make_refined_set(vec![at_least(1.0), at_most(2.0)]), None, TrustProved, SetKindTag::None)
+        };
+        let one = float_operand(1.0);
+        let adapter = binary_arithmetic_value_with_kernel(Operator::Div, &one, &denominator, &kernel);
+        assert_eq!(adapter.kind, Kind::Set, "a zero-excluding divisor window must still answer: {adapter:?}");
+        assert_eq!(adapter.kind_tag, Some(PrimitiveKind::Float));
+        let want = make_refined_set(vec![at_least(0.5), at_most(1.0)]);
+        assert!((kernel.scalar_subset)(&adapter.set, &want), "adapter {:?} not ⊆ want {:?}", adapter.set, want);
+        assert!((kernel.scalar_subset)(&want, &adapter.set), "want {:?} not ⊆ adapter {:?}", want, adapter.set);
     }
 
     /// LEDGER ROW G4: the brief asks for NaN-operand arithmetic rows.

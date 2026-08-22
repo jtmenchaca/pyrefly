@@ -116,13 +116,30 @@
 //! the crossing itself rests on cited spec behaviour (the JSON number
 //! round-trip) this tree has not proved as a kernel theorem.
 //!
-//! A JSON number crossing to Python is read as `PrimitiveKind::Float`:
 //! `json.loads` always answers a Python `float` for a JSON number
-//! (library/json.rst's conversion table — "number (int)" only when the
-//! JSON text itself has no fractional/exponent part AND the loader's
-//! own `parse_int` is not overridden; this checker does not read that
-//! override, so the safe, uniform reading here is Float, mirroring the
-//! Go twin's own `foreignReturnValue` comment on the identical premise).
+//! whose text carries a fractional/exponent part (library/json.rst's
+//! conversion table — "number (int)" only when the JSON text itself
+//! has no such part AND the loader's own `parse_int` is not
+//! overridden, which this checker does not read). The CHECKER's own
+//! sort tag on the crossed value does not stamp Float uniformly over
+//! this ambiguity; it reads the target's declared return set for its
+//! own `Integer` form the same way a declared position's sort is read
+//! (`foreign_return_value`'s doc) — an all-integer return reads
+//! Integer, and only an unmarked or genuinely fractional return reads
+//! Float.
+//!
+//! CORNER CHECK: the return set's own corner values must be ones the
+//! JSON leg can actually carry. `JSON.stringify` on the TypeScript
+//! target's own side commits to legal JSON text (RFC 8259), which has
+//! no token for ±Infinity — `JSON.stringify(Infinity)` answers the
+//! bare literal `null` (ECMA-262's `SerializeJSONProperty`, the
+//! finiteness check on a Number value), a value outside the claimed
+//! numeric set landing at this leg's own `json.loads` consumer. A
+//! return set whose corners admit ±Infinity degrades to a named
+//! undetermined instead of binding the set as stated
+//! (`foreign_return_value_or_undetermined`); NaN is already excluded
+//! from every `RefinedSet` at construction (the boundary ruling), so
+//! only the two infinite corners need the check.
 
 use std::sync::Arc;
 
@@ -134,6 +151,9 @@ use refined_domain::abstract_value::SetKindTag;
 use refined_domain::lattice_operations::set_of_known;
 use refined_domain::trust_grades::TrustSpec;
 use refined_kernel::kernel_interface::RefinedTSKernel;
+use refined_sets::refinement_forms::on_one_tuple_layer;
+use refined_sets::refinement_forms::requires_integer;
+use refined_sets::refinement_forms::Form;
 use refined_sets::refinement_forms::RefinedSet;
 use refined_sets::repetition_window_forms::as_repetition;
 use ruff_python_ast::Expr;
@@ -146,6 +166,7 @@ use ruff_python_ast::StmtWith;
 use ruff_text_size::Ranged;
 use ruff_text_size::TextRange;
 
+use crate::refinedpy::assignability::states_sequence;
 use crate::refinedpy::diagnostic_sentences;
 use crate::refinedpy::env::Environment;
 use crate::refinedpy::foreign_edge_artifact::ForeignSurface;
@@ -334,12 +355,15 @@ pub fn foreign_edge_at(
             range: edge.call,
         });
     }
-    // the RETURN leg: the target's own fact, attached to the parse
+    // the RETURN leg: the target's own fact, attached to the parse —
+    // unless the declared return admits a corner the JSON leg cannot
+    // carry, which degrades to a named undetermined instead of binding
+    // the set as stated
     match sole_parse_consumer_of(statements, edge.consumer_scan_from, &edge.result_name, edge.result_read) {
-        Ok(parse_range) => Some(ForeignEdgeOutcome::Override {
-            parse_range,
-            value: foreign_return_value(&artifact),
-        }),
+        Ok(parse_range) => match foreign_return_value_or_undetermined(&artifact) {
+            Ok(value) => Some(ForeignEdgeOutcome::Override { parse_range, value }),
+            Err(message) => Some(ForeignEdgeOutcome::Decline { message, range: parse_range }),
+        },
         Err(message) => Some(ForeignEdgeOutcome::Decline { message, range: edge.call }),
     }
 }
@@ -410,11 +434,150 @@ fn read_foreign_ts_artifact(target_path: &str) -> Result<ForeignTsArtifact, Stri
 /// is not this kernel's own decision about this expression, it is
 /// another language's claim carried across a transport whose identity
 /// is a CITED PREMISE, not a proved theorem.
+///
+/// The SORT tag comes from the set's own forms, never a stamp: an
+/// explicit `Integer` form, or every member of an all-integer `OneOf`
+/// (a union-of-integer-literal return like `union_levels.ts`'s derived
+/// `{1, 2, 4}` — `requires_or_reads_integer` below), reads Integer; a
+/// numeric set stating neither reads Float; a set that is not on the
+/// numeric one-tuple layer at all (a sequence return, or a
+/// string-sorted one) carries no numeric tag — the same
+/// `on_one_tuple_layer`/`states_sequence` gate `check.rs`'s
+/// `declared_set_instance` already applies to a DECLARED position,
+/// applied here to a CROSSED one.
 fn foreign_return_value(artifact: &ForeignTsArtifact) -> AbstractValue {
-    AbstractValue {
-        kind_tag: Some(PrimitiveKind::Float),
-        ..known_set(artifact.called.return_set.clone(), None, TrustSpec, SetKindTag::None)
+    let set = artifact.called.return_set.clone();
+    if on_one_tuple_layer(&set) && !states_sequence(&set) {
+        let sort = if requires_or_reads_integer(&set) { PrimitiveKind::Integer } else { PrimitiveKind::Float };
+        return AbstractValue { kind_tag: Some(sort), ..known_set(set, None, TrustSpec, SetKindTag::None) };
     }
+    known_set(set, None, TrustSpec, SetKindTag::None)
+}
+
+/// Whether a set's own forms state an integer sort — `requires_integer`
+/// (the explicit `Form::Integer` marker, looking through `Union`/
+/// `Difference`) OR every value an `OneOf` form admits is a whole,
+/// finite number. A crossed return carries no annotation to attach an
+/// explicit `Integer` form to (unlike a declared `int`-based alias), so
+/// a derived Literal-set return (`union_levels.ts`'s `{1, 2, 4}`) is
+/// only ever an all-integer `OneOf` — this is the wider reading the
+/// crossed-value case needs beyond the declared-position law it
+/// otherwise mirrors.
+fn requires_or_reads_integer(set: &RefinedSet) -> bool {
+    if requires_integer(set) {
+        return true;
+    }
+    for form in &set.forms {
+        match form.form {
+            Form::OneOf => {
+                if !form.w.is_empty() && form.w.iter().all(|&w| w.is_finite() && w == w.trunc()) {
+                    return true;
+                }
+            }
+            Form::Union | Form::Difference => {
+                if requires_or_reads_integer(form.a_.as_ref().unwrap())
+                    || form.b.as_ref().is_some_and(|b| requires_or_reads_integer(b))
+                {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Which infinite corner a return set's own forms admit — `None` when
+/// the return is not a scalar on the numeric one-tuple layer at all
+/// (a sequence return states no scalar corner this JSON-number premise
+/// is about; a compound object/array return is a different wire shape
+/// entirely, out of this check's scope), or when a scalar return's own
+/// hull is bounded on both ends. A set is an INTERSECTION of its
+/// forms, so a ray form (`AtLeast`/`Above` narrows the hull's lower end
+/// up; `AtMost`/`Below` narrows the upper end down) only leaves a side
+/// unbounded when NO form in the intersection states a finite bound on
+/// that side — the same reading `set_simplification.rs`'s own
+/// `hull_of` computes for simplification, done locally here since that
+/// reader is private to its crate. A `Union` widens to the LOOSER of
+/// its two arms' own hulls (either arm admitting the corner means the
+/// union does); a `Difference` reads only its left arm's hull (removing
+/// members never widens). NaN is excluded from every `RefinedSet` at
+/// construction (the boundary ruling), so only the two infinite
+/// corners are asked about here.
+fn uncarriable_corner_of(set: &RefinedSet) -> Option<&'static str> {
+    if !on_one_tuple_layer(set) || states_sequence(set) {
+        return None;
+    }
+    let hull = hull_of(set);
+    if hull.lo == f64::NEG_INFINITY {
+        return Some("-Infinity");
+    }
+    if hull.hi == f64::INFINITY {
+        return Some("+Infinity");
+    }
+    None
+}
+
+/// The outermost bounds a set's own top-level forms state, read
+/// syntactically — unbounded (`NEG_INFINITY`/`INFINITY`) on a side no
+/// form narrows. `MultipleOf` states no bound and is skipped;
+/// `uncarriable_corner_of`'s own gate keeps this reader off a
+/// sequence-shaped set entirely, so no sequence form ever reaches this
+/// match.
+struct ScalarHull {
+    lo: f64,
+    hi: f64,
+}
+
+fn hull_of(set: &RefinedSet) -> ScalarHull {
+    let mut lo = f64::NEG_INFINITY;
+    let mut hi = f64::INFINITY;
+    for form in &set.forms {
+        match form.form {
+            Form::AtLeast | Form::Above => lo = lo.max(form.a),
+            Form::AtMost | Form::Below => hi = hi.min(form.a),
+            Form::OneOf => {
+                if !form.w.is_empty() {
+                    lo = lo.max(form.w.iter().copied().fold(form.w[0], f64::min));
+                    hi = hi.min(form.w.iter().copied().fold(form.w[0], f64::max));
+                }
+            }
+            Form::Union => {
+                let a = hull_of(form.a_.as_ref().unwrap());
+                let b = hull_of(form.b.as_ref().unwrap());
+                lo = lo.max(a.lo.min(b.lo));
+                hi = hi.min(a.hi.max(b.hi));
+            }
+            Form::Difference => {
+                let a = hull_of(form.a_.as_ref().unwrap());
+                lo = lo.max(a.lo);
+                hi = hi.min(a.hi);
+            }
+            _ => {}
+        }
+    }
+    ScalarHull { lo, hi }
+}
+
+/// The return leg's own fact, degraded to a named undetermined when
+/// the target's declared return admits a corner (+Infinity or
+/// -Infinity) the JSON stdout leg cannot carry — `JSON.stringify`
+/// writes that corner as the bare token `null` (ECMA-262's
+/// `SerializeJSONProperty`), a value outside the claimed numeric set
+/// landing at this call's own consumer. A finite-cornered set binds
+/// exactly as `foreign_return_value` already reads it; this is the
+/// gate every caller of `foreign_return_value` for a RETURN (never an
+/// entry — the outbound leg's own NaN-freedom check is the different,
+/// already-landed premise for the value crossing OUT) must pass
+/// through first.
+fn foreign_return_value_or_undetermined(artifact: &ForeignTsArtifact) -> Result<AbstractValue, String> {
+    if let Some(corner) = uncarriable_corner_of(&artifact.called.return_set) {
+        return Err(diagnostic_sentences::foreign_edge_return_admits_uncarriable_corner(
+            &artifact.called.name,
+            corner,
+        ));
+    }
+    Ok(foreign_return_value(artifact))
 }
 
 /* ── recognition ──────────────────────────────────────────────────── */
@@ -2277,6 +2440,7 @@ mod tests {
     use refined_sets::refinement_forms::at_most;
     use refined_sets::refinement_forms::integer;
     use refined_sets::refinement_forms::make_refined_set;
+    use refined_sets::refinement_forms::one_of;
     use refined_sets::refinement_forms::star;
     use refined_sets::repetition_window_forms::repetition;
 
@@ -2362,6 +2526,49 @@ mod tests {
         ForeignTsArtifact { surface: ForeignSurface::ArgvJson { arg_index: 2 }, ..audio_level_ts_artifact() }
     }
 
+    /// The same fact, with an unbounded `atLeast` return — the derived
+    /// window a `Math.max(0, x)`-shaped target's own kernel summary
+    /// states, admitting +Infinity with no literal spelling needed
+    /// (the corner-check fixture: `foreign_edge.rs:181`'s Go-twin
+    /// grounding for the identical premise).
+    fn audio_level_unbounded_return_artifact() -> ForeignTsArtifact {
+        ForeignTsArtifact {
+            called: ForeignTsFunctionFact {
+                return_set: make_refined_set(vec![at_least(0.0)]),
+                ..audio_level_ts_artifact().called
+            },
+            ..audio_level_ts_artifact()
+        }
+    }
+
+    /// The same fact, with a float-sorted (no `Integer` form) finite
+    /// return window — the sibling of the int-sorted default fixture,
+    /// used to pin that an unmarked numeric return still reads Float.
+    fn audio_level_float_return_artifact() -> ForeignTsArtifact {
+        ForeignTsArtifact {
+            called: ForeignTsFunctionFact {
+                return_set: make_refined_set(vec![at_least(0.0), at_most(1.0)]),
+                ..audio_level_ts_artifact().called
+            },
+            ..audio_level_ts_artifact()
+        }
+    }
+
+    /// The same fact, with an all-integer `OneOf` return — the shape
+    /// `union_levels.ts`'s derived `{1, 2, 4}` Literal-set return
+    /// carries (f-value-unions.py's own `louder_level_wider_window`
+    /// pin): no explicit `Integer` form, but every admitted value is a
+    /// whole number.
+    fn audio_level_one_of_integer_return_artifact() -> ForeignTsArtifact {
+        ForeignTsArtifact {
+            called: ForeignTsFunctionFact {
+                return_set: make_refined_set(vec![one_of(&[1.0, 2.0, 4.0])]),
+                ..audio_level_ts_artifact().called
+            },
+            ..audio_level_ts_artifact()
+        }
+    }
+
     const FIXTURE_SOURCE: &str = concat!(
         "def audio_level_via_ts(boosted):\n",
         "    result = subprocess.run(\n",
@@ -2381,6 +2588,11 @@ mod tests {
         def.body.to_vec()
     }
 
+    /// REGRESSION PIN: the finite, int-sorted return
+    /// (`audio_level_ts_artifact`'s `integer, >= 0, <= 1`) binds exactly
+    /// as before — a corner-free, explicitly-int-sorted set crosses
+    /// undegraded, now correctly Integer-tagged (the fixed reading of
+    /// defect 2, not the pre-fix Float stamp).
     #[test]
     fn the_exact_shape_recognizes_and_binds_the_proved_return() {
         register_fixture_artifact("./audio_level.ts", audio_level_ts_artifact());
@@ -2391,11 +2603,82 @@ mod tests {
         match outcome {
             ForeignEdgeOutcome::Override { value, .. } => {
                 assert_eq!(value.kind, Kind::Set);
+                assert_eq!(value.kind_tag, Some(PrimitiveKind::Integer));
+            }
+            ForeignEdgeOutcome::Decline { message, .. } => panic!("wanted an override, got a decline: {message}"),
+            ForeignEdgeOutcome::Fired { message, .. } => panic!("wanted an override, got a fire: {message}"),
+        }
+    }
+
+    /// DEFECT 1's fix: a return set admitting +Infinity (an unbounded
+    /// `atLeast` with no upper ray) degrades to a named undetermined
+    /// naming the corner and the leg, rather than binding the set as
+    /// stated — the JSON stdout leg cannot carry `+Infinity`
+    /// (`JSON.stringify(Infinity)` answers the bare token `null`).
+    #[test]
+    fn an_unbounded_return_degrades_to_the_named_undetermined() {
+        register_fixture_artifact("./audio_level.ts", audio_level_unbounded_return_artifact());
+        let Some(kernel) = loaded_kernel() else { return };
+        let body = def_body(FIXTURE_SOURCE);
+        let environment = env_with(&[("boosted", boosted_sequence_value())]);
+        match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("the shape recognizes") {
+            ForeignEdgeOutcome::Decline { message, .. } => {
+                assert!(message.contains("audioLevel"), "{message}");
+                assert!(message.contains("+Infinity"), "{message}");
+                assert!(message.contains("JSON stdout leg"), "{message}");
+                assert!(message.contains("cannot be trusted"), "{message}");
+            }
+            ForeignEdgeOutcome::Override { .. } => {
+                panic!("wanted the corner-check decline, got an override binding the uncarriable set")
+            }
+            ForeignEdgeOutcome::Fired { message, .. } => {
+                panic!("wanted the corner-check decline, got a fire: {message}")
+            }
+        }
+    }
+
+    /// DEFECT 2's fix: an unmarked, genuinely float-sorted return window
+    /// (no `Integer` form) still reads Float — the sibling row proving
+    /// the fix does not over-correct into tagging every crossed return
+    /// Integer.
+    #[test]
+    fn a_float_window_return_reads_float_tagged() {
+        register_fixture_artifact("./audio_level.ts", audio_level_float_return_artifact());
+        let Some(kernel) = loaded_kernel() else { return };
+        let body = def_body(FIXTURE_SOURCE);
+        let environment = env_with(&[("boosted", boosted_sequence_value())]);
+        match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("the shape recognizes") {
+            ForeignEdgeOutcome::Override { value, .. } => {
+                assert_eq!(value.kind, Kind::Set);
                 assert_eq!(value.kind_tag, Some(PrimitiveKind::Float));
             }
             ForeignEdgeOutcome::Decline { message, .. } => panic!("wanted an override, got a decline: {message}"),
             ForeignEdgeOutcome::Fired { message, .. } => panic!("wanted an override, got a fire: {message}"),
         }
+    }
+
+    /// DEFECT 2's fix: an all-integer `OneOf` return (`{1, 2, 4}`, the
+    /// shape `union_levels.ts`'s derived Literal-set return carries,
+    /// f-value-unions.py's `louder_level_wider_window` pin) reads
+    /// Integer-tagged and passes an integer-window judge — the crossed
+    /// value's own sort read from the set, never a Float stamp.
+    #[test]
+    fn an_all_integer_one_of_return_reads_integer_and_fits_an_integer_window() {
+        register_fixture_artifact("./audio_level.ts", audio_level_one_of_integer_return_artifact());
+        let Some(kernel) = loaded_kernel() else { return };
+        let body = def_body(FIXTURE_SOURCE);
+        let environment = env_with(&[("boosted", boosted_sequence_value())]);
+        let value = match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("the shape recognizes") {
+            ForeignEdgeOutcome::Override { value, .. } => value,
+            ForeignEdgeOutcome::Decline { message, .. } => panic!("wanted an override, got a decline: {message}"),
+            ForeignEdgeOutcome::Fired { message, .. } => panic!("wanted an override, got a fire: {message}"),
+        };
+        assert_eq!(value.kind, Kind::Set);
+        assert_eq!(value.kind_tag, Some(PrimitiveKind::Integer));
+        // an integer-window judge: {1, 2, 4} subset-of [0, 10] ∧ integer
+        let narrow_window = make_refined_set(vec![integer(), at_least(0.0), at_most(10.0)]);
+        let fits = foreign_scalar_subset(&kernel, &value.set, &narrow_window);
+        assert_eq!(fits, Some(true), "the all-integer OneOf return must fit an integer-window judge");
     }
 
     /// The recognized foreign-edge shape's `json.loads(result.stdout)`
@@ -2577,7 +2860,7 @@ mod tests {
         match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("the argv-json shape recognizes") {
             ForeignEdgeOutcome::Override { value, .. } => {
                 assert_eq!(value.kind, Kind::Set);
-                assert_eq!(value.kind_tag, Some(PrimitiveKind::Float));
+                assert_eq!(value.kind_tag, Some(PrimitiveKind::Integer));
             }
             ForeignEdgeOutcome::Decline { message, .. } => panic!("wanted an override, got a decline: {message}"),
             ForeignEdgeOutcome::Fired { message, .. } => panic!("wanted an override, got a fire: {message}"),
@@ -2710,7 +2993,7 @@ mod tests {
         match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("the temp-file shape recognizes") {
             ForeignEdgeOutcome::Override { value, .. } => {
                 assert_eq!(value.kind, Kind::Set);
-                assert_eq!(value.kind_tag, Some(PrimitiveKind::Float));
+                assert_eq!(value.kind_tag, Some(PrimitiveKind::Integer));
             }
             ForeignEdgeOutcome::Decline { message, .. } => panic!("wanted an override, got a decline: {message}"),
             ForeignEdgeOutcome::Fired { message, .. } => panic!("wanted an override, got a fire: {message}"),
@@ -2931,7 +3214,7 @@ mod tests {
         match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("the shape recognizes") {
             ForeignEdgeOutcome::Override { value, .. } => {
                 assert_eq!(value.kind, Kind::Set);
-                assert_eq!(value.kind_tag, Some(PrimitiveKind::Float));
+                assert_eq!(value.kind_tag, Some(PrimitiveKind::Integer));
             }
             ForeignEdgeOutcome::Decline { message, .. } => panic!("wanted an override, got a decline: {message}"),
             ForeignEdgeOutcome::Fired { message, .. } => panic!("wanted an override, got a fire: {message}"),
@@ -2984,7 +3267,7 @@ mod tests {
         match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("the shape recognizes") {
             ForeignEdgeOutcome::Override { value, .. } => {
                 assert_eq!(value.kind, Kind::Set);
-                assert_eq!(value.kind_tag, Some(PrimitiveKind::Float));
+                assert_eq!(value.kind_tag, Some(PrimitiveKind::Integer));
             }
             ForeignEdgeOutcome::Decline { message, .. } => panic!("wanted an override, got a decline: {message}"),
             ForeignEdgeOutcome::Fired { message, .. } => panic!("wanted an override, got a fire: {message}"),
@@ -3012,7 +3295,7 @@ mod tests {
         match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("the shape recognizes") {
             ForeignEdgeOutcome::Override { value, .. } => {
                 assert_eq!(value.kind, Kind::Set);
-                assert_eq!(value.kind_tag, Some(PrimitiveKind::Float));
+                assert_eq!(value.kind_tag, Some(PrimitiveKind::Integer));
             }
             ForeignEdgeOutcome::Decline { message, .. } => panic!("wanted an override, got a decline: {message}"),
             ForeignEdgeOutcome::Fired { message, .. } => panic!("wanted an override, got a fire: {message}"),
@@ -3040,7 +3323,7 @@ mod tests {
         match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("the shape recognizes") {
             ForeignEdgeOutcome::Override { value, .. } => {
                 assert_eq!(value.kind, Kind::Set);
-                assert_eq!(value.kind_tag, Some(PrimitiveKind::Float));
+                assert_eq!(value.kind_tag, Some(PrimitiveKind::Integer));
             }
             ForeignEdgeOutcome::Decline { message, .. } => panic!("wanted an override, got a decline: {message}"),
             ForeignEdgeOutcome::Fired { message, .. } => panic!("wanted an override, got a fire: {message}"),
@@ -3092,7 +3375,7 @@ mod tests {
         match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("the const-held path resolves") {
             ForeignEdgeOutcome::Override { value, .. } => {
                 assert_eq!(value.kind, Kind::Set);
-                assert_eq!(value.kind_tag, Some(PrimitiveKind::Float));
+                assert_eq!(value.kind_tag, Some(PrimitiveKind::Integer));
             }
             ForeignEdgeOutcome::Decline { message, .. } => panic!("wanted an override, got a decline: {message}"),
             ForeignEdgeOutcome::Fired { message, .. } => panic!("wanted an override, got a fire: {message}"),
@@ -3240,7 +3523,7 @@ mod tests {
         match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("the Popen pair recognizes") {
             ForeignEdgeOutcome::Override { value, .. } => {
                 assert_eq!(value.kind, Kind::Set);
-                assert_eq!(value.kind_tag, Some(PrimitiveKind::Float));
+                assert_eq!(value.kind_tag, Some(PrimitiveKind::Integer));
             }
             ForeignEdgeOutcome::Decline { message, .. } => panic!("wanted an override, got a decline: {message}"),
             ForeignEdgeOutcome::Fired { message, .. } => panic!("wanted an override, got a fire: {message}"),
@@ -3373,7 +3656,7 @@ mod tests {
         match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("the shape recognizes") {
             ForeignEdgeOutcome::Override { value, .. } => {
                 assert_eq!(value.kind, Kind::Set);
-                assert_eq!(value.kind_tag, Some(PrimitiveKind::Float));
+                assert_eq!(value.kind_tag, Some(PrimitiveKind::Integer));
             }
             ForeignEdgeOutcome::Decline { message, .. } => panic!("wanted an override, got a decline: {message}"),
             ForeignEdgeOutcome::Fired { message, .. } => panic!("wanted an override, got a fire: {message}"),

@@ -54,6 +54,27 @@
 //! `Integer`/`Float` on the values this file reads, `subject_is_singleton`
 //! is the one place that gains a new arm — every other function here
 //! goes through it rather than re-deriving the identity check.
+//!
+//! A `MatchValue`/`MatchOr` subject is not always one known scalar.
+//! `enumerable_subject_members` reads the admitted numeric members off
+//! THREE subject shapes: a multi-valued `Kind::Values` (`{1, 2, 4}`
+//! read directly off `subject.values`); a `Kind::Set` that enumerates a
+//! union-of-singleton-scalars form (`scalars_of_union_of_singletons`,
+//! `collection_models.rs`'s own reader for exactly this shape, reused
+//! rather than re-parsed); and, per arm, a `Kind::KindUnion`'s own
+//! Values-kind arms. `match_value_outcome` then asks MEMBERSHIP rather
+//! than the single-value equality it used to: a pattern literal that IS
+//! a member is Taken, one that is NOT is NotTaken (a dead arm — the
+//! same NotTaken every other unreachable arm answers, never a new
+//! label), and a subject this reading cannot enumerate stays
+//! Undecidable exactly as before. `pattern_outcome`'s own `Kind::KindUnion`
+//! arm judges the pattern against EACH arm through this same recursive
+//! core (mirroring `assignability.rs`'s KindUnion judge: a Fire/Taken
+//! arm decides, an Undetermined/Undecidable arm poisons the whole
+//! union, and the union is NotTaken only when every arm is) — the same
+//! "apply per arm, keep what the pattern admits" reading
+//! `narrow_isinstance_call`'s own KindUnion filter (`narrowing.rs`)
+//! already uses for `isinstance`, applied here to `match`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -180,6 +201,9 @@ fn pattern_outcome(
     environment: &Environment,
     kernel: &Arc<RefinedTSKernel>,
 ) -> ArmOutcome {
+    if subject.kind == Kind::KindUnion {
+        return kind_union_pattern_outcome(pattern, subject, environment, kernel);
+    }
     match pattern {
         Pattern::MatchValue(value_pattern) => match_value_outcome(value_pattern, subject, environment, kernel),
         Pattern::MatchSingleton(singleton_pattern) => match_singleton_outcome(singleton_pattern, subject, environment),
@@ -202,25 +226,69 @@ fn pattern_outcome(
     }
 }
 
+/// A `Kind::KindUnion` subject (`json.loads`'s own honest return-space
+/// union, `expressions.rs::json_loads_value_space`, is the one producer
+/// today) — the pattern is judged against EACH arm through this same
+/// recursive `pattern_outcome` core, the per-arm reading
+/// `assignability.rs`'s KindUnion judge and `narrowing.rs`'s
+/// `narrow_isinstance_call` KindUnion filter both already use for their
+/// own questions, applied here to a match pattern's TAKEN/NOT-TAKEN
+/// question instead of an assignability Fire or an isinstance filter.
+/// The union claims the runtime subject is SOME arm, never which one:
+/// an arm the pattern proves Undecidable makes the whole union
+/// Undecidable (this file cannot rule out that arm being the real
+/// runtime value); with no Undecidable arm, ANY arm the pattern takes
+/// makes the union Taken (that arm's own environment is a sound fork —
+/// CPython runs the arm whenever the runtime value happens to be that
+/// arm, so the union subject can genuinely reach this case); every arm
+/// NotTaken is the whole union NotTaken (no possible runtime shape ever
+/// reaches this pattern).
+fn kind_union_pattern_outcome(
+    pattern: &Pattern,
+    subject: &AbstractValue,
+    environment: &Environment,
+    kernel: &Arc<RefinedTSKernel>,
+) -> ArmOutcome {
+    for arm in &subject.arms {
+        if let ArmOutcome::Undecidable = pattern_outcome(pattern, arm, environment, kernel) {
+            return ArmOutcome::Undecidable;
+        }
+    }
+    for arm in &subject.arms {
+        if let ArmOutcome::Taken(arm_env) = pattern_outcome(pattern, arm, environment, kernel) {
+            return ArmOutcome::Taken(arm_env);
+        }
+    }
+    ArmOutcome::NotTaken
+}
+
 /// `MatchValue` — "`LITERAL` will succeed only if `<subject> ==
-/// LITERAL`." Decided when `subject` and the pattern's own evaluated
-/// expression (via `evaluate_expression`, which forces the walk's OWN
-/// literal rules) are BOTH known single numeric/boolean values, or BOTH
-/// known exact strings — the two `==` rows CPython's own equality
-/// actually reaches for a `MatchValue` pattern (expressions.rst,
-/// "Comparisons": numeric types compare by mathematical value, strings
-/// compare by their code-point sequence). Numeric: `1 == True` and
-/// `1 == 1.0` both hold, so a Number-tagged subject of 1 DOES take
-/// `case 1:` and `case True:`'s VALUE reading would too if it appeared
-/// as a MatchValue (it never does — `True` always parses as
-/// MatchSingleton, never MatchValue). String: `case "left":` against a
+/// LITERAL`." Decided when `subject` ENUMERATES its admitted numeric
+/// members (`enumerable_numeric_members` — a single known scalar, a
+/// multi-valued `Kind::Values` set such as `{1, 2, 4}`, or a `Kind::Set`
+/// that enumerates a union-of-singletons form) and the pattern's own
+/// evaluated expression (via `evaluate_expression`, which forces the
+/// walk's OWN literal rules) is a known single numeric/boolean value —
+/// or BOTH sides are known exact strings — the two `==` rows CPython's
+/// own equality actually reaches for a `MatchValue` pattern
+/// (expressions.rst, "Comparisons": numeric types compare by
+/// mathematical value, strings compare by their code-point sequence).
+/// Numeric: `1 == True` and `1 == 1.0` both hold, so a Number-tagged
+/// subject admitting 1 DOES take `case 1:` and `case True:`'s VALUE
+/// reading would too if it appeared as a MatchValue (it never does —
+/// `True` always parses as MatchSingleton, never MatchValue). The
+/// pattern's own literal being a MEMBER of the subject's admitted set
+/// is Taken; not a member is NotTaken (a dead arm no runtime value of
+/// this subject can ever reach — the same NotTaken every other
+/// unreachable arm answers). String: `case "left":` against a
 /// String-tagged subject compares the code-point vectors directly, the
 /// same reading `expressions.rs::exact_string_values` gives an ordinary
 /// `==` comparison — this is what lets `anchor_of`'s own `match o: case
 /// "left": ...` decide its arm for a concrete `Literal["left", ...]`
 /// argument instead of falling through to the undecided join over every
 /// arm. A subject/pattern pair that is neither both-numeric nor
-/// both-string (or one side unknown) is Undecidable.
+/// both-string (or one side unknown, or the subject's set does not
+/// enumerate) is Undecidable.
 fn match_value_outcome(
     value_pattern: &ruff_python_ast::PatternMatchValue,
     subject: &AbstractValue,
@@ -228,10 +296,10 @@ fn match_value_outcome(
     kernel: &Arc<RefinedTSKernel>,
 ) -> ArmOutcome {
     let literal_value = evaluate_expression(&value_pattern.value, environment, kernel);
-    if let (Some(subject_value), Some(pattern_value)) =
-        (single_numeric_value(subject), single_numeric_value(&literal_value))
+    if let (Some(subject_members), Some(pattern_value)) =
+        (enumerable_numeric_members(subject), single_numeric_value(&literal_value))
     {
-        return if subject_value == pattern_value {
+        return if subject_members.iter().any(|member| *member == pattern_value) {
             ArmOutcome::Taken(environment.fork())
         } else {
             ArmOutcome::NotTaken
@@ -246,7 +314,69 @@ fn match_value_outcome(
             ArmOutcome::NotTaken
         };
     }
+    // `None`/a dict/a list is a STRUCTURAL SORT MISMATCH against any
+    // scalar (numeric or string) `MatchValue` literal — neither is ever
+    // `==` a number or a string, the same "never a member of a scalar
+    // set" reading `assignability.rs::judge`'s own Null/Object/List
+    // rows give a declared scalar refinement. This is a definite
+    // NotTaken, not Undecidable: it is what lets a `Kind::KindUnion`'s
+    // own None/list/dict arms (`kind_union_pattern_outcome`) drop out
+    // of a numeric pattern's union judgment instead of poisoning it.
+    if is_structural_scalar_mismatch(subject) && (single_numeric_value(&literal_value).is_some() || exact_string_values(&literal_value).is_some())
+    {
+        return ArmOutcome::NotTaken;
+    }
     ArmOutcome::Undecidable
+}
+
+/// Whether `subject` is a KNOWN kind that can never be `==` a scalar
+/// (a number or a string) — `Kind::Null` (`None`), `Kind::Object` (a
+/// dict), and `Kind::List` (a list/tuple). The same three kinds
+/// `assignability.rs::judge` fires outright against a declared scalar
+/// refinement, read here for a `MatchValue` pattern's own `==` question
+/// instead of an assignability question.
+fn is_structural_scalar_mismatch(subject: &AbstractValue) -> bool {
+    matches!(subject.kind, Kind::Null | Kind::Object | Kind::List)
+}
+
+/// The admitted numeric members a subject enumerates, if it enumerates
+/// any this file can read — the membership-question counterpart
+/// `match_value_outcome` asks instead of the plain single-value
+/// equality `single_numeric_value` alone can answer. Three shapes:
+///
+/// - `Kind::Values` (Number/Boolean/Integer/Float-tagged): its own
+///   `values` directly — a single known scalar is the `len() == 1`
+///   case already handled before this function existed; a
+///   multi-valued binding (`{1, 2, 4}`, an ordinary join of several
+///   known values — `lattice_operations.rs::join_known`'s same-sort
+///   arm) enumerates every value it carries.
+/// - `Kind::Set` that enumerates a union-of-singleton-scalars form —
+///   `collection_models.rs::scalars_of_union_of_singletons`, reused
+///   here rather than re-parsed, the same reader
+///   `known_value_of_state` uses to read a kernel-joined dict value
+///   back to exact values. A set that does NOT enumerate (a range, a
+///   star, a multi-codepoint string tuple) answers `None` — this
+///   function never guesses at values that are not actually
+///   enumerated.
+/// - `Kind::KindUnion` is read one level up, in
+///   `kind_union_pattern_outcome` — a union asks per-arm, not through
+///   this flat membership list, since an Undecidable arm must poison
+///   the whole judgment rather than silently drop out of a merged
+///   member list.
+fn enumerable_numeric_members(subject: &AbstractValue) -> Option<Vec<f64>> {
+    if subject.kind == Kind::Values {
+        return match subject.kind_tag {
+            Some(PrimitiveKind::Number)
+            | Some(PrimitiveKind::Boolean)
+            | Some(PrimitiveKind::Integer)
+            | Some(PrimitiveKind::Float) => Some(subject.values.clone()),
+            _ => None,
+        };
+    }
+    if subject.kind == Kind::Set {
+        return crate::refinedpy::collection_models::scalars_of_union_of_singletons(&subject.set);
+    }
+    None
 }
 
 /// The code-point vector an AbstractValue carries, if it is a known
@@ -797,9 +927,11 @@ pub fn match_taken_environment(
 mod tests {
     use std::collections::HashSet;
 
+    use refined_domain::abstract_value::known_set;
     use refined_domain::abstract_value::known_values;
     use refined_domain::abstract_value::null_value;
     use refined_domain::abstract_value::unknown;
+    use refined_domain::abstract_value::SetKindTag;
     use refined_domain::trust_grades::TrustProved;
     use refined_kernel::kernel_bridge::dylib_path;
     use refined_kernel::kernel_bridge::kernel_artifacts_present;
@@ -854,6 +986,127 @@ mod tests {
         let environment = empty_environment();
         let outcome = arm_outcome(&cases[0].pattern, cases[0].guard.as_deref(), &subject, &environment, &kernel);
         assert!(matches!(outcome, ArmOutcome::NotTaken), "2 must not match `case 1:`");
+    }
+
+    /// `case 1:` over a multi-valued `{1, 2, 4}` subject (an ordinary
+    /// `Kind::Values` join, not a single known scalar) is Taken — 1 is
+    /// a member of the subject's admitted set, the membership question
+    /// `enumerable_numeric_members` answers instead of the old
+    /// single-value equality.
+    #[test]
+    fn value_pattern_hit_on_multi_valued_subject() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let cases = match_cases("match x:\n    case 1:\n        pass\n");
+        let subject = known_values(vec![1.0, 2.0, 4.0], PrimitiveKind::Integer, TrustProved);
+        let environment = empty_environment();
+        let outcome = arm_outcome(&cases[0].pattern, cases[0].guard.as_deref(), &subject, &environment, &kernel);
+        assert!(
+            matches!(outcome, ArmOutcome::Taken(_)),
+            "1 is a member of {{1, 2, 4}} and must match `case 1:`"
+        );
+    }
+
+    /// The miss half: a literal that is NOT a member of the subject's
+    /// multi-valued set is a dead arm — NotTaken, the same outcome
+    /// every other unreachable arm answers, never a new label.
+    #[test]
+    fn value_pattern_miss_on_multi_valued_subject() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let cases = match_cases("match x:\n    case 8:\n        pass\n");
+        let subject = known_values(vec![1.0, 2.0, 4.0], PrimitiveKind::Integer, TrustProved);
+        let environment = empty_environment();
+        let outcome = arm_outcome(&cases[0].pattern, cases[0].guard.as_deref(), &subject, &environment, &kernel);
+        assert!(
+            matches!(outcome, ArmOutcome::NotTaken),
+            "8 is not a member of {{1, 2, 4}}: `case 8:` must be a dead arm"
+        );
+    }
+
+    /// `case 2 | 4:` over the same `{1, 2, 4}` subject is Taken — both
+    /// alternatives are members (`match_or_outcome` takes the first
+    /// Taken alternative, `case 2:`, without needing to try `case 4:`).
+    #[test]
+    fn or_pattern_hit_on_multi_valued_subject() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let cases = match_cases("match x:\n    case 2 | 4:\n        pass\n");
+        let subject = known_values(vec![1.0, 2.0, 4.0], PrimitiveKind::Integer, TrustProved);
+        let environment = empty_environment();
+        let outcome = arm_outcome(&cases[0].pattern, cases[0].guard.as_deref(), &subject, &environment, &kernel);
+        assert!(
+            matches!(outcome, ArmOutcome::Taken(_)),
+            "2 and 4 are both members of {{1, 2, 4}}: `case 2 | 4:` must be Taken"
+        );
+        let proved = pattern_proved_value(&cases[0].pattern, &environment, &kernel)
+            .expect("a MatchOr of two numeric literals proves their union");
+        let mut values = proved.values.clone();
+        values.sort_by(f64::total_cmp);
+        assert_eq!(values, vec![2.0, 4.0], "`case 2 | 4:` proves exactly {{2, 4}}");
+    }
+
+    /// A `Kind::Set` subject that enumerates a union-of-singletons form
+    /// (`{1, 2, 4}` built as a right-fold `Union` tree of one-element
+    /// `OneOf` leaves — the exact shape
+    /// `collection_models.rs::scalars_of_union_of_singletons` reads,
+    /// and the shape the kernel's own `join_state` answers for several
+    /// distinct scalar values, per that function's own doc) is
+    /// readable the same way a multi-valued `Kind::Values` subject is —
+    /// `case 1:` is Taken.
+    #[test]
+    fn value_pattern_hit_on_enumerable_set_subject() {
+        let Some(kernel) = loaded_kernel() else { return };
+        use refined_sets::refinement_forms::make_refined_set;
+        use refined_sets::refinement_forms::one_of;
+        use refined_sets::refinement_forms::union;
+        let cases = match_cases("match x:\n    case 1:\n        pass\n");
+        let singleton = |v: f64| make_refined_set(vec![one_of(&[v])]);
+        let set = make_refined_set(vec![union(singleton(1.0), make_refined_set(vec![union(singleton(2.0), singleton(4.0))]))]);
+        let subject = known_set(set, None, TrustProved, SetKindTag::None);
+        let environment = empty_environment();
+        let outcome = arm_outcome(&cases[0].pattern, cases[0].guard.as_deref(), &subject, &environment, &kernel);
+        assert!(
+            matches!(outcome, ArmOutcome::Taken(_)),
+            "1 is a member of the enumerable set {{1, 2, 4}} and must match `case 1:`"
+        );
+    }
+
+    /// The KindUnion axis: a subject union with a numeric-tagged arm
+    /// admitting `{1, 2, 4}` alongside a non-numeric arm (a null value,
+    /// the same "some arm, never which one" shape `json.loads`'s own
+    /// return-space union carries, `expressions.rs::
+    /// json_loads_value_space`) narrows under `case 1:` to the numeric
+    /// arm's own intersection — `kind_union_pattern_outcome` judges the
+    /// pattern against each arm and takes the first arm the pattern
+    /// admits, mirroring `assignability.rs`'s per-arm KindUnion judge.
+    #[test]
+    fn value_pattern_hit_on_kind_union_subject() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let cases = match_cases("match x:\n    case 1:\n        pass\n");
+        let numeric_arm = known_values(vec![1.0, 2.0, 4.0], PrimitiveKind::Integer, TrustProved);
+        let subject = refined_domain::abstract_value::kind_union_of(vec![null_value(), numeric_arm]);
+        assert_eq!(subject.kind, Kind::KindUnion, "the two distinct-kind arms must not collapse");
+        let environment = empty_environment();
+        let outcome = arm_outcome(&cases[0].pattern, cases[0].guard.as_deref(), &subject, &environment, &kernel);
+        assert!(
+            matches!(outcome, ArmOutcome::Taken(_)),
+            "the numeric arm admits 1, so the KindUnion subject must match `case 1:`"
+        );
+    }
+
+    /// The miss half: every arm of the union rules the pattern out (no
+    /// arm's value could ever be `8`) — the whole union is NotTaken.
+    #[test]
+    fn value_pattern_miss_on_kind_union_subject() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let cases = match_cases("match x:\n    case 8:\n        pass\n");
+        let numeric_arm = known_values(vec![1.0, 2.0, 4.0], PrimitiveKind::Integer, TrustProved);
+        let subject = refined_domain::abstract_value::kind_union_of(vec![null_value(), numeric_arm]);
+        assert_eq!(subject.kind, Kind::KindUnion, "the two distinct-kind arms must not collapse");
+        let environment = empty_environment();
+        let outcome = arm_outcome(&cases[0].pattern, cases[0].guard.as_deref(), &subject, &environment, &kernel);
+        assert!(
+            matches!(outcome, ArmOutcome::NotTaken),
+            "no arm of the union can ever be 8: `case 8:` must be NotTaken"
+        );
     }
 
     /// `anchor_of`'s own row: a String-tagged subject against a

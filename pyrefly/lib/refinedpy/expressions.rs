@@ -4099,15 +4099,25 @@ fn transferable_numeric_operand(value: &AbstractValue) -> Option<(RefinedSet, Pr
 ///   integer result outside the f64-exact 2^53 range rather than claim
 ///   an inexact one) — so these three rows are semantics-identical
 ///   between the two languages and safe to lower.
-/// - `Div` (`/`) ALSO lowers. Python's `/` is always true division —
-///   arith.9 (python-pins.md): "Division of int by int (`/`) yields a
-///   float — the type is widened even when the arguments are exact
-///   integers" — and elects `binary64.div` for exactly this reason, the
-///   SAME election the kernel's `Div` row already carries; the two
-///   `/`s are not merely similarly-shaped, they name the same theorem.
-///   `transfer_over_sets`'s own `result_sort` computation carries the
-///   always-Float override for this one op — the `both_int` rule the
-///   other three admitted ops share does not apply here.
+/// - `Div` (`/`) lowers EXCEPT at the zero-divisor corner. Python's `/`
+///   is always true division — arith.9 (python-pins.md): "Division of
+///   int by int (`/`) yields a float — the type is widened even when
+///   the arguments are exact integers" — and elects `binary64.div` for
+///   exactly this reason, the SAME election the kernel's `Div` row
+///   already carries. Away from a zero divisor the two `/`s name the
+///   same theorem. AT a zero divisor they diverge: arith.10 makes
+///   Python's `/` raise `ZeroDivisionError` (an exception, not a
+///   value), while ECMA's `binary64.div` answers a DETERMINED
+///   `±Infinity`/NaN (`theories/binary64/div.lean`'s `transferDiv`,
+///   proved sound for that theorem — a correct answer to the WRONG
+///   question for a Python operand). `transfer_over_sets` gates this:
+///   it asks the kernel only when the divisor operand's set provably
+///   EXCLUDES zero (`divisor_provably_excludes_zero`); when the
+///   divisor's set may admit zero, the value question declines rather
+///   than relabel ECMA's answer as Python's. `transfer_over_sets`'s own
+///   `result_sort` computation carries the always-Float override for
+///   this one op — the `both_int` rule the other three admitted ops
+///   share does not apply here.
 /// - `FloorDiv` (`//`), `Mod` (`%`), and `Pow` (`**`) do NOT lower to
 ///   the FLOAT family. `%` takes the DIVISOR's sign in Python, the
 ///   opposite of ECMA's dividend-sign remainder (AGENT-BRIEF.md,
@@ -4389,6 +4399,25 @@ fn shift_as_int_composition(
 /// `assignability.rs`'s own containment ask catches one — refusal
 /// reads as `None` here (the caller falls back to `unknown()`), never
 /// a crash and never a guessed value.
+///
+/// Whether a divisor's set PROVABLY EXCLUDES zero — the gate `/` needs
+/// before it may ask `binary64.div` (see `admitted_transfer_op`'s `Div`
+/// bullet: away from a zero divisor the two `/`s name the same
+/// theorem, but AT one, ECMA answers a determined `±Infinity`/NaN
+/// while Python raises `ZeroDivisionError`, arith.10). `0.0` is a
+/// member of `divisor` exactly when the kernel's own membership
+/// decider says so (`kernel.member`, `x ∈ A` — `memberB_iff`, the same
+/// ask `assignability.rs`'s containment law poses); `member` is total
+/// over every enclosure this file builds, so there is no refusal shape
+/// here to catch the way `scalar_subset`/`seq_subset` need one. A
+/// divisor set that DOES admit zero answers `false` here — this
+/// function only PROVES the exclusion, it never guesses it, so any
+/// doubt routes to "may be zero."
+fn divisor_provably_excludes_zero(divisor: &RefinedSet, kernel: &Arc<RefinedTSKernel>) -> bool {
+    let asked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (kernel.member)(divisor, &[0.0])));
+    matches!(asked, Ok(false))
+}
+
 fn transfer_over_sets(
     op: Operator,
     left: &AbstractValue,
@@ -4424,6 +4453,18 @@ fn transfer_over_sets(
         }
     }
     let transfer_op = admitted_transfer_op(op)?;
+    // arith.10's carve-out: `/` at a divisor whose set may admit zero
+    // diverges from `binary64.div` — ECMA answers a determined
+    // `±Infinity`/NaN there, Python raises `ZeroDivisionError`. Asking
+    // the kernel would relabel ECMA's correct answer to the WRONG
+    // question as Python's; the value question declines instead
+    // (`provable_raise`'s `binop_provable_raise` is where the raise
+    // itself gets named, for the operand shapes it can read). Every
+    // other admitted op (Add/Sub/Mult) has no such divisor and asks
+    // unconditionally.
+    if op == Operator::Div && !divisor_provably_excludes_zero(&right_set, kernel) {
+        return None;
+    }
     // `Div`'s always-float override (arith.9: "the type is widened even
     // when the arguments are exact integers") beats the both_int rule
     // outright — Python `/` never stays Integer-sorted regardless of
@@ -4736,10 +4777,27 @@ pub fn provable_raise(
 /// `x / 0`, `x // 0`, `x % 0` — a known ZERO divisor provably raises
 /// `ZeroDivisionError: division by zero` (expressions.rst §6.7:
 /// "raise[s] ZeroDivisionError" for `/`/`//`/`%` when the right operand
-/// is zero). The evaluation path (`binary_arithmetic_value`) already
-/// declines these to `unknown()` for the VALUE question; this is the
-/// same zero-divisor check speaking the fact as a provable raise rather
-/// than a silent decline — the value path is unchanged.
+/// is zero). The evaluation path (`binary_arithmetic_value`/
+/// `transfer_over_sets`) already declines these to `unknown()` for the
+/// VALUE question; this is the same zero-divisor check speaking the
+/// fact as a provable raise rather than a silent decline — the value
+/// path is unchanged.
+///
+/// Two shapes prove the divisor is ALWAYS zero, never SOMETIMES zero
+/// (`provable_raise`'s own contract — a fire here means every real
+/// execution raises, `check.rs::sink_value`'s doc): a known scalar
+/// `0.0`/`-0.0` (`single_numeric_value`), or a `Kind::Set` divisor whose
+/// entire real range is the singleton `{0.0}` — a seeded window that
+/// has narrowed to nothing but zero, not merely a window that ADMITS
+/// zero alongside other values (`age - age`'s own `[0, 0]` window
+/// against a `/`, for instance). A wider window that only ADMITS zero
+/// (e.g. `[0.0, 2.0]`) is a SOMETIMES-raises divisor, which this
+/// function must NOT fire on — `divisor_provably_excludes_zero` is the
+/// gate that keeps the VALUE question silent there instead
+/// (`transfer_over_sets`); firing an unconditional raise for a
+/// mostly-nonzero window would be a false positive, the same
+/// overreach `rounding_argument_raises`' finite-argument gate avoids
+/// on the value side.
 fn binop_provable_raise(
     binop: &ruff_python_ast::ExprBinOp,
     environment: &Environment,
@@ -4749,14 +4807,39 @@ fn binop_provable_raise(
         return None;
     }
     let right = evaluate_expression(&binop.right, environment, kernel);
-    let (right_value, _) = single_numeric_value(&right)?;
-    if right_value != 0.0 {
+    if let Some((right_value, _)) = single_numeric_value(&right) {
+        if right_value == 0.0 {
+            return Some((
+                binop.range(),
+                "this expression provably raises ZeroDivisionError: division by zero".to_owned(),
+            ));
+        }
         return None;
     }
-    Some((
-        binop.range(),
-        "this expression provably raises ZeroDivisionError: division by zero".to_owned(),
-    ))
+    if right.kind == Kind::Set && divisor_is_provably_always_zero(&right.set, kernel) {
+        return Some((
+            binop.range(),
+            "this expression provably raises ZeroDivisionError: division by zero".to_owned(),
+        ));
+    }
+    None
+}
+
+/// Whether a divisor SET's entire real range is nothing but zero — a
+/// nonempty subset of `{0.0}` (`kernel.scalar_subset`, guarded by
+/// `kernel.scalar_empty` since the empty set is vacuously a subset of
+/// everything but names no real divisor to raise on). Both closures are
+/// total over the scalar shapes this file builds (the same discipline
+/// `divisor_provably_excludes_zero` and `assignability.rs`'s own
+/// containment ask keep), so there is no refusal to catch here.
+fn divisor_is_provably_always_zero(divisor: &RefinedSet, kernel: &Arc<RefinedTSKernel>) -> bool {
+    let zero = make_refined_set(vec![one_of(&[0.0])]);
+    let empty = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (kernel.scalar_empty)(divisor)));
+    if matches!(empty, Ok(true)) || empty.is_err() {
+        return false;
+    }
+    let subset = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (kernel.scalar_subset)(divisor, &zero)));
+    matches!(subset, Ok(true))
 }
 
 /// `container[index]` where `container` and `index` are both KNOWN and
@@ -7669,5 +7752,248 @@ mod tests {
         let parsed = parse_expression("gather_kwargs(age=200)").expect("test source must parse");
         let value = evaluate_expression(&parsed.into_expr(), &environment, &kernel);
         assert_eq!(value.values, vec![200.0]);
+    }
+
+    // --- `/` at a SET-SHAPED divisor that may admit zero ---
+
+    /// `1.0 / denominator` where `denominator` is a seeded Float-sorted
+    /// SET `[0.0, 2.0]` — a WIDE window admitting zero. Before this
+    /// gate, `transfer_over_sets` asked `binary64.div` unconditionally
+    /// for `Div`; the kernel's own general-interval branch
+    /// (`divisorMayBeZero`, `theories/binary64/div.lean`) already
+    /// refuses a range this wide on its own, so this row was always
+    /// safe by the kernel's own refusal even before the adapter-side
+    /// gate landed — the adapter's decline here is belt-and-braces, not
+    /// the sole guard. The sole-guard row is a DEGENERATE zero-only Set
+    /// (`{0.0}`, `Kind::Set` built from a single `one_of`), where the
+    /// kernel's `bothSingle` branch DOES answer a determined `±Infinity`
+    /// pair (see `transfer_conformance.rs`'s ledger row G5, which pins
+    /// that shape and the real divergence directly). `divisor_provably_
+    /// excludes_zero` gates both shapes uniformly through `kernel.member`
+    /// rather than special-casing either.
+    #[test]
+    fn test_div_by_a_set_that_may_admit_zero_declines_rather_than_answering_ecma_infinity() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let denominator = AbstractValue {
+            kind_tag: Some(PrimitiveKind::Float),
+            ..known_set(
+                make_refined_set(vec![at_least(0.0), refined_sets::refinement_forms::at_most(2.0)]),
+                None,
+                TrustProved,
+                SetKindTag::None,
+            )
+        };
+        let one = known_values(vec![1.0], PrimitiveKind::Float, TrustProved);
+        let result = binary_arithmetic_value_with_kernel(Operator::Div, &one, &denominator, &kernel);
+        assert_eq!(
+            result.kind,
+            Kind::Unknown,
+            "a divisor window admitting zero must decline the value question, never answer ECMA's ±Infinity: {result:?}"
+        );
+    }
+
+    /// The SOLE-GUARD row: `1.0 / denominator` where `denominator` is a
+    /// DEGENERATE Set carrying nothing but `{0.0}` (`one_of`, `Kind::Set`
+    /// rather than the ordinary `Kind::Values` `single_numeric_value`
+    /// already reads). Unlike the wide-window row above, the kernel's
+    /// OWN `bothSingle` branch (`theories/binary64/div.lean`) answers a
+    /// DETERMINED `±Infinity` pair for this exact shape — so this row is
+    /// the one `divisor_provably_excludes_zero` alone protects; without
+    /// the gate, `transfer_over_sets` would relabel that pair as
+    /// Python's answer, which is the unsound row this whole unit fixes.
+    #[test]
+    fn test_div_by_a_degenerate_zero_only_set_declines_where_the_kernel_would_otherwise_answer() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let denominator = AbstractValue {
+            kind_tag: Some(PrimitiveKind::Float),
+            ..known_set(make_refined_set(vec![one_of(&[0.0])]), None, TrustProved, SetKindTag::None)
+        };
+        let one = known_values(vec![1.0], PrimitiveKind::Float, TrustProved);
+        let result = binary_arithmetic_value_with_kernel(Operator::Div, &one, &denominator, &kernel);
+        assert_eq!(
+            result.kind,
+            Kind::Unknown,
+            "a degenerate zero-only divisor Set must decline — the kernel's bothSingle branch answers \
+             a determined ±Infinity pair here, and relabeling it as Python's answer is exactly the \
+             unsoundness this gate exists to prevent: {result:?}"
+        );
+    }
+
+    /// The mirror row: a divisor set that PROVABLY EXCLUDES zero (a
+    /// window `[1.0, 2.0]`, strictly above zero) still lowers through
+    /// `binary64.div` — the gate only refuses the zero-admitting case,
+    /// it does not disable the SET path outright. `1.0 / [1.0, 2.0]`
+    /// certifies to `[0.5, 1.0]`.
+    #[test]
+    fn test_div_by_a_set_that_provably_excludes_zero_still_lowers_through_the_kernel() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let denominator = AbstractValue {
+            kind_tag: Some(PrimitiveKind::Float),
+            ..known_set(
+                make_refined_set(vec![at_least(1.0), refined_sets::refinement_forms::at_most(2.0)]),
+                None,
+                TrustProved,
+                SetKindTag::None,
+            )
+        };
+        let one = known_values(vec![1.0], PrimitiveKind::Float, TrustProved);
+        let result = binary_arithmetic_value_with_kernel(Operator::Div, &one, &denominator, &kernel);
+        assert_eq!(result.kind, Kind::Set, "a zero-excluding divisor must still answer: {result:?}");
+        assert_eq!(result.kind_tag, Some(PrimitiveKind::Float));
+        let want = make_refined_set(vec![at_least(0.5), refined_sets::refinement_forms::at_most(1.0)]);
+        assert!((kernel.scalar_subset)(&result.set, &want), "result {:?} not ⊆ want {:?}", result.set, want);
+        assert!((kernel.scalar_subset)(&want, &result.set), "want {:?} not ⊆ result {:?}", want, result.set);
+    }
+
+    /// The pinning ask for `divisor_provably_excludes_zero` directly: a
+    /// half-open ray `(0.0, ∞)` (strictly positive, zero itself NOT a
+    /// member) excludes zero, while `[0.0, ∞)` (zero included) does not.
+    #[test]
+    fn test_divisor_provably_excludes_zero_reads_strict_vs_inclusive_bounds() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let strictly_positive = make_refined_set(vec![refined_sets::refinement_forms::above(0.0)]);
+        assert!(
+            divisor_provably_excludes_zero(&strictly_positive, &kernel),
+            "a strictly-positive ray must be proved to exclude zero"
+        );
+        let nonnegative = make_refined_set(vec![at_least(0.0)]);
+        assert!(
+            !divisor_provably_excludes_zero(&nonnegative, &kernel),
+            "a nonnegative ray admits zero and must not be proved to exclude it"
+        );
+    }
+
+    // --- `//`/`%` at a SET-SHAPED divisor that may admit zero ---
+
+    /// `age // denominator` where `denominator` is a seeded Integer-sorted
+    /// SET `[0, 5]` — the `//`/`%` twin of the `/` corner above, checked
+    /// for the SAME hazard. `admitted_int_transfer_op`'s `int.floorDiv`
+    /// row only ever answers over TWO EXACT SINGLETONS
+    /// (`boundary/python.lean`'s `exactIntOf A, exactIntOf B` match); a
+    /// range divisor is not a singleton, so the kernel itself refuses
+    /// (`.unknown`) before any zero-admission question is even reached —
+    /// this row is sound by construction, with no adapter-side gate
+    /// needed. Pinned here so the finding is asserted, not merely
+    /// claimed.
+    #[test]
+    fn test_floor_div_by_a_set_that_may_admit_zero_declines_because_the_kernel_refuses_ranges() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let age = known_set(
+            make_refined_set(vec![integer(), at_least(0.0), refined_sets::refinement_forms::at_most(120.0)]),
+            None,
+            TrustProved,
+            SetKindTag::None,
+        );
+        let age = AbstractValue { kind_tag: Some(PrimitiveKind::Integer), ..age };
+        let denominator = AbstractValue {
+            kind_tag: Some(PrimitiveKind::Integer),
+            ..known_set(
+                make_refined_set(vec![integer(), at_least(0.0), refined_sets::refinement_forms::at_most(5.0)]),
+                None,
+                TrustProved,
+                SetKindTag::None,
+            )
+        };
+        let result = binary_arithmetic_value_with_kernel(Operator::FloorDiv, &age, &denominator, &kernel);
+        assert_eq!(
+            result.kind,
+            Kind::Unknown,
+            "a range divisor has no int.floorDiv row at all (exact singletons only) — declines: {result:?}"
+        );
+    }
+
+    /// The `%` twin: `age % denominator` over the SAME `[0, 5]` divisor
+    /// window. `rem.divisorSign` DOES have a general-interval branch
+    /// (unlike `int.floorDiv`), so this is the row that actually
+    /// exercises `theories/rem/divisor_sign.lean`'s own `divisorMayBeZero`
+    /// gate rather than merely a singleton-only refusal: the kernel
+    /// itself declines (`.unknown`) the moment the divisor's range
+    /// admits zero, so the adapter's decline here is inherited soundly
+    /// from the kernel, with no separate adapter-side gate needed for
+    /// `Mod` either.
+    #[test]
+    fn test_mod_by_a_set_that_may_admit_zero_declines_because_the_kernel_gates_the_interval_branch() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let age = known_set(
+            make_refined_set(vec![integer(), at_least(0.0), refined_sets::refinement_forms::at_most(120.0)]),
+            None,
+            TrustProved,
+            SetKindTag::None,
+        );
+        let age = AbstractValue { kind_tag: Some(PrimitiveKind::Integer), ..age };
+        let denominator = AbstractValue {
+            kind_tag: Some(PrimitiveKind::Integer),
+            ..known_set(
+                make_refined_set(vec![integer(), at_least(0.0), refined_sets::refinement_forms::at_most(5.0)]),
+                None,
+                TrustProved,
+                SetKindTag::None,
+            )
+        };
+        let result = binary_arithmetic_value_with_kernel(Operator::Mod, &age, &denominator, &kernel);
+        assert_eq!(
+            result.kind,
+            Kind::Unknown,
+            "rem.divisorSign's own divisorMayBeZero gate refuses a zero-admitting range: {result:?}"
+        );
+    }
+
+    // --- `provable_raise` at a SET-SHAPED divisor ---
+
+    /// A divisor set that is ALWAYS zero — a degenerate seeded window
+    /// that has narrowed to nothing but `{0.0}` — provably raises, the
+    /// SET-shaped twin of the scalar `1 / 0` row `test_provable_raise_
+    /// zero_division` already pins. `divisor_is_provably_always_zero`
+    /// is the check: the set is a nonempty subset of `{0.0}`.
+    #[test]
+    fn test_provable_raise_fires_for_a_set_divisor_that_is_always_zero() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let mut environment = empty_environment();
+        // a degenerate Set that carries nothing but the value zero — the
+        // shape a narrowed range can collapse to, distinct from the
+        // ordinary Kind::Values `single_numeric_value` already reads;
+        // built directly here to pin `divisor_is_provably_always_zero`
+        // itself rather than lean on a derived Sub row to produce it
+        let always_zero = AbstractValue {
+            kind_tag: Some(PrimitiveKind::Float),
+            ..known_set(make_refined_set(vec![one_of(&[0.0])]), None, TrustProved, SetKindTag::None)
+        };
+        environment.bind("difference", always_zero);
+        let parsed = parse_expression("1 / difference").expect("test source must parse");
+        let Expr::BinOp(binop) = parsed.into_expr() else { panic!("expected a BinOp") };
+        let found = binop_provable_raise(&binop, &environment, &kernel);
+        let Some((_, message)) = found else {
+            panic!("a divisor set that is always zero must provably raise");
+        };
+        assert!(message.contains("ZeroDivisionError"), "{message}");
+        assert!(message.contains("division by zero"), "{message}");
+    }
+
+    /// The negative row: a divisor set that only SOMETIMES admits zero
+    /// (`[0.0, 2.0]`) must NOT provably raise — most real executions
+    /// never hit the zero corner, so an unconditional raise finding here
+    /// would be a false positive. The VALUE question still declines
+    /// (pinned above); this only confirms the RAISE question stays
+    /// silent rather than overreaching.
+    #[test]
+    fn test_provable_raise_stays_silent_for_a_set_divisor_that_only_sometimes_admits_zero() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let mut environment = empty_environment();
+        let denominator = AbstractValue {
+            kind_tag: Some(PrimitiveKind::Float),
+            ..known_set(
+                make_refined_set(vec![at_least(0.0), refined_sets::refinement_forms::at_most(2.0)]),
+                None,
+                TrustProved,
+                SetKindTag::None,
+            )
+        };
+        environment.bind("denominator", denominator);
+        let parsed = parse_expression("1.0 / denominator").expect("test source must parse");
+        let Expr::BinOp(binop) = parsed.into_expr() else { panic!("expected a BinOp") };
+        assert!(
+            binop_provable_raise(&binop, &environment, &kernel).is_none(),
+            "a sometimes-zero divisor window must not fire an unconditional raise"
+        );
     }
 }
