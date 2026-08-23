@@ -1161,10 +1161,6 @@ fn known_number_sorted(value: f64, sort: PrimitiveKind) -> AbstractValue {
     known_values(vec![value], sort, TrustProved)
 }
 
-fn known_number(value: f64) -> AbstractValue {
-    known_number_sorted(value, PrimitiveKind::Number)
-}
-
 /// A Python `str`, as this domain's exact-string `AbstractValue` — one
 /// code point per `f64` (`string_models.rs`'s documented representation;
 /// repeated here rather than reaching into that module's private
@@ -2075,6 +2071,14 @@ mod tests {
     use ruff_python_parser::parse_module;
 
     use super::*;
+
+    /// Test-only convenience: a Number-sorted (unsplit-int/float) known
+    /// value — `known_number_sorted`'s own doc explains why production
+    /// code now always states the true CPython sort instead (`for age
+    /// in [10, 20, 30]` binds Integer, not this joined `Number` tag).
+    fn known_number(value: f64) -> AbstractValue {
+        known_number_sorted(value, PrimitiveKind::Number)
+    }
 
     fn loaded_kernel() -> Option<Arc<RefinedTSKernel>> {
         let path = dylib_path();

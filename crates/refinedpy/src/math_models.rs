@@ -41,6 +41,7 @@ use std::sync::Arc;
 use refined_domain::abstract_value::float_sorted_unknown;
 use refined_domain::abstract_value::known_set;
 use refined_domain::abstract_value::known_values;
+use refined_domain::abstract_value::nan_value;
 use refined_domain::abstract_value::AbstractValue;
 use refined_domain::abstract_value::Kind;
 use refined_domain::abstract_value::PrimitiveKind;
@@ -97,8 +98,16 @@ fn integer_result(value: f64) -> AbstractValue {
 /// Wraps an exact Float-sort result. `fabs`/`copysign` are covered by
 /// the module's blanket rule (library/math.html intro: "Except when
 /// explicitly noted otherwise, all return values are floats") — Float
-/// sort always, regardless of the operand's own sort.
+/// sort always, regardless of the operand's own sort. `fabs_call`'s own
+/// doc states `math.fabs(nan)` returns `nan` normally (a real value,
+/// not a raise), so this wrapper answers `nan_value()` — the domain's
+/// own NaN state (`refined_domain::abstract_value::nan_value`) — rather
+/// than let a bare NaN enter `known_values`, which no refined set
+/// admits (`refinement_forms::element`'s own construction-time refusal).
 fn float_result(value: f64) -> AbstractValue {
+    if value.is_nan() {
+        return nan_value();
+    }
     known_values(vec![value], PrimitiveKind::Float, TrustProved)
 }
 

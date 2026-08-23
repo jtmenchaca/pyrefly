@@ -18,6 +18,7 @@ use refined_domain::abstract_value::float_sorted_unknown;
 use refined_domain::abstract_value::kind_union_of;
 use refined_domain::abstract_value::known_set;
 use refined_domain::abstract_value::known_values;
+use refined_domain::abstract_value::nan_value;
 use refined_domain::abstract_value::null_value;
 use refined_domain::abstract_value::opaque_value;
 use refined_domain::abstract_value::unknown;
@@ -5276,12 +5277,16 @@ fn binary_arithmetic_pair(
         // (expressions §6.7). Division by zero raises ZeroDivisionError
         // rather than producing ±Infinity/NaN — this file has no
         // exception channel, so a zero divisor declines to unknown()
-        // rather than answering IEEE's ±Infinity.
+        // rather than answering IEEE's ±Infinity. A non-zero divisor can
+        // still divide two infinities (`inf / inf` is NaN, IEEE 754), so
+        // this routes through `arithmetic_result` — the same NaN screen
+        // every other Float-sorted row here already keeps — rather than
+        // build `known_values` directly.
         Operator::Div => {
             if right_value == 0.0 {
                 unknown()
             } else {
-                known_values(vec![left_value / right_value], PrimitiveKind::Float, TrustProved)
+                arithmetic_result(left_value / right_value, false)
             }
         }
         // `//` floors toward negative infinity for both int and float
@@ -6340,12 +6345,25 @@ fn string_shaped_set(value: &AbstractValue) -> Option<RefinedSet> {
 /// value stays exact), `Float` otherwise — the mixed-arithmetic widening
 /// rule (stdtypes' Numeric Types) and `/`'s own always-float override
 /// both route through this by passing `both_int = false`.
+///
+/// A Python `float` arithmetic result CAN be NaN (`inf - inf`, `inf *
+/// 0.0` — IEEE 754, arith.9's own doc), so the Float row answers
+/// `nan_value()` — the domain's own NaN state — rather than let a bare
+/// NaN enter `known_values`, which no refined set admits
+/// (`refinement_forms::element`'s own construction-time refusal). The
+/// int row cannot reach this: an int-sorted pair's NaN check already
+/// takes the `value.fract() != 0.0` decline above (`NaN.fract()` is
+/// itself NaN, which is `!= 0.0`), so no int-sorted NaN ever reaches
+/// `known_values` here.
 fn arithmetic_result(value: f64, both_int: bool) -> AbstractValue {
     if both_int {
         if value.fract() != 0.0 || value.abs() >= 2f64.powi(53) {
             return unknown();
         }
         return known_values(vec![value], PrimitiveKind::Integer, TrustProved);
+    }
+    if value.is_nan() {
+        return nan_value();
     }
     known_values(vec![value], PrimitiveKind::Float, TrustProved)
 }
@@ -7376,6 +7394,43 @@ mod tests {
         let result = binary_arithmetic_value(Operator::Add, &ten_int, &half_float);
         assert_eq!(result.values, vec![10.5]);
         assert_eq!(result.kind_tag, Some(PrimitiveKind::Float));
+    }
+
+    /// `inf - inf` — a Float `Sub` result that is NaN (IEEE 754). This
+    /// must answer the domain's own `Kind::NaN` state rather than panic:
+    /// `arithmetic_result`'s Float row screens for NaN and answers
+    /// `nan_value()` instead of building `known_values(vec![NaN], ..)`,
+    /// which `refinement_forms::element` would refuse at construction
+    /// the moment the value crossed into a `one_of` set
+    /// (showcase.py's `record_ratio(inf - inf)` row).
+    #[test]
+    fn test_binary_arithmetic_value_inf_minus_inf_is_the_nan_state_not_a_panic() {
+        let positive_infinity = known_values(vec![f64::INFINITY], PrimitiveKind::Float, TrustProved);
+        let result = binary_arithmetic_value(Operator::Sub, &positive_infinity, &positive_infinity);
+        assert_eq!(result.kind, Kind::NaN, "{result:?}");
+    }
+
+    /// `inf * 0` — a Float `Mult` result that is NaN (IEEE 754), the
+    /// second of showcase.py's three NaN-producing rows
+    /// (`record_ratio(inf * 0)`). Same non-panicking `Kind::NaN` answer
+    /// as the `Sub` row above.
+    #[test]
+    fn test_binary_arithmetic_value_inf_times_zero_is_the_nan_state_not_a_panic() {
+        let positive_infinity = known_values(vec![f64::INFINITY], PrimitiveKind::Float, TrustProved);
+        let zero = known_values(vec![0.0], PrimitiveKind::Float, TrustProved);
+        let result = binary_arithmetic_value(Operator::Mult, &positive_infinity, &zero);
+        assert_eq!(result.kind, Kind::NaN, "{result:?}");
+    }
+
+    /// `inf / inf` — a non-zero divisor (so the `ZeroDivisionError`
+    /// decline does not apply), still NaN by IEEE 754. Pins the `Div`
+    /// row's own route through `arithmetic_result` rather than a direct
+    /// `known_values` call.
+    #[test]
+    fn test_binary_arithmetic_value_inf_over_inf_is_the_nan_state_not_a_panic() {
+        let positive_infinity = known_values(vec![f64::INFINITY], PrimitiveKind::Float, TrustProved);
+        let result = binary_arithmetic_value(Operator::Div, &positive_infinity, &positive_infinity);
+        assert_eq!(result.kind, Kind::NaN, "{result:?}");
     }
 
     /// `{1.0, 2.0} * 2.0` — a MULTI-valued `Kind::Values` operand

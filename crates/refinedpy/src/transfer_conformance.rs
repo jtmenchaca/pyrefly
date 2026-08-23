@@ -46,7 +46,7 @@
 //! | G1 | `+` int/int overflowing 2^53 | 2^53, 1 | declines (`arithmetic_result`'s exactness gate) | `int.add` answers exactly (unbounded ints) | GAP |
 //! | G2 | `*` int/int overflowing 2^53 | 2^53, 2 | declines | `int.mul` answers exactly | GAP |
 //! | G3 | `/` by zero | 1, 0 | declines to `unknown()` (no exception channel) | refuses too | agree-on-silence |
-//! | G4 | `+` with a NaN operand | NaN, 1 | never constructed (`RefinedSet` refuses NaN at construction) | n/a | out of the value vocabulary |
+//! | G4 | `+` with a NaN operand | NaN, 1 | answers `Kind::NaN` (`nan_value()`) directly, never a `RefinedSet` | n/a — no `TransferQuestion` is ever posed | out of the wire's value vocabulary |
 //! | G5 | `/` by a degenerate SET-shaped zero divisor | 1.0, `{0.0}` (`Kind::Set`, not `Kind::Values`) | declines (`divisor_provably_excludes_zero` gate) | `binary64.div`'s `bothSingle` branch answers the determined pair `[-∞, +∞]` | GENUINE DIVERGENCE, correct |
 //!
 //! G5 is NOT a determination gap: it is deliberately excluded from
@@ -215,8 +215,15 @@ mod tests {
     /// The single value an adapter `AbstractValue` pins, when it pins
     /// exactly one, together with the Python sort it carries. `None`
     /// where the adapter declined (`unknown()` is `Kind::Unknown`, never
-    /// `Kind::Values`).
+    /// `Kind::Values`). `Kind::NaN` (`nan_value()` — the domain's own NaN
+    /// state, never a NaN spelled inside `Kind::Values`, since no refined
+    /// set admits NaN as an element) reads back as `f64::NAN` with no
+    /// sort — the same convention `kernel_exact_value` above already
+    /// keeps for the wire's `TransferAnswerKind::NaN`.
     fn adapter_exact_value(value: &AbstractValue) -> Option<(f64, Option<PrimitiveKind>)> {
+        if value.kind == Kind::NaN {
+            return Some((f64::NAN, None));
+        }
         if value.kind != Kind::Values {
             return None;
         }
@@ -770,7 +777,14 @@ mod tests {
     /// construction, which is the boundary ruling, not a gap. What CAN
     /// be checked is the adapter side alone: a NaN operand flows through
     /// the f64 arithmetic and answers NaN, which is IEEE-correct for
-    /// Python's own float NaN.
+    /// Python's own float NaN — spelled as `Kind::NaN` (`nan_value()`),
+    /// the domain's own NaN state, never as a `Kind::Values` list
+    /// carrying a bare NaN. A NaN INSIDE `Kind::Values` would panic the
+    /// moment anything crossed it into a set (`set_of_known`/
+    /// `entry_state_of`'s own `one_of` construction), so `arithmetic_result`
+    /// screens for it before ever building `known_values` — the same
+    /// screen this test's own `singleton(f64::NAN)` row proves is
+    /// necessary by showing the alternative panics.
     #[test]
     fn test_nan_operand_is_outside_the_wires_value_vocabulary() {
         // the wire refuses it at construction — a fact, recorded
@@ -780,11 +794,15 @@ mod tests {
             "NaN is not an element of ℝ̄; one_of must refuse it at construction"
         );
 
-        // the adapter's own concrete path still computes it, IEEE-style
+        // the adapter's own concrete path still computes it, IEEE-style,
+        // and answers the domain's Kind::NaN state — never a Kind::Values
+        // carrying NaN, which would panic the same way `singleton` above
+        // just did the moment it crossed into a set
         let adapter = binary_arithmetic_value(Operator::Add, &float_operand(f64::NAN), &float_operand(1.0));
-        let (value, sort) = adapter_exact_value(&adapter).expect("NaN + 1 answers a float value");
+        assert_eq!(adapter.kind, Kind::NaN, "NaN + 1 must answer the domain's NaN state: {adapter:?}");
+        let (value, sort) = adapter_exact_value(&adapter).expect("NaN + 1 reads back as the NaN value");
         assert!(value.is_nan(), "NaN + 1 is NaN under IEEE-754");
-        assert_eq!(sort, Some(PrimitiveKind::Float));
+        assert_eq!(sort, None, "Kind::NaN carries no sort tag (nan_value()'s own construction)");
     }
 
     /// The signed-zero corner, isolated: `-0.0 + -0.0` is `-0.0` and

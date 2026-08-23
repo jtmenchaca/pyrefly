@@ -20,7 +20,7 @@
 
 use std::sync::Arc;
 
-use refined_domain::abstract_value::{float_sorted_unknown, known_set, known_values, opaque_value, AbstractValue, Kind, PrimitiveKind, SetKindTag};
+use refined_domain::abstract_value::{float_sorted_unknown, known_set, known_values, nan_value, opaque_value, AbstractValue, Kind, PrimitiveKind, SetKindTag};
 use refined_domain::known_constructors::known_list;
 use refined_domain::trust_grades::{derived_trust_level, TrustSpec};
 use refined_kernel::kernel_interface::RefinedTSKernel;
@@ -49,10 +49,18 @@ fn single_known_numeric(argument: &AbstractValue) -> Option<(f64, PrimitiveKind)
 /// `abs(x)` on a single known numeric — library/functions.html#abs:
 /// "Return the absolute value of a number." Sort is preserved: an int
 /// argument's absolute value is an int, a float's a float — abs never
-/// changes the numeric sort of its single argument.
+/// changes the numeric sort of its single argument. `abs(float('nan'))`
+/// returns `nan` normally in CPython (no exception, the same posture
+/// `math.fabs`/`float_result` keep in math_models.rs), so a NaN operand
+/// answers the domain's own NaN state (`nan_value()`) rather than let a
+/// bare NaN enter `known_values`, which no refined set admits
+/// (`refinement_forms::element`'s own construction-time refusal).
 fn abs_call(arguments: &[AbstractValue]) -> Option<AbstractValue> {
     let [only] = arguments else { return None };
     let (value, sort) = single_known_numeric(only)?;
+    if value.is_nan() {
+        return Some(nan_value());
+    }
     let grade = derived_trust_level(TrustSpec, arguments);
     Some(known_values(vec![value.abs()], sort, grade))
 }
@@ -199,6 +207,15 @@ fn sum_call(arguments: &[AbstractValue]) -> Option<AbstractValue> {
         let (value, sort) = single_known_numeric_element(element)?;
         total += value;
         all_int = all_int && sort == PrimitiveKind::Integer;
+    }
+    // A running Float total can land on NaN even when no single addend
+    // was NaN (`inf + (-inf)`, IEEE 754) — the same accumulation-order
+    // hazard `arithmetic_result` in expressions.rs guards for `+`. The
+    // domain's own NaN state (`nan_value()`) is the answer, never a
+    // bare NaN inside `known_values`, which no refined set admits
+    // (`refinement_forms::element`'s own construction-time refusal).
+    if total.is_nan() {
+        return Some(nan_value());
     }
     let grade = derived_trust_level(TrustSpec, &[iterable.clone()]);
     let sort = if all_int { PrimitiveKind::Integer } else { PrimitiveKind::Float };
@@ -687,6 +704,16 @@ fn int_call(arguments: &[AbstractValue]) -> Option<AbstractValue> {
         return Some(known_values(vec![parsed], PrimitiveKind::Integer, grade));
     }
     let (value, _sort) = single_known_numeric(only)?;
+    // `int(float('nan'))` RAISES `ValueError: cannot convert float NaN
+    // to integer` in CPython (library/functions.html#int delegates to
+    // `__trunc__`, and `float.__trunc__` raises on a non-finite operand
+    // — the same domain gate `math_models.rs`'s `integral_domain_admits`
+    // documents for `math.floor`/`ceil`/`trunc`). No value is returned,
+    // so this declines outright rather than answer a value the real
+    // call never produces.
+    if !value.is_finite() {
+        return None;
+    }
     let grade = derived_trust_level(TrustSpec, arguments);
     Some(known_values(vec![value.trunc()], PrimitiveKind::Integer, grade))
 }
@@ -762,12 +789,25 @@ fn parse_base_ten_int_string(text: &str) -> Option<f64> {
 fn float_call(arguments: &[AbstractValue]) -> Option<AbstractValue> {
     let [only] = arguments else { return None };
     if let Some((value, _sort)) = single_known_numeric(only) {
+        if value.is_nan() {
+            return Some(nan_value());
+        }
         let grade = derived_trust_level(TrustSpec, arguments);
         return Some(known_values(vec![value], PrimitiveKind::Float, grade));
     }
     if only.kind == Kind::Values && only.kind_tag == Some(PrimitiveKind::String) {
         let text: String = only.values.iter().filter_map(|point| char::from_u32(*point as i64 as u32)).collect();
         if let Some(value) = parse_float_literal_string(&text) {
+            // `float("nan")` (and its case/sign variants — parsed by
+            // `parse_float_literal_string`'s own grammar reading)
+            // answers the domain's NaN state rather than let a bare NaN
+            // enter `known_values`, which no refined set admits
+            // (`refinement_forms::element`'s own construction-time
+            // refusal — the same guard `float_result` keeps in
+            // math_models.rs for `math.fabs(nan)`).
+            if value.is_nan() {
+                return Some(nan_value());
+            }
             let grade = derived_trust_level(TrustSpec, arguments);
             return Some(known_values(vec![value], PrimitiveKind::Float, grade));
         }
@@ -1211,11 +1251,14 @@ mod tests {
 
     #[test]
     fn float_of_nan_string_is_the_nan_admitting_value() {
+        // `float("nan")` answers the domain's own `Kind::NaN` state
+        // (`nan_value()`), never a `Kind::Values` list carrying a bare
+        // NaN — no refined set admits NaN as an element
+        // (`refinement_forms::element`'s own construction-time
+        // refusal), so `Kind::Values` must stay NaN-free too.
         let string_argument = string_value("nan");
         let got = builtin_call_result("float", &[string_argument]).expect("float(\"nan\") models");
-        assert_eq!(got.values.len(), 1);
-        assert!(got.values[0].is_nan(), "float(\"nan\") should answer NaN: {:?}", got.values);
-        assert_eq!(got.kind_tag, Some(PrimitiveKind::Float));
+        assert_eq!(got.kind, Kind::NaN, "float(\"nan\") should answer the domain's NaN state: {got:?}");
     }
 
     #[test]

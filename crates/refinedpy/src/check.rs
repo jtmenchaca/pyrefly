@@ -34,7 +34,6 @@ use refined_domain::abstract_value::{
 use refined_domain::known_constructors::{known_list, known_object};
 use refined_domain::trust_grades::{TrustProved, TrustSpec};
 use refined_kernel::kernel_interface::RefinedTSKernel;
-use refined_sets::format_for_diagnostics::format_for_diagnostics;
 use refined_sets::refinement_forms::{make_refined_set, on_one_tuple_layer, one_of, repeat_of, requires_integer, RefinedSet};
 use ruff_python_ast::{
     Alias, AtomicNodeIndex, CmpOp, ExceptHandler, ExceptHandlerExceptHandler, Expr, ExprAttribute, ExprSubscript,
@@ -7182,6 +7181,7 @@ fn collect_parameter_names(parameters: &Parameters, bound: &mut HashSet<String>)
 mod tests {
     use super::*;
     use refined_kernel::kernel_bridge::{dylib_path, kernel_artifacts_present, load_kernel};
+    use refined_sets::format_for_diagnostics::format_for_diagnostics;
 
     fn parsed(source: &str) -> ModModule {
         ruff_python_parser::parse_module(source)

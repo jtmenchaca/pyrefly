@@ -269,6 +269,39 @@ pub fn judge(
         let inner = value.inner.as_deref().expect("Kind::PossiblyUndefined always carries an inner value");
         return judge(inner, declared, kernel);
     }
+    // `Kind::NaN` (the arithmetic layer's own answer for `inf - inf`,
+    // `inf * 0`, `inf / inf`, `float("nan")`): a `RefinedSet` denotes a
+    // subset of the reals, and NaN is a member of no refined set (the
+    // boundary ruling `foreign_edge.rs::nan_freedom_obstacle` already
+    // states for the cross-language crossing) — so a provably-NaN value
+    // is provably outside EVERY declared refinement this table judges,
+    // unconditionally. No declared-side spelling admits NaN into a set:
+    // `PYREFLY-PYDANTIC-SURFACE.md`'s own row for `allow_inf_nan=True`
+    // (float/Decimal's pydantic default) reads "honesty: do not admit
+    // NaN into sets, no zod twin" — `typereading.rs` never compiles that
+    // knob into `DeclaredRefinement` at all, so this fires outright, the
+    // same unconditional way a dict/list fires against a scalar-ground
+    // declared set below, never gated on `declared.admits_none` or any
+    // other declared-side field. `Kind::PossiblyNaN` (the wrapper a
+    // narrowing has not yet stripped, e.g. an unguarded `x / y` where `y`
+    // may be zero) is not provably NaN — the PRESENT side may or may not
+    // sit inside the declared set — so it judges its inner value through
+    // this SAME seam recursively, exactly the way `Kind::PossiblyUndefined`
+    // above judges its own present side: the maybe-NaN carrier changes
+    // nothing about what the inner value states, and cannot itself be
+    // read as a fire (that would refuse every real value the wrapper may
+    // also hold) or a silence (that would let an actually-NaN run escape
+    // undetected).
+    if value.kind == Kind::NaN {
+        return Verdict::Fire(format!(
+            "{} — a value that is NaN is a member of no refined set",
+            refutation("NaN", &declared.spelling, &declared.set),
+        ));
+    }
+    if value.kind == Kind::PossiblyNaN {
+        let inner = value.inner.as_deref().expect("Kind::PossiblyNaN always carries an inner value");
+        return judge(inner, declared, kernel);
+    }
     if let Some(element) = &declared.element {
         if value.kind == Kind::Null {
             if declared.admits_none {
@@ -2344,5 +2377,60 @@ mod tests {
         let message = fire_message(judge(&value, &declared, &kernel));
         assert!(message.contains("1 element"), "{message}");
         assert!(message.contains("states 2 element"), "{message}");
+    }
+
+    // --- NaN against a declared numeric refinement: a RefinedSet denotes
+    // a subset of the reals, and NaN is a member of no refined set —
+    // `foreign_edge.rs::nan_freedom_obstacle` states the same boundary
+    // ruling for a cross-language crossing.
+
+    /// `x: Age = float("nan")` (or `inf - inf`, `inf * 0`, `inf / inf` —
+    /// every arithmetic-layer producer of `Kind::NaN`) fires against a
+    /// bounded float declaration: NaN escapes every declared refinement
+    /// unconditionally, never gated on `declared.admits_none` or any
+    /// other declared-side field, because no spelling admits NaN into a
+    /// set (`PYREFLY-PYDANTIC-SURFACE.md`'s `allow_inf_nan` row: "honesty:
+    /// do not admit NaN into sets" — `typereading.rs` never compiles that
+    /// knob into `DeclaredRefinement`).
+    #[test]
+    fn a_provably_nan_value_into_a_bounded_float_declaration_fires() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let declared = age_refinement();
+        let value = refined_domain::abstract_value::nan_value();
+        let message = fire_message(judge(&value, &declared, &kernel));
+        assert!(message.contains("NaN"), "{message}");
+        assert!(message.contains("'Age'"), "{message}");
+        assert!(message.contains("is a member of no refined set"), "{message}");
+    }
+
+    /// A `possibly_nan`-wrapped in-window value judges its PRESENT side
+    /// through this same seam, exactly the way `Kind::PossiblyUndefined`
+    /// judges its own present side: the wrapper is not PROVABLY NaN (the
+    /// runtime value may be the real, in-range inner value), so it is
+    /// neither fired as NaN nor waved through as silent on the wrapper
+    /// alone — an in-window inner value under the wrapper is silent,
+    /// because the inner value itself sits inside Age's bounds.
+    #[test]
+    fn a_possibly_nan_wrapped_in_window_value_judges_its_inner_value_and_is_silent() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let declared = age_refinement();
+        let inner = known_values(vec![30.0], PrimitiveKind::Integer, TrustProved);
+        let value = refined_domain::abstract_value::possibly_nan(inner);
+        assert_eq!(value.kind, refined_domain::abstract_value::Kind::PossiblyNaN);
+        assert!(matches!(judge(&value, &declared, &kernel), Verdict::Silent));
+    }
+
+    /// The mirror: a `possibly_nan`-wrapped OUT-OF-WINDOW inner value
+    /// fires on the inner value's own escape, not on the NaN wrapper —
+    /// the recursion judges exactly what the present side states.
+    #[test]
+    fn a_possibly_nan_wrapped_out_of_window_value_fires_on_the_inner_values_own_escape() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let declared = age_refinement();
+        let inner = known_values(vec![200.0], PrimitiveKind::Integer, TrustProved);
+        let value = refined_domain::abstract_value::possibly_nan(inner);
+        let message = fire_message(judge(&value, &declared, &kernel));
+        assert!(message.contains("'200'"), "{message}");
+        assert!(message.contains("'Age'"), "{message}");
     }
 }
