@@ -208,6 +208,13 @@ mod tests {
             let compiled_wire = wire_set(&compiled_set);
 
             assert_eq!(
+                row.admits_none, golden_absent,
+                "{}: the row declares admits_none = {} but the golden's own \"absent\" field says \
+                 {golden_absent} — the golden on disk is not the row this table describes",
+                row.golden_name, row.admits_none
+            );
+
+            assert_eq!(
                 compiled_wire, golden_set,
                 "{}: the Python compile's wire JSON diverged from the Go adapter's golden ({}). \
                  A mismatch here means one adapter's compile drifted — fix the compile, never \

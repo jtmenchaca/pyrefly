@@ -1905,7 +1905,7 @@ fn array_double_construction_value(
 /// reads its bare `datetime.date(...)` calls the same as before this
 /// table existed).
 #[derive(Default)]
-pub(crate) struct DatetimeImports {
+pub struct DatetimeImports {
     module_names: HashSet<String>,
     datetime_class_names: HashSet<String>,
     date_class_names: HashSet<String>,

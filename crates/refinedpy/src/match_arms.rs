@@ -1279,7 +1279,6 @@ pub fn match_taken_environment(
                     if let Some(name) = subject_name {
                         arm_env.bind(name, intersected.clone());
                     }
-                    any_arm_walked = true;
                     let survives = walk_arm_body(&case.body, &mut arm_env)?;
                     if survives {
                         survivors.push(arm_env);

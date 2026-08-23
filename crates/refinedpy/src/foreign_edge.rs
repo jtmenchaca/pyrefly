@@ -1357,7 +1357,7 @@ fn recognize_foreign_edge(
     let Stmt::Assign(assign) = &statements[index] else {
         return None;
     };
-    if let Some(result) = recognize_os_system(statements, index, assign, environment, kernel) {
+    if let Some(result) = recognize_os_system(statements, index, assign, environment) {
         return Some(result);
     }
     let [Expr::Name(target)] = assign.targets.as_slice() else {
@@ -1444,7 +1444,6 @@ fn recognize_os_system(
     index: usize,
     assign: &StmtAssign,
     environment: &Environment,
-    kernel: &Arc<RefinedTSKernel>,
 ) -> Option<Result<ForeignEdge, RecognitionDecline>> {
     let Expr::Call(call) = assign.value.as_ref() else {
         return None;
@@ -1516,7 +1515,7 @@ fn recognize_os_system(
             range: call_range,
         }));
     };
-    recognize_os_system_file_legs(statements, index, call_range, runner, &runner_and_script, infile, outfile, environment, kernel)
+    recognize_os_system_file_legs(statements, index, call_range, runner, &runner_and_script, infile, outfile)
 }
 
 /// `os.system("<runner> <script> < <infile> > <outfile>")` with both
@@ -1548,7 +1547,6 @@ fn recognize_os_system(
 /// shape — the ONE leg-judging path this row never duplicates.
 /// `result_name` carries no meaning for this shape (there is no bound
 /// name the return leg reads through) and stays empty.
-#[allow(clippy::too_many_arguments)]
 fn recognize_os_system_file_legs(
     statements: &[Stmt],
     index: usize,
@@ -1557,8 +1555,6 @@ fn recognize_os_system_file_legs(
     runner_and_script: &str,
     infile: &str,
     outfile: &str,
-    environment: &Environment,
-    kernel: &Arc<RefinedTSKernel>,
 ) -> Option<Result<ForeignEdge, RecognitionDecline>> {
     // the script itself must still be a `.ts` file this checker models a
     // fact for, exactly as every other recognized shape requires
@@ -1751,28 +1747,11 @@ fn tokenize_shell_command(command_text: &str) -> Option<Vec<&str>> {
 }
 
 /// Reads the leading `[runner(+word), script]` prefix off a tokenized
-/// shell command, answering the recognized "runner script" text and
-/// whatever tokens follow it. `None` when the leading tokens are not
-/// one of the four recognized runner rows at all.
-fn split_runner_and_script<'a>(tokens: &'a [&'a str]) -> Option<(String, &'a [&'a str])> {
-    match tokens {
-        [runner_word, script, rest @ ..] if is_recognized_runner_word(runner_word) => {
-            Some((format!("{runner_word} {script}"), rest))
-        }
-        [runner_word, second_word, script, rest @ ..] if is_recognized_two_word_runner(runner_word, second_word) => {
-            Some((format!("{runner_word} {second_word} {script}"), rest))
-        }
-        _ => None,
-    }
-}
-
-/// `split_runner_and_script`'s own twin, additionally naming which
-/// `Runner` the leading tokens spelled — `recognize_os_system_file_legs`'s
-/// own need: a real `ForeignEdge` carries a `Runner` tag (the same one
-/// `recognized_argv`'s `Expr::List` path already resolves), which the
-/// plain text-only reader above has no reason to compute for a decline
-/// sentence alone. Shares the identical leading-token match so the two
-/// readers can never disagree about which command is this shape.
+/// shell command, answering which `Runner` the leading tokens spelled
+/// (the same tag `recognized_argv`'s `Expr::List` path already
+/// resolves), the recognized "runner script" text, and whatever tokens
+/// follow it. `None` when the leading tokens are not one of the four
+/// recognized runner rows at all.
 fn split_runner_and_script_tagged<'a>(tokens: &'a [&'a str]) -> Option<(Runner, String, &'a [&'a str])> {
     match tokens {
         [runner_word, script, rest @ ..] if is_recognized_runner_word(runner_word) => {

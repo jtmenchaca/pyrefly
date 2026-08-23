@@ -1723,7 +1723,7 @@ fn walk_statement(
             // indistinguishable from any other unmodeled call.
             if instance_method_call_result(expr_stmt.value.as_ref(), context, environment).is_none()
                 && apply_call_effects(expr_stmt.value.as_ref(), context, environment, aug_assign_refinements, out).is_none()
-                && !walk_mutating_call_statement(expr_stmt.value.as_ref(), context, environment, out)
+                && !walk_mutating_call_statement(expr_stmt.value.as_ref(), context, environment)
             {
                 sink_value(expr_stmt.value.as_ref(), context, environment, aug_assign_refinements, out);
             }
@@ -5858,7 +5858,6 @@ fn walk_mutating_call_statement(
     expr: &Expr,
     context: &WalkContext,
     environment: &mut Environment,
-    out: &mut Vec<Finding>,
 ) -> bool {
     let Expr::Call(call) = expr else {
         return false;

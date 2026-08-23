@@ -3002,7 +3002,7 @@ mod tests {
             "for x in [200]:\n",
             "    bad: Unrelated = x\n",
         ));
-        let mut environment = Environment::new(HashSet::from(["x".to_owned(), "bad".to_owned()]));
+        let environment = Environment::new(HashSet::from(["x".to_owned(), "bad".to_owned()]));
         let declared = declared_age("total");
         let mut out = Vec::new();
         let answer = loop_final_environment(&stmt, &environment, &kernel, &declared, &mut out)

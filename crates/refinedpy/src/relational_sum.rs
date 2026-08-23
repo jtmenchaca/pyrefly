@@ -77,8 +77,6 @@
 //! unchanged — including `sum([...])` over a list comprehension, which
 //! the eager path already materializes.
 
-use std::sync::Arc;
-
 use refined_domain::abstract_value::known_set;
 use refined_domain::abstract_value::AbstractValue;
 use refined_domain::abstract_value::Kind;
