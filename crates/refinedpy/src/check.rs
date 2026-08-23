@@ -48,7 +48,7 @@ use crate::collection_models::{dict_get_result, dict_with_item, dict_without_ite
 use crate::cross_module::{module_surface, ModuleResolver, IMPORT_DEPTH_CAP};
 use crate::diagnostic_sentences::{empty_set, loop_accumulation_did_not_stabilize, unhonorable_annotation};
 use crate::env::Environment;
-use crate::expressions::{binary_arithmetic_value, evaluate_expression, fieldless_exception_value, possible_raise, provable_raise, register_retained_callables};
+use crate::expressions::{binary_arithmetic_value, evaluate_expression, fieldless_exception_value, math_from_imports, possible_raise, provable_raise, register_retained_callables};
 use crate::foreign_edge;
 use crate::function_table::{function_table, merged, FunctionTable};
 use crate::instances;
@@ -150,6 +150,28 @@ struct WalkContext<'a> {
     /// module_at`, `derived_return_values`) — ordinary walks never pay
     /// for recording they never asked for.
     evaluations_recorder: Option<Arc<Mutex<Vec<(TextRange, AbstractValue)>>>>,
+}
+
+/// `surface.bindings` (the cross-module resolver's own map) plus every
+/// `from math import inf/nan/pi/e/tau[ as x]` local name this module's
+/// own top-level statements bind (`expressions::math_from_imports`'s own
+/// doc) — `math` is a host module with no Python source for the
+/// cross-module resolver to read, so `surface.bindings` never carries a
+/// `math` name on its own; this is the one place those two tables meet.
+/// Math wins on a spelling collision (impossible in practice: the
+/// resolver only ever answers a name found in ANOTHER module's own
+/// source, and no module actually named `math` exists on disk here), the
+/// same "last write wins" merge direction as every other table join in
+/// this file. `WalkContext.module_bindings` is what `bind_or_forget_
+/// imported_name`'s existing per-import-statement walk and `module_
+/// scope_environment`'s existing seed both already read — so a module-
+/// level `from math import inf` becomes readable through the SAME
+/// mechanism a `from helper import forty` cross-module import already
+/// uses, with no new `Environment` field.
+fn module_bindings_with_math_imports(surface_bindings: HashMap<String, AbstractValue>, module: &ModModule) -> HashMap<String, AbstractValue> {
+    let mut bindings = surface_bindings;
+    bindings.extend(math_from_imports(module));
+    bindings
 }
 
 /// Every finding in one module, resolving no imports — the LSP seam's
@@ -263,7 +285,7 @@ pub fn findings_for_module_at(
         functions,
         classes: Arc::new(classes),
         datetime_imports: Arc::new(crate::expressions::datetime_imports(module)),
-        module_bindings: surface.bindings,
+        module_bindings: module_bindings_with_math_imports(surface.bindings, module),
         module_callable_returns,
         strict_int_aliases: &strict_int_aliases,
         typed_dicts,
@@ -345,7 +367,7 @@ pub fn refined_set_at_position(
         functions,
         classes: Arc::new(classes),
         datetime_imports: Arc::new(crate::expressions::datetime_imports(module)),
-        module_bindings: surface.bindings,
+        module_bindings: module_bindings_with_math_imports(surface.bindings, module),
         module_callable_returns,
         strict_int_aliases: &strict_int_aliases,
         typed_dicts,
@@ -1713,15 +1735,28 @@ fn walk_statement(
             // instances::method_call_result, discarding the returned
             // value (an expression-statement's own value is never read,
             // matching sink_value's other callers' discard convention at
-            // Stmt::Expr). Declining (None) falls to the CALLEE-EFFECTS
-            // CHANNEL (a bare-Name same-module call whose body writes an
-            // enclosing name — `apply_call_effects`), then the collection
-            // mutated_receiver path, then to sink_value's plain read —
-            // exactly the ordering already in place, with the effects
-            // channel inserted where a bare same-module call is otherwise
-            // indistinguishable from any other unmodeled call.
+            // Stmt::Expr). Declining (None) falls to the collection
+            // `mutated_receiver` path, then to `sink_value` — which owns
+            // the CALLEE-EFFECTS CHANNEL itself (`apply_call_effects`, a
+            // bare-Name same-module call whose body writes an enclosing
+            // name) alongside every other call-shaped check `sink_value`
+            // makes (provable/possible raises, construction, callable-
+            // variable calls, manifest-argument judging, and same-module
+            // call-argument judging against the callee's declared
+            // parameters). `apply_call_effects` used to be tried HERE as
+            // its own gate, `Option`-short-circuiting `sink_value`
+            // entirely on `Some(())` — which that function's own doc
+            // states it answers for EVERY same-module def call that
+            // resolves, whether or not it reports any actual effect ("a
+            // same-module def with an empty effect list still matched").
+            // That meant `sink_value` — and every fire only it can
+            // produce, `same_module_call_argument_fires` chief among
+            // them — never ran for the ordinary, effect-free case, which
+            // is most same-module calls. `sink_value` is the one place
+            // `apply_call_effects` runs now, so every check it makes
+            // applies uniformly regardless of whether the callee also
+            // happens to write an enclosing name.
             if instance_method_call_result(expr_stmt.value.as_ref(), context, environment).is_none()
-                && apply_call_effects(expr_stmt.value.as_ref(), context, environment, aug_assign_refinements, out).is_none()
                 && !walk_mutating_call_statement(expr_stmt.value.as_ref(), context, environment)
             {
                 sink_value(expr_stmt.value.as_ref(), context, environment, aug_assign_refinements, out);
@@ -2294,7 +2329,7 @@ pub fn derived_return_values_at(
         functions,
         classes: Arc::new(classes),
         datetime_imports: Arc::new(crate::expressions::datetime_imports(module)),
-        module_bindings: surface.bindings,
+        module_bindings: module_bindings_with_math_imports(surface.bindings, module),
         module_callable_returns,
         strict_int_aliases: &strict_int_aliases,
         typed_dicts,
@@ -5514,6 +5549,7 @@ fn sink_value(
     // at whichever declared sink judges it, through
     // `name_unmodeled_call_sentence`'s own manifest-aware naming step.
     manifest_call_fires(expr, context, environment, out);
+    same_module_call_argument_fires(expr, context, environment, out);
     apply_call_effects(expr, context, environment, aug_assign_refinements, out);
     Some(evaluate_expression(expr, environment, context.kernel))
 }
@@ -5573,6 +5609,99 @@ fn manifest_call_fires(expr: &Expr, context: &WalkContext, environment: &Environ
         crate::binding_manifest::judge_manifest_call(module_name.id.as_str(), entry, &positional, &keyword, context.kernel);
     for (range, message) in outcome.fires {
         out.push(Finding { range, code: "RTS7001", message });
+    }
+}
+
+/// A SAME-MODULE CALL's own written arguments, judged against the
+/// callee's OWN declared parameter refinements — `record_ratio(float
+/// ("nan"))`'s own shape, where `record_ratio(r: Ratio)` states a
+/// refined sink at the parameter position and the caller's argument
+/// must cross into it. Mirrors `manifest_call_fires`'s law for a
+/// foreign manifest entry, at the same sink: judged HERE, at the call
+/// expression's own site, because the call's VALUE (what
+/// `evaluate_expression`'s same-module-call path computes from the
+/// callee's body) is an entirely separate question from whether the
+/// PASSED argument itself crosses into the parameter's declared set —
+/// `bind_parameters`/`positional_arguments_for_def` bind and evaluate
+/// argument values only to replay the callee's body for its return
+/// value, and judge nothing.
+///
+/// Only a WRITTEN, MATCHED argument's own sort is judged — an arity
+/// mismatch, a starred/spread argument, or a keyword naming no
+/// parameter contributes no fire here (the same restraint
+/// `judge_manifest_call`'s own doc states for its identical shape). A
+/// parameter with no annotation this table can read (`declared_
+/// refinement` answers `None`) is skipped; nothing is judged against
+/// an unrefined slot. `Verdict::Undetermined` is dropped — there is no
+/// body-level blocker for a call's own argument crossing, the same
+/// "verdict's fires only" restraint `judge_construction`'s own call
+/// site takes for a construction's own arguments.
+fn same_module_call_argument_fires(expr: &Expr, context: &WalkContext, environment: &Environment, out: &mut Vec<Finding>) {
+    let Expr::Call(call) = expr else {
+        return;
+    };
+    let Expr::Name(callee_name) = call.func.as_ref() else {
+        return;
+    };
+    // A real value bound to the same name shadows the def — the same
+    // narrower re-check `apply_call_effects` takes for its own
+    // identical gate, private to `expressions.rs`.
+    if environment.read(callee_name.id.as_str()).is_some() {
+        return;
+    }
+    let Some(functions) = environment.functions() else {
+        return;
+    };
+    let Some(def) = functions.def(callee_name.id.as_str()) else {
+        return;
+    };
+    if call.arguments.args.iter().any(|arg| matches!(arg, Expr::Starred(_))) {
+        return;
+    }
+    if call.arguments.keywords.iter().any(|kw| kw.arg.is_none()) {
+        return;
+    }
+    let positional_parameters: Vec<&ruff_python_ast::ParameterWithDefault> =
+        def.parameters.posonlyargs.iter().chain(def.parameters.args.iter()).collect();
+    for (parameter, arg) in positional_parameters.iter().zip(call.arguments.args.iter()) {
+        judge_one_call_argument(parameter, arg, context, environment, out);
+    }
+    for keyword in &call.arguments.keywords {
+        let Some(arg_name) = keyword.arg.as_ref() else {
+            continue;
+        };
+        let named = positional_parameters
+            .iter()
+            .copied()
+            .chain(def.parameters.kwonlyargs.iter())
+            .find(|parameter| parameter.parameter.name.id.as_str() == arg_name.as_str());
+        if let Some(parameter) = named {
+            judge_one_call_argument(parameter, &keyword.value, context, environment, out);
+        }
+    }
+}
+
+/// One call argument's own crossing judge against its matched
+/// parameter's declared refinement — `same_module_call_argument_
+/// fires`'s per-position body, factored out so the positional and
+/// keyword loops share it instead of repeating the annotation read
+/// and `judge` call.
+fn judge_one_call_argument(
+    parameter: &ruff_python_ast::ParameterWithDefault,
+    argument: &Expr,
+    context: &WalkContext,
+    environment: &Environment,
+    out: &mut Vec<Finding>,
+) {
+    let Some(annotation) = parameter.parameter.annotation.as_deref() else {
+        return;
+    };
+    let Some(declared) = declared_refinement(annotation, context.aliases, context.imports, environment) else {
+        return;
+    };
+    let value = evaluate_expression(argument, environment, context.kernel);
+    if let Verdict::Fire(message) = judge(&value, &declared, context.kernel) {
+        out.push(Finding { range: argument.range(), code: "RTS7001", message });
     }
 }
 
@@ -7658,6 +7787,107 @@ mod tests {
         );
         assert_eq!(findings[0].code, "RTS7001");
         assert!(findings[0].message.contains("'200'"), "{}", findings[0].message);
+    }
+
+    /// `record_ratio(float("nan"))` — showcase.py's own designated NaN
+    /// row shape, mirrored: a same-module call whose WRITTEN argument is
+    /// a NaN-producing expression, passed directly (no intervening named
+    /// binding) into a declared, refined parameter. Before `same_module_
+    /// call_argument_fires` existed, nothing judged a call's own argument
+    /// against the callee's declared parameter set — `sink_value`'s
+    /// same-module-call fallthrough only ever computed the call's RETURN
+    /// value (`evaluate_expression`), never judging what flowed IN. NaN
+    /// is a member of no refined set (`assignability.rs`'s `Kind::NaN`
+    /// arm), so this must fire at the argument's own position.
+    #[test]
+    fn a_nan_call_argument_fires_against_the_callees_declared_parameter() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Ratio = Annotated[float, Field(ge=0, le=1)]\n",
+            "def record_ratio(r: Ratio) -> float:\n",
+            "    return r\n",
+            "record_ratio(float(\"nan\"))\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        assert_eq!(
+            findings.len(),
+            1,
+            "want the fire for float(\"nan\") at the call argument: {:?}",
+            findings.iter().map(|f| (&f.code, &f.message)).collect::<Vec<_>>()
+        );
+        assert_eq!(findings[0].code, "RTS7001");
+        assert!(findings[0].message.contains("NaN"), "{}", findings[0].message);
+    }
+
+    /// The same call-argument shape, for `inf - inf` and `inf * 0` — the
+    /// two other arithmetic-layer producers of `Kind::NaN`
+    /// (`expressions.rs::arithmetic_result`), spelled `float("inf")`
+    /// here; the bare `inf`/`math.inf` spellings also bind the concrete
+    /// `f64::INFINITY` now (`math_models::math_constant_value` and
+    /// `expressions.rs::math_from_imports`), with their own pinned
+    /// tests beside those readers. `float("inf")` likewise
+    /// parse to the exact `f64::INFINITY` value (`builtin_models::
+    /// float_call`'s own grammar reading), so it is the one spelling
+    /// that actually reaches `arithmetic_result`'s concrete-f64 NaN
+    /// check through the live evaluator, matching showcase.py's own
+    /// `inf - inf`/`inf * 0` rows' ARITHMETIC shape exactly, just not
+    /// their exact `inf`-name spelling. Both must fire at their own
+    /// call argument, one finding per statement.
+    #[test]
+    fn inf_arithmetic_nan_call_arguments_fire_against_the_callees_declared_parameter() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Ratio = Annotated[float, Field(ge=0, le=1)]\n",
+            "def record_ratio(r: Ratio) -> float:\n",
+            "    return r\n",
+            "record_ratio(float(\"inf\") - float(\"inf\"))\n",
+            "record_ratio(float(\"inf\") * 0)\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        assert_eq!(
+            findings.len(),
+            2,
+            "want one fire per NaN call argument (inf - inf, inf * 0): {:?}",
+            findings.iter().map(|f| (&f.code, &f.message)).collect::<Vec<_>>()
+        );
+        assert!(findings.iter().all(|f| f.code == "RTS7001"));
+        assert!(
+            findings.iter().all(|f| f.message.contains("NaN")),
+            "{:?}",
+            findings.iter().map(|f| (&f.code, &f.message)).collect::<Vec<_>>()
+        );
+    }
+
+    /// A non-NaN call-argument fire — `record_ratio(2.0)`, an ordinary
+    /// out-of-set float — pinning that `same_module_call_argument_fires`
+    /// is a GENERAL call-argument judging site, not a NaN-only special
+    /// case: the same discard that lost every NaN row would equally lose
+    /// this ordinary containment fire, since both reach the sink through
+    /// the identical unjudged fallthrough.
+    #[test]
+    fn an_ordinary_out_of_set_call_argument_fires_against_the_callees_declared_parameter() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Ratio = Annotated[float, Field(ge=0, le=1)]\n",
+            "def record_ratio(r: Ratio) -> float:\n",
+            "    return r\n",
+            "record_ratio(2.0)\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        assert_eq!(
+            findings.len(),
+            1,
+            "want the fire for 2.0 at the call argument: {:?}",
+            findings.iter().map(|f| (&f.code, &f.message)).collect::<Vec<_>>()
+        );
+        assert_eq!(findings[0].code, "RTS7001");
+        assert!(findings[0].message.contains("'2.0'") || findings[0].message.contains("'2'"), "{}", findings[0].message);
     }
 
     /// A module with neither a `type` alias nor a recognized `Annotated`

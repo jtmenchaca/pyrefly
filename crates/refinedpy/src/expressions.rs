@@ -1887,6 +1887,53 @@ fn array_double_construction_value(
     Some(bytes_models::array_double_literal_value(&elements))
 }
 
+/// Every `from math import inf/nan/pi/e/tau[ as x]` local name, bound to
+/// the SAME CONCRETE VALUE `math_models::math_constant_value` answers
+/// for the attribute spelling — read once from the module's own
+/// top-level `from … import …` statements, the same "read the module's
+/// import statements once, resolve by canonical identity" shape
+/// `datetime_imports` below already keeps for the `datetime` module
+/// family. `import math` (the plain module import, no `from`) needs no
+/// entry here: `math.inf`/`math.pi`/… already resolve through the
+/// ATTRIBUTE arm (`evaluate_attribute`'s own `math_constant_value` call)
+/// regardless of this table, since that arm reads the literal `math`
+/// module name directly. Only `from math import <name>` strips the
+/// `math.` qualifier entirely, leaving a bare `Name` node with no module
+/// to route through — this table is what lets `evaluate_expression`'s
+/// bare-name arm resolve `inf`/`nan`/`pi`/`e`/`tau` after that import,
+/// the same gap `bind_or_forget_imported_name` closes for `datetime`'s
+/// own from-imports via `context.module_bindings`. Built once per module
+/// (`math_from_imports`) and merged into that same `module_bindings`
+/// table at `check.rs`'s three `WalkContext` construction sites, so a
+/// module-level import statement, `bind_or_forget_imported_name`'s
+/// existing walk, and `module_scope_environment`'s existing seed all
+/// pick this up with no new `Environment` field or thread of their own.
+/// A rebound name (`inf = 200`) still shadows correctly: `module_
+/// bindings` only seeds where `environment.alias_is_visible` allows, the
+/// same rule every other module-level binding already obeys.
+pub(crate) fn math_from_imports(module: &ModModule) -> HashMap<String, AbstractValue> {
+    let mut table = HashMap::new();
+    for stmt in module.body.iter() {
+        let Stmt::ImportFrom(import) = stmt else {
+            continue;
+        };
+        let Some(source) = import.module.as_ref() else {
+            continue;
+        };
+        if source.id.as_str() != "math" || import.level != 0 {
+            continue;
+        }
+        for alias in &import.names {
+            let Some(value) = math_models::math_constant_value(alias.name.id.as_str()) else {
+                continue;
+            };
+            let local = alias.asname.as_ref().unwrap_or(&alias.name);
+            table.insert(local.id.as_str().to_owned(), value);
+        }
+    }
+    table
+}
+
 /// Which datetime construct a local name means, read once from the
 /// module's own `import`/`from … import …` statements — the same
 /// "one import table, read once" mechanism `surface::SurfaceImports`
@@ -4599,11 +4646,11 @@ fn evaluate_attribute_read(
             return opaque_value("a calendar year");
         }
     }
-    // `math.pi`/`math.e`/`math.tau`/`math.inf` — an ATTRIBUTE READ on
-    // the `math` module name (not shadowed by a local binding), routed
-    // through `math_models::math_constant_value` (library/math.rst,
-    // "Constants" — see that function's own doc for the sort-only
-    // Float answer and the `math.nan` exclusion).
+    // `math.pi`/`math.e`/`math.tau`/`math.inf`/`math.nan` — an ATTRIBUTE
+    // READ on the `math` module name (not shadowed by a local binding),
+    // routed through `math_models::math_constant_value` (library/
+    // math.rst, "Constants" — see that function's own doc for each
+    // constant's exact concrete value).
     if let Expr::Name(module_name) = attribute.value.as_ref() {
         if module_name.id.as_str() == "math" && environment.read("math").is_none() {
             if let Some(value) = math_models::math_constant_value(attribute.attr.as_str()) {
@@ -8089,17 +8136,109 @@ mod tests {
         assert_eq!(value.kind_tag, Some(PrimitiveKind::Integer));
     }
 
-    /// `math.pi` is an attribute read, not a call — the sort-only Float
-    /// set `math_models::math_constant_value` answers (library/math.rst,
-    /// "Constants").
+    /// `math.pi` is an attribute read, not a call — the exact
+    /// `std::f64::consts::PI` value `math_models::math_constant_value`
+    /// answers (library/math.rst, "Constants").
     #[test]
     fn test_math_pi_attribute_read() {
         let Some(kernel) = loaded_kernel() else { return };
         let parsed = parse_expression("math.pi").expect("test source must parse");
         let environment = empty_environment();
         let value = evaluate_expression(&parsed.into_expr(), &environment, &kernel);
-        assert_eq!(value.kind, Kind::Set);
+        assert_eq!(value.kind, Kind::Values);
+        assert_eq!(value.values, vec![std::f64::consts::PI]);
         assert_eq!(value.kind_tag, Some(PrimitiveKind::Float));
+    }
+
+    /// One module's `from math import ...` table, seeded onto a fresh
+    /// environment the SAME WAY `check.rs::module_bindings_with_math_
+    /// imports` seeds `context.module_bindings` for a real walk — the
+    /// harness every from-import pin below shares.
+    fn environment_with_math_imports(module: &ruff_python_ast::ModModule) -> Environment {
+        let mut environment = empty_environment();
+        for (name, value) in math_from_imports(module) {
+            environment.bind(&name, value);
+        }
+        environment
+    }
+
+    /// `from math import inf` then `inf - inf` — IEEE 754's own NaN
+    /// production (arith.9's doc, cited by `arithmetic_result`), reached
+    /// only once the bare name `inf` resolves to the CONCRETE
+    /// `f64::INFINITY` value a from-import now carries, matching
+    /// `math.inf`'s own attribute spelling.
+    #[test]
+    fn test_from_import_inf_minus_inf_is_nan() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = ruff_python_parser::parse_module("from math import inf\n").expect("test module parses").into_syntax();
+        let environment = environment_with_math_imports(&module);
+        let parsed = parse_expression("inf - inf").expect("test source must parse");
+        let value = evaluate_expression(&parsed.into_expr(), &environment, &kernel);
+        assert_eq!(value.kind, Kind::NaN);
+    }
+
+    /// `from math import inf` then `inf * 0` — the other IEEE 754 NaN
+    /// producer arith.9 names alongside `inf - inf`.
+    #[test]
+    fn test_from_import_inf_times_zero_is_nan() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = ruff_python_parser::parse_module("from math import inf\n").expect("test module parses").into_syntax();
+        let environment = environment_with_math_imports(&module);
+        let parsed = parse_expression("inf * 0").expect("test source must parse");
+        let value = evaluate_expression(&parsed.into_expr(), &environment, &kernel);
+        assert_eq!(value.kind, Kind::NaN);
+    }
+
+    /// `math.inf - math.inf` — the ATTRIBUTE spelling, same NaN result as
+    /// the from-import spelling above: both routes resolve to the same
+    /// concrete `f64::INFINITY` value.
+    #[test]
+    fn test_math_inf_attribute_minus_math_inf_is_nan() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let environment = empty_environment();
+        let parsed = parse_expression("math.inf - math.inf").expect("test source must parse");
+        let value = evaluate_expression(&parsed.into_expr(), &environment, &kernel);
+        assert_eq!(value.kind, Kind::NaN);
+    }
+
+    /// `math.inf * 0` — the attribute spelling's own `inf * 0` row.
+    #[test]
+    fn test_math_inf_attribute_times_zero_is_nan() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let environment = empty_environment();
+        let parsed = parse_expression("math.inf * 0").expect("test source must parse");
+        let value = evaluate_expression(&parsed.into_expr(), &environment, &kernel);
+        assert_eq!(value.kind, Kind::NaN);
+    }
+
+    /// `from math import nan` — the from-import spelling of the NaN
+    /// constant itself, matching `math.nan`'s own attribute spelling
+    /// (`math_models::math_constant_value`'s own doc: `Kind::NaN`, never
+    /// a value inside `known_values`).
+    #[test]
+    fn test_from_import_nan_is_nan_kind() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = ruff_python_parser::parse_module("from math import nan\n").expect("test module parses").into_syntax();
+        let environment = environment_with_math_imports(&module);
+        let parsed = parse_expression("nan").expect("test source must parse");
+        let value = evaluate_expression(&parsed.into_expr(), &environment, &kernel);
+        assert_eq!(value.kind, Kind::NaN);
+    }
+
+    /// A rename (`from math import inf as infinity`) binds the LOCAL
+    /// name, not the original `inf` spelling — the same `asname` rule
+    /// `datetime_imports` already keeps for its own from-import shapes.
+    #[test]
+    fn test_from_import_inf_as_rename_binds_the_local_name() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = ruff_python_parser::parse_module("from math import inf as infinity\n")
+            .expect("test module parses")
+            .into_syntax();
+        let environment = environment_with_math_imports(&module);
+        let parsed = parse_expression("infinity").expect("test source must parse");
+        let value = evaluate_expression(&parsed.into_expr(), &environment, &kernel);
+        assert_eq!(value.kind, Kind::Values);
+        assert_eq!(value.values, vec![f64::INFINITY]);
     }
 
     #[test]

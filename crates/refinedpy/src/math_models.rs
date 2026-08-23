@@ -1160,22 +1160,39 @@ fn approximated_family_result(function: &str, arguments: &[AbstractValue]) -> Op
     Some(float_sorted_unknown())
 }
 
-/// `math.pi` / `math.e` / `math.tau` / `math.inf` — ATTRIBUTE READS, not
-/// calls (library/math.rst, "Constants" section: `data:: pi`/`data:: e`/
-/// `data:: tau`/`data:: inf`, each "to available precision" or, for
-/// `inf`, "Equivalent to the output of `float('inf')`"). None of the
-/// four is a whole number, so a Float-sorted sort-only answer
-/// (`float_sorted_unknown()`) is enough for `assignability`'s int-sort
-/// fire law to refuse an int-sorted sink — the exact digit sequence is
-/// never claimed. `math.nan` is deliberately excluded: NaN fails every
-/// ordering comparison, which would make the sort-only Float set answer
-/// UNSOUND for a sink that compares by value (a NaN is never `<=` any
-/// bound), so this row stays undecided rather than answer a set that
-/// does not actually contain the value. `None` for any other attribute
-/// name.
+/// `math.pi` / `math.e` / `math.tau` / `math.inf` / `math.nan` —
+/// ATTRIBUTE READS, not calls (library/math.rst, "Constants" section:
+/// `data:: pi`/`data:: e`/`data:: tau`/`data:: inf`/`data:: nan`, each
+/// "to available precision" or, for `inf`/`nan`, "Equivalent to the
+/// output of `float('inf')`" / `float('nan')`. Each answers the EXACT
+/// CPython value, not a sort-only approximation:
+///
+/// - `pi`/`e`/`tau`: `std::f64::consts::PI`/`E`/`TAU` ARE CPython's own
+///   values — both are the nearest binary64 double to the mathematical
+///   constant, and IEEE 754 binary64 has exactly one nearest
+///   representable value for a given real number, so Rust's constant
+///   and CPython's libm-derived constant are the same bit pattern.
+/// - `inf`: `f64::INFINITY`, library/math.rst's own "Equivalent to the
+///   output of `float('inf')`." `+inf` is a legal `RefinedSet` element
+///   (`refinement_forms.rs`'s `element` helper panics ONLY on NaN, never
+///   on an infinite operand — `one_of`/`at_least`/`above` all route
+///   through it unchanged), matching the Lean kernel's own admission of
+///   `+-infinity` as elements of R-bar (`refinement_forms.go`'s twin
+///   comment) — so `known_values` is the ordinary, unmodified route for
+///   this constant, the same route every other exact numeric constant
+///   in this file takes.
+/// - `nan`: `nan_value()` — the domain's own `Kind::NaN` carrier, NEVER
+///   a value inside `known_values`: `element`'s construction-time panic
+///   refuses NaN for every refined-set form, so a `one_of`/singleton
+///   containing NaN cannot be built at all. This is the same NaN
+///   carrier `float_result` reaches for elsewhere in this file.
 pub fn math_constant_value(name: &str) -> Option<AbstractValue> {
     match name {
-        "pi" | "e" | "tau" | "inf" => Some(float_sorted_unknown()),
+        "pi" => Some(known_values(vec![std::f64::consts::PI], PrimitiveKind::Float, TrustProved)),
+        "e" => Some(known_values(vec![std::f64::consts::E], PrimitiveKind::Float, TrustProved)),
+        "tau" => Some(known_values(vec![std::f64::consts::TAU], PrimitiveKind::Float, TrustProved)),
+        "inf" => Some(known_values(vec![f64::INFINITY], PrimitiveKind::Float, TrustProved)),
+        "nan" => Some(nan_value()),
         _ => None,
     }
 }
@@ -1261,8 +1278,8 @@ pub fn random_call_result(function: &str, arguments: &[AbstractValue]) -> Option
 /// `modf`, `dist`, `prod` — every one of them falls through to
 /// `None`. Constants (`math.pi`, `math.e`, `math.tau`, `math.inf`,
 /// `math.nan`) are attribute reads, not calls — out of scope for this
-/// function entirely; see `math_constant_value` for those (`math.nan`
-/// still excluded there, see its own doc).
+/// function entirely; see `math_constant_value` for those (each answers
+/// its exact CPython value, see its own doc).
 pub fn math_call_result(
     function: &str,
     arguments: &[AbstractValue],
@@ -1773,29 +1790,37 @@ mod tests {
         assert_eq!(result, None, "atan2's kernel arm does not yet serve x <= 0 — must decline, not guess");
     }
 
-    /// `math.pi` is a sort-only Float set — never an exact digit
-    /// sequence, and never a whole number (so an int-sorted sink still
-    /// fires against it).
+    /// `math.pi` answers the exact `std::f64::consts::PI` value — the
+    /// nearest binary64 double to the mathematical constant, and
+    /// CPython's own value (library/math.rst's "Constants" section).
     #[test]
-    fn test_math_pi_is_sort_only_float() {
-        let result = math_constant_value("pi").expect("math.pi should answer sort-only");
-        assert_eq!(result.kind, Kind::Set);
+    fn test_math_pi_is_exact_value() {
+        let result = math_constant_value("pi").expect("math.pi should answer a value");
+        assert_eq!(result.kind, Kind::Values);
+        assert_eq!(result.values, vec![std::f64::consts::PI]);
         assert_eq!(result.kind_tag, Some(PrimitiveKind::Float));
     }
 
+    /// `math.e`/`math.tau`/`math.inf` each answer their exact concrete
+    /// value, not a sort-only approximation.
     #[test]
-    fn test_math_e_tau_inf_are_sort_only_float() {
-        for name in ["e", "tau", "inf"] {
-            let result = math_constant_value(name).unwrap_or_else(|| panic!("math.{name} should answer sort-only"));
-            assert_eq!(result.kind, Kind::Set);
+    fn test_math_e_tau_inf_are_exact_values() {
+        let expectations = [("e", std::f64::consts::E), ("tau", std::f64::consts::TAU), ("inf", f64::INFINITY)];
+        for (name, expected) in expectations {
+            let result = math_constant_value(name).unwrap_or_else(|| panic!("math.{name} should answer a value"));
+            assert_eq!(result.kind, Kind::Values);
+            assert_eq!(result.values, vec![expected]);
+            assert_eq!(result.kind_tag, Some(PrimitiveKind::Float));
         }
     }
 
-    /// `math.nan` is excluded: a NaN value would make the sort-only
-    /// Float set claim unsound for a value-comparing sink.
+    /// `math.nan` answers the domain's own NaN carrier (`Kind::NaN`),
+    /// never a value inside `known_values` — `element`'s construction-time
+    /// panic refuses NaN for every refined-set form.
     #[test]
-    fn test_math_nan_declines() {
-        assert_eq!(math_constant_value("nan"), None);
+    fn test_math_nan_is_nan_kind() {
+        let result = math_constant_value("nan").expect("math.nan should answer a value");
+        assert_eq!(result.kind, Kind::NaN);
     }
 
     #[test]
