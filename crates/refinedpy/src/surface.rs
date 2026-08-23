@@ -172,6 +172,33 @@ pub fn compile_aliases(module: &ModModule) -> HashMap<String, AliasEntry> {
                 })
             })
             .or_else(|| {
+                // A BARE container RHS with no outer `Annotated[...]`
+                // wrapper (`type Amounts = list[Annotated[float,
+                // Field(ge=0)]]`, or a plain `type Ints = list[int]`) —
+                // `annotated_expression_set` above only recognizes an
+                // OUTER `Annotated[...]` subscript, so this shape never
+                // reaches it and falls through to here. Enters the SAME
+                // `container_head_and_element` recognition the wrapped
+                // arm above uses, on `value` directly rather than on
+                // `annotated_base_expr(value, ...)`'s unwrap (there is no
+                // outer wrapper to unwrap). The container itself states
+                // no scalar set — the same empty-set convention the
+                // wrapped arm's `set` carries when it has no `Field(…)`
+                // kwarg of its own — and `length_window` is always `None`
+                // here: a bare container RHS carries no `Field(min_length=
+                // …)` slot to read (that kwarg only ever rides the OUTER
+                // `Annotated[...]` metadata tuple the wrapped arm reads).
+                let (head, element_expr) = container_head_and_element(value, &imports, &sets_by_name)?;
+                let element = element_set_and_spelling_for_alias(element_expr, &imports, &out)?;
+                Some(AliasEntry {
+                    set: make_refined_set(Vec::new()),
+                    head: Some(head),
+                    element: Some(Box::new(element)),
+                    length_window: None,
+                    admits_none: false,
+                })
+            })
+            .or_else(|| {
                 literal_alias_set(value).map(|set| AliasEntry {
                     set,
                     head: None,
@@ -1630,6 +1657,84 @@ mod tests {
             .expect("TypeAlias-annotated spelling compiles");
         assert_eq!(from_type_stmt, from_plain_assign);
         assert_eq!(from_plain_assign, from_type_alias_assign);
+    }
+
+    // --- Bare container alias, no outer Annotated[...] wrapper (showcase.py's Amounts-shaped) ---
+
+    /// `type Amounts = list[Annotated[float, Field(ge=0)]]` — a BARE
+    /// `list[...]` RHS with no outer `Annotated[...]` wrapper. The
+    /// element itself is `Annotated[float, Field(ge=0)]`, so it resolves
+    /// through `annotated_expression_set` (the non-container case) to
+    /// the `ge=0` float ray, spelled through `format_for_diagnostics` —
+    /// the same element reading `Boosted`'s own `list[float]` element
+    /// gets, but reached from a bare container RHS instead of a wrapped
+    /// one.
+    #[test]
+    fn a_bare_container_alias_with_an_annotated_element_compiles() {
+        let module = parsed(
+            "from pydantic import Field\n\
+             from typing import Annotated\n\
+             type Amounts = list[Annotated[float, Field(ge=0)]]\n",
+        );
+        let out = compile_aliases(&module);
+        let compiled = out.get("Amounts").expect("Amounts compiles");
+        assert_eq!(compiled.head, Some("list"));
+        assert!(compiled.set.forms.is_empty(), "the container's own set states nothing");
+        assert!(compiled.length_window.is_none(), "a bare container RHS carries no Field(min_length=…) slot");
+        let (element_set, _element_spelling) = compiled.element.as_deref().expect("Amounts carries an element set");
+        let direct = annotated_expression_set(
+            &parsed_expression("Annotated[float, Field(ge=0)]"),
+            &surface_imports(&parsed("from pydantic import Field\nfrom typing import Annotated\n")),
+            &HashMap::new(),
+        )
+        .expect("the element's own Annotated[...] spelling compiles directly")
+        .0;
+        assert_eq!(element_set, &direct);
+    }
+
+    /// `type Ints = list[int]` — the bare container's element is a plain
+    /// ground sort, not `Annotated[...]`-wrapped at all. Resolves through
+    /// `element_set_and_spelling_for_alias`'s own bare `int` fallback,
+    /// the same set `base_sort_return_refinement` gives `int` everywhere
+    /// else it is read: the whole-number ray, never the empty set.
+    #[test]
+    fn a_bare_container_alias_with_a_plain_ground_element_compiles() {
+        let module = parsed("type Ints = list[int]\n");
+        let out = compile_aliases(&module);
+        let compiled = out.get("Ints").expect("Ints compiles");
+        assert_eq!(compiled.head, Some("list"));
+        assert!(compiled.length_window.is_none());
+        let (element_set, element_spelling) = compiled.element.as_deref().expect("Ints carries an element set");
+        assert_eq!(element_spelling.as_str(), "int");
+        assert_eq!(
+            element_set,
+            &make_refined_set(vec![integer(), at_least(f64::NEG_INFINITY)])
+        );
+    }
+
+    /// The `Annotated[...]`-wrapped spelling of the SAME container still
+    /// compiles identically to before this arm existed — widening
+    /// `compile_aliases`'s recognition to a bare RHS must not change what
+    /// an already-wrapped alias compiles to. `type Wrapped =
+    /// Annotated[list[Annotated[float, Field(ge=0)]], Field()]` (an inert
+    /// no-op outer `Field()`, since a container needs SOME metadata tuple
+    /// to spell as `Annotated[...]` at all) carries the identical head,
+    /// element set, and element spelling `Amounts`'s bare spelling gives
+    /// the same inner shape.
+    #[test]
+    fn the_annotated_wrapped_spelling_of_the_same_container_is_unaffected() {
+        let module = parsed(
+            "from pydantic import Field\n\
+             from typing import Annotated\n\
+             type Amounts = list[Annotated[float, Field(ge=0)]]\n\
+             type Wrapped = Annotated[list[Annotated[float, Field(ge=0)]], Field()]\n",
+        );
+        let out = compile_aliases(&module);
+        let bare = out.get("Amounts").expect("Amounts compiles");
+        let wrapped = out.get("Wrapped").expect("Wrapped compiles");
+        assert_eq!(bare.head, wrapped.head);
+        assert_eq!(bare.element, wrapped.element);
+        assert_eq!(bare.length_window, wrapped.length_window);
     }
 
     /// A scalar alias (`Age`) is unaffected by the container carry — it

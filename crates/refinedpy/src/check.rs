@@ -1866,6 +1866,20 @@ fn walk_statement(
         }
         Stmt::TypeAlias(alias) => {
             if let Expr::Name(name) = alias.name.as_ref() {
+                // The alias's compiled set is judged for emptiness at its own
+                // declaration, exactly as the AnnAssign arm judges an inline
+                // annotation: a set no value can satisfy is the declaration's
+                // own defect and fires before any value flows. A kernel
+                // decline leaves the alias unjudged.
+                if let Some(entry) = context.aliases.get(name.id.as_str()) {
+                    if let Some(true) = declared_set_is_empty(&entry.set, context.kernel) {
+                        out.push(Finding {
+                            range: alias.value.range(),
+                            code: "RTS7003",
+                            message: empty_set(&entry.set),
+                        });
+                    }
+                }
                 environment.forget(name.id.as_str());
             }
         }
@@ -5699,7 +5713,20 @@ fn judge_one_call_argument(
     let Some(declared) = declared_refinement(annotation, context.aliases, context.imports, environment) else {
         return;
     };
-    let value = evaluate_expression(argument, environment, context.kernel);
+    // A construction nested in argument position has no statement sink
+    // hosting it, and evaluate_expression's construction arm discards
+    // judge_construction's per-field fires by design — so the verdict
+    // is taken here: its fires land at their own field positions, and
+    // its built instance is the value the parameter judges.
+    let value = match construction_call_verdict(argument, context, environment) {
+        Some(verdict) => {
+            for (range, message) in verdict.fires {
+                out.push(Finding { range, code: "RTS7001", message });
+            }
+            verdict.instance
+        }
+        None => evaluate_expression(argument, environment, context.kernel),
+    };
     if let Verdict::Fire(message) = judge(&value, &declared, context.kernel) {
         out.push(Finding { range: argument.range(), code: "RTS7001", message });
     }
@@ -12359,6 +12386,82 @@ mod tests {
         assert!(
             findings.is_empty(),
             "a concretely-executable for loop over a literal list must stay determined and sentence-free: {:?}",
+            findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// showcase.py's own `invoice_total`/`refund_everything` shape: a
+    /// plain `total = total + amount` accumulation (never `total +=
+    /// amount`) over a `list[float]`-typed parameter — a repetition-window
+    /// element (`repetition_window_element_pass`'s own shape), so the
+    /// element `amount` is a `Kind::Set`, not one known number. This pins
+    /// whether `total + amount`'s arithmetic (`transfer_over_sets`,
+    /// `Values + Set` under `Add`) determines a sort-only answer that
+    /// `run_assign_once`/`bind_checked` can bind (walking the loop through
+    /// `stabilized_join`'s widen-to-unknown branch, the SAME non-
+    /// stabilizing-accumulation shape `a_for_loop_whose_accumulation_does_
+    /// not_stabilize_names_its_blocker_even_under_a_bare_return_sort`
+    /// already pins for a doubling rebind) — or declines the whole loop
+    /// outright, landing on the coarser "a for statement is not yet
+    /// walked" RTS7002 blocker instead.
+    #[test]
+    fn a_plain_rebind_accumulation_over_a_float_list_parameter_walks_the_loop() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Amounts = list[Annotated[float, Field(ge=0)]]\n",
+            "type Total = Annotated[float, Field(ge=0)]\n",
+            "def invoice_total(amounts: Amounts) -> Total:\n",
+            "    total = 0.0\n",
+            "    for amount in amounts:\n",
+            "        total = total + amount\n",
+            "    return total\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        let statement_blockers: Vec<&Finding> = findings
+            .iter()
+            .filter(|f| f.code == "RTS7002" && f.message.contains("is not yet walked"))
+            .collect();
+        assert!(
+            statement_blockers.is_empty(),
+            "the loop itself must be walked through stabilized_join, never left as the coarser \
+            statement-shape blocker: {:?}",
+            findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// The designated-fire twin: the SAME accumulation shape, but the
+    /// running total only ever SUBTRACTS (`refund_everything`'s own row),
+    /// so the widened `total` still carries no lower bound past `0` at the
+    /// `-> Total` sink (`Total`'s own `Field(ge=0)`) — a returned value
+    /// this walk cannot prove satisfies the declared floor. Pins that once
+    /// the loop itself walks (this file's fix), the pre-existing
+    /// RETURN-THROUGH-LOOP CHANNEL / straight-line `walk_return` judging
+    /// still reaches its own designated fire on `total`'s value, rather
+    /// than the loop's own blocker swallowing it.
+    #[test]
+    fn a_plain_rebind_accumulation_that_only_subtracts_still_fires_its_return_sink() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Amounts = list[Annotated[float, Field(ge=0)]]\n",
+            "type Total = Annotated[float, Field(ge=0)]\n",
+            "def refund_everything(amounts: Amounts) -> Total:\n",
+            "    total = 0.0\n",
+            "    for amount in amounts:\n",
+            "        total = total - amount\n",
+            "    return total\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        let statement_blockers: Vec<&Finding> = findings
+            .iter()
+            .filter(|f| f.code == "RTS7002" && f.message.contains("is not yet walked"))
+            .collect();
+        assert!(
+            statement_blockers.is_empty(),
+            "the loop itself must be walked, never left as the coarser statement-shape blocker: {:?}",
             findings.iter().map(|f| &f.message).collect::<Vec<_>>()
         );
     }

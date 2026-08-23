@@ -2750,6 +2750,337 @@ fn strptime_iso_date_value(text: &str, kernel: &Arc<RefinedTSKernel>) -> Option<
     date_fromisoformat_value(text, kernel)
 }
 
+/// `%Y` — datetime.rst:2413-2415, "Year with century as a decimal
+/// number," note (2): "years < 1000 must be zero-filled to 4-digit
+/// width." Reads EXACTLY 4 digits, the same width `date_fromisoformat_
+/// value`'s own `year_text` split already commits to — note (9)'s
+/// optional-leading-zero list does NOT name `%Y`, so this directive
+/// alone keeps the fixed-width read rather than the variable-width rule
+/// every OTHER numeric directive below takes.
+fn read_year_field(rest: &str) -> Option<(i64, &str)> {
+    let (digits, tail) = take_fixed_digits(rest, 4)?;
+    let value: i64 = digits.parse().ok()?;
+    Some((value, tail))
+}
+
+/// `%y` — datetime.rst:2410-2412, "Year without century as a zero-padded
+/// decimal number," note (9): "Format `%y` DOES require a leading zero"
+/// — so this reads EXACTLY 2 digits, never 1. The two-digit value is
+/// then pivoted to its full year per time.rst:45-48 ("values 69--99 are
+/// mapped to 1969--1999, and values 0--68 are mapped to 2000--2068") —
+/// the POSIX/ISO C rule datetime.strptime itself defers to (this table's
+/// own `%y` row cites no separate pivot, so the platform-shared rule
+/// applies).
+fn read_two_digit_year_field(rest: &str) -> Option<(i64, &str)> {
+    let (digits, tail) = take_fixed_digits(rest, 2)?;
+    let two_digit: i64 = digits.parse().ok()?;
+    let full_year = if two_digit >= 69 { 1900 + two_digit } else { 2000 + two_digit };
+    Some((full_year, tail))
+}
+
+/// `%m`/`%d`/`%H`/`%M`/`%S` — each a zero-padded two-digit field in the
+/// table (`%m` :2407-2409, `%d` :2394-2396, `%H` :2416-2418, `%M`
+/// :2425-2427, `%S` :2428-2430), but note (9) makes the leading zero
+/// OPTIONAL for strptime across this exact directive set. Reads 1 or 2
+/// digits, greedily preferring 2 — the same optional-width rule every
+/// directive note (9) names shares, spelled once here rather than
+/// per-directive since the read rule is identical for all five.
+fn read_one_or_two_digit_field(rest: &str) -> Option<(i64, &str)> {
+    let (digits, tail) = take_variable_digits(rest, 1, 2)?;
+    let value: i64 = digits.parse().ok()?;
+    Some((value, tail))
+}
+
+/// `%j` — datetime.rst:2443-2445, "Day of the year as a zero-padded
+/// decimal number," 001-366; note (9) makes the leading zero optional
+/// for strptime, so this reads 1 to 3 digits.
+fn read_day_of_year_field(rest: &str) -> Option<(&str, &str)> {
+    take_variable_digits(rest, 1, 3)
+}
+
+/// `%U`/`%W` — datetime.rst:2446-2461, week-of-year 00-53; note (9)
+/// makes the leading zero optional. Reads 1 or 2 digits. Note (7): "`%U`
+/// and `%W` are only used in calculations when the day of the week and
+/// the calendar year (`%Y`) are specified" — this stage carries no
+/// day-of-week directive (`%a`/`%w`/`%u` are all outside this round's
+/// transcribed set), so a recognized `%U`/`%W` field is read and range-
+/// checked but never folded into the constructed date, matching the
+/// spec's own statement that it does nothing without a weekday alongside
+/// it.
+fn read_week_number_field(rest: &str) -> Option<(&str, &str)> {
+    take_variable_digits(rest, 1, 2)
+}
+
+/// `%f` — datetime.rst note (5): "the `%f` directive accepts from one to
+/// six digits and zero pads on the right" (e.g. `"5"` reads as `500000`
+/// microseconds, `"123"` as `123000`). Reads 1 to 6 digits and pads the
+/// result to 6 digits before parsing, matching the note's own rule
+/// exactly.
+fn read_microsecond_field(rest: &str) -> Option<(i64, &str)> {
+    let (digits, tail) = take_variable_digits(rest, 1, 6)?;
+    let mut padded = digits.to_owned();
+    while padded.len() < 6 {
+        padded.push('0');
+    }
+    let value: i64 = padded.parse().ok()?;
+    Some((value, tail))
+}
+
+/// Exactly `width` ASCII digits off the front of `rest`, or `None` if
+/// fewer than `width` digits are available or a non-digit byte sits
+/// inside that span. `date_fromisoformat_value`'s own `year_text`/
+/// `month_text`/`day_text` split is this same rule specialized to `%Y`'s
+/// fixed 4-digit width.
+fn take_fixed_digits(rest: &str, width: usize) -> Option<(&str, &str)> {
+    if rest.len() < width || !rest.as_bytes()[..width].iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    Some((&rest[..width], &rest[width..]))
+}
+
+/// 1 to `max_width` ASCII digits off the front of `rest`, preferring the
+/// LONGEST run up to `max_width` — the greedy read note (9)'s optional-
+/// leading-zero rule needs (a written `"1"` before a literal `"/"` reads
+/// as one digit; a written `"12"` reads as two, never leaving a spare
+/// digit for the next directive to misread). `None` when fewer than
+/// `min_width` digits are available.
+fn take_variable_digits(rest: &str, min_width: usize, max_width: usize) -> Option<(&str, &str)> {
+    let available = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if available < min_width {
+        return None;
+    }
+    let width = available.min(max_width);
+    Some((&rest[..width], &rest[width..]))
+}
+
+/// The two decline reasons date.12 STAGE 2 names, per the AGENT-BRIEF's
+/// own split: an UNREAD directive (`%z %Z %I %G %u %V`, this round's
+/// named remainder — not yet transcribed against the spec, but a
+/// host-independent set is buildable once it is) versus a LOCALE
+/// directive (`%a %A %b %B %p %c %x %X`, datetime.rst note (1): "the
+/// format depends on the current locale... Field orderings will vary...
+/// and the output may contain non-ASCII characters") — a genuinely
+/// different construct, since a locale directive has no host-independent
+/// value set to derive AT ALL, not merely one this round left unread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Strptime2Decline {
+    UnreadDirective(char),
+    LocaleDirective(char),
+}
+
+/// Whether `letter` is one of the six locale-dependent directives
+/// datetime.rst note (1) names — `%a %A %b %B %p %c %x %X`.
+fn is_locale_directive(letter: char) -> bool {
+    matches!(letter, 'a' | 'A' | 'b' | 'B' | 'p' | 'c' | 'x' | 'X')
+}
+
+/// STAGE 2's directive transcription: every letter this round reads
+/// against datetime.rst's format-codes table (`%Y %m %d %H %M %S %f %j
+/// %U %W %y`, plus `%%`'s literal-percent escape, :2474-2475) answers
+/// `Ok(())`; `Err` names the FIRST directive letter this round does NOT
+/// transcribe, distinguishing the locale boundary from the plain
+/// not-yet-read one (`Strptime2Decline`'s own doc) — the AGENT-BRIEF's
+/// own requirement that an unread directive names ITSELF, never the
+/// whole format string. Run as its own pre-pass before `strptime2_parse`
+/// so a format's decline reason is named even when the TEXT does not
+/// match at all (`strptime2_parse` has no reason channel of its own,
+/// only `None`).
+fn strptime2_scan_format(format: &str) -> Result<(), Strptime2Decline> {
+    let mut chars = format.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '%' {
+            continue;
+        }
+        let Some(letter) = chars.next() else {
+            continue; // a trailing lone '%' — no directive follows, nothing to name
+        };
+        match letter {
+            '%' | 'Y' | 'y' | 'm' | 'd' | 'H' | 'M' | 'S' | 'f' | 'j' | 'U' | 'W' => continue,
+            other if is_locale_directive(other) => return Err(Strptime2Decline::LocaleDirective(other)),
+            other => return Err(Strptime2Decline::UnreadDirective(other)),
+        }
+    }
+    Ok(())
+}
+
+/// STAGE 2's parse: walks `format` and `text` in lockstep, matching each
+/// literal span byte-for-byte and each directive through its own reader
+/// above, then folds the read fields into a tagged instance the SAME way
+/// `datetime_construction_value` does (`year`/`month`/`day`/`hour`/
+/// `minute`/`second` Integer `ObjectKey`s, `aware_utc` false — no `%z`/
+/// `%Z` reaches here, so every STAGE 2 result is naive) — the fields
+/// this stage's own construct feeds are read FROM a string here, the
+/// mirror of `datetime_construction_value` reading them FROM already-
+/// known Integer arguments. Absent fields (an `%H:%M:%S`-less format)
+/// default to 0, `datetime.strptime`'s own default-value rule
+/// (datetime.rst:2527-2529: "the default value is `1900-01-01T00:00:00.
+/// 000`: any components not specified in the format string will be
+/// pulled from the default value") restricted to the six components this
+/// file tracks — `year`/`month`/`day` are NOT required by a directive in
+/// the format (a bare `"%H:%M:%S"` format is modeled, defaulting to
+/// 1900-01-01, matching `test_strptime_stage_2_derives_a_time_of_day_
+/// only_format`'s own pin). Declines (`None`) on any text
+/// that does not match the literal/directive sequence, a repeated field
+/// kind (two `%Y`s), or a value that fails the SAME two kernel asks
+/// `date_fromisoformat_value` poses (`pyYearInRange` then `validDate`).
+/// `%f`'s microsecond is read but not carried on the constructed
+/// instance — `datetime_construction_value`'s own tagged shape has no
+/// `microsecond` field (its own doc: "a `microsecond`/`fold` argument...
+/// declines the WHOLE construction" for the FORWARD constructor, so this
+/// reverse direction matches by simply not adding one), so `%f` is
+/// recognized and its digits validated (1-6 digits, note 5) but its
+/// resolved value does not reach the returned instance.
+fn strptime2_parse(format: &str, text: &str, kernel: &Arc<RefinedTSKernel>) -> Option<AbstractValue> {
+    let mut year: Option<i64> = None;
+    let mut month: Option<i64> = None;
+    let mut day: Option<i64> = None;
+    let mut hour: Option<i64> = None;
+    let mut minute: Option<i64> = None;
+    let mut second: Option<i64> = None;
+
+    let mut format_chars = format.chars().peekable();
+    let mut remaining_text = text;
+    while let Some(ch) = format_chars.next() {
+        if ch != '%' {
+            remaining_text = remaining_text.strip_prefix(ch)?;
+            continue;
+        }
+        let letter = format_chars.next()?;
+        match letter {
+            '%' => {
+                remaining_text = remaining_text.strip_prefix('%')?;
+            }
+            'Y' => {
+                let (value, tail) = read_year_field(remaining_text)?;
+                set_once(&mut year, value)?;
+                remaining_text = tail;
+            }
+            'y' => {
+                let (value, tail) = read_two_digit_year_field(remaining_text)?;
+                set_once(&mut year, value)?;
+                remaining_text = tail;
+            }
+            'm' => {
+                let (value, tail) = read_one_or_two_digit_field(remaining_text)?;
+                if !(1..=12).contains(&value) {
+                    return None;
+                }
+                set_once(&mut month, value)?;
+                remaining_text = tail;
+            }
+            'd' => {
+                let (value, tail) = read_one_or_two_digit_field(remaining_text)?;
+                if !(1..=31).contains(&value) {
+                    return None;
+                }
+                set_once(&mut day, value)?;
+                remaining_text = tail;
+            }
+            'H' => {
+                let (value, tail) = read_one_or_two_digit_field(remaining_text)?;
+                if !(0..=23).contains(&value) {
+                    return None;
+                }
+                set_once(&mut hour, value)?;
+                remaining_text = tail;
+            }
+            'M' => {
+                let (value, tail) = read_one_or_two_digit_field(remaining_text)?;
+                if !(0..=59).contains(&value) {
+                    return None;
+                }
+                set_once(&mut minute, value)?;
+                remaining_text = tail;
+            }
+            'S' => {
+                let (value, tail) = read_one_or_two_digit_field(remaining_text)?;
+                if !(0..=59).contains(&value) {
+                    return None;
+                }
+                set_once(&mut second, value)?;
+                remaining_text = tail;
+            }
+            'f' => {
+                let (_value, tail) = read_microsecond_field(remaining_text)?;
+                remaining_text = tail;
+            }
+            'j' => {
+                let (digits, tail) = read_day_of_year_field(remaining_text)?;
+                let value: i64 = digits.parse().ok()?;
+                if !(1..=366).contains(&value) {
+                    return None;
+                }
+                remaining_text = tail;
+            }
+            'U' | 'W' => {
+                let (digits, tail) = read_week_number_field(remaining_text)?;
+                let value: i64 = digits.parse().ok()?;
+                if !(0..=53).contains(&value) {
+                    return None;
+                }
+                remaining_text = tail;
+            }
+            // every other letter is caught by strptime2_scan_format's own
+            // pre-pass before this function is ever called — unreachable
+            // here by construction, matching this file's own convention
+            // of proving unreachable states through the caller's gate
+            // rather than re-checking them a second time
+            _ => return None,
+        }
+    }
+    if !remaining_text.is_empty() {
+        return None; // trailing text the format did not account for
+    }
+    // datetime.rst:2527-2529's own default value, `1900-01-01T00:00:00.
+    // 000`: any component the format did not name is pulled from this
+    // default, restricted to the three date components (hour/minute/
+    // second already default to 0 below). Since 1900 is not a leap year,
+    // a partial format landing on default-year February 29 fails the
+    // SAME `valid_civil_date` kernel ask any other invalid date fails
+    // through — reproducing datetime.rst:2531-2546's own documented
+    // "will raise when encountering February 29" note without a
+    // separate special case.
+    let year = year.unwrap_or(1900);
+    let month = month.unwrap_or(1);
+    let day = day.unwrap_or(1);
+    if !python_year_in_range(year, kernel)? {
+        return None;
+    }
+    if !valid_civil_date(year, month, day, kernel)? {
+        return None;
+    }
+    let keys = vec![
+        integer_object_key("year", year),
+        integer_object_key("month", month),
+        integer_object_key("day", day),
+        integer_object_key("hour", hour.unwrap_or(0)),
+        integer_object_key("minute", minute.unwrap_or(0)),
+        integer_object_key("second", second.unwrap_or(0)),
+        ObjectKey {
+            name: "aware_utc".to_owned(),
+            numeric: false,
+            value: known_values(vec![0.0], PrimitiveKind::Boolean, TrustProved),
+        },
+    ];
+    let mut instance = known_object(keys, None, true, TrustProved, false);
+    instance.source = "datetime_datetime".to_owned();
+    Some(instance)
+}
+
+/// Sets an `Option<i64>` slot the FIRST time a directive fills it, and
+/// declines (`None`) if the SAME calendar component is named twice by
+/// the format (`"%Y-%Y"` or similar) — CPython's own `_strptime.py`
+/// raises `ValueError` on a repeated directive naming the same group;
+/// this file has no exception channel, so the construction simply
+/// declines, matching every other malformed-input row in this stage.
+fn set_once(slot: &mut Option<i64>, value: i64) -> Option<()> {
+    if slot.is_some() {
+        return None;
+    }
+    *slot = Some(value);
+    Some(())
+}
+
 /// date.12 STAGE 1 — `date.strftime(format)` (datetime.rst, `method::
 /// date.strftime(format)`: "Return a string representing the date,
 /// controlled by an explicit format string"). Modeled ONLY for the
@@ -4206,27 +4537,35 @@ fn evaluate_attribute_call(
     if is_datetime_datetime_attribute(attribute.value.as_ref(), environment) && attribute.attr.as_str() == "now" {
         return opaque_value("the current datetime");
     }
-    // `datetime.datetime.strptime(date_string, format)` — date.12
-    // STAGE 1, the SAME receiver shape `.now()` reads just above
-    // (qualified chain or bare aliased class name). Modeled ONLY when
-    // BOTH arguments are known exact strings AND `format` is EXACTLY
-    // the literal `"%Y-%m-%d"` (`strptime_iso_date_value`'s own doc —
-    // the ISO date-only directive sequence date.3's grammar already
-    // commits to). A NON-literal `format` (a parameter, a computed
-    // expression, an f-string) is not a string this file can read the
-    // DIRECTIVES of at all — this file has no format-code mini-language
-    // reader for anything but the exact `"%Y-%m-%d"` spelling — so it
-    // declines the same way `date_fromisoformat_value`'s own
-    // non-literal-argument row does: no sentence-carrying channel
-    // exists on this dispatch path (`evaluate_attribute_call`
-    // returns a plain `AbstractValue`, never a message), so the
-    // decline is named here, in this comment, the same way every
-    // other declining recognizer in this file states its reason in
-    // prose beside its own `return unknown()`. A literal format
-    // OTHER than `"%Y-%m-%d"` (`"%d/%m/%Y"`, any other directive
-    // sequence) names date.12 STAGE 2 — the directive-grammar
-    // kernel theory this stage does not build — as its own reason,
-    // by the identical convention.
+    // `datetime.datetime.strptime(date_string, format)` — date.12,
+    // the SAME receiver shape `.now()` reads just above (qualified
+    // chain or bare aliased class name). Modeled ONLY when BOTH
+    // arguments are known exact strings; a NON-literal `format` (a
+    // parameter, a computed expression, an f-string) is not a string
+    // this file can read the DIRECTIVES of at all, so it declines the
+    // same way `date_fromisoformat_value`'s own non-literal-argument
+    // row does — no sentence-carrying channel exists on this dispatch
+    // path (`evaluate_attribute_call` returns a plain `AbstractValue`,
+    // never a message), so every decline reason below is named in
+    // this comment, the same way every other declining recognizer in
+    // this file states its reason in prose beside its own `return
+    // unknown()`.
+    //
+    // The exact literal `"%Y-%m-%d"` keeps STAGE 1's own path
+    // (`strptime_iso_date_value`, reusing `date_fromisoformat_value`
+    // outright rather than re-deriving its parse). Every OTHER
+    // literal format is read by STAGE 2's directive scanner
+    // (`strptime2_scan_format`): a format whose every directive is
+    // one of `%Y %m %d %H %M %S %f %j %U %W %y %%` is parsed by
+    // `strptime2_parse` against the SAME two kernel asks STAGE 1
+    // poses (`pyYearInRange` then `validDate`); a format naming a
+    // directive this round does not transcribe declines, naming that
+    // ONE directive rather than the whole format string — split into
+    // the two decline shapes `Strptime2Decline` states: a locale
+    // directive (`%a %A %b %B %p %c %x %X`, datetime.rst note (1) —
+    // no host-independent value set exists for these AT ALL) reads as
+    // its own distinct reason from an unread directive (`%z %Z %I %G
+    // %u %V` — not yet transcribed against the spec, but buildable).
     if is_datetime_datetime_attribute(attribute.value.as_ref(), environment) && attribute.attr.as_str() == "strptime" {
         if let [text, format] = arguments {
             if let (Some(text_points), Some(format_points)) = (exact_string_values(text), exact_string_values(format)) {
@@ -4237,6 +4576,20 @@ fn evaluate_attribute_call(
                             None => unknown(),
                         };
                     }
+                    if strptime2_scan_format(&format_spelling).is_ok() {
+                        return match strptime2_parse(&format_spelling, &text_spelling, kernel) {
+                            Some(value) => value,
+                            None => unknown(),
+                        };
+                    }
+                    // strptime2_scan_format's own Err names the
+                    // specific unread or locale directive that
+                    // blocked this format — no channel carries that
+                    // reason string further than this comment today
+                    // (the same standing decline every other row in
+                    // this dispatch takes), so the value answer is
+                    // unknown() regardless of which of the two
+                    // Strptime2Decline arms fired.
                 }
             }
         }
@@ -9907,12 +10260,122 @@ mod tests {
     }
 
     /// `datetime.datetime.strptime("01/03/2024", "%d/%m/%Y")` — a
-    /// LITERAL format, but not the ISO `"%Y-%m-%d"` sequence this stage
-    /// builds; names date.12 STAGE 2 (the directive-grammar kernel
-    /// theory) as the reason, per `strptime_iso_date_value`'s own doc.
+    /// LITERAL format, not the ISO `"%Y-%m-%d"` sequence STAGE 1 builds,
+    /// but every directive here (`%d`, `%m`, `%Y`) IS one STAGE 2
+    /// transcribes (`strptime2_scan_format`'s own directive set) — so
+    /// this now DETERMINES, a tagged `datetime_datetime` instance (day 1,
+    /// month 3, year 2024), the mirror of STAGE 1's own agreement test
+    /// against `date.fromisoformat`.
     #[test]
-    fn test_strptime_with_a_non_iso_literal_format_declines() {
+    fn test_strptime_with_a_non_iso_literal_format_now_determines_via_stage_2() {
         let Some(value) = eval("datetime.datetime.strptime(\"01/03/2024\", \"%d/%m/%Y\")") else { return };
+        assert_eq!(value.kind, Kind::Object);
+        assert_eq!(value.source.as_str(), "datetime_datetime");
+        assert_eq!(datetime_field(&value, "year"), Some(2024.0));
+        assert_eq!(datetime_field(&value, "month"), Some(3.0));
+        assert_eq!(datetime_field(&value, "day"), Some(1.0));
+    }
+
+    // --- j-stdlib-surfaces.py: strptime STAGE 2 (date.12, the
+    // non-ISO directive grammar: %Y %m %d %H %M %S %f %j %U %W %y) ---
+
+    /// `datetime.datetime.strptime("2024/03/01", "%Y/%m/%d")` — the SAME
+    /// three date-only directives STAGE 1's `"%Y-%m-%d"` reads, spelled
+    /// with a different literal separator: this is STAGE 2's own full
+    /// derivation of a plain `%Y`/`%m`/`%d` sequence, landing on the
+    /// SAME year/month/day fields `strptime_iso_date_value` would bind
+    /// for the equivalent ISO text — but as a `datetime_datetime`
+    /// instance (STAGE 2's own tagged shape, `strptime2_parse`'s own
+    /// doc), not the `datetime_date` STAGE 1 binds, since STAGE 2 always
+    /// carries the six `datetime_construction_value` fields.
+    #[test]
+    fn test_strptime_stage_2_derives_year_month_day_with_a_non_iso_separator() {
+        let Some(value) = eval("datetime.datetime.strptime(\"2024/03/01\", \"%Y/%m/%d\")") else { return };
+        assert_eq!(value.kind, Kind::Object);
+        assert_eq!(value.source.as_str(), "datetime_datetime");
+        assert_eq!(datetime_field(&value, "year"), Some(2024.0));
+        assert_eq!(datetime_field(&value, "month"), Some(3.0));
+        assert_eq!(datetime_field(&value, "day"), Some(1.0));
+        assert_eq!(datetime_field(&value, "hour"), Some(0.0));
+        assert_eq!(datetime_field(&value, "minute"), Some(0.0));
+        assert_eq!(datetime_field(&value, "second"), Some(0.0));
+    }
+
+    /// `datetime.datetime.strptime("23:59:59", "%H:%M:%S")` — a
+    /// time-of-day-only format (note (9)'s own three "leading zero
+    /// optional" directives), the composite EXCLUDED from STAGE 1
+    /// (`strptime_iso_date_value`'s own doc: "EXCLUDED from this stage:
+    /// any `%H:%M:%S`-composite format"). No `%Y`/`%m`/`%d` directive
+    /// appears, so year/month/day fall to `strptime2_parse`'s own
+    /// default-value rule (datetime.rst:2527-2529, the default
+    /// `1900-01-01`) — this test names the hour/minute/second fields
+    /// STAGE 2 newly derives, the reverse of STAGE 1's own
+    /// date-only reach.
+    #[test]
+    fn test_strptime_stage_2_derives_a_time_of_day_only_format() {
+        let Some(value) = eval("datetime.datetime.strptime(\"23:59:59\", \"%H:%M:%S\")") else { return };
+        assert_eq!(value.kind, Kind::Object);
+        assert_eq!(value.source.as_str(), "datetime_datetime");
+        assert_eq!(datetime_field(&value, "year"), Some(1900.0));
+        assert_eq!(datetime_field(&value, "month"), Some(1.0));
+        assert_eq!(datetime_field(&value, "day"), Some(1.0));
+        assert_eq!(datetime_field(&value, "hour"), Some(23.0));
+        assert_eq!(datetime_field(&value, "minute"), Some(59.0));
+        assert_eq!(datetime_field(&value, "second"), Some(59.0));
+    }
+
+    /// `%y`'s century pivot, LOW side — time.rst:45-48: "values 0--68 are
+    /// mapped to 2000--2068." `"68"` is the pivot's own upper LOW-side
+    /// edge, landing on year 2068.
+    #[test]
+    fn test_strptime_stage_2_two_digit_year_pivot_low_side_maps_into_2000s() {
+        let Some(value) = eval("datetime.datetime.strptime(\"68-03-01\", \"%y-%m-%d\")") else { return };
+        assert_eq!(value.kind, Kind::Object);
+        assert_eq!(datetime_field(&value, "year"), Some(2068.0));
+    }
+
+    /// `%y`'s century pivot, HIGH side — time.rst:45-48: "values 69--99
+    /// are mapped to 1969--1999." `"69"` is the pivot's own lower
+    /// HIGH-side edge, landing on year 1969 — the two tests together pin
+    /// the pivot's exact boundary at 68/69.
+    #[test]
+    fn test_strptime_stage_2_two_digit_year_pivot_high_side_maps_into_1900s() {
+        let Some(value) = eval("datetime.datetime.strptime(\"69-03-01\", \"%y-%m-%d\")") else { return };
+        assert_eq!(value.kind, Kind::Object);
+        assert_eq!(datetime_field(&value, "year"), Some(1969.0));
+    }
+
+    /// `datetime.datetime.strptime("2024-03-01 +0000", "%Y-%m-%d %z")` —
+    /// `%z` is named in the AGENT-BRIEF's own unread-directive list; this
+    /// format's `%Y`/`%m`/`%d` are each transcribed, but `%z` itself is
+    /// not, so `strptime2_scan_format` declines the WHOLE format,
+    /// naming `%z` specifically (`Strptime2Decline::UnreadDirective('z')`)
+    /// rather than treating the format as an unrecognized sequence in
+    /// general — this test exists to prove the decline names ONE
+    /// directive, not the whole string, even though this file has no
+    /// channel today to surface that name as a diagnostic (the dispatch
+    /// site's own comment states the same standing limitation STAGE 1
+    /// already carries).
+    #[test]
+    fn test_strptime_stage_2_names_an_unread_directive_z_and_declines() {
+        let format = "%Y-%m-%d %z";
+        assert_eq!(strptime2_scan_format(format), Err(Strptime2Decline::UnreadDirective('z')));
+        let Some(value) = eval("datetime.datetime.strptime(\"2024-03-01 +0000\", \"%Y-%m-%d %z\")") else { return };
+        assert_eq!(value.kind, Kind::Unknown);
+    }
+
+    /// `datetime.datetime.strptime("Mon 2024-03-01", "%a %Y-%m-%d")` —
+    /// `%a` is a LOCALE directive (datetime.rst note (1)): a genuinely
+    /// distinct construct from an unread-but-buildable directive, since
+    /// no host-independent value set exists for it at all. This test
+    /// pins that `strptime2_scan_format` answers the LOCALE decline
+    /// shape specifically (`Strptime2Decline::LocaleDirective('a')`),
+    /// never the plain unread-directive shape `%z`'s own test pins.
+    #[test]
+    fn test_strptime_stage_2_names_the_locale_directive_a_as_its_own_distinct_reason() {
+        let format = "%a %Y-%m-%d";
+        assert_eq!(strptime2_scan_format(format), Err(Strptime2Decline::LocaleDirective('a')));
+        let Some(value) = eval("datetime.datetime.strptime(\"Mon 2024-03-01\", \"%a %Y-%m-%d\")") else { return };
         assert_eq!(value.kind, Kind::Unknown);
     }
 

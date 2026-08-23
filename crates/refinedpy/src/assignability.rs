@@ -25,8 +25,11 @@ use refined_sets::refinement_forms::requires_integer;
 
 use crate::diagnostic_sentences::at_index;
 use crate::diagnostic_sentences::at_key;
+use crate::diagnostic_sentences::at_member;
+use crate::diagnostic_sentences::at_slot;
 use crate::diagnostic_sentences::containment_refutation;
 use crate::diagnostic_sentences::cross_sort_of_value;
+use crate::diagnostic_sentences::element_set_refutation;
 use crate::diagnostic_sentences::refutation;
 use crate::diagnostic_sentences::required_words;
 use crate::diagnostic_sentences::SENTENCE;
@@ -351,6 +354,50 @@ pub fn judge(
             }
             return Verdict::Silent;
         }
+        // The ELEMENT-SET LAW: a `Kind::Set` value under a container
+        // declaration is an UNKNOWN-LENGTH sequence — a repetition
+        // window over its own element set, `check.rs::seed_parameters`'s
+        // own seed for a `list[X]`/`set[X]`/`Sequence[X]` PARAMETER, and
+        // the shape a comprehension over such a parameter still carries
+        // when it returns (`expressions.rs::comprehension_star_elements`,
+        // which re-windows the mapped element but keeps the outer value
+        // a `Kind::Set` repetition — there is no concrete per-item list
+        // to walk the way the `Kind::List` arm above does). There is no
+        // single escaping INDEX to blame, so this asks whether the
+        // value's own admitted ELEMENT SET sits inside the declared
+        // element set as a whole — the SAME `seq_subset`-when-sequence-
+        // shaped, `scalar_subset`-otherwise routing the CONTAINMENT-
+        // REFUTATION law takes further below in this file for a bare
+        // `Kind::Set` value (see that law's own doc): `sequence_shaped_
+        // safely` on EITHER side decides which ask actually applies —
+        // `Ratings`'s own int-bounded element sits on the 1-tuple layer,
+        // so it takes `scalar_subset` directly, while an element that is
+        // itself sequence-shaped (a `list[str]`'s own element window)
+        // takes `seq_subset`, falling back to `scalar_subset` only on a
+        // REFUSAL (a kernel decline, never a decided `false`).
+        if value.kind == Kind::Set && declares_sequence {
+            let Some(repeated) = refined_sets::repetition_window_forms::as_repetition(&value.set) else {
+                return Verdict::Undetermined(SENTENCE.value_not_readable.to_owned());
+            };
+            if sequence_shaped_safely(&repeated.element, kernel) || sequence_shaped_safely(&element.set, kernel) {
+                let seq_asked =
+                    crate::kernel_ask::ask_kernel(|| (kernel.seq_subset)(&repeated.element, &element.set));
+                match seq_asked {
+                    Ok(true) => return Verdict::Silent,
+                    Ok(false) => {
+                        return Verdict::Fire(element_set_refutation(&repeated.element, &element.set));
+                    }
+                    Err(_) => {}
+                }
+            }
+            let scalar_asked =
+                crate::kernel_ask::ask_kernel(|| (kernel.scalar_subset)(&repeated.element, &element.set));
+            return match scalar_asked {
+                Ok(true) => Verdict::Silent,
+                Ok(false) => Verdict::Fire(element_set_refutation(&repeated.element, &element.set)),
+                Err(_) => Verdict::Undetermined(SENTENCE.kernel_declined_containment.to_owned()),
+            };
+        }
     }
     // The POSITIONS LAW: a fixed-arity tuple declaration (`declared.
     // positions` Some, `declared.set` unused/empty, the same "one active
@@ -390,7 +437,7 @@ pub fn judge(
             for (index, (item, position_declared)) in value.items.iter().zip(positions.iter()).enumerate() {
                 match judge(item, position_declared, kernel) {
                     Verdict::Fire(message) => {
-                        return Verdict::Fire(at_index(&message, index));
+                        return Verdict::Fire(at_slot(&message, index, positions.len(), &position_declared.set));
                     }
                     Verdict::Undetermined(sentence) => return Verdict::Undetermined(sentence),
                     Verdict::Silent => {}
@@ -443,7 +490,7 @@ pub fn judge(
                 };
                 match judge(&member_value.value, member_declared, kernel) {
                     Verdict::Fire(message) => {
-                        return Verdict::Fire(at_key(&message, member_name));
+                        return Verdict::Fire(at_member(&message, member_name, &member_declared.set));
                     }
                     Verdict::Undetermined(sentence) => return Verdict::Undetermined(sentence),
                     Verdict::Silent => {}
@@ -1043,6 +1090,7 @@ mod tests {
     use refined_domain::abstract_value::known_set;
     use refined_domain::abstract_value::known_values;
     use refined_domain::trust_grades::TrustProved;
+    use refined_domain::trust_grades::TrustSpec;
     use refined_kernel::kernel_bridge::dylib_path;
     use refined_kernel::kernel_bridge::kernel_artifacts_present;
     use refined_kernel::kernel_bridge::load_kernel;
@@ -2214,6 +2262,79 @@ mod tests {
         assert!(message.to_lowercase().contains("list"), "{message}");
     }
 
+    // --- the ELEMENT-SET LAW: an unknown-length Kind::Set sequence's
+    // own element set against a list[X] declaration's element set ---
+
+    /// `type Ratings = list[Annotated[int, Field(ge=1, le=5)]]` — the
+    /// `element`-carrying declaration the showcase's `bump_all` return
+    /// position states, `element` set to the bounded 1-to-5 window
+    /// `bump_all_clamped`'s in-set twin needs.
+    fn ratings_refinement() -> DeclaredRefinement {
+        let element_set = make_refined_set(vec![integer(), at_least(1.0), at_most(5.0)]);
+        DeclaredRefinement {
+            set: make_refined_set(Vec::new()),
+            spelling: "list[Ratings]".to_owned(),
+            admits_none: false,
+            element: Some(Box::new(DeclaredRefinement {
+                set: element_set,
+                spelling: ">= 1 && <= 5 && integer".to_owned(),
+                admits_none: false,
+                element: None,
+                element_length: None,
+                generator: None,
+                members: None,
+                positions: None,
+            })),
+            element_length: None,
+            generator: None,
+            members: None,
+            positions: None,
+        }
+    }
+
+    /// A `Kind::Set` sequence with NO length bound — the same star shape
+    /// `repeat_of(element, lo, hi)` builds — wrapping `element`'s own
+    /// set, tagged Integer: `check.rs::seed_parameters`'s own seed for a
+    /// `list[X]` PARAMETER, and what a comprehension over it still
+    /// carries at its own return (`expressions.rs::comprehension_star_
+    /// elements`'s own re-windowed result).
+    fn ratings_sequence_value(lo: f64, hi: f64) -> AbstractValue {
+        use refined_sets::refinement_forms::repeat_of;
+        let element = make_refined_set(vec![integer(), at_least(lo), at_most(hi)]);
+        AbstractValue {
+            kind_tag: Some(PrimitiveKind::Integer),
+            ..known_set(make_refined_set(vec![repeat_of(element, 0, None)]), None, TrustSpec, SetKindTag::None)
+        }
+    }
+
+    /// `bump_all`'s own showcase row: `[r + 1 for r in rs]` widens the
+    /// declared `1..=5` window to `2..=6`, which is NOT a subset of the
+    /// declared element set — fires the whole-container ELEMENT-SET
+    /// sentence, no single index to blame.
+    #[test]
+    fn a_sequence_whose_element_set_escapes_the_declared_element_set_fires() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let declared = ratings_refinement();
+        let value = ratings_sequence_value(2.0, 6.0);
+        let message = fire_message(judge(&value, &declared, &kernel));
+        assert_eq!(
+            message,
+            "a value of type 'list of (>= 2 && <= 6 && integer)' is not assignable to type 'list of (>= 1 && <= 5 && integer)'"
+        );
+    }
+
+    /// `bump_all_clamped`'s own showcase twin: `[min(5, r + 1) for r in
+    /// rs]` keeps every mapped value inside the declared `1..=5`
+    /// window (clamped at 5) — the flowing element set sits inside the
+    /// declared one, so this is Silent.
+    #[test]
+    fn a_sequence_whose_element_set_sits_inside_the_declared_element_set_is_silent() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let declared = ratings_refinement();
+        let value = ratings_sequence_value(2.0, 5.0);
+        assert!(matches!(judge(&value, &declared, &kernel), Verdict::Silent));
+    }
+
     // --- the MEMBERS LAW: a TypedDict's per-member judgment ---
 
     /// `PersonDict`'s own `age: Age` member table — the `members`-carrying
@@ -2234,8 +2355,10 @@ mod tests {
     }
 
     /// `return {"age": 200}` under `-> PersonDict` — the declared member's
-    /// own out-of-set value fires, naming the key exactly like the
-    /// element law's own key-naming convention.
+    /// own out-of-set value fires, naming the key and the value bare, up
+    /// front: "the key 'age' of value 200 is not assignable to type
+    /// '...'" — never the outer TypedDict's own alias name, since a
+    /// reader at this exact member needs to see what THIS member admits.
     #[test]
     fn a_typed_dict_with_an_out_of_set_member_fires_naming_the_key() {
         let Some(kernel) = loaded_kernel() else { return };
@@ -2252,8 +2375,90 @@ mod tests {
             false,
         );
         let message = fire_message(judge(&value, &declared, &kernel));
-        assert!(message.contains("'Age'"), "{message}");
-        assert!(message.contains("(at key 'age')"), "{message}");
+        assert!(message.contains("the key 'age' of value 200"), "{message}");
+        assert!(message.contains("120"), "names Age's own ceiling: {message}");
+    }
+
+    /// The showcase's own `record_vitals(Vitals(heart_rate=72,
+    /// spo2=130))` row: a `spo2` member over its own `0..=100` ceiling
+    /// fires the exact wording the marker states. This pins the WORDING
+    /// half of the fix (`assignability::judge`'s MEMBERS LAW, given a
+    /// `members`-carrying declaration) — the SURFACING half is a
+    /// `check.rs` gap outside this file: a STATEMENT-LEVEL construction
+    /// (`return Person.model_validate(...)`, the m-pydantic corpus's own
+    /// shape) already fires correctly today, because `check.rs::sink_
+    /// value`'s law 3 surfaces `judge_construction`'s own per-field
+    /// fires directly at the sink with NO dependency on `Vitals`'s own
+    /// return/parameter annotation compiling a `DeclaredRefinement` at
+    /// all. A construction NESTED inside a call argument, this
+    /// showcase row's own shape, is the one construct that still loses
+    /// its fire: `check.rs::judge_one_call_argument` evaluates each
+    /// argument through plain `evaluate_expression`, whose same-module-
+    /// construction arm discards `judge_construction`'s fires by design
+    /// (they belong to whichever sink hosts the call, and an argument
+    /// position is not currently such a sink). `instances::model_
+    /// members_refinement` (already `pub`) builds exactly the `members:
+    /// Some(...)` shape this test constructs by hand, ready for a
+    /// `check.rs` fix to adopt either as a re-judged sink or to surface
+    /// `judge_construction`'s own already-correct verdict directly.
+    #[test]
+    fn a_vitals_construction_with_spo2_out_of_set_fires_the_shown_words_key_wording() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let heart_rate_refinement = || DeclaredRefinement {
+            set: make_refined_set(vec![integer(), at_least(20.0), at_most(250.0)]),
+            spelling: ">= 20 && <= 250 && integer".to_owned(),
+            admits_none: false,
+            element: None,
+            element_length: None,
+            generator: None,
+            members: None,
+            positions: None,
+        };
+        let spo2_refinement = DeclaredRefinement {
+            set: make_refined_set(vec![at_least(0.0), at_most(100.0)]),
+            spelling: ">= 0 && <= 100".to_owned(),
+            admits_none: false,
+            element: None,
+            element_length: None,
+            generator: None,
+            members: None,
+            positions: None,
+        };
+        let declared = DeclaredRefinement {
+            set: make_refined_set(Vec::new()),
+            spelling: "Vitals".to_owned(),
+            admits_none: false,
+            element: None,
+            element_length: None,
+            generator: None,
+            members: Some(vec![("heart_rate".to_owned(), heart_rate_refinement()), ("spo2".to_owned(), spo2_refinement)]),
+            positions: None,
+        };
+        let value = refined_domain::known_constructors::known_object(
+            vec![
+                refined_domain::abstract_value::ObjectKey {
+                    name: "heart_rate".to_owned(),
+                    numeric: false,
+                    value: known_values(vec![72.0], PrimitiveKind::Integer, TrustProved),
+                },
+                refined_domain::abstract_value::ObjectKey {
+                    name: "spo2".to_owned(),
+                    numeric: false,
+                    // `spo2=130` is a bare Python int literal — evaluates
+                    // Integer-tagged regardless of the field's own
+                    // `float`-typed annotation (this checker's literal
+                    // reader does not itself coerce; only the MEMBERS
+                    // LAW's per-value judgment below does).
+                    value: known_values(vec![130.0], PrimitiveKind::Integer, TrustProved),
+                },
+            ],
+            None,
+            true,
+            TrustProved,
+            false,
+        );
+        let message = fire_message(judge(&value, &declared, &kernel));
+        assert_eq!(message, "the key 'spo2' of value 130 is not assignable to type '>= 0 && <= 100'");
     }
 
     /// `return {"age": 40}` under `-> PersonDict` — the member sits inside
@@ -2351,10 +2556,12 @@ mod tests {
     }
 
     /// Slot 0 out of its own declared set fires, naming the offending
-    /// index — the positions law's own twin of the element law's
-    /// key-naming convention.
+    /// slot by its ordinal word — a 2-slot tuple's own slot 0 reads as
+    /// "the first slot," and the message states the slot's own bare
+    /// contents (never the outer tuple's alias name — a reader at this
+    /// exact position needs to see what THIS slot admits).
     #[test]
-    fn a_two_slot_list_with_slot_zero_out_of_set_fires_naming_the_index() {
+    fn a_two_slot_list_with_slot_zero_out_of_set_fires_naming_the_slot() {
         let Some(kernel) = loaded_kernel() else { return };
         let declared = age_label_tuple_refinement();
         let value = refined_domain::known_constructors::known_list(
@@ -2365,8 +2572,89 @@ mod tests {
             TrustProved,
         );
         let message = fire_message(judge(&value, &declared, &kernel));
-        assert!(message.contains("'Age'"), "{message}");
-        assert!(message.contains("(at index 0)"), "{message}");
+        assert!(message.contains("200 in the first slot"), "{message}");
+        assert!(message.contains("120"), "names Age's own ceiling: {message}");
+    }
+
+    /// `paint((255, 300, 0))` — the showcase's own 3-tuple row: slot 1
+    /// (the exact center of a 3-slot tuple) reads as "the middle slot,"
+    /// and the message states the slot's own bare contents with no "a
+    /// value of type" preamble: "300 in the middle slot is not
+    /// assignable to type '>= 0 && <= 255 && integer'".
+    #[test]
+    fn a_three_slot_tuples_middle_slot_out_of_set_fires_naming_it_the_middle_slot() {
+        let Some(kernel) = loaded_kernel() else { return };
+        fn channel_refinement() -> DeclaredRefinement {
+            DeclaredRefinement {
+                set: make_refined_set(vec![integer(), at_least(0.0), at_most(255.0)]),
+                spelling: "Channel".to_owned(),
+                admits_none: false,
+                element: None,
+                element_length: None,
+                generator: None,
+                members: None,
+                positions: None,
+            }
+        }
+        let declared = DeclaredRefinement {
+            set: make_refined_set(Vec::new()),
+            spelling: "tuple[Channel, Channel, Channel]".to_owned(),
+            admits_none: false,
+            element: None,
+            element_length: None,
+            generator: None,
+            members: None,
+            positions: Some(vec![channel_refinement(), channel_refinement(), channel_refinement()]),
+        };
+        let value = refined_domain::known_constructors::known_list(
+            vec![
+                known_values(vec![255.0], PrimitiveKind::Integer, TrustProved),
+                known_values(vec![300.0], PrimitiveKind::Integer, TrustProved),
+                known_values(vec![0.0], PrimitiveKind::Integer, TrustProved),
+            ],
+            TrustProved,
+        );
+        let message = fire_message(judge(&value, &declared, &kernel));
+        assert_eq!(message, "300 in the middle slot is not assignable to type '>= 0 && <= 255 && integer'");
+    }
+
+    /// `paint((255, 128, 0))` — every slot of the 3-tuple inside its own
+    /// declared set is Silent, the showcase's own in-set twin of the
+    /// middle-slot fire above.
+    #[test]
+    fn a_three_slot_tuple_with_every_slot_in_set_is_silent() {
+        let Some(kernel) = loaded_kernel() else { return };
+        fn channel_refinement() -> DeclaredRefinement {
+            DeclaredRefinement {
+                set: make_refined_set(vec![integer(), at_least(0.0), at_most(255.0)]),
+                spelling: "Channel".to_owned(),
+                admits_none: false,
+                element: None,
+                element_length: None,
+                generator: None,
+                members: None,
+                positions: None,
+            }
+        }
+        let declared = DeclaredRefinement {
+            set: make_refined_set(Vec::new()),
+            spelling: "tuple[Channel, Channel, Channel]".to_owned(),
+            admits_none: false,
+            element: None,
+            element_length: None,
+            generator: None,
+            members: None,
+            positions: Some(vec![channel_refinement(), channel_refinement(), channel_refinement()]),
+        };
+        let value = refined_domain::known_constructors::known_list(
+            vec![
+                known_values(vec![255.0], PrimitiveKind::Integer, TrustProved),
+                known_values(vec![128.0], PrimitiveKind::Integer, TrustProved),
+                known_values(vec![0.0], PrimitiveKind::Integer, TrustProved),
+            ],
+            TrustProved,
+        );
+        assert!(matches!(judge(&value, &declared, &kernel), Verdict::Silent));
     }
 
     /// A list of the WRONG LENGTH (one slot, not two) fires as a

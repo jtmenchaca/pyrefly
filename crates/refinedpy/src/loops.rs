@@ -244,6 +244,7 @@ pub fn loop_final_environment(
 /// `Broke` does, ending the WHOLE loop (real CPython: a `return` exits
 /// the function outright, so no later statement in this body, this
 /// iteration, or any further iteration ever runs).
+#[derive(Debug)]
 enum BodyOutcome {
     Fell,
     Broke,
@@ -2231,6 +2232,122 @@ mod tests {
             result.read("total").map(|v| v.kind),
             Some(Kind::Unknown),
             "the unstable name holds no claim past the loop"
+        );
+    }
+
+    // --- STEPWISE DIAGNOSTIC CHAIN for showcase.py's own `total = total +
+    // amount` shape (invoice_total/refund_everything) — the two pins at
+    // check.rs's own test module (`a_plain_rebind_accumulation_over_a_
+    // float_list_parameter_walks_the_loop` and its subtracting twin) still
+    // fail with the coarser "a for statement is not yet walked" blocker
+    // after the join's own numeric-fallback union was fixed to thread a
+    // shared `kind_tag` (lattice_operations.rs) — these three tests
+    // measure each link of the chain in isolation rather than inferring
+    // which one still declines from the pins' own outer failure.
+
+    /// STEP 1: `join_known` directly, on the EXACT pair `stabilized_join`
+    /// builds for `total` after the loop's first pass — the pre-loop
+    /// binding (`total = 0.0`, `Kind::Values`, Float-tagged) against a
+    /// pass-one Set (`total + amount` — the same `[0, +inf)`-shaped
+    /// Float-tagged window `transfer_over_sets`'s `TransferAnswerKind::Set`
+    /// row answers for a non-negative Float set added to `{0.0}`, built by
+    /// hand here rather than round-tripped through the kernel, matching
+    /// this test's own narrow question: what the JOIN does with this
+    /// shape, not what the transfer computes). Asserts the joined value's
+    /// kind, kind_tag, and set forms — the fixed `shared_kind_tag` should
+    /// carry `Some(Float)` through onto the union.
+    #[test]
+    fn join_known_of_preloop_total_and_pass_one_set_keeps_the_float_tag() {
+        let preloop_total = known_values(vec![0.0], PrimitiveKind::Float, TrustProved);
+        let pass_one_total = AbstractValue {
+            kind_tag: Some(PrimitiveKind::Float),
+            ..known_set(make_refined_set(vec![at_least(0.0)]), None, TrustProved, SetKindTag::None)
+        };
+        let joined = refined_domain::lattice_operations::join_known(preloop_total, pass_one_total);
+        assert_eq!(joined.kind, Kind::Set, "a Values/Set numeric pair joins to a Set: {joined:?}");
+        assert_eq!(
+            joined.kind_tag,
+            Some(PrimitiveKind::Float),
+            "the join must thread the shared Float tag onto the union rather than drop it: {joined:?}"
+        );
+        assert_eq!(joined.set_kind_tag, SetKindTag::None, "a plain numeric set carries no worn tag: {joined:?}");
+    }
+
+    /// STEP 2: feeds STEP 1's joined value as the LEFT operand of the same
+    /// `total + amount` binary op the loop's SECOND pass evaluates,
+    /// through `binary_arithmetic_value_with_kernel` — the exact function
+    /// `evaluate_binop` calls (expressions.rs) — asking what the kernel's
+    /// own `transfer_over_sets` path does with a UNION-shaped operand
+    /// (`union({0.0}, [0, +inf))`) now that it carries a tag. Two
+    /// possibilities distinguish the remaining failing link: if this
+    /// answers `Kind::Unknown`, the tag fix alone was not enough — the
+    /// kernel's own `transfer` closure declines a Union-form operand
+    /// outright (unfolded), and the fix is a fold at the ask site; if this
+    /// answers `Kind::Set`/`Kind::Values`, the join/transfer chain itself
+    /// is clean and the remaining defect is downstream (`run_assign_once`/
+    /// `stabilized_join`'s own comparison, or `bind_checked`).
+    #[test]
+    fn transfer_over_the_joined_union_set_plus_amount_measures_the_kernel_answer() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let preloop_total = known_values(vec![0.0], PrimitiveKind::Float, TrustProved);
+        let pass_one_total = AbstractValue {
+            kind_tag: Some(PrimitiveKind::Float),
+            ..known_set(make_refined_set(vec![at_least(0.0)]), None, TrustProved, SetKindTag::None)
+        };
+        let joined_total = refined_domain::lattice_operations::join_known(preloop_total, pass_one_total);
+        let amount = AbstractValue {
+            kind_tag: Some(PrimitiveKind::Float),
+            ..known_set(make_refined_set(vec![at_least(0.0)]), None, TrustProved, SetKindTag::None)
+        };
+        let result = crate::expressions::binary_arithmetic_value_with_kernel(Operator::Add, &joined_total, &amount, &kernel);
+        eprintln!("STEP 2 measured answer: {result:?}");
+        assert_ne!(
+            result.kind,
+            Kind::Unknown,
+            "if this fails, the kernel's transfer declines the joined UNION operand outright — the \
+            remaining fix is a fold (fold_ray_forms) of the joined set before the ask, either at \
+            transfer_over_sets' own call site or at join_known's union-building arm: {result:?}"
+        );
+    }
+
+    /// STEP 3: the same union-shaped joined value, folded through
+    /// `refined_sets::refinement_forms::fold_ray_forms` BEFORE the ask —
+    /// the Rust twin of the Go adapter's `FoldRayForms`/`CanonicalScalarForms`
+    /// hygiene (refinement_forms.go's own doc: "posing the folded question
+    /// saves the kernel the redundant forms... while asking for the same
+    /// set"). `{0.0} ∪ [0, +inf)` folds to the single ray `[0, +inf)` —
+    /// `at_least(0.0)` dominates the singleton, so the fold both simplifies
+    /// AND stays semantically identical. If STEP 2 shows the kernel
+    /// declining the unfolded union but this step's folded ask determines,
+    /// the fix site is confirmed: fold the joined set's forms before
+    /// `transfer_over_sets` asks the kernel (or fold at `join_known`'s own
+    /// union-building arms directly, so every caller of `join_known`
+    /// inherits the same hygiene without a second call site).
+    #[test]
+    fn transfer_over_the_folded_joined_set_plus_amount_measures_the_kernel_answer() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let preloop_total = known_values(vec![0.0], PrimitiveKind::Float, TrustProved);
+        let pass_one_total = AbstractValue {
+            kind_tag: Some(PrimitiveKind::Float),
+            ..known_set(make_refined_set(vec![at_least(0.0)]), None, TrustProved, SetKindTag::None)
+        };
+        let joined_total = refined_domain::lattice_operations::join_known(preloop_total, pass_one_total);
+        let folded_forms = refined_sets::refinement_forms::fold_ray_forms(&joined_total.set.forms);
+        let folded_total = AbstractValue {
+            set: make_refined_set(folded_forms),
+            ..joined_total
+        };
+        let amount = AbstractValue {
+            kind_tag: Some(PrimitiveKind::Float),
+            ..known_set(make_refined_set(vec![at_least(0.0)]), None, TrustProved, SetKindTag::None)
+        };
+        let result = crate::expressions::binary_arithmetic_value_with_kernel(Operator::Add, &folded_total, &amount, &kernel);
+        eprintln!("STEP 3 measured answer (folded operand): {result:?}");
+        assert_ne!(
+            result.kind,
+            Kind::Unknown,
+            "the folded ray form still declines — the remaining defect is not the union's redundant \
+            forms: {result:?}"
         );
     }
 

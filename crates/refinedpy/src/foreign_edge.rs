@@ -188,6 +188,7 @@ use crate::foreign_edge_artifact::ForeignTsArtifact;
 use crate::foreign_edge_artifact::ForeignTsEntry;
 #[cfg(test)]
 use crate::foreign_edge_artifact::ForeignTsFunctionFact;
+use crate::foreign_edge_artifact::read_compiled_binary_fact;
 #[cfg(not(test))]
 use crate::foreign_edge_artifact::read_foreign_ts_artifact as read_foreign_ts_artifact_landed;
 
@@ -479,28 +480,49 @@ fn discharge_edge_premises(
             edge.target_path = directory.join(target).to_string_lossy().into_owned();
         }
     }
-    let artifact = match read_foreign_ts_artifact(&edge.target_path) {
-        Ok(artifact) => artifact,
-        Err(reason) => {
-            let message = if edge.runner == Runner::CompiledBinary {
-                // The artifact reader's own sentence names a missing
-                // TypeScript-fact file and the `-export-fact` command
-                // that writes one — neither applies here: the target is
-                // a compiled binary, and no producer in this checker
-                // exports a fact for one. Name the construct that
-                // actually blocks, not the generic no-fact sentence.
-                diagnostic_sentences::compiled_binary_no_fact(&edge.target_path)
-            } else {
-                "the target ".to_owned() + &edge.target_path + " states no fact for this edge — " + &reason
-            };
-            return Err(EdgeDischargeError::Decline(ForeignEdgeOutcome::Decline { message, range: edge.call }));
+    let artifact = if edge.runner == Runner::CompiledBinary {
+        // A compiled binary reads its fact from a SIBLING file
+        // (`<binary_path>.facts.json`), never the TypeScript reader's
+        // project-cache path — a compiled binary has no `.refined/cache/`
+        // entry any producer in this checker writes.
+        match read_compiled_binary_fact(&edge.target_path) {
+            Ok(artifact) => artifact,
+            Err(reason) => {
+                let sibling_exists = crate::foreign_edge_artifact::compiled_binary_fact_path(&edge.target_path).exists();
+                let message = if sibling_exists {
+                    // The sibling file exists but failed to read as a
+                    // fact — name the unreadable file, not the generic
+                    // "no producer" sentence, which is only true when
+                    // there is no fact file at all.
+                    reason
+                } else {
+                    // The artifact reader's own sentence names a missing
+                    // TypeScript-fact file and the `-export-fact` command
+                    // that writes one — neither applies here: the target
+                    // is a compiled binary, and no producer in this
+                    // checker exports a fact for one. Name the construct
+                    // that actually blocks, not the generic no-fact
+                    // sentence.
+                    diagnostic_sentences::compiled_binary_no_fact(&edge.target_path)
+                };
+                return Err(EdgeDischargeError::Decline(ForeignEdgeOutcome::Decline { message, range: edge.call }));
+            }
+        }
+    } else {
+        match read_foreign_ts_artifact(&edge.target_path) {
+            Ok(artifact) => artifact,
+            Err(reason) => {
+                let message = "the target ".to_owned() + &edge.target_path + " states no fact for this edge — " + &reason;
+                return Err(EdgeDischargeError::Decline(ForeignEdgeOutcome::Decline { message, range: edge.call }));
+            }
         }
     };
-    // RUNTIME IDENTITY: the artifact's own band names an ECMA-262 spec
-    // level, not one runtime binary (ruling, 2026-08-21) — the sibling
-    // reader already checked the band against this checker's pinned
-    // `es2023+` string, so any recognized runner (node, deno, bun, npx
-    // tsx) discharges this premise identically once that check passed.
+    // RUNTIME IDENTITY: the artifact's own band names a spec level, not
+    // one runtime binary (ruling, 2026-08-21) — the reader that produced
+    // `artifact` already checked its band against the pin for its own
+    // language (`es2023+` for a JS runner row, `c++17` for a compiled-
+    // binary row), so every recognized row discharges this premise
+    // identically once that check passed.
     //
     // CARRIER IDENTITY: the call's own spelling states one channel, and
     // the target's surface states the one it actually reads — a JSON
@@ -3987,7 +4009,9 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::collections::HashSet;
+    use std::fs;
     use std::path::PathBuf;
+    use std::time::SystemTime;
 
     use refined_domain::abstract_value::possibly_nan;
     use refined_domain::trust_grades::TrustProved;
@@ -5338,15 +5362,69 @@ mod tests {
 
     /* ── the compiled-binary argv row ─────────────────────────────────── */
 
+    /// A fresh temp directory (unique per test run), mirroring
+    /// `foreign_edge_artifact.rs`'s own `temp_project_root` convention —
+    /// a compiled binary's fact reads from a SIBLING file discovered by
+    /// path alone (`compiled_binary_fact_path`), so no `.git` marker is
+    /// needed here (unlike the TypeScript reader's project-cache walk).
+    fn temp_binary_dir(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "refinedpy_foreign_edge_compiled_binary_test_{label}_{}_{}",
+            std::process::id(),
+            SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("create temp binary dir");
+        root
+    }
+
+    /// A well-formed compiled-binary fact file's JSON — the triangle's
+    /// own `cpp_level` contract in miniature: one sequence entry (numbers
+    /// -2.0…2.0, at least one element) and a number 0.0…1.0 return,
+    /// through the identical cases-schema envelope
+    /// `audio_level_ts_artifact` builds for a TypeScript target, with
+    /// `language: "cpp"` in place of `"typescript"` and the compiled
+    /// runtime band in place of the JS one.
+    fn compiled_binary_fact_json(called: &str) -> serde_json::Value {
+        use refined_kernel::wire_format::wire_set;
+        use serde_json::json;
+        let entry_set = make_refined_set(vec![at_least(-2.0), at_most(2.0)]);
+        let return_set = make_refined_set(vec![at_least(0.0), at_most(1.0)]);
+        json!({
+            "refined": {"kind": "fact-artifact"},
+            "language": "cpp",
+            "runtime": {"band": "c++17"},
+            "surface": {"kind": "stdin-json", "stdin": "json", "stdout": "json", "calls": called},
+            "functions": {
+                called: {
+                    "entry": [{"name": "samples", "sequence": {"element": {"cases": [
+                        {"sort": "number", "set": wire_set(&entry_set)}
+                    ]}, "lengthAtLeast": 1}}],
+                    "return": {"cases": [{"sort": "number", "set": wire_set(&return_set)}], "stdoutPure": true},
+                    "provenance": {"line": 35, "said": "level's own derivation: clamp, mean of squares, sqrt"},
+                }
+            }
+        })
+    }
+
     /// A single-element, path-shaped argv (`["./targets/cpp_level"]`)
     /// recognizes as a compiled-binary invocation and reaches the
-    /// artifact lookup exactly as a `node` row does: registering a
-    /// fixture artifact under the binary's own path serves the crossing
-    /// (`Override`), the same as any other recognized runner row.
+    /// SIBLING fact-file reader exactly as the triangle's own
+    /// `level_via_cpp` is designed to once `cpp_level.facts.json` exists
+    /// beside the binary: a real `<dir>/targets/cpp_level.facts.json`
+    /// written under a temp `entry_directory` serves the crossing
+    /// (`Override`), never the in-memory TypeScript stub (which
+    /// `Runner::CompiledBinary` no longer reaches at all).
     #[test]
-    fn a_bare_binary_argv_recognizes_and_reaches_the_artifact_lookup() {
-        register_fixture_artifact("./targets/cpp_level", audio_level_ts_artifact());
+    fn a_bare_binary_argv_recognizes_and_reaches_the_sibling_fact_file() {
         let Some(kernel) = loaded_kernel() else { return };
+        let root = temp_binary_dir("well_formed");
+        fs::create_dir_all(root.join("targets")).expect("create targets dir");
+        fs::write(
+            root.join("targets").join("cpp_level.facts.json"),
+            compiled_binary_fact_json("level").to_string(),
+        )
+        .expect("write sibling fact file");
+
         let source = concat!(
             "def f(boosted):\n",
             "    result = subprocess.run(\n",
@@ -5359,26 +5437,36 @@ mod tests {
         );
         let body = def_body(source);
         let environment = env_with(&[("boosted", boosted_sequence_value())]);
-        match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("a bare-binary argv recognizes") {
+        match foreign_edge_at(&body, 0, &environment, &kernel, Some(&root)).expect("a bare-binary argv recognizes") {
             ForeignEdgeOutcome::Override { value, .. } => {
                 assert_eq!(value.kind, Kind::Set);
-                assert_eq!(value.kind_tag, Some(PrimitiveKind::Integer));
+                // The fact's return set carries no `integer()` form (a
+                // real-valued 0.0…1.0 band, matching `Level`'s own
+                // declared type `float`) — `requires_or_reads_integer`
+                // reads `PrimitiveKind::Float` here, unlike this test
+                // module's OTHER fixtures, whose return sets state
+                // `integer()` explicitly.
+                assert_eq!(value.kind_tag, Some(PrimitiveKind::Float));
             }
             ForeignEdgeOutcome::Decline { message, .. } => panic!("wanted an override, got a decline: {message}"),
             ForeignEdgeOutcome::Fired { message, .. } => panic!("wanted an override, got a fire: {message}"),
         }
+
+        fs::remove_dir_all(&root).ok();
     }
 
-    /// The SAME bare-binary argv with no fixture artifact registered:
-    /// recognition still reaches the artifact lookup (the call is not
-    /// declined as an unrecognized shape), and the lookup's own decline
-    /// names the compiled-binary construct — never the generic "there is
-    /// no <path>.refined.json; write it with -export-fact" sentence,
-    /// which names a command that has no meaning for a target that is
-    /// not TypeScript source.
+    /// The SAME bare-binary argv with no sibling fact file on disk at
+    /// all: recognition still reaches the artifact lookup (the call is
+    /// not declined as an unrecognized shape), and the lookup's own
+    /// decline names the compiled-binary construct — never the generic
+    /// "there is no <path>.refined.json; write it with -export-fact"
+    /// sentence, which names a command that has no meaning for a target
+    /// that is not TypeScript source. The no-file rung of the ladder.
     #[test]
     fn a_bare_binary_argv_with_no_artifact_declines_naming_the_compiled_binary() {
         let Some(kernel) = loaded_kernel() else { return };
+        let root = temp_binary_dir("no_fact");
+        fs::create_dir_all(root.join("targets")).expect("create targets dir");
         let source = concat!(
             "def f(boosted):\n",
             "    result = subprocess.run(\n",
@@ -5391,15 +5479,52 @@ mod tests {
         );
         let body = def_body(source);
         let environment = env_with(&[("boosted", boosted_sequence_value())]);
-        match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("a bare-binary argv recognizes") {
+        match foreign_edge_at(&body, 0, &environment, &kernel, Some(&root)).expect("a bare-binary argv recognizes") {
             ForeignEdgeOutcome::Decline { message, .. } => {
-                assert!(message.contains("./targets/cpp_level"), "{message}");
+                assert!(message.contains("cpp_level"), "{message}");
                 assert!(message.contains("compiled binary"), "{message}");
                 assert!(!message.contains("-export-fact"), "{message}");
             }
             ForeignEdgeOutcome::Override { .. } => panic!("wanted a decline, got an override"),
             ForeignEdgeOutcome::Fired { message, .. } => panic!("wanted a decline, got a fire: {message}"),
         }
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A sibling fact file that EXISTS but is not readable JSON declines
+    /// naming the unreadable file — the ladder's second rung, distinct
+    /// from the no-file rung above: `sibling_exists` at the discharge
+    /// site is what tells the two rungs apart.
+    #[test]
+    fn a_sibling_fact_file_that_fails_to_parse_declines_naming_the_file() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let root = temp_binary_dir("unreadable");
+        fs::create_dir_all(root.join("targets")).expect("create targets dir");
+        fs::write(root.join("targets").join("cpp_level.facts.json"), b"not json at all").expect("write garbage fact file");
+
+        let source = concat!(
+            "def f(boosted):\n",
+            "    result = subprocess.run(\n",
+            "        [\"./targets/cpp_level\"],\n",
+            "        input=json.dumps(boosted),\n",
+            "        capture_output=True,\n",
+            "        text=True,\n",
+            "    )\n",
+            "    return json.loads(result.stdout)\n",
+        );
+        let body = def_body(source);
+        let environment = env_with(&[("boosted", boosted_sequence_value())]);
+        match foreign_edge_at(&body, 0, &environment, &kernel, Some(&root)).expect("a bare-binary argv recognizes") {
+            ForeignEdgeOutcome::Decline { message, .. } => {
+                assert!(message.contains("cpp_level.facts.json"), "{message}");
+                assert!(message.contains("not readable JSON"), "{message}");
+            }
+            ForeignEdgeOutcome::Override { .. } => panic!("wanted a decline, got an override"),
+            ForeignEdgeOutcome::Fired { message, .. } => panic!("wanted a decline, got a fire: {message}"),
+        }
+
+        fs::remove_dir_all(&root).ok();
     }
 
     /// A bare WORD with no leading path marker (`["cpp_level"]`, no
@@ -6248,8 +6373,6 @@ mod tests {
     // registered into the fixture stub under the SAME target path this
     // recognizer resolves to, so `foreign_edge_at`'s own recognition and
     // premise logic runs unchanged over a fact that really came off disk.
-
-    use std::fs;
 
     use refined_kernel::wire_format::wire_set;
     use serde_json::json;
