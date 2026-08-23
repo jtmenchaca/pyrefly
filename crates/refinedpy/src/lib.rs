@@ -12,6 +12,7 @@
 //! refined value and every judgment is owned here (plan-v2 laws L3-L5).
 
 pub mod assignability;
+pub mod binding_manifest;
 pub mod builtin_models;
 pub mod bytes_models;
 pub mod check;

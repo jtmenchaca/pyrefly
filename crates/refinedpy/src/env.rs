@@ -202,6 +202,37 @@ pub struct Environment {
     /// anywhere along the call chain. `None` for a walk that never set
     /// one.
     classes: Option<Arc<HashMap<String, ClassModel>>>,
+    /// The module's own `datetime` import identities — which local
+    /// names mean the `datetime` module, the `datetime.datetime`
+    /// class, the `datetime.date` class, and the `datetime.timedelta`
+    /// class (`expressions::DatetimeImports`'s own doc), if this
+    /// environment's walk has one to offer. Rides the environment for
+    /// the same reason `functions`/`classes` do: `expressions.rs`'s
+    /// datetime gates (`is_datetime_datetime_attribute` and its two
+    /// siblings) answer a construction/classmethod call by reading
+    /// `environment.datetime_imports()`, with no signature change
+    /// anywhere along the call chain. `None` for a walk that never set
+    /// one (a test environment, or a body reached before the table is
+    /// threaded through) — those gates fall back to the literal
+    /// `datetime.*` spelling only.
+    datetime_imports: Option<Arc<crate::expressions::DatetimeImports>>,
+    /// The checked file's own directory, if this environment's walk has
+    /// one to offer. Rides the environment for the same reason
+    /// `functions`/`classes`/`datetime_imports` do: `expressions.rs`'s
+    /// binding-manifest reader (`binding_manifest.rs`) discovers a
+    /// module's manifest file beside the checked file, and needs that
+    /// directory at the call-evaluation site
+    /// (`evaluate_attribute_call`'s own fallthrough), which reads only
+    /// `&Environment` and has no `WalkContext` of its own to read
+    /// `entry_directory` off — mirroring `check.rs::WalkContext`'s own
+    /// field of the identical name, populated at the same one site
+    /// `datetime_imports` is (`walk_body_with_self_binding`). `None` for
+    /// a walk that never set one (a test environment, or a body reached
+    /// before the field is threaded through) — the manifest reader
+    /// declines to discover any manifest at all in that case, the same
+    /// "nothing to offer" reading every other `None` on this struct
+    /// already carries.
+    entry_directory: Option<Arc<std::path::PathBuf>>,
     /// Every CALLABLE-VARIABLE name this walk has recorded a return
     /// refinement for — `x: Callable[[...], R] = ...`'s own `R`, keyed
     /// on `x`. Rides the environment for the same reason
@@ -267,25 +298,32 @@ pub struct Environment {
     /// back. Shares the same `Arc<Mutex<...>>` reach as `retained_
     /// callables` itself, for the identical cross-call-boundary reason.
     lambda_keys_by_range: Arc<Mutex<HashMap<u32, u32>>>,
-    /// One expression node's already-computed value, keyed by that
-    /// node's own AST range: `evaluate_expression` answers it directly
-    /// instead of evaluating the node. Set for the walk of exactly one
-    /// statement and cleared after.
+    /// Every expression node's already-computed value published for the
+    /// walk of a single statement, keyed by that node's own AST range:
+    /// `evaluate_expression` answers a matching range directly instead
+    /// of evaluating the node. Set for the walk of exactly one statement
+    /// and cleared after.
     ///
-    /// The relational sum is the one writer (`check.rs`'s
-    /// `walk_relational_sum`). A division `total / len(xs)` whose two
-    /// operands the kernel tied together answers far more tightly than
-    /// evaluating the node here could — the tie is a fact of the kernel
-    /// program, not of either operand — so the already-proved answer is
-    /// published for that node rather than recomputed and lost. The
-    /// range identifies the node the way `lambda_keys_by_range` already
-    /// identifies a lambda, and for the same reason: the evaluation
-    /// site reads only `&Environment` and knows a node by its range.
+    /// Two writers publish here. The relational sum (`check.rs`'s
+    /// `walk_relational_sum`) publishes a division `total / len(xs)`
+    /// whose two operands the kernel tied together — that answers far
+    /// more tightly than evaluating the node here could, since the tie
+    /// is a fact of the kernel program, not of either operand. A
+    /// recognized foreign-edge crossing (`check.rs`'s `serve_foreign_
+    /// edge_at`) publishes the return fact at its `json.loads(...)`
+    /// node AND, on a discharged crossing whose return is number-sorted,
+    /// the serialized stdout string at a SECOND node sitting in the
+    /// SAME statement's walk (`foreign_edge.rs`'s `ForeignEdgeOutcome::
+    /// stdout_override` doc) — a single slot cannot hold both, so this
+    /// carries up to two entries rather than one. The range identifies
+    /// each node the way `lambda_keys_by_range` already identifies a
+    /// lambda, and for the same reason: the evaluation site reads only
+    /// `&Environment` and knows a node by its range.
     ///
     /// A plain owned field rather than the shared `Arc<Mutex<...>>` the
-    /// retained-callable tables need: this value never has to outlive
-    /// the statement whose walk set it.
-    evaluated_node: Option<(TextRange, AbstractValue)>,
+    /// retained-callable tables need: these values never have to outlive
+    /// the statement whose walk set them.
+    evaluated_node: Vec<(TextRange, AbstractValue)>,
     /// Every value this body's `return` statements produced, in walk
     /// order — `None` unless a caller asked for them
     /// (`collect_returned_values`). `check.rs::walk_return` records the
@@ -330,13 +368,15 @@ impl Environment {
             locally_bound,
             functions: None,
             classes: None,
+            datetime_imports: None,
+            entry_directory: None,
             callable_returns: None,
             call_depth: 0,
             variadic_parameter_names: Arc::new(HashSet::new()),
             retained_callables: Arc::new(Mutex::new(HashMap::new())),
             retained_callable_counter: Arc::new(AtomicU32::new(0)),
             lambda_keys_by_range: Arc::new(Mutex::new(HashMap::new())),
-            evaluated_node: None,
+            evaluated_node: Vec::new(),
             returned_values: None,
             evaluations: None,
         }
@@ -378,6 +418,34 @@ impl Environment {
     /// The module's function table, if this environment carries one.
     pub fn functions(&self) -> Option<&Arc<FunctionTable>> {
         self.functions.as_ref()
+    }
+
+    /// Attaches the module's `datetime` import identities so a
+    /// construction/classmethod call evaluated against this
+    /// environment (and any environment forked from it) can resolve
+    /// `datetime`/`date`/`timedelta` by canonical identity rather than
+    /// literal spelling (`DatetimeImports`'s own doc).
+    pub fn set_datetime_imports(&mut self, datetime_imports: Arc<crate::expressions::DatetimeImports>) {
+        self.datetime_imports = Some(datetime_imports);
+    }
+
+    /// The module's `datetime` import identities, if this environment
+    /// carries one.
+    pub fn datetime_imports(&self) -> Option<&Arc<crate::expressions::DatetimeImports>> {
+        self.datetime_imports.as_ref()
+    }
+
+    /// Attaches the checked file's own directory so a call evaluated
+    /// against this environment (and any environment forked from it) can
+    /// discover a manifest file beside the checked file
+    /// (`binding_manifest.rs`'s own discovery convention).
+    pub fn set_entry_directory(&mut self, entry_directory: Arc<std::path::PathBuf>) {
+        self.entry_directory = Some(entry_directory);
+    }
+
+    /// The checked file's own directory, if this environment carries one.
+    pub fn entry_directory(&self) -> Option<&Arc<std::path::PathBuf>> {
+        self.entry_directory.as_ref()
     }
 
     /// Attaches the module's class table so a construction call
@@ -495,20 +563,21 @@ impl Environment {
             .copied()
     }
 
-    /// Publishes one expression node's already-computed value for the
-    /// walk of a single statement (see the field's own doc). `None`
-    /// clears it, which every caller does once that statement is walked.
-    pub fn set_evaluated_node(&mut self, evaluated: Option<(TextRange, AbstractValue)>) {
+    /// Publishes up to two expression nodes' already-computed values for
+    /// the walk of a single statement (see the field's own doc). An
+    /// empty `Vec` clears it, which every caller does once that
+    /// statement is walked.
+    pub fn set_evaluated_node(&mut self, evaluated: Vec<(TextRange, AbstractValue)>) {
         self.evaluated_node = evaluated;
     }
 
     /// The published value for the node at `range`, if one was set for
     /// this walk. Every other node reads `None` and evaluates normally.
     pub fn evaluated_node(&self, range: TextRange) -> Option<&AbstractValue> {
-        match &self.evaluated_node {
-            Some((published, value)) if *published == range => Some(value),
-            _ => None,
-        }
+        self.evaluated_node
+            .iter()
+            .find(|(published, _)| *published == range)
+            .map(|(_, value)| value)
     }
 
     /// Asks this body's walk to record every value its `return`
@@ -605,6 +674,8 @@ impl Environment {
             locally_bound: self.locally_bound.clone(),
             functions: self.functions.clone(),
             classes: self.classes.clone(),
+            datetime_imports: self.datetime_imports.clone(),
+            entry_directory: self.entry_directory.clone(),
             callable_returns: self.callable_returns.clone(),
             call_depth: self.call_depth,
             variadic_parameter_names: self.variadic_parameter_names.clone(),
@@ -612,8 +683,8 @@ impl Environment {
             retained_callable_counter: self.retained_callable_counter.clone(),
             lambda_keys_by_range: self.lambda_keys_by_range.clone(),
             // a fork walks part of the SAME statement (a comprehension's
-            // own element pass, a branch arm), so the published node
-            // travels with it
+            // own element pass, a branch arm), so the published nodes
+            // travel with it
             evaluated_node: self.evaluated_node.clone(),
             // the SAME recorder, never a copy: a `return` inside the arm
             // this fork walks must reach the asker (the field's own doc)
@@ -628,17 +699,20 @@ impl Environment {
     /// Rejoin two branch arms: only names both arms still know survive,
     /// each joined through the lattice. The locally-bound set is scope
     /// structure, not flow state — it is identical in both arms. The
-    /// function, class, callable-return, and retained-callable tables
-    /// are likewise identical in both arms (both forked from the same
-    /// body's one environment, sharing the very same `Arc`s —
-    /// `fork`'s own doc — so `a`'s and `b`'s own retained-callable
-    /// tables are not merely equal, they are the SAME underlying map),
-    /// so the joined environment simply carries `a`'s.
+    /// function, class, datetime-import, callable-return, and
+    /// retained-callable tables are likewise identical in both arms
+    /// (both forked from the same body's one environment, sharing the
+    /// very same `Arc`s — `fork`'s own doc — so `a`'s and `b`'s own
+    /// retained-callable tables are not merely equal, they are the
+    /// SAME underlying map), so the joined environment simply carries
+    /// `a`'s.
     pub fn join(a: Environment, b: &Environment) -> Environment {
         let mut bindings = HashMap::new();
         let locally_bound = a.locally_bound;
         let functions = a.functions;
         let classes = a.classes;
+        let datetime_imports = a.datetime_imports;
+        let entry_directory = a.entry_directory;
         let callable_returns = a.callable_returns;
         let call_depth = a.call_depth;
         let variadic_parameter_names = a.variadic_parameter_names;
@@ -664,6 +738,8 @@ impl Environment {
             locally_bound,
             functions,
             classes,
+            datetime_imports,
+            entry_directory,
             callable_returns,
             call_depth,
             variadic_parameter_names,
@@ -672,7 +748,7 @@ impl Environment {
             lambda_keys_by_range,
             // a join lands past the statement whose walk published a
             // node, so nothing carries forward
-            evaluated_node: None,
+            evaluated_node: Vec::new(),
             returned_values,
             evaluations,
         }

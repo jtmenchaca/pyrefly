@@ -157,6 +157,15 @@ pub struct RecognizedAccumulation {
     /// caller's own one-hop scan (`is_length_alias_assignment`) — this
     /// module never walks a statement list itself to fill it.
     pub length_aliases: std::collections::HashMap<String, String>,
+    /// The sequence's own count set, read once by `element_and_count_sets`
+    /// when the accumulation was recognized — the same nonnegative,
+    /// integer-sorted window `entry_states`'s slot 2 carries into the
+    /// kernel ask. `walk_accumulation` binds a count-alias name
+    /// (`count = len(samples)`) to exactly this set: the length is
+    /// already known here, from the sequence's own repetition window,
+    /// so a count-alias's value is this field re-read, never a fresh
+    /// derivation.
+    pub count_set: RefinedSet,
 }
 
 /// Recognizes `for <var> in <name>: <total> += <expr over var>` as a
@@ -357,7 +366,7 @@ fn accumulation_program(
             // slot 1: the element abstraction the body reads each trip
             number_state(element_set),
             // slot 2: the count
-            number_state(count_set),
+            number_state(count_set.clone()),
             // slot 3: the quotient slot, holding nothing until a
             // division writes it
             KnownStateWire {
@@ -380,6 +389,7 @@ fn accumulation_program(
         grade: trust_level_of(sequence_value),
         total_kind_tag,
         length_aliases: std::collections::HashMap::new(),
+        count_set,
     })
 }
 
@@ -705,6 +715,16 @@ pub struct AccumulationAnswer {
     /// The value the divided name holds, when a division was folded in
     /// and the kernel answered a bindable set for it.
     pub quotient: Option<AbstractValue>,
+    /// The sequence's own length, integer-sorted — the value a
+    /// count-alias name (`count = len(samples)`) binds to. Read straight
+    /// off `RecognizedAccumulation::count_set`, the same window
+    /// `entry_states`'s slot 2 already carried into the kernel ask; this
+    /// is not a kernel answer, since the length is a fact this checker
+    /// already held before asking (the sequence's own repetition
+    /// window), not one the kernel derived. `None` only when that window
+    /// itself states nothing bindable (an empty form list) — the same
+    /// rule `bindable_state` applies to every other slot.
+    pub count: Option<AbstractValue>,
 }
 
 /// Asks the kernel to walk the lowered program and reads back the slots
@@ -754,14 +774,32 @@ pub fn walk_accumulation(recognized: &RecognizedAccumulation) -> Option<Accumula
             .get(QUOTIENT_SLOT as usize)
             .and_then(|state| bindable_state(state, recognized.grade, Some(PrimitiveKind::Float))),
     };
+    // The count is not a kernel answer — it is the sequence's own
+    // repetition window, already read at recognition time
+    // (`element_and_count_sets`, stashed as `count_set`) and carried into
+    // the kernel ask as slot 2's entry state unchanged. A `len(...)` call
+    // yields Python's own `int` (library/functions.html#len), so the
+    // sort is Integer-tagged, exactly as `integer_set_bounds` reads back.
+    // Empty forms is the one case that states nothing bindable, the same
+    // rule every other slot answers under.
+    let count = if recognized.count_set.forms.is_empty() {
+        None
+    } else {
+        Some(AbstractValue {
+            kind_tag: Some(PrimitiveKind::Integer),
+            ..known_set(recognized.count_set.clone(), None, recognized.grade, SetKindTag::None)
+        })
+    };
     // An answer with NEITHER slot bindable claims nothing; either slot
     // alone still stands — a top total must not drop a proved quotient
     // (the ledger ties the quotient to the count even when the total's
-    // own enclosure is unbounded), and the reverse held already.
+    // own enclosure is unbounded), and the reverse held already. The
+    // count rides independently of both: it is known whenever the
+    // accumulation recognized at all, so it does not gate this decline.
     if total.is_none() && quotient.is_none() {
         return None;
     }
-    Some(AccumulationAnswer { total, quotient })
+    Some(AccumulationAnswer { total, quotient, count })
 }
 
 /// One exit state as a value this checker can bind, or `None` when the
@@ -1134,6 +1172,7 @@ mod tests {
             grade: TrustProved,
             total_kind_tag: None,
             length_aliases: std::collections::HashMap::new(),
+            count_set: make_refined_set(vec![]),
         };
         let expression = division_expression("total", "samples");
         assert!(
@@ -1160,6 +1199,7 @@ mod tests {
             grade: TrustProved,
             total_kind_tag: None,
             length_aliases: std::collections::HashMap::new(),
+            count_set: make_refined_set(vec![]),
         };
         let expression = division_expression("total", "others");
         assert!(
@@ -1298,6 +1338,7 @@ mod tests {
             grade: TrustProved,
             total_kind_tag: None,
             length_aliases: std::collections::HashMap::new(),
+            count_set: make_refined_set(vec![]),
         };
         let mut environment = environment_with_samples();
         environment.bind(
@@ -1335,6 +1376,7 @@ mod tests {
             grade: TrustProved,
             total_kind_tag: None,
             length_aliases: std::collections::HashMap::new(),
+            count_set: make_refined_set(vec![]),
         };
         let mut environment = environment_with_samples();
         environment.bind(
@@ -1522,6 +1564,7 @@ mod tests {
             grade: TrustProved,
             total_kind_tag: None,
             length_aliases: std::collections::HashMap::new(),
+            count_set: make_refined_set(vec![]),
         }
     }
 

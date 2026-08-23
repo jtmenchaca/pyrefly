@@ -87,6 +87,16 @@ struct WalkContext<'a> {
     kernel: &'a Arc<RefinedTSKernel>,
     functions: Arc<FunctionTable>,
     classes: Arc<HashMap<String, ClassModel>>,
+    /// The module's own `datetime` import identities — which local
+    /// names mean the `datetime` module, `datetime.datetime`,
+    /// `datetime.date`, and `datetime.timedelta`
+    /// (`expressions::DatetimeImports`'s own doc), built once here the
+    /// same "built once before any body walk" posture `functions`/
+    /// `classes` already take, and layered onto each body's own
+    /// `Environment` (`walk_body_with_self_binding`) so
+    /// `expressions.rs`'s datetime gates answer by canonical identity
+    /// rather than the literal `datetime`/`date`/`timedelta` spelling.
+    datetime_imports: Arc<crate::expressions::DatetimeImports>,
     module_bindings: HashMap<String, AbstractValue>,
     /// Every MODULE-LEVEL callable-variable's own return refinement:
     /// `name: Callable[[...], R] = ...` (or `| None`) at the module's
@@ -253,6 +263,7 @@ pub fn findings_for_module_at(
         kernel,
         functions,
         classes: Arc::new(classes),
+        datetime_imports: Arc::new(crate::expressions::datetime_imports(module)),
         module_bindings: surface.bindings,
         module_callable_returns,
         strict_int_aliases: &strict_int_aliases,
@@ -334,6 +345,7 @@ pub fn refined_set_at_position(
         kernel,
         functions,
         classes: Arc::new(classes),
+        datetime_imports: Arc::new(crate::expressions::datetime_imports(module)),
         module_bindings: surface.bindings,
         module_callable_returns,
         strict_int_aliases: &strict_int_aliases,
@@ -671,7 +683,7 @@ fn serve_foreign_edge_at(
     context: &WalkContext,
     blocked: &mut bool,
     out: &mut Vec<Finding>,
-    foreign_edge_overrides: &mut HashMap<usize, (TextRange, AbstractValue)>,
+    foreign_edge_overrides: &mut HashMap<usize, Vec<(TextRange, AbstractValue)>>,
 ) {
     if !matches!(body[position], Stmt::Assign(_) | Stmt::With(_)) {
         return;
@@ -682,7 +694,7 @@ fn serve_foreign_edge_at(
         return;
     };
     match outcome {
-        foreign_edge::ForeignEdgeOutcome::Override { parse_range, value } => {
+        foreign_edge::ForeignEdgeOutcome::Override { parse_range, value, stdout_override } => {
             // The override applies at the STATEMENT HOLDING the
             // `json.loads(...)` node — the sole consumer may sit any
             // number of statements after the call, so find it by range
@@ -692,7 +704,17 @@ fn serve_foreign_edge_at(
             // this insert, so two recognized calls before either is
             // consumed each keep their own entry.
             if let Some(consumer_position) = foreign_edge_consumer_position(body, position, parse_range) {
-                foreign_edge_overrides.insert(consumer_position, (parse_range, value));
+                let mut published = vec![(parse_range, value)];
+                // `stdout_override`'s own node (a `result.stdout`
+                // attribute access, or the bound name's own node) is a
+                // SUB-NODE of the SAME `json.loads(...)` statement
+                // `parse_range` already resolved a position for, so it
+                // always shares that position — `foreign_edge_consumer_
+                // position` is not asked a second time.
+                if let Some((stdout_range, stdout_value)) = stdout_override {
+                    published.push((stdout_range, stdout_value));
+                }
+                foreign_edge_overrides.insert(consumer_position, published);
             }
         }
         foreign_edge::ForeignEdgeOutcome::Fired { message, range, consumer } => {
@@ -706,7 +728,7 @@ fn serve_foreign_edge_at(
             // determined read.
             if let Some((consumer_range, value)) = consumer {
                 if let Some(consumer_position) = foreign_edge_consumer_position(body, position, consumer_range) {
-                    foreign_edge_overrides.insert(consumer_position, (consumer_range, value));
+                    foreign_edge_overrides.insert(consumer_position, vec![(consumer_range, value)]);
                 }
             }
         }
@@ -789,6 +811,10 @@ fn walk_body_with_self_binding(
     }
     environment.set_functions(Arc::new(merged(&local_function_table(body), &context.functions)));
     environment.set_classes(merged_classes_for_body(body, context));
+    environment.set_datetime_imports(context.datetime_imports.clone());
+    if let Some(entry_directory) = context.entry_directory.clone() {
+        environment.set_entry_directory(Arc::new(entry_directory));
+    }
     // Every module-level binding (this module's own top-level constants
     // AND every import statement's resolved value) is readable here
     // UNLESS this body itself rebinds the name — a local rebinding
@@ -896,7 +922,7 @@ fn walk_body_with_self_binding(
     // recurs — the same body never reaches it again — simply stays in
     // the map unconsumed and unread, exactly as inert as the single
     // slot's own unconsumed `None` was).
-    let mut foreign_edge_overrides: HashMap<usize, (TextRange, AbstractValue)> = HashMap::new();
+    let mut foreign_edge_overrides: HashMap<usize, Vec<(TextRange, AbstractValue)>> = HashMap::new();
     for (position, stmt) in body.iter().enumerate() {
         if let (Some(class), Stmt::FunctionDef(def)) = (self_model, stmt) {
             if is_self_method(def) {
@@ -971,8 +997,8 @@ fn walk_body_with_self_binding(
         // under a different position, is untouched here — each entry is
         // published only at its own consumer, never at another one's.
         let at_recognized_crossing = foreign_edge_overrides.contains_key(&position);
-        if let Some((parse_range, value)) = foreign_edge_overrides.get(&position) {
-            environment.set_evaluated_node(Some((*parse_range, value.clone())));
+        if let Some(published) = foreign_edge_overrides.get(&position) {
+            environment.set_evaluated_node(published.clone());
         }
         // RELATIONAL SUM AT A BARE RETURN: `return sum(<elt> for <var>
         // in <seq>)` with no assignment in the body at all — the
@@ -1017,7 +1043,7 @@ fn walk_body_with_self_binding(
         // (above) is likewise scoped to exactly the one statement whose
         // walk just ran — either way, the publication ends here and no
         // later node can match it.
-        environment.set_evaluated_node(None);
+        environment.set_evaluated_node(Vec::new());
         // This position's own entry (if it had one) expires the moment
         // its statement's walk runs — the same way the single slot's
         // `None` reset did, widened to a per-key removal so a DIFFERENT
@@ -1960,6 +1986,7 @@ fn walk_return(
         }),
         Verdict::Silent => {}
         Verdict::Undetermined(sentence) => {
+            let sentence = name_unmodeled_call_sentence(sentence, Some(value_expr), environment);
             record_blocker(blocked, value_expr.range(), sentence, out);
         }
     }
@@ -2002,7 +2029,7 @@ fn walk_yield(
     match yield_expr {
         Expr::Yield(yield_node) => {
             let range = yield_node.range();
-            let value = match yield_node.value.as_deref() {
+            let (value, source_expr) = match yield_node.value.as_deref() {
                 Some(value_expr) => {
                     bind_walrus_targets(value_expr, context, aug_assign_refinements, environment, out);
                     let Some(value) = sink_value(value_expr, context, environment, aug_assign_refinements, out) else {
@@ -2010,12 +2037,12 @@ fn walk_yield(
                         // this yield never produces a value to judge.
                         return;
                     };
-                    value
+                    (value, Some(value_expr))
                 }
                 // bare `yield` — the generator hands back None here.
-                None => refined_domain::abstract_value::null_value(),
+                None => (refined_domain::abstract_value::null_value(), None),
             };
-            judge_at(&value, declared, range, context, blocked, out);
+            judge_at(&value, declared, range, source_expr, context, environment, blocked, out);
         }
         Expr::YieldFrom(yield_from) => {
             let range = yield_from.range();
@@ -2029,7 +2056,7 @@ fn walk_yield(
                 return;
             };
             for element in &elements {
-                judge_at(element, declared, range, context, blocked, out);
+                judge_at(element, declared, range, None, context, environment, blocked, out);
                 // the first Fire this loop pushes is the row's own
                 // verdict — later elements still walk (so a LATER
                 // element's own Undetermined can still set the body's
@@ -2053,12 +2080,21 @@ fn walk_yield(
 /// recording the body's blocker candidate — `walk_return`'s own
 /// Fire/Silent/Undetermined tail, factored out so `walk_yield`'s two
 /// call shapes (a plain yield's one value, a delegation's several) share
-/// it instead of repeating the match.
+/// it instead of repeating the match. `source_expr` is the single
+/// expression this `value` was read from, when one exists (a plain
+/// `yield value_expr`'s own operand) — `None` for a `yield from`
+/// delegation's own per-element judging, where no single source
+/// expression names any one element. Passed through to
+/// `name_unmodeled_call_sentence` so a plain `yield torch.arange(5)`
+/// under a declared yield type names the module the same way a return
+/// or an assignment does.
 fn judge_at(
     value: &AbstractValue,
     declared: &DeclaredRefinement,
     range: TextRange,
+    source_expr: Option<&Expr>,
     context: &WalkContext,
+    environment: &Environment,
     blocked: &mut bool,
     out: &mut Vec<Finding>,
 ) {
@@ -2066,6 +2102,7 @@ fn judge_at(
         Verdict::Fire(message) => out.push(Finding { range, code: "RTS7001", message }),
         Verdict::Silent => {}
         Verdict::Undetermined(sentence) => {
+            let sentence = name_unmodeled_call_sentence(sentence, source_expr, environment);
             record_blocker(blocked, range, sentence, out);
         }
     }
@@ -2257,6 +2294,7 @@ pub fn derived_return_values_at(
         kernel,
         functions,
         classes: Arc::new(classes),
+        datetime_imports: Arc::new(crate::expressions::datetime_imports(module)),
         module_bindings: surface.bindings,
         module_callable_returns,
         strict_int_aliases: &strict_int_aliases,
@@ -2505,7 +2543,7 @@ fn serve_foreign_edge_in_walrus_test(
     context: &WalkContext,
     blocked: &mut bool,
     out: &mut Vec<Finding>,
-) -> HashMap<usize, (TextRange, AbstractValue)> {
+) -> HashMap<usize, Vec<(TextRange, AbstractValue)>> {
     let mut foreign_edge_overrides = HashMap::new();
     let Some((target, call)) = walrus_bound_call_in_test(test) else {
         return foreign_edge_overrides;
@@ -2522,14 +2560,22 @@ fn serve_foreign_edge_in_walrus_test(
         return foreign_edge_overrides;
     };
     match outcome {
-        foreign_edge::ForeignEdgeOutcome::Override { parse_range, value } => {
+        foreign_edge::ForeignEdgeOutcome::Override { parse_range, value, stdout_override } => {
             if let Some(consumer_position) = arm_body
                 .iter()
                 .enumerate()
                 .find(|(_, statement)| statement.range().contains_range(parse_range))
                 .map(|(position, _)| position)
             {
-                foreign_edge_overrides.insert(consumer_position, (parse_range, value));
+                let mut published = vec![(parse_range, value)];
+                // `stdout_override`'s own node sits inside the SAME
+                // `json.loads(...)` statement `parse_range` already
+                // resolved a position for (`serve_foreign_edge_at`'s own
+                // doc on this point).
+                if let Some((stdout_range, stdout_value)) = stdout_override {
+                    published.push((stdout_range, stdout_value));
+                }
+                foreign_edge_overrides.insert(consumer_position, published);
             }
         }
         foreign_edge::ForeignEdgeOutcome::Fired { message, range, consumer } => {
@@ -2545,7 +2591,7 @@ fn serve_foreign_edge_in_walrus_test(
                     .find(|(_, statement)| statement.range().contains_range(consumer_range))
                     .map(|(position, _)| position)
                 {
-                    foreign_edge_overrides.insert(consumer_position, (consumer_range, value));
+                    foreign_edge_overrides.insert(consumer_position, vec![(consumer_range, value)]);
                 }
             }
         }
@@ -2662,8 +2708,8 @@ fn walk_if(
                 let mut foreign_edge_overrides =
                     serve_foreign_edge_in_walrus_test(test, body, &arm_environment, context, blocked, out);
                 for (position, stmt) in body.iter().enumerate() {
-                    if let Some((parse_range, value)) = foreign_edge_overrides.get(&position) {
-                        arm_environment.set_evaluated_node(Some((*parse_range, value.clone())));
+                    if let Some(published) = foreign_edge_overrides.get(&position) {
+                        arm_environment.set_evaluated_node(published.clone());
                     }
                     walk_statement(
                         stmt,
@@ -2676,7 +2722,7 @@ fn walk_if(
                         blocked,
                         out,
                     );
-                    arm_environment.set_evaluated_node(None);
+                    arm_environment.set_evaluated_node(Vec::new());
                     foreign_edge_overrides.remove(&position);
                 }
                 *environment = if arm_terminates(body) { environment.fork() } else { arm_environment };
@@ -2695,8 +2741,8 @@ fn walk_if(
             .map(|test| serve_foreign_edge_in_walrus_test(test, body, &arm_environment, context, blocked, out))
             .unwrap_or_default();
         for (position, stmt) in body.iter().enumerate() {
-            if let Some((parse_range, value)) = foreign_edge_overrides.get(&position) {
-                arm_environment.set_evaluated_node(Some((*parse_range, value.clone())));
+            if let Some(published) = foreign_edge_overrides.get(&position) {
+                arm_environment.set_evaluated_node(published.clone());
             }
             walk_statement(
                 stmt,
@@ -2709,7 +2755,7 @@ fn walk_if(
                 blocked,
                 out,
             );
-            arm_environment.set_evaluated_node(None);
+            arm_environment.set_evaluated_node(Vec::new());
             foreign_edge_overrides.remove(&position);
         }
         if !arm_terminates(body) {
@@ -2886,17 +2932,23 @@ fn walk_relational_sum(
     // A walrus rebinding either name anywhere in the expression
     // declines both shapes: the rebinding happens mid-expression, so
     // the division would be over a value the kernel never tied.
-    let mut divided_into = None;
+    let mut divided_into: Option<(String, ruff_text_size::TextRange)> = None;
     let mut published_division = None;
     // How many of `following`'s leading statements this walk consumed:
     // 1 for the division alone, 2 when a count-alias assignment was
     // consumed ahead of it. Stays 0 on a decline, so the caller's own
     // skip bookkeeping only ever advances past what was actually folded.
     let mut consumed_statements: usize = 0;
+    // The alias name and its own Assign range, held only long enough to
+    // bind+publish below once the division actually folds — mirroring
+    // `divided_into`'s own tentativeness (an alias with nothing folded
+    // behind it is not consumed, so nothing about it is bound either).
+    let mut alias_binding: Option<(String, ruff_text_size::TextRange)> = None;
     let mut division_candidate = following.first();
     if let Some(Stmt::Assign(alias_assign)) = following.first() {
         if let Some(alias) = relational_sum::is_length_alias_assignment(alias_assign, &recognized, environment) {
-            relational_sum::record_length_alias(&mut recognized, alias);
+            relational_sum::record_length_alias(&mut recognized, alias.clone());
+            alias_binding = Some((alias, alias_assign.range()));
             division_candidate = following.get(1);
             consumed_statements = 1;
         }
@@ -2907,7 +2959,7 @@ fn walk_relational_sum(
                 if !rebinds_relational_name(assign.value.as_ref(), &recognized)
                     && relational_sum::fold_division(&mut recognized, assign.value.as_ref(), environment)
                 {
-                    divided_into = Some(target.id.as_str().to_owned());
+                    divided_into = Some((target.id.as_str().to_owned(), assign.range()));
                     consumed_statements += 1;
                 }
             }
@@ -2931,6 +2983,7 @@ fn walk_relational_sum(
     // read had never been tried.
     if divided_into.is_none() && published_division.is_none() {
         consumed_statements = 0;
+        alias_binding = None;
     }
     // Plain data dump for the two relational-sum fixtures one exhausted
     // static trace could not tell apart (the const-effect variant
@@ -2989,6 +3042,23 @@ fn walk_relational_sum(
         }
         None => environment.forget(&recognized.total_name),
     }
+    // The count-alias name (`count = len(samples)`) binds when a division
+    // actually folded behind it AND the kernel's own count window is
+    // bindable. The SAME publish the total's binding gets above: this
+    // recognizer consumes the whole alias Assign before the ordinary
+    // evaluator ever runs, so without this the alias binding's own
+    // position answers no set at `refined_set_at_position`. A count the
+    // machinery cannot state (an empty count window) leaves the alias
+    // exactly as today — forgotten, nothing fabricated.
+    if let Some((alias_name, alias_range)) = alias_binding {
+        match answer.count {
+            Some(count) => {
+                environment.record_evaluation(alias_range, count.clone());
+                environment.bind(&alias_name, count);
+            }
+            None => environment.forget(&alias_name),
+        }
+    }
     // The quotient rides its own slot, so the divided name carries
     // exactly what the kernel proved — or, where the kernel answered the
     // total but not the quotient, nothing at all rather than a guess.
@@ -3001,9 +3071,17 @@ fn walk_relational_sum(
     // of its own leading-statement tally, so that one is subtracted back
     // out here before it becomes a caller-facing skip count.
     let outcome = match (divided_into, published_division) {
-        (Some(target), _) => {
+        (Some((target, bound_range)), _) => {
             match answer.quotient {
-                Some(quotient) => environment.bind(&target, quotient),
+                Some(quotient) => {
+                    // The SAME publish the total's binding gets above:
+                    // this recognizer consumes the whole Assign before
+                    // the ordinary evaluation runs, so without this the
+                    // quotient binding's own position answers no set at
+                    // `refined_set_at_position`.
+                    environment.record_evaluation(bound_range, quotient.clone());
+                    environment.bind(&target, quotient)
+                }
                 None => environment.forget(&target),
             }
             RelationalSum::ConsumedWithDivision { skip_statements: consumed_statements }
@@ -3016,7 +3094,7 @@ fn walk_relational_sum(
         // evaluates ordinarily: never a weaker path than before.
         (None, Some(range)) => {
             if let Some(quotient) = answer.quotient {
-                environment.set_evaluated_node(Some((range, quotient)));
+                environment.set_evaluated_node(vec![(range, quotient)]);
             }
             // A count-alias assignment sat ahead of this return and was
             // folded in — that ONE statement still needs skipping, even
@@ -3085,7 +3163,7 @@ fn publish_relational_sum_return(ret: &StmtReturn, environment: &mut Environment
         return;
     };
     if let Some(total) = answer.total {
-        environment.set_evaluated_node(Some((value.range(), total)));
+        environment.set_evaluated_node(vec![(value.range(), total)]);
     }
 }
 
@@ -3505,11 +3583,11 @@ fn walk_with(
     // it — `with_stmt.body` is itself a statement list, so nesting one
     // level inside another `with` (`level_via_nested_tempdir`) no longer
     // removes it from every scan `foreign_edge_at` ever runs.
-    let mut foreign_edge_overrides: HashMap<usize, (TextRange, AbstractValue)> = HashMap::new();
+    let mut foreign_edge_overrides: HashMap<usize, Vec<(TextRange, AbstractValue)>> = HashMap::new();
     for (position, stmt) in with_stmt.body.iter().enumerate() {
         serve_foreign_edge_at(&with_stmt.body, position, environment, context, blocked, out, &mut foreign_edge_overrides);
-        if let Some((parse_range, value)) = foreign_edge_overrides.get(&position) {
-            environment.set_evaluated_node(Some((*parse_range, value.clone())));
+        if let Some(published) = foreign_edge_overrides.get(&position) {
+            environment.set_evaluated_node(published.clone());
         }
         walk_statement(
             stmt,
@@ -3522,7 +3600,7 @@ fn walk_with(
             blocked,
             out,
         );
-        environment.set_evaluated_node(None);
+        environment.set_evaluated_node(Vec::new());
         foreign_edge_overrides.remove(&position);
     }
 }
@@ -3558,8 +3636,17 @@ fn enter_method_result(
     let model = context.classes.get(receiver.source.as_str())?;
     let method_name = if is_async { "__aenter__" } else { "__enter__" };
     let method = instances::method_def_of(model, method_name)?;
-    let (new_instance, result) =
-        instances::method_call_result(receiver, model, method, &[], Some(&context.functions), Some(&context.classes), context.kernel, environment.call_depth())?;
+    let (new_instance, result) = instances::method_call_result(
+        receiver,
+        model,
+        method,
+        &[],
+        Some(&context.functions),
+        Some(&context.classes),
+        Some(&context.datetime_imports),
+        context.kernel,
+        environment.call_depth(),
+    )?;
     if let Expr::Name(receiver_name) = receiver_expr {
         environment.bind(receiver_name.id.as_str(), new_instance);
     }
@@ -3952,6 +4039,40 @@ fn judge_and_bind(
     environment: &mut Environment,
     out: &mut Vec<Finding>,
 ) -> Option<String> {
+    judge_and_bind_naming(name, value, declared, fire_range, None, context, environment, out)
+}
+
+/// `judge_and_bind`'s own body, plus the ONE naming step
+/// `python-c-extension-boundary.md`'s naming unit adds: when the verdict
+/// is the GENERIC undetermined sentence (`SENTENCE.value_not_readable` —
+/// `assignability.rs::judge`'s own catch-all, which carries no construct
+/// name at all) AND `source_expr` is the exact RHS expression this value
+/// came from, a call on an attribute chain rooted at an imported-but-
+/// unmodeled module renames the sentence to name that module
+/// (`expressions::unmodeled_module_call_name`'s own recognition — the
+/// SAME gate `evaluate_attribute_call`'s own module arms already apply,
+/// so this never fires for a module the walk actually modeled). Every
+/// OTHER undetermined sentence (a kernel refusal, a TypedDict/tuple
+/// position, a loop-stabilization blocker, …) already names its own
+/// construct and passes through unchanged — this step only ever
+/// SHARPENS the one anonymous case, never rewrites a sentence that
+/// already has a name.
+///
+/// Split from `judge_and_bind` itself (rather than adding the parameter
+/// there directly) so the many call sites with no single RHS expression
+/// to offer (a destructured element, a same-module call's own mutation
+/// effect) keep calling the original signature unchanged, and only the
+/// sites that DO have the RHS in scope opt into naming.
+fn judge_and_bind_naming(
+    name: &str,
+    value: AbstractValue,
+    declared: &DeclaredRefinement,
+    fire_range: TextRange,
+    source_expr: Option<&Expr>,
+    context: &WalkContext,
+    environment: &mut Environment,
+    out: &mut Vec<Finding>,
+) -> Option<String> {
     match judge(&value, declared, context.kernel) {
         Verdict::Fire(message) => {
             out.push(Finding {
@@ -3986,8 +4107,83 @@ fn judge_and_bind(
         }
         Verdict::Undetermined(sentence) => {
             environment.forget(name);
-            Some(sentence)
+            Some(name_unmodeled_call_sentence(sentence, source_expr, environment))
         }
+    }
+}
+
+/// The one naming step `judge_and_bind_naming` applies: `sentence`
+/// unchanged UNLESS it is the exact generic `value_not_readable` wording
+/// AND `source_expr` names a call this file recognizes SOMETHING about —
+/// in which case a narrower sentence replaces it. Two rungs, tried in
+/// order (`python-c-extension-boundary.md`'s recognition ladder):
+///
+/// 1. RUNG 2 — a call on a manifested module's own LISTED function
+///    (`binding_manifest::discover_manifest` finds a manifest AND it
+///    names an entry for the called function): the manifest states the
+///    entry, never the return, so the sentence names the missing
+///    producer (`diagnostic_sentences::manifest_entry_names_no_producer`).
+///    A manifest that exists but names NO entry for this function is a
+///    narrower named decline too
+///    (`diagnostic_sentences::manifest_names_no_entry_for`) — still more
+///    specific than rung 1's plain "no model at all," since the module
+///    itself IS modeled in part.
+/// 2. RUNG 1 — every other unmodeled-module call
+///    (`expressions::unmodeled_module_call_name`'s own recognition).
+///
+/// Factored out so the two direct `judge(...)` call sites that also have
+/// a source expression in scope (`walk_return`'s own return-position
+/// judge, `judge_at`) can apply the identical rule without duplicating
+/// it.
+fn name_unmodeled_call_sentence(sentence: String, source_expr: Option<&Expr>, environment: &Environment) -> String {
+    if sentence != crate::diagnostic_sentences::SENTENCE.value_not_readable {
+        return sentence;
+    }
+    let Some(source_expr) = source_expr else {
+        return sentence;
+    };
+    let Expr::Call(call) = source_expr else {
+        return sentence;
+    };
+    if let Some(named) = manifest_named_sentence(call, environment) {
+        return named;
+    }
+    match crate::expressions::unmodeled_module_call_name(call, environment) {
+        Some(module_name) => crate::diagnostic_sentences::unmodeled_module_call(module_name),
+        None => sentence,
+    }
+}
+
+/// Rung 2's own naming: `call` on a bare-Name-rooted attribute chain
+/// whose root reads unbound AND has a discovered, readable manifest —
+/// `Some` names either the missing entry (the function is not one of
+/// the manifest's own listed rows) or the missing producer (the function
+/// IS listed, so the entry judged the call's arguments already, and the
+/// only remaining gap is the return). `None` for every other shape: no
+/// manifest discovered at all (rung 1 owns it), or a manifest that could
+/// not be read (this naming step never reports a manifest's own parse
+/// failure — that is `discover_manifest`'s own `Err` the export/CLI path
+/// surfaces, not a per-call sentence).
+fn manifest_named_sentence(call: &ruff_python_ast::ExprCall, environment: &Environment) -> Option<String> {
+    let Expr::Attribute(attribute) = call.func.as_ref() else {
+        return None;
+    };
+    let Expr::Name(module_name) = attribute.value.as_ref() else {
+        return None;
+    };
+    if environment.read(module_name.id.as_str()).is_some() {
+        return None;
+    }
+    let entry_directory = environment.entry_directory().map(|path| path.as_path());
+    let manifest = crate::binding_manifest::discover_manifest(module_name.id.as_str(), entry_directory)?.ok()?;
+    let function_name = attribute.attr.as_str();
+    match manifest.entries.get(function_name) {
+        Some(entry) => Some(crate::diagnostic_sentences::manifest_entry_names_no_producer(
+            module_name.id.as_str(),
+            function_name,
+            &entry.producer_symbol,
+        )),
+        None => Some(crate::diagnostic_sentences::manifest_names_no_entry_for(module_name.id.as_str(), function_name)),
     }
 }
 
@@ -4442,6 +4638,7 @@ fn walk_ann_assign(
             }),
             Verdict::Silent => {}
             Verdict::Undetermined(sentence) => {
+                let sentence = name_unmodeled_call_sentence(sentence, Some(value_expr), environment);
                 record_blocker(blocked, value_expr.range(), sentence, out);
             }
         }
@@ -4449,9 +4646,16 @@ fn walk_ann_assign(
         return;
     };
 
-    if let Some(sentence) =
-        judge_and_bind(target_name.id.as_str(), value, &declared, value_expr.range(), context, environment, out)
-    {
+    if let Some(sentence) = judge_and_bind_naming(
+        target_name.id.as_str(),
+        value,
+        &declared,
+        value_expr.range(),
+        Some(value_expr),
+        context,
+        environment,
+        out,
+    ) {
         record_blocker(blocked, value_expr.range(), sentence, out);
     }
 }
@@ -5298,8 +5502,79 @@ fn sink_value(
     if let Some(result) = callable_variable_call_result(expr, context, environment) {
         return Some(result);
     }
+    // RUNG 2 — THE MANIFEST READER TEMPLATE
+    // (`packages/cpp/findings/python-c-extension-boundary.md`): a call
+    // recognized against a discovered manifest judges its own written
+    // arguments against the manifest's parsed entry contract HERE, at
+    // this expression's own sink — an escaping argument fires the same
+    // way any other refused write does. The call's own VALUE still falls
+    // through to the ordinary `evaluate_expression` reading below
+    // (`unknown()`, since no arm in that dispatcher recognizes a
+    // manifested module either) — the naming of THAT undetermined value
+    // (the "no producer exports its return fact" sentence) happens later,
+    // at whichever declared sink judges it, through
+    // `name_unmodeled_call_sentence`'s own manifest-aware naming step.
+    manifest_call_fires(expr, context, environment, out);
     apply_call_effects(expr, context, environment, aug_assign_refinements, out);
     Some(evaluate_expression(expr, environment, context.kernel))
+}
+
+/// Recognizes `expr` as a call on a manifested module's own listed
+/// function, judges every WRITTEN argument (positional matched by
+/// position, keyword matched by name) against the manifest's parsed
+/// entry contract, and pushes an RTS7001 for each one that escapes —
+/// `binding_manifest::judge_manifest_call`'s own crossing-fit check, the
+/// SAME refusal shape the stdio edge fires for an escaping outbound
+/// value. A no-op for every call this recognizes nothing about: an
+/// unmodeled module with no manifest, a manifest with no row for the
+/// called function (rung 1's own plain decline territory either way),
+/// or a manifest file this reader could not parse — a bad manifest never
+/// crashes the walk, it simply contributes no crossing-fit judging this
+/// call.
+fn manifest_call_fires(expr: &Expr, context: &WalkContext, environment: &Environment, out: &mut Vec<Finding>) {
+    let Expr::Call(call) = expr else {
+        return;
+    };
+    let Expr::Attribute(attribute) = call.func.as_ref() else {
+        return;
+    };
+    let Expr::Name(module_name) = attribute.value.as_ref() else {
+        return;
+    };
+    if environment.read(module_name.id.as_str()).is_some() {
+        return;
+    }
+    let entry_directory = environment.entry_directory().map(|path| path.as_path());
+    let Some(Ok(manifest)) = crate::binding_manifest::discover_manifest(module_name.id.as_str(), entry_directory) else {
+        return;
+    };
+    let Some(entry) = manifest.entries.get(attribute.attr.as_str()) else {
+        return;
+    };
+    let positional: Vec<(AbstractValue, TextRange)> = call
+        .arguments
+        .args
+        .iter()
+        .map(|arg| (evaluate_expression(arg, environment, context.kernel), arg.range()))
+        .collect();
+    let keyword: Vec<(String, AbstractValue, TextRange)> = call
+        .arguments
+        .keywords
+        .iter()
+        .filter_map(|kw| {
+            let arg_name = kw.arg.as_ref()?;
+            Some((
+                arg_name.as_str().to_owned(),
+                evaluate_expression(&kw.value, environment, context.kernel),
+                kw.value.range(),
+            ))
+        })
+        .collect();
+    let outcome =
+        crate::binding_manifest::judge_manifest_call(module_name.id.as_str(), entry, &positional, &keyword, context.kernel);
+    for (range, message) in outcome.fires {
+        out.push(Finding { range, code: "RTS7001", message });
+    }
 }
 
 /// A CALLABLE-VARIABLE CALL: `name(...)` where `name` is a bare Name
@@ -5409,6 +5684,7 @@ fn instance_method_call_result(
     let model = classes.get(instance.source.as_str())?;
     let method = instances::method_def_of(model, attribute.attr.as_str())?;
     let arguments = keyword_arguments_by_position(call, method, context, environment)?;
+    let datetime_imports = environment.datetime_imports().unwrap_or(&context.datetime_imports);
     let (new_instance, result) = instances::method_call_result(
         &instance,
         model,
@@ -5416,6 +5692,7 @@ fn instance_method_call_result(
         &arguments,
         Some(&context.functions),
         Some(classes),
+        Some(datetime_imports),
         context.kernel,
         environment.call_depth(),
     )?;
@@ -7175,6 +7452,65 @@ mod tests {
         );
     }
 
+    /// The quotient binding's twin of the test above: `mean = total /
+    /// len(samples)` is consumed by the same recognizer
+    /// (`walk_relational_sum`'s divided-into arm), which binds the
+    /// kernel's quotient — and now records it at the Assign statement's
+    /// own range too, so `mean`'s own position answers the quotient's
+    /// set instead of nothing.
+    #[test]
+    fn the_quotient_binding_position_answers_the_derived_set() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let source = concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "Sample = Annotated[float, Field(ge=-2.0, le=2.0)]\n",
+            "Level = Annotated[float, Field(ge=0.0, le=1.0)]\n",
+            "\n",
+            "def mean_square(samples: Annotated[list[Sample], Field(min_length=1)]) -> Level:\n",
+            "    total = sum(s * s for s in samples)\n",
+            "    mean = total / len(samples)\n",
+            "    return mean\n",
+        );
+        let module = parsed(source);
+        let position = offset_of(source, "mean = total");
+        assert!(
+            refined_set_at_position(&module, no_imports_resolver(), &kernel, position).is_some(),
+            "the quotient binding's own position must answer the kernel's derived set"
+        );
+    }
+
+    /// A count-alias binding (`count = len(samples)`) consumed ahead of
+    /// the division now binds and publishes — the alias's own name reads
+    /// an integer-sorted set admitting the sequence's length window, and
+    /// its position answers that same set, exactly the way the total's
+    /// and the quotient's own positions do above. The window here is
+    /// `min_length=1` with no upper bound, so the alias's set is at
+    /// least the count-alias fold's own floor and never a fabricated
+    /// exact value.
+    #[test]
+    fn a_count_alias_binding_now_answers_the_derived_length_window() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let source = concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "Sample = Annotated[float, Field(ge=-2.0, le=2.0)]\n",
+            "Level = Annotated[float, Field(ge=0.0, le=1.0)]\n",
+            "\n",
+            "def mean_square(samples: Annotated[list[Sample], Field(min_length=1)]) -> Level:\n",
+            "    total = sum(s * s for s in samples)\n",
+            "    count = len(samples)\n",
+            "    mean = total / count\n",
+            "    return mean\n",
+        );
+        let module = parsed(source);
+        let position = offset_of(source, "count = len");
+        assert!(
+            refined_set_at_position(&module, no_imports_resolver(), &kernel, position).is_some(),
+            "the count-alias binding's own position must answer the kernel's derived length window"
+        );
+    }
+
     /// The count-alias spelling — `count = len(samples)` then
     /// `mean = total / count` — judges IDENTICALLY to the direct
     /// spelling `mean = total / len(samples)`, and the statement after
@@ -7632,6 +7968,163 @@ mod tests {
         );
     }
 
+    /// The naming unit's own pinned shape (`python-c-extension-boundary.md`):
+    /// `x: Age = torch.arange(5)` — a call on an attribute chain rooted at
+    /// an imported-but-unmodeled module name — reads undetermined naming
+    /// `torch` rather than the generic "not yet readable" wording, since
+    /// `torch` is never bound to a real tracked value (the walk carries no
+    /// same-project module named `torch` for the no-resolver test harness
+    /// to find) and is not one of `expressions::MODELED_MODULE_NAMES`.
+    #[test]
+    fn an_unmodeled_module_call_into_a_declared_position_names_the_module() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "import torch\n",
+            "type Age = Annotated[int, Field(ge=0, le=120)]\n",
+            "def read_it() -> None:\n",
+            "    x: Age = torch.arange(5)\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        assert_eq!(findings.len(), 1, "{:?}", findings.iter().map(|f| &f.message).collect::<Vec<_>>());
+        assert_eq!(findings[0].code, "RTS7002");
+        assert!(findings[0].message.contains("'torch'"), "{}", findings[0].message);
+        assert!(findings[0].message.contains("no model for"), "{}", findings[0].message);
+    }
+
+    /// The same naming, at a `return` sink rather than an `AnnAssign`:
+    /// `return torch.arange(5)` under a declared `-> Age` return names
+    /// `torch` too, proving the naming step is not AnnAssign-specific.
+    #[test]
+    fn an_unmodeled_module_call_returned_from_a_declared_function_names_the_module() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "import torch\n",
+            "type Age = Annotated[int, Field(ge=0, le=120)]\n",
+            "def read_it() -> Age:\n",
+            "    return torch.arange(5)\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        assert_eq!(findings.len(), 1, "{:?}", findings.iter().map(|f| &f.message).collect::<Vec<_>>());
+        assert_eq!(findings[0].code, "RTS7002");
+        assert!(findings[0].message.contains("'torch'"), "{}", findings[0].message);
+    }
+
+    /// A MODELED module (`math`, already in `MODELED_MODULE_NAMES`) whose
+    /// own unmodeled FUNCTION (`math.frexp`, not one of the rows
+    /// `math_call_result` reads) is a different, narrower gap the naming
+    /// unit does NOT claim — the sentence stays the generic wording, never
+    /// misnaming `math` as if the checker carried no model for it at all.
+    #[test]
+    fn an_unmodeled_function_on_a_modeled_module_keeps_the_generic_sentence() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "import math\n",
+            "type Age = Annotated[int, Field(ge=0, le=120)]\n",
+            "def read_it() -> None:\n",
+            "    x: Age = math.frexp(5.0)\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        assert_eq!(findings.len(), 1, "{:?}", findings.iter().map(|f| &f.message).collect::<Vec<_>>());
+        assert_eq!(findings[0].code, "RTS7002");
+        assert!(!findings[0].message.contains("'math'"), "{}", findings[0].message);
+        assert!(findings[0].message.contains("not yet readable"), "{}", findings[0].message);
+    }
+
+    /// RUNG 2's own end-to-end fixture: a tiny hand-authored manifest for
+    /// a two-function module (`scale(Scalar factor)`, `label(str text)`),
+    /// exercised against all four shapes
+    /// `python-c-extension-boundary.md`'s manifest-reader unit names —
+    /// one module, one temp directory standing in for the checked file's
+    /// own `entry_directory`.
+    ///
+    /// 1. A FITTING call (`widgets.scale(2)`): the entry judges silently
+    ///    (no RTS7001), and the return still declines naming the missing
+    ///    producer.
+    /// 2. An ESCAPING call (`widgets.scale("nope")`): the entry fires
+    ///    RTS7001, naming the module, function, parameter, and both
+    ///    words.
+    /// 3. An UNLISTED function (`widgets.unlisted(1)`): the module HAS a
+    ///    manifest, but it names no row for `unlisted` — the narrower
+    ///    "manifest names no entry" decline, not rung 1's plain one.
+    /// 4. An UNMANIFESTED module (`import other_widgets;
+    ///    other_widgets.scale(2)`): no manifest file exists for
+    ///    `other_widgets` at all — rung 1's plain "no model for" decline.
+    #[test]
+    fn the_manifest_reader_template_covers_all_four_recognition_shapes() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let root = std::env::temp_dir().join(format!(
+            "refinedpy_check_binding_manifest_fixture_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::SystemTime::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        let manifest_json = serde_json::json!({
+            "scale": {"entry": "scale(Scalar factor)", "producer": "widgets_scale_impl"},
+            "label": {"entry": "label(str text)", "producer": "widgets_label_impl"},
+        });
+        std::fs::write(root.join("widgets.manifest.json"), manifest_json.to_string()).expect("write manifest");
+
+        let module = parsed(concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "import widgets\n",
+            "import other_widgets\n",
+            "type Age = Annotated[int, Field(ge=0, le=120)]\n",
+            "def fitting() -> None:\n",
+            "    x: Age = widgets.scale(2)\n",
+            "def escaping() -> None:\n",
+            "    widgets.scale(\"nope\")\n",
+            "def unlisted() -> None:\n",
+            "    x: Age = widgets.unlisted(1)\n",
+            "def unmanifested() -> None:\n",
+            "    x: Age = other_widgets.scale(2)\n",
+        ));
+        let no_imports: ModuleResolver = &|_: &str| None;
+        let findings = findings_for_module_at(&module, no_imports, &kernel, Some(&root));
+
+        // 1. FITTING: no RTS7001 for `fitting`'s own body, and its own
+        // RTS7002 blocker names the missing producer.
+        let fitting_blocker = findings
+            .iter()
+            .find(|f| f.code == "RTS7002" && f.message.contains("widgets.scale") && f.message.contains("widgets_scale_impl"))
+            .expect(&format!("fitting's own blocker must name the missing producer: {:?}", findings.iter().map(|f| &f.message).collect::<Vec<_>>()));
+        assert!(fitting_blocker.message.contains("no producer exports its return fact"), "{}", fitting_blocker.message);
+
+        // 2. ESCAPING: an RTS7001 naming the module, function, parameter,
+        // and both value words.
+        let escaping_fire = findings
+            .iter()
+            .find(|f| f.code == "RTS7001" && f.message.contains("widgets.scale"))
+            .expect(&format!("the escaping call must fire: {:?}", findings.iter().map(|f| &f.message).collect::<Vec<_>>()));
+        assert!(escaping_fire.message.contains("'factor: Scalar'"), "{}", escaping_fire.message);
+        assert!(escaping_fire.message.contains("a str"), "{}", escaping_fire.message);
+
+        // 3. UNLISTED: the manifest names no row for `unlisted` — the
+        // narrower manifest decline, not the plain module-level one.
+        let unlisted_blocker = findings
+            .iter()
+            .find(|f| f.code == "RTS7002" && f.message.contains("manifest names no entry"))
+            .expect(&format!("the unlisted call must name the missing entry: {:?}", findings.iter().map(|f| &f.message).collect::<Vec<_>>()));
+        assert!(unlisted_blocker.message.contains("'widgets'"), "{}", unlisted_blocker.message);
+        assert!(unlisted_blocker.message.contains("'unlisted'"), "{}", unlisted_blocker.message);
+
+        // 4. UNMANIFESTED: no manifest file exists for `other_widgets` —
+        // rung 1's own plain decline.
+        let unmanifested_blocker = findings
+            .iter()
+            .find(|f| f.code == "RTS7002" && f.message.contains("'other_widgets'"))
+            .expect(&format!("the unmanifested module must fall back to rung 1's naming: {:?}", findings.iter().map(|f| &f.message).collect::<Vec<_>>()));
+        assert!(unmanifested_blocker.message.contains("no model for"), "{}", unmanifested_blocker.message);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn a_list_element_compound_write_past_the_declared_ceiling_fires() {
         let Some(kernel) = loaded_kernel() else { return };
@@ -8011,6 +8504,7 @@ mod tests {
             kernel: &kernel,
             functions,
             classes,
+            datetime_imports: Arc::new(crate::expressions::datetime_imports(&module)),
             module_bindings: HashMap::new(),
             module_callable_returns: Arc::new(HashMap::new()),
             strict_int_aliases: &HashSet::new(),
@@ -11227,7 +11721,11 @@ mod tests {
      * `walk_body_with_self_binding`'s pending foreign-edge override is
      * keyed by the position of the STATEMENT holding the recognized
      * edge's own `json.loads(...)` consumer (`foreign_edge_overrides:
-     * HashMap<usize, (TextRange, AbstractValue)>`), never a single
+     * HashMap<usize, Vec<(TextRange, AbstractValue)>>` — a `Vec` rather
+     * than a single pair per position, since a discharged crossing whose
+     * return is number-sorted publishes a SECOND override at the same
+     * position: the intermediate captured-stdout reading's own
+     * serialized-string fact, alongside the return fact), never a single
      * unkeyed slot — two recognized crossing calls in the same body,
      * each consumed at a DIFFERENT later statement, must each publish
      * their own fact at their own consumer, with neither clobbering the

@@ -1466,6 +1466,23 @@ pub fn method_def_of<'a>(model: &'a ClassModel, name: &str) -> Option<&'a StmtFu
 /// type against, and declines even though the class and method both
 /// exist. `None` when the caller has no class table to offer (a plain
 /// unit test constructing a method call directly, for instance).
+///
+/// `datetime_imports` seeds the method body's own environment with the
+/// module's `datetime` import identities (`environment.set_datetime_
+/// imports`), the same explicit-parameter shape `classes` already takes
+/// here — this function builds a FRESH `Environment` for the method
+/// body (below) and has no enclosing `Environment` in scope to inherit
+/// from (unlike `summaries::call_result_with_enclosing`, which inherits
+/// `classes`/`datetime_imports` from its own `enclosing: Option<&
+/// Environment>` parameter when the callee sets neither of its own), so
+/// every caller threads its own module's table through explicitly, the
+/// same way every caller already threads `classes`. Without it, a
+/// method body's own `date(...)`/`dt.strptime(...)` call (an aliased
+/// `datetime` construction/classmethod call — `expressions.rs`'s
+/// datetime gates) has no import table to resolve the alias against and
+/// declines even though the same call in a plain function recognizes.
+/// `None` when the caller has no import table to offer (a plain unit
+/// test constructing a method call directly, for instance).
 pub fn method_call_result(
     instance: &AbstractValue,
     model: &ClassModel,
@@ -1473,6 +1490,7 @@ pub fn method_call_result(
     arguments: &[AbstractValue],
     table: Option<&Arc<FunctionTable>>,
     classes: Option<&Arc<HashMap<String, ClassModel>>>,
+    datetime_imports: Option<&Arc<crate::expressions::DatetimeImports>>,
     kernel: &Arc<RefinedTSKernel>,
     depth: u32,
 ) -> Option<(AbstractValue, AbstractValue)> {
@@ -1547,6 +1565,9 @@ pub fn method_call_result(
     if let Some(classes) = classes {
         environment.set_classes(classes.clone());
     }
+    if let Some(datetime_imports) = datetime_imports {
+        environment.set_datetime_imports(datetime_imports.clone());
+    }
     if let Some(receiver_parameter_name) = receiver_parameter_name {
         environment.bind("self", instance.clone());
         if receiver_parameter_name != "self" {
@@ -1577,8 +1598,17 @@ pub fn method_call_result(
             parent_methods: HashMap::new(),
             class_attributes: Vec::new(),
         };
-        let (_after, result) =
-            method_call_result(&working_instance, &parentless, parent_def, args, table, classes, kernel, depth + 1)?;
+        let (_after, result) = method_call_result(
+            &working_instance,
+            &parentless,
+            parent_def,
+            args,
+            table,
+            classes,
+            datetime_imports,
+            kernel,
+            depth + 1,
+        )?;
         Some(result)
     };
 
@@ -2682,12 +2712,12 @@ mod tests {
         let instance = judge_construction(kid, &[(integer_value(40.0), range_of("40"))], &[], &kernel).instance;
 
         let effective = method_def_of(kid, "label").expect("label is declared");
-        let (_after, effective_result) = method_call_result(&instance, kid, effective, &[], None, None, &kernel, 0)
+        let (_after, effective_result) = method_call_result(&instance, kid, effective, &[], None, None, None, &kernel, 0)
             .expect("the child's own label() must interpret");
         assert_eq!(effective_result, integer_value(2.0), "method_def_of answers the CHILD's own override");
 
         let inherited = kid.parent_methods.get("label").expect("parent_methods keeps the parent's own def");
-        let (_after, inherited_result) = method_call_result(&instance, kid, inherited, &[], None, None, &kernel, 0)
+        let (_after, inherited_result) = method_call_result(&instance, kid, inherited, &[], None, None, None, &kernel, 0)
             .expect("the parent's own label() must interpret");
         assert_eq!(inherited_result, integer_value(1.0), "parent_methods is unaffected by the child's override");
     }
@@ -2715,7 +2745,7 @@ mod tests {
         let outlaw = table.get("Outlaw").expect("Outlaw class recorded");
         let instance = judge_construction(outlaw, &[(integer_value(40.0), range_of("40"))], &[], &kernel).instance;
         let method = method_def_of(outlaw, "spoil").expect("spoil is declared");
-        let (after, _result) = method_call_result(&instance, outlaw, method, &[], None, None, &kernel, 0)
+        let (after, _result) = method_call_result(&instance, outlaw, method, &[], None, None, None, &kernel, 0)
             .expect("spoil's straight-line self-write must interpret");
         assert_eq!(field_read(&after, "age"), Some(integer_value(200.0)), "the write survives on the returned instance");
     }
@@ -2746,9 +2776,55 @@ mod tests {
         let kid = table.get("KidYears").expect("KidYears class recorded");
         let instance = judge_construction(kid, &[(integer_value(40.0), range_of("40"))], &[], &kernel).instance;
         let method = method_def_of(kid, "call_super_method").expect("call_super_method is declared");
-        let (_after, result) = method_call_result(&instance, kid, method, &[], None, None, &kernel, 0)
+        let (_after, result) = method_call_result(&instance, kid, method, &[], None, None, None, &kernel, 0)
             .expect("the super().years() call must resolve through parent_methods");
         assert_eq!(result, integer_value(41.0), "super().years() answers 40, plus 1");
+    }
+
+    /// A class method body's own `from datetime import date`-aliased
+    /// `date(2024, 3, 1)` construction recognizes IDENTICALLY to the same
+    /// call in a plain function (`expressions.rs`'s own
+    /// `test_bare_imported_date_construction_matches_the_qualified_
+    /// spelling`, mirrored here for a method body): `method_call_result`
+    /// is handed the module's own `datetime_imports` table explicitly
+    /// (the same explicit-parameter shape `classes` already takes), so
+    /// the method body's fresh `Environment` resolves the bare `date`
+    /// alias exactly as a module-level call would, rather than reading
+    /// no table at all and declining the construction.
+    #[test]
+    fn method_body_bare_imported_date_construction_matches_the_qualified_spelling() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "from datetime import date\n",
+            "class Anniversary:\n",
+            "    def __init__(self, count: int) -> None:\n",
+            "        self.count = count\n",
+            "    def occasion(self):\n",
+            "        return date(2024, 3, 1)\n",
+        ));
+        let aliases = HashMap::new();
+        let imports = crate::surface::surface_imports(&module);
+        let table = class_table(&module, &aliases, &imports, &kernel);
+        let anniversary = table.get("Anniversary").expect("Anniversary class recorded");
+        let instance =
+            judge_construction(anniversary, &[(integer_value(1.0), range_of("1"))], &[], &kernel).instance;
+        let method = method_def_of(anniversary, "occasion").expect("occasion is declared");
+        let datetime_imports = Arc::new(crate::expressions::datetime_imports(&module));
+
+        let plain_environment = {
+            let mut environment = Environment::new(Default::default());
+            environment.set_datetime_imports(Arc::new(crate::expressions::datetime_imports(&module)));
+            environment
+        };
+        let plain_parsed = ruff_python_parser::parse_expression("date(2024, 3, 1)").expect("test source parses");
+        let plain_value = crate::expressions::evaluate_expression(&plain_parsed.into_expr(), &plain_environment, &kernel);
+
+        let (_after, method_value) =
+            method_call_result(&instance, anniversary, method, &[], None, None, Some(&datetime_imports), &kernel, 0)
+                .expect("the method body's own date(...) construction must interpret");
+
+        assert_eq!(method_value.kind, Kind::Object);
+        assert_eq!(method_value, plain_value, "a method body's aliased date(...) construction must equal the same call in a plain function");
     }
 
     // --- field_write: the source tag survives ---

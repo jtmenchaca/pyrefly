@@ -238,6 +238,19 @@ pub fn call_result_with_enclosing(
                 environment.set_classes(classes.clone());
             }
         }
+        // DATETIME IMPORTS: the same inherit-when-unset rule `classes`
+        // just took, for the identical reason — a same-module def
+        // interpreted here may itself construct/call a `datetime`
+        // class the CALLER's own module aliased (`from datetime import
+        // date as d`), and `evaluate_call`'s datetime gates only ever
+        // resolve that alias by reading `environment.datetime_imports()`
+        // — `None` here otherwise, since `fresh_body_environment` never
+        // populates it on its own.
+        if environment.datetime_imports().is_none() {
+            if let Some(datetime_imports) = enclosing.datetime_imports() {
+                environment.set_datetime_imports(datetime_imports.clone());
+            }
+        }
     }
     let Some(()) = bind_parameters(def, arguments, kernel, &mut environment, enclosing) else {
         return return_sort_fallback(def);

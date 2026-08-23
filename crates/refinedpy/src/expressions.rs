@@ -11,6 +11,7 @@
 //! walk calls; the expressions unit fills it in construct by construct.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use refined_domain::abstract_value::float_sorted_unknown;
@@ -53,8 +54,10 @@ use ruff_python_ast::CmpOp;
 use ruff_python_ast::ConversionFlag;
 use ruff_python_ast::Expr;
 use ruff_python_ast::InterpolatedStringElement;
+use ruff_python_ast::ModModule;
 use ruff_python_ast::Number;
 use ruff_python_ast::Operator;
+use ruff_python_ast::Stmt;
 use ruff_python_ast::UnaryOp;
 use ruff_text_size::Ranged;
 use ruff_text_size::TextRange;
@@ -1883,20 +1886,125 @@ fn array_double_construction_value(
     Some(bytes_models::array_double_literal_value(&elements))
 }
 
-/// Whether `attribute` is exactly the two-level attribute chain
-/// `datetime.datetime` with `datetime` NOT locally shadowed — the
-/// receiver shape both the `datetime.datetime(...)` CONSTRUCTION call
-/// (this function's caller in `evaluate_call`) and the
-/// `datetime.datetime.now()` CLASSMETHOD call
-/// (`evaluate_attribute_call`'s own datetime arm) both gate on.
-fn is_datetime_datetime_attribute(attribute: &ruff_python_ast::ExprAttribute, environment: &Environment) -> bool {
-    if attribute.attr.as_str() != "datetime" {
+/// Which datetime construct a local name means, read once from the
+/// module's own `import`/`from … import …` statements — the same
+/// "one import table, read once" mechanism `surface::SurfaceImports`
+/// already carries for the pydantic surface (`surface_imports`'s own
+/// doc), scoped here to the `datetime` module family so this file's
+/// gates answer by CANONICAL identity rather than the literal spelling
+/// `datetime`/`date`/`timedelta`. Three shapes recognize:
+/// `import datetime[ as x]` (`module_names`, `x` means the WHOLE
+/// module — `x.datetime`/`x.date`/`x.timedelta` all still resolve
+/// through it), `from datetime import datetime[ as x]`/`date[ as
+/// x]`/`timedelta[ as x]` (each lands in its own class-name set, `x`
+/// alone now means that ONE class, no further attribute needed), and
+/// no import at all (every set stays empty, and `datetime_imports`'s
+/// caller falls back to the literal `datetime.*` spelling unchanged —
+/// datetime.rst's classes are named `datetime`/`date`/`timedelta`
+/// either way, so a module with no explicit `datetime` import still
+/// reads its bare `datetime.date(...)` calls the same as before this
+/// table existed).
+#[derive(Default)]
+pub(crate) struct DatetimeImports {
+    module_names: HashSet<String>,
+    datetime_class_names: HashSet<String>,
+    date_class_names: HashSet<String>,
+    timedelta_class_names: HashSet<String>,
+}
+
+/// Reads `module`'s top-level `import`/`from … import …` statements
+/// into a `DatetimeImports` table (see that struct's own doc for the
+/// three recognized shapes). Anything else — a re-export, a
+/// submodule import (`import datetime.date`, not a real Python
+/// shape for this stdlib module anyway), a star import — is out of
+/// scope and leaves the corresponding set empty, the same "recognize
+/// only the shapes the mission names" discipline `surface_imports`
+/// already keeps.
+pub(crate) fn datetime_imports(module: &ModModule) -> DatetimeImports {
+    let mut table = DatetimeImports::default();
+    for stmt in module.body.iter() {
+        match stmt {
+            Stmt::Import(import) => {
+                for alias in &import.names {
+                    if alias.name.id.as_str() == "datetime" {
+                        let local = alias.asname.as_ref().unwrap_or(&alias.name);
+                        table.module_names.insert(local.id.as_str().to_owned());
+                    }
+                }
+            }
+            Stmt::ImportFrom(import) => {
+                let Some(source) = import.module.as_ref() else {
+                    continue;
+                };
+                if source.id.as_str() != "datetime" || import.level != 0 {
+                    continue;
+                }
+                for alias in &import.names {
+                    let local = alias.asname.as_ref().unwrap_or(&alias.name);
+                    match alias.name.id.as_str() {
+                        "datetime" => {
+                            table.datetime_class_names.insert(local.id.as_str().to_owned());
+                        }
+                        "date" => {
+                            table.date_class_names.insert(local.id.as_str().to_owned());
+                        }
+                        "timedelta" => {
+                            table.timedelta_class_names.insert(local.id.as_str().to_owned());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    table
+}
+
+/// Whether `callee` names the `datetime.datetime` class, NOT locally
+/// shadowed — resolved by CANONICAL import identity through
+/// `environment`'s own `DatetimeImports` table (`datetime_imports`'s
+/// own doc) rather than the literal spelling. `callee` is the exact
+/// expression a caller wants to prove IS the `datetime.datetime`
+/// class — either the CONSTRUCTION call's own callee
+/// (`datetime.datetime(...)`) or a classmethod call's own RECEIVER
+/// (`datetime.datetime.now()`'s `datetime.datetime`). Two shapes
+/// recognize: the qualified attribute chain `datetime.datetime`/
+/// `dtm.datetime` (any local name the table's `module_names`
+/// resolved to the whole module), and the bare aliased class name
+/// (`dt`, from `from datetime import datetime as dt` — the table's
+/// `datetime_class_names`). A module with no `DatetimeImports` table
+/// at all (`environment.datetime_imports()` answers `None` — a test
+/// environment, or a walk that never set one) falls back to the
+/// literal `datetime.datetime` spelling only for the qualified shape,
+/// and never recognizes a bare name — matching this function's own
+/// behavior before the table existed. Shadowing is checked the same
+/// way either shape already did: the resolved base name must read
+/// `None` from `environment`'s own bindings — a body that locally
+/// rebinds `datetime`/`dtm`/`dt` to some other value shadows the
+/// import regardless of which spelling reached it.
+fn is_datetime_datetime_attribute(callee: &Expr, environment: &Environment) -> bool {
+    if let Expr::Attribute(attribute) = callee {
+        if attribute.attr.as_str() == "datetime" {
+            if let Expr::Name(module_name) = attribute.value.as_ref() {
+                if environment.read(module_name.id.as_str()).is_some() {
+                    return false;
+                }
+                if let Some(imports) = environment.datetime_imports() {
+                    return imports.module_names.contains(module_name.id.as_str());
+                }
+                return module_name.id.as_str() == "datetime";
+            }
+        }
         return false;
     }
-    let Expr::Name(module_name) = attribute.value.as_ref() else {
+    let Expr::Name(name) = callee else {
         return false;
     };
-    module_name.id.as_str() == "datetime" && environment.read("datetime").is_none()
+    let Some(imports) = environment.datetime_imports() else {
+        return false;
+    };
+    imports.datetime_class_names.contains(name.id.as_str()) && environment.read(name.id.as_str()).is_none()
 }
 
 /// `datetime.datetime(year, month, day, hour=0, minute=0, second=0, ...,
@@ -2157,34 +2265,69 @@ fn datetime_field(instance: &AbstractValue, name: &str) -> Option<f64> {
     Some(value)
 }
 
-/// Whether `attribute` is exactly the two-level attribute chain
-/// `datetime.date` with `datetime` NOT locally shadowed — `date.1`'s own
-/// receiver shape, mirroring `is_datetime_datetime_attribute` for the
-/// sibling `date` class (datetime.rst, `class:: date(year, month,
-/// day)`). Gates both the `datetime.date(...)` CONSTRUCTION call and the
-/// `datetime.date.fromisoformat(...)` CLASSMETHOD call.
-fn is_datetime_date_attribute(attribute: &ruff_python_ast::ExprAttribute, environment: &Environment) -> bool {
-    if attribute.attr.as_str() != "date" {
+/// Whether `callee` names the `datetime.date` class, NOT locally
+/// shadowed — `date.1`'s own receiver shape, resolved by CANONICAL
+/// import identity the same way `is_datetime_datetime_attribute` is
+/// for the sibling `datetime` class (that function's own doc — the
+/// qualified chain `datetime.date`/`dtm.date` OR the bare aliased
+/// name `from datetime import date[ as x]` gave `x`). Gates both the
+/// `datetime.date(...)` CONSTRUCTION call and the
+/// `datetime.date.fromisoformat(...)` CLASSMETHOD call's own receiver
+/// (datetime.rst, `class:: date(year, month, day)`).
+fn is_datetime_date_attribute(callee: &Expr, environment: &Environment) -> bool {
+    if let Expr::Attribute(attribute) = callee {
+        if attribute.attr.as_str() == "date" {
+            if let Expr::Name(module_name) = attribute.value.as_ref() {
+                if environment.read(module_name.id.as_str()).is_some() {
+                    return false;
+                }
+                if let Some(imports) = environment.datetime_imports() {
+                    return imports.module_names.contains(module_name.id.as_str());
+                }
+                return module_name.id.as_str() == "datetime";
+            }
+        }
         return false;
     }
-    let Expr::Name(module_name) = attribute.value.as_ref() else {
+    let Expr::Name(name) = callee else {
         return false;
     };
-    module_name.id.as_str() == "datetime" && environment.read("datetime").is_none()
+    let Some(imports) = environment.datetime_imports() else {
+        return false;
+    };
+    imports.date_class_names.contains(name.id.as_str()) && environment.read(name.id.as_str()).is_none()
 }
 
-/// Whether `attribute` is exactly the two-level attribute chain
-/// `datetime.timedelta` with `datetime` NOT locally shadowed — date.5's
-/// own receiver shape, mirroring `is_datetime_datetime_attribute` for
-/// the `timedelta` class (datetime.rst, `class:: timedelta(days=0, ...)`).
-fn is_datetime_timedelta_attribute(attribute: &ruff_python_ast::ExprAttribute, environment: &Environment) -> bool {
-    if attribute.attr.as_str() != "timedelta" {
+/// Whether `callee` names the `datetime.timedelta` class, NOT locally
+/// shadowed — date.5's own receiver shape, resolved by CANONICAL
+/// import identity the same way `is_datetime_datetime_attribute` is
+/// for the sibling `datetime` class (that function's own doc — the
+/// qualified chain `datetime.timedelta`/`dtm.timedelta` OR the bare
+/// aliased name `from datetime import timedelta[ as x]` gave `x`).
+/// Gates the `datetime.timedelta(days=n)` CONSTRUCTION call
+/// (datetime.rst, `class:: timedelta(days=0, ...)`).
+fn is_datetime_timedelta_attribute(callee: &Expr, environment: &Environment) -> bool {
+    if let Expr::Attribute(attribute) = callee {
+        if attribute.attr.as_str() == "timedelta" {
+            if let Expr::Name(module_name) = attribute.value.as_ref() {
+                if environment.read(module_name.id.as_str()).is_some() {
+                    return false;
+                }
+                if let Some(imports) = environment.datetime_imports() {
+                    return imports.module_names.contains(module_name.id.as_str());
+                }
+                return module_name.id.as_str() == "datetime";
+            }
+        }
         return false;
     }
-    let Expr::Name(module_name) = attribute.value.as_ref() else {
+    let Expr::Name(name) = callee else {
         return false;
     };
-    module_name.id.as_str() == "datetime" && environment.read("datetime").is_none()
+    let Some(imports) = environment.datetime_imports() else {
+        return false;
+    };
+    imports.timedelta_class_names.contains(name.id.as_str()) && environment.read(name.id.as_str()).is_none()
 }
 
 /// datetime.rst:88,94 — `MINYEAR` is 1, `MAXYEAR` is 9999 (date.2's own
@@ -3040,6 +3183,7 @@ fn evaluate_call(call: &ruff_python_ast::ExprCall, environment: &Environment, ke
                             &positional,
                             environment.functions(),
                             Some(classes),
+                            environment.datetime_imports(),
                             kernel,
                             environment.call_depth(),
                         ) {
@@ -3143,58 +3287,67 @@ fn evaluate_call(call: &ruff_python_ast::ExprCall, environment: &Environment, ke
         // `datetime_construction_value`'s own doc for the exact fields
         // read and the aware-UTC-only scope.
     }
+    // The three datetime CONSTRUCTION gates run against `call.func`
+    // itself, BEFORE the `Expr::Attribute`-only block below: each gate
+    // (`is_datetime_datetime_attribute` and its two siblings) already
+    // recognizes both the qualified chain (`datetime.datetime(...)`, an
+    // `Expr::Attribute` callee) AND a bare aliased class name
+    // (`dt(...)`, an `Expr::Name` callee — `from datetime import
+    // datetime as dt`), so trying it here covers both shapes in one
+    // place rather than duplicating the bare-Name arm alongside the
+    // Attribute-only recognizers further down.
+    if is_datetime_datetime_attribute(call.func.as_ref(), environment) {
+        if let Some(value) = datetime_construction_value(call, environment, kernel) {
+            return value;
+        }
+        return unknown();
+    }
+    // `datetime.date(year, month, day)` — date.1's own construction,
+    // recognized the same way `datetime.datetime(...)` is (BEFORE the
+    // keyword gate below, though this construction reads no keyword
+    // this file's corpus does not already handle positionally). See
+    // `date_construction_value`'s own doc for the exact fields read
+    // and the `calendar.validDate` kernel validation.
+    if is_datetime_date_attribute(call.func.as_ref(), environment) {
+        if let Some(value) = date_construction_value(call, environment, kernel) {
+            return value;
+        }
+        return unknown();
+    }
+    // `datetime.timedelta(days=n)` — date.5's own construction,
+    // recognized here (BEFORE the keyword gate below) because
+    // `days=` always arrives as a keyword argument. See
+    // `timedelta_construction_value`'s own doc for the one field
+    // read and the `calendar.validDuration` kernel validation.
+    if is_datetime_timedelta_attribute(call.func.as_ref(), environment) {
+        if let Some(value) = timedelta_construction_value(call, environment, kernel) {
+            return value;
+        }
+        return unknown();
+    }
     if let Expr::Attribute(attribute) = call.func.as_ref() {
-        if is_datetime_datetime_attribute(attribute, environment) {
-            if let Some(value) = datetime_construction_value(call, environment, kernel) {
-                return value;
-            }
-            return unknown();
-        }
-        // `datetime.date(year, month, day)` — date.1's own construction,
-        // recognized the same way `datetime.datetime(...)` is (BEFORE the
-        // keyword gate below, though this construction reads no keyword
-        // this file's corpus does not already handle positionally). See
-        // `date_construction_value`'s own doc for the exact fields read
-        // and the `calendar.validDate` kernel validation.
-        if is_datetime_date_attribute(attribute, environment) {
-            if let Some(value) = date_construction_value(call, environment, kernel) {
-                return value;
-            }
-            return unknown();
-        }
-        // `datetime.timedelta(days=n)` — date.5's own construction,
-        // recognized here (BEFORE the keyword gate below) because
-        // `days=` always arrives as a keyword argument. See
-        // `timedelta_construction_value`'s own doc for the one field
-        // read and the `calendar.validDuration` kernel validation.
-        if is_datetime_timedelta_attribute(attribute, environment) {
-            if let Some(value) = timedelta_construction_value(call, environment, kernel) {
-                return value;
-            }
-            return unknown();
-        }
         // `datetime.date.fromisoformat("YYYY-MM-DD")` — a TWO-level
         // attribute chain the same way `datetime.datetime.now()` is
-        // (`attribute` here is one level further out than
-        // `is_datetime_date_attribute`'s own single-level check). See
-        // `date_fromisoformat_value`'s own doc for the exact grammar
-        // read.
-        if let Expr::Attribute(inner) = attribute.value.as_ref() {
-            if is_datetime_date_attribute(inner, environment) && attribute.attr.as_str() == "fromisoformat" {
-                if let [text] = &*call.arguments.args {
-                    if call.arguments.keywords.is_empty() {
-                        let argument = evaluate_expression(text, environment, kernel);
-                        if let Some(code_points) = exact_string_values(&argument) {
-                            if let Some(spelling) = code_points_to_string(code_points) {
-                                if let Some(value) = date_fromisoformat_value(&spelling, kernel) {
-                                    return value;
-                                }
+        // when `date` reached the file qualified (`datetime.date`), OR
+        // ONE level when `date` reached it as a bare aliased class name
+        // (`date.fromisoformat(...)`, `from datetime import date`) —
+        // `is_datetime_date_attribute` resolves `attribute.value`
+        // either way. See `date_fromisoformat_value`'s own doc for the
+        // exact grammar read.
+        if is_datetime_date_attribute(attribute.value.as_ref(), environment) && attribute.attr.as_str() == "fromisoformat" {
+            if let [text] = &*call.arguments.args {
+                if call.arguments.keywords.is_empty() {
+                    let argument = evaluate_expression(text, environment, kernel);
+                    if let Some(code_points) = exact_string_values(&argument) {
+                        if let Some(spelling) = code_points_to_string(code_points) {
+                            if let Some(value) = date_fromisoformat_value(&spelling, kernel) {
+                                return value;
                             }
                         }
                     }
                 }
-                return unknown();
             }
+            return unknown();
         }
         // `array.array(typecode, initializer)` — the Float64Array twin,
         // p-typed-array.py's `array_double_from_iterable`/`array_double_
@@ -3673,6 +3826,71 @@ fn json_dumps_value(value: &AbstractValue) -> Option<String> {
     None
 }
 
+/// Every module name `evaluate_attribute_call` carries a model for, at
+/// least in part — the recognized-module gate every arm in that function
+/// already applies one at a time (`module_name.id.as_str() == "math"`,
+/// `== "random"`, and so on). Named here as ONE list so a recognizer that
+/// needs the COMPLEMENT (rung 1's naming unit, and the manifest reader's
+/// own "is this module already modeled here?" check,
+/// `python-c-extension-boundary.md`'s build order) reads one table
+/// instead of re-deriving it from the arms below. `datetime`'s own three
+/// aliases (`date`/`timedelta`) are matched by IDENTITY through
+/// `environment.datetime_imports()`, not by this literal list, so they
+/// are named here too even though no arm below tests
+/// `module_name.id.as_str() == "datetime"` directly.
+const MODELED_MODULE_NAMES: &[&str] =
+    &["math", "random", "re", "json", "importlib", "types", "weakref", "asyncio", "array", "subprocess", "datetime"];
+
+/// The leftmost `Name` under an attribute-chain receiver (`a.b.c` → `a`;
+/// `a` itself → `a`) — `None` when the receiver is not built from a
+/// plain name chain at all. The expression-side twin of `check.rs`'s own
+/// `receiver_base_name` (private to that file), duplicated rather than
+/// exported across the crate boundary this module already keeps thin —
+/// both copies read the identical two-line recursion.
+fn attribute_chain_root_name(receiver: &Expr) -> Option<&str> {
+    match receiver {
+        Expr::Name(name) => Some(name.id.as_str()),
+        Expr::Attribute(attribute) => attribute_chain_root_name(attribute.value.as_ref()),
+        _ => None,
+    }
+}
+
+/// Rung 1 of the compiled-extension recognition ladder
+/// (`python-c-extension-boundary.md`'s naming unit): whether `call` is a
+/// call on an attribute chain rooted at an imported-but-unmodeled module
+/// name — `torch.arange(5)`, `pandas.read_csv(...).head()`'s own
+/// receiver — answering that root module's own name for the caller to
+/// name in its decline sentence.
+///
+/// Recognized the same way every modeled-module arm in
+/// `evaluate_attribute_call` recognizes ITS OWN module: the chain's root
+/// is a bare `Name` that reads UNBOUND in `environment`
+/// (`environment.read(name).is_none()` — the identical gate `math`/`re`/
+/// `json`/etc. already apply, since an import that resolved to nothing
+/// this checker tracks leaves the name unbound, `check.rs::
+/// bind_or_forget_imported_name`'s own doc) AND is not itself one of the
+/// `MODELED_MODULE_NAMES` this file already carries a model for (a
+/// modeled module's own unmodeled FUNCTION — `math.frexp`, say — is a
+/// different, narrower gap this naming unit does not claim; only a
+/// module with NO model at all is named here). `None` for every other
+/// call shape: a bare-name call, a method call on an evaluated (non-
+/// module) receiver, or a call whose root name IS bound to a real
+/// tracked value (shadowing the module the way every existing arm's own
+/// gate already respects).
+pub fn unmodeled_module_call_name<'a>(call: &'a ruff_python_ast::ExprCall, environment: &Environment) -> Option<&'a str> {
+    let Expr::Attribute(attribute) = call.func.as_ref() else {
+        return None;
+    };
+    let root = attribute_chain_root_name(attribute.value.as_ref())?;
+    if environment.read(root).is_some() {
+        return None;
+    }
+    if MODELED_MODULE_NAMES.contains(&root) {
+        return None;
+    }
+    Some(root)
+}
+
 /// `receiver.attr(...)` — the known receiver shapes this file
 /// dispatches: `math.<name>(...)` / `re.compile(...)` (only when the
 /// module name is not shadowed by a local binding) and a method call
@@ -3919,61 +4137,62 @@ fn evaluate_attribute_call(
             }
         }
     }
-    // `datetime.datetime.now()` — a TWO-level attribute chain
-    // (`Attribute(value=Attribute(value=Name("datetime"),
-    // attr="datetime"), attr="now")`), never reaching
-    // `is_datetime_datetime_attribute`'s own single-level check (that
-    // check gates the CONSTRUCTION call, `datetime.datetime(...)`, whose
-    // `call.func` IS the `datetime.datetime` chain itself — here
-    // `attribute` is one level further out, `datetime.datetime.now`).
-    // classmethod:: datetime.now(tz=None): "Return the current local
-    // date and time." — a value that changes every run, never a whole
-    // number Age could ever admit (this fixture's own row's reason:
-    // "the current moment is not in the set"); answered OPAQUE, the
-    // same "not a scalar/set this domain models" honesty every other
-    // host-nondeterministic read in this file already carries. The
-    // `tz=` argument (if any) is not read — every outcome is equally
-    // opaque regardless of which timezone the caller requests.
-    if let Expr::Attribute(inner) = attribute.value.as_ref() {
-        if is_datetime_datetime_attribute(inner, environment) && attribute.attr.as_str() == "now" {
-            return opaque_value("the current datetime");
-        }
-        // `datetime.datetime.strptime(date_string, format)` — date.12
-        // STAGE 1, the SAME two-level attribute chain shape `.now()`
-        // reads just above. Modeled ONLY when BOTH arguments are known
-        // exact strings AND `format` is EXACTLY the literal `"%Y-%m-%d"`
-        // (`strptime_iso_date_value`'s own doc — the ISO date-only
-        // directive sequence date.3's grammar already commits to). A
-        // NON-literal `format` (a parameter, a computed expression, an
-        // f-string) is not a string this file can read the DIRECTIVES
-        // of at all — this file has no format-code mini-language reader
-        // for anything but the exact `"%Y-%m-%d"` spelling — so it
-        // declines the same way `date_fromisoformat_value`'s own
-        // non-literal-argument row does: no sentence-carrying channel
-        // exists on this dispatch path (`evaluate_attribute_call`
-        // returns a plain `AbstractValue`, never a message), so the
-        // decline is named here, in this comment, the same way every
-        // other declining recognizer in this file states its reason in
-        // prose beside its own `return unknown()`. A literal format
-        // OTHER than `"%Y-%m-%d"` (`"%d/%m/%Y"`, any other directive
-        // sequence) names date.12 STAGE 2 — the directive-grammar
-        // kernel theory this stage does not build — as its own reason,
-        // by the identical convention.
-        if is_datetime_datetime_attribute(inner, environment) && attribute.attr.as_str() == "strptime" {
-            if let [text, format] = arguments {
-                if let (Some(text_points), Some(format_points)) = (exact_string_values(text), exact_string_values(format)) {
-                    if let (Some(text_spelling), Some(format_spelling)) = (code_points_to_string(text_points), code_points_to_string(format_points)) {
-                        if format_spelling == "%Y-%m-%d" {
-                            return match strptime_iso_date_value(&text_spelling, kernel) {
-                                Some(value) => value,
-                                None => unknown(),
-                            };
-                        }
+    // `datetime.datetime.now()` — the receiver (`attribute.value`) is
+    // either a TWO-level attribute chain (`Attribute(value=Attribute
+    // (value=Name("datetime"), attr="datetime"), attr="now")`) when
+    // `datetime` reached the file qualified, or a bare aliased class
+    // name (`dt.now()`, `from datetime import datetime as dt`) ONE
+    // level — never reaching `is_datetime_datetime_attribute`'s own
+    // CONSTRUCTION-callee use (that check ALSO gates
+    // `datetime.datetime(...)`, whose `call.func` IS the receiver
+    // chain itself; here `attribute` is one level further out,
+    // `datetime.datetime.now`/`dt.now`). classmethod:: datetime.now
+    // (tz=None): "Return the current local date and time." — a value
+    // that changes every run, never a whole number Age could ever
+    // admit (this fixture's own row's reason: "the current moment is
+    // not in the set"); answered OPAQUE, the same "not a scalar/set
+    // this domain models" honesty every other host-nondeterministic
+    // read in this file already carries. The `tz=` argument (if any)
+    // is not read — every outcome is equally opaque regardless of
+    // which timezone the caller requests.
+    if is_datetime_datetime_attribute(attribute.value.as_ref(), environment) && attribute.attr.as_str() == "now" {
+        return opaque_value("the current datetime");
+    }
+    // `datetime.datetime.strptime(date_string, format)` — date.12
+    // STAGE 1, the SAME receiver shape `.now()` reads just above
+    // (qualified chain or bare aliased class name). Modeled ONLY when
+    // BOTH arguments are known exact strings AND `format` is EXACTLY
+    // the literal `"%Y-%m-%d"` (`strptime_iso_date_value`'s own doc —
+    // the ISO date-only directive sequence date.3's grammar already
+    // commits to). A NON-literal `format` (a parameter, a computed
+    // expression, an f-string) is not a string this file can read the
+    // DIRECTIVES of at all — this file has no format-code mini-language
+    // reader for anything but the exact `"%Y-%m-%d"` spelling — so it
+    // declines the same way `date_fromisoformat_value`'s own
+    // non-literal-argument row does: no sentence-carrying channel
+    // exists on this dispatch path (`evaluate_attribute_call`
+    // returns a plain `AbstractValue`, never a message), so the
+    // decline is named here, in this comment, the same way every
+    // other declining recognizer in this file states its reason in
+    // prose beside its own `return unknown()`. A literal format
+    // OTHER than `"%Y-%m-%d"` (`"%d/%m/%Y"`, any other directive
+    // sequence) names date.12 STAGE 2 — the directive-grammar
+    // kernel theory this stage does not build — as its own reason,
+    // by the identical convention.
+    if is_datetime_datetime_attribute(attribute.value.as_ref(), environment) && attribute.attr.as_str() == "strptime" {
+        if let [text, format] = arguments {
+            if let (Some(text_points), Some(format_points)) = (exact_string_values(text), exact_string_values(format)) {
+                if let (Some(text_spelling), Some(format_spelling)) = (code_points_to_string(text_points), code_points_to_string(format_points)) {
+                    if format_spelling == "%Y-%m-%d" {
+                        return match strptime_iso_date_value(&text_spelling, kernel) {
+                            Some(value) => value,
+                            None => unknown(),
+                        };
                     }
                 }
             }
-            return unknown();
         }
+        return unknown();
     }
     let receiver = evaluate_expression(&attribute.value, environment, kernel);
     // A tagged `datetime_datetime` instance's own METHODS —
@@ -6845,8 +7064,6 @@ fn is_valid_base_ten_int_string(text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
-
     use refined_kernel::kernel_bridge::dylib_path;
     use refined_kernel::kernel_bridge::kernel_artifacts_present;
     use refined_kernel::kernel_bridge::load_kernel;
@@ -9147,6 +9364,131 @@ mod tests {
     fn test_date_construction_of_an_invalid_calendar_date_declines() {
         let Some(value) = eval("datetime.date(2023, 2, 30)") else { return };
         assert_eq!(value.kind, Kind::Unknown);
+    }
+
+    // --- import aliasing: the datetime gates resolve canonical identity,
+    // not the literal `datetime`/`date`/`timedelta` spelling ---
+
+    /// One module's `datetime` import table, seeded onto a fresh
+    /// environment the same way `check.rs::walk_body_with_self_binding`
+    /// seeds it for a real walk — the harness every aliasing pin below
+    /// shares.
+    fn environment_with_datetime_imports(module: &ruff_python_ast::ModModule) -> Environment {
+        let mut environment = empty_environment();
+        environment.set_datetime_imports(Arc::new(datetime_imports(module)));
+        environment
+    }
+
+    /// `from datetime import date` + `date(2024, 3, 1)` — a bare aliased
+    /// class name construction. Recognizes IDENTICALLY to the qualified
+    /// `datetime.date(2024, 3, 1)` spelling (`test_date_construction_
+    /// carries_its_own_fields`'s own pin): same tag, same three fields.
+    #[test]
+    fn test_bare_imported_date_construction_matches_the_qualified_spelling() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = ruff_python_parser::parse_module("from datetime import date\n")
+            .expect("test module parses")
+            .into_syntax();
+        let environment = environment_with_datetime_imports(&module);
+        let parsed = parse_expression("date(2024, 3, 1)").expect("test source must parse");
+        let value = evaluate_expression(&parsed.into_expr(), &environment, &kernel);
+        let qualified = parse_expression("datetime.date(2024, 3, 1)").expect("test source must parse");
+        let qualified_value = evaluate_expression(&qualified.into_expr(), &empty_environment(), &kernel);
+        assert_eq!(value.kind, Kind::Object);
+        assert_eq!(value, qualified_value, "an aliased bare-Name construction must equal the qualified spelling's own pin");
+        assert_eq!(datetime_field(&value, "year"), Some(2024.0));
+        assert_eq!(datetime_field(&value, "month"), Some(3.0));
+        assert_eq!(datetime_field(&value, "day"), Some(1.0));
+    }
+
+    /// `from datetime import datetime as dt` + `dt.strptime("2024-03-01",
+    /// "%Y-%m-%d")` — a bare aliased class name's own classmethod call.
+    /// Recognizes the same ISO-date STAGE 1 grammar the qualified
+    /// `datetime.datetime.strptime(...)` spelling already pins
+    /// (`test_strptime_...` rows above), landing on the same
+    /// `datetime_datetime`-tagged instance a direct `datetime.datetime(
+    /// 2024, 3, 1)` construction gives (`strptime_iso_date_value`'s own
+    /// doc: date-only, hour/minute/second all zero).
+    #[test]
+    fn test_aliased_datetime_strptime_recognizes() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = ruff_python_parser::parse_module("from datetime import datetime as dt\n")
+            .expect("test module parses")
+            .into_syntax();
+        let environment = environment_with_datetime_imports(&module);
+        let parsed = parse_expression("dt.strptime(\"2024-03-01\", \"%Y-%m-%d\")").expect("test source must parse");
+        let value = evaluate_expression(&parsed.into_expr(), &environment, &kernel);
+        assert_eq!(value.kind, Kind::Object);
+        assert_eq!(datetime_field(&value, "year"), Some(2024.0));
+        assert_eq!(datetime_field(&value, "month"), Some(3.0));
+        assert_eq!(datetime_field(&value, "day"), Some(1.0));
+    }
+
+    /// `import datetime as dtm` + `dtm.date(2024, 3, 1)` — the whole
+    /// MODULE aliased (not one class), the qualified-chain shape
+    /// resolved through the module alias rather than the literal
+    /// `datetime` spelling. Recognizes identically to the unaliased
+    /// `datetime.date(2024, 3, 1)` construction.
+    #[test]
+    fn test_module_aliased_date_construction_recognizes() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = ruff_python_parser::parse_module("import datetime as dtm\n")
+            .expect("test module parses")
+            .into_syntax();
+        let environment = environment_with_datetime_imports(&module);
+        let parsed = parse_expression("dtm.date(2024, 3, 1)").expect("test source must parse");
+        let value = evaluate_expression(&parsed.into_expr(), &environment, &kernel);
+        assert_eq!(value.kind, Kind::Object);
+        assert_eq!(datetime_field(&value, "year"), Some(2024.0));
+        assert_eq!(datetime_field(&value, "month"), Some(3.0));
+        assert_eq!(datetime_field(&value, "day"), Some(1.0));
+    }
+
+    /// A LOCALLY SHADOWED imported name never recognizes — `date` here
+    /// is a same-module `def`, never `from datetime import date`
+    /// (the import table's own `date_class_names` set stays empty since
+    /// no such import statement exists), mirroring `surface.rs`'s own
+    /// `locally_defined_field_not_recognized` pin: a same-spelled local
+    /// definition that was never the real import is not the shape this
+    /// table names, so the same-module-def dispatch (`same_module_def_
+    /// gate_open`) answers the call instead of the datetime gate ever
+    /// running — `date(2024, 3, 1)` calls the LOCAL zero-argument `def`
+    /// (which takes no `year`/`month`/`day`, so the call is unread) and
+    /// never reads as a tagged `datetime_date` instance.
+    #[test]
+    fn test_locally_defined_date_name_not_recognized_as_datetime() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = ruff_python_parser::parse_module(concat!(
+            "def date():\n",
+            "    pass\n",
+        ))
+        .expect("test module parses")
+        .into_syntax();
+        let table = Arc::new(crate::function_table::function_table(&module));
+        let mut environment = environment_with_datetime_imports(&module);
+        environment.set_functions(table);
+        let parsed = parse_expression("date(2024, 3, 1)").expect("test source must parse");
+        let value = evaluate_expression(&parsed.into_expr(), &environment, &kernel);
+        assert_ne!(value.kind, Kind::Object, "a locally defined `date` must never read as a datetime_date instance");
+    }
+
+    /// A REBOUND imported name never recognizes — `date` is genuinely
+    /// `from datetime import date`, but this body's own `date = 40`
+    /// rebinds it before the call. `is_datetime_date_attribute`'s own
+    /// shadow check (`environment.read(name).is_none()`) must see the
+    /// rebinding and decline, the same way the qualified `datetime.date`
+    /// spelling already declines when `datetime` itself is rebound.
+    #[test]
+    fn test_locally_rebound_imported_date_name_not_recognized() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = ruff_python_parser::parse_module("from datetime import date\n")
+            .expect("test module parses")
+            .into_syntax();
+        let mut environment = environment_with_datetime_imports(&module);
+        environment.bind("date", known_values(vec![40.0], PrimitiveKind::Integer, TrustProved));
+        let parsed = parse_expression("date(2024, 3, 1)").expect("test source must parse");
+        let value = evaluate_expression(&parsed.into_expr(), &environment, &kernel);
+        assert_ne!(value.kind, Kind::Object, "a locally rebound `date` must never read as a datetime_date instance");
     }
 
     /// `datetime.date(2024, 3, 1).weekday()` — PIN VALUE FROM THE

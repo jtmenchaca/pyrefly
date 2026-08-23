@@ -165,6 +165,7 @@ use refined_sets::refinement_forms::requires_integer;
 use refined_sets::refinement_forms::union;
 use refined_sets::refinement_forms::Form;
 use refined_sets::refinement_forms::RefinedSet;
+use refined_sets::regex_compiler::format_grammar;
 use refined_sets::repetition_window_forms::as_repetition;
 use ruff_python_ast::ConversionFlag;
 use ruff_python_ast::Expr;
@@ -302,7 +303,20 @@ pub struct ForeignEdge {
 pub enum ForeignEdgeOutcome {
     /// Every premise came back green: the range of the `json.loads(...)`
     /// node to publish the value under, and the value itself.
-    Override { parse_range: TextRange, value: AbstractValue },
+    ///
+    /// `stdout_override`, when `Some`, is a SECOND, independent binding:
+    /// the intermediate captured-stdout reading's own node (a `result
+    /// .stdout` attribute access for `ResultRead::StdoutAttribute`, or
+    /// the bound name's own node for `ResultRead::Bare`) paired with the
+    /// SERIALIZED form of the return fact — the string-sorted JSON-
+    /// number-grammar set the harness's own encoder can spell for a
+    /// return whose every case is number-sorted
+    /// (`foreign_stdout_serialized_value`'s own doc). `None` for every
+    /// return shape that derivation does not cover (any non-number
+    /// case), and unconditionally `None` for `ResultRead::FileRead`
+    /// (`os.system` has no intermediate stdout binding to serialize at
+    /// all — the captured target there is the process's exit status).
+    Override { parse_range: TextRange, value: AbstractValue, stdout_override: Option<(TextRange, AbstractValue)> },
     /// The crossing escapes what the target states it admits: an
     /// RTS7001 the caller reports at `range` (the payload), never a
     /// decline — the call is wrong, so there is no fact to attach.
@@ -534,14 +548,45 @@ fn discharge_edge_premises(
 /// construct (`d-data-legs.py`'s own `level_via_raw_stdout` row: the
 /// value is read as `float(result.stdout)`, never parsed as JSON at all,
 /// and that read is free to judge on its own ordinary terms).
-fn return_leg_outcome(consumer: ParseConsumer, artifact: &ForeignTsArtifact, call: TextRange) -> Option<ForeignEdgeOutcome> {
+///
+/// `consumer_scan_statements` is the SAME statement list the caller's
+/// own `consumer` scan already ran over — passed again (rather than
+/// re-sliced here) so `stdout_override`'s own argument-range scan
+/// (`foreign_parse_argument_range_of`) searches the identical range and
+/// finds the identical node `consumer`'s own `parse_range` names.
+fn return_leg_outcome(
+    consumer: ParseConsumer,
+    artifact: &ForeignTsArtifact,
+    edge: &ForeignEdge,
+    consumer_scan_statements: &[Stmt],
+) -> Option<ForeignEdgeOutcome> {
     match consumer {
         ParseConsumer::Found(parse_range) => Some(match foreign_return_value_or_undetermined(artifact) {
-            Ok(value) => ForeignEdgeOutcome::Override { parse_range, value },
+            Ok(value) => {
+                // The intermediate captured-stdout reading's own SECOND
+                // override — bound ONLY on a DISCHARGED crossing (this
+                // arm is reached exclusively from the green
+                // `discharge_edge_premises` path, never `Fired`) and
+                // ONLY when every return case is number-sorted
+                // (`foreign_stdout_serialized_value`'s own gate). `os
+                // .system`'s `ResultRead::FileRead` has no intermediate
+                // stdout binding at all — `foreign_parse_argument_range_of`
+                // answers `None` for it (`foreign_parse_argument_range`'s
+                // own `FileRead` arm), so this stays `None` there
+                // unconditionally, leaving that shape's existing
+                // return-fact consumer override as its only publish.
+                let stdout_override = foreign_stdout_serialized_value(&artifact.called.return_cases).and_then(
+                    |serialized| {
+                        foreign_parse_argument_range_of(consumer_scan_statements, &edge.result_name, &edge.result_read)
+                            .map(|argument_range| (argument_range, serialized))
+                    },
+                );
+                ForeignEdgeOutcome::Override { parse_range, value, stdout_override }
+            }
             Err(message) => ForeignEdgeOutcome::Decline { message, range: parse_range },
         }),
         ParseConsumer::NoneFound => None,
-        ParseConsumer::Blocked(message) => Some(ForeignEdgeOutcome::Decline { message, range: call }),
+        ParseConsumer::Blocked(message) => Some(ForeignEdgeOutcome::Decline { message, range: edge.call }),
     }
 }
 
@@ -630,7 +675,11 @@ fn finish_recognized_edge(
         Err(EdgeDischargeError::Decline(outcome)) => return Some(outcome),
     };
     let consumer = scan_sole_consumer(statements, &edge);
-    return_leg_outcome(consumer, &artifact, edge.call)
+    // `scan_sole_consumer`'s own non-`FileRead` arm scans
+    // `statements[edge.consumer_scan_from + 1..]` (`sole_parse_consumer_of`'s
+    // doc) — sliced identically here so `return_leg_outcome`'s own
+    // argument-range scan searches the same range.
+    return_leg_outcome(consumer, &artifact, &edge, &statements[edge.consumer_scan_from + 1..])
 }
 
 /// `discharge_edge_premises` plus the INCLUSIVE return-leg scan
@@ -661,7 +710,10 @@ fn finish_recognized_edge_from_start(
         Err(EdgeDischargeError::Decline(outcome)) => return Some(outcome),
     };
     let consumer = sole_parse_consumer_from(statements, &edge.result_name, &edge.result_read);
-    return_leg_outcome(consumer, &artifact, edge.call)
+    // `finish_recognized_edge_from_start`'s own INCLUSIVE scan — the
+    // whole `statements` slice, unsliced, matching `sole_parse_consumer_
+    // from`'s own call just above.
+    return_leg_outcome(consumer, &artifact, &edge, statements)
 }
 
 /// Whether the call's own carrier and the target's declared surface
@@ -958,6 +1010,81 @@ fn clip_uncarriable_corners(cases: &[ForeignCase]) -> Vec<ForeignCase> {
         clipped.push(ForeignCase::Null);
     }
     clipped
+}
+
+/* ── the intermediate captured-stdout reading ────────────────────── */
+
+/// The JSON number production (RFC 8259 §6 / json.org's number diagram,
+/// the same grammar `json.loads`'s own `NUMBER_RE` cites): an optional
+/// sign, an integer part that is either the single digit 0 or a nonzero
+/// digit followed by any run of digits (no leading zero —
+/// `json.dumps` never writes one), an optional fractional part, an
+/// optional exponent. Anchored `^...$` by `format_grammar`'s own
+/// convention (this crate's kernel-bridge-facts row: anchor sub-patterns
+/// yourself, since an unanchored compile pads both sides with `C*`) and
+/// followed by the ONE trailing newline `subprocess.run`'s captured
+/// stdout always carries when `text=True` (the harness's own print/
+/// stdout.write terminates its line) — the harness never writes a
+/// SECOND line for a scalar return, so exactly one `\n`, not a star of
+/// them. Mirrors `refined-ts-go/internal/refinedts/walk/foreign_edge.go`'s
+/// `jsonNumberGrammarPattern` exactly, the Go twin's own reverse-pair
+/// row this derivation ports.
+const JSON_NUMBER_GRAMMAR_PATTERN: &str = r"-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?\n";
+
+/// Compiles `JSON_NUMBER_GRAMMAR_PATTERN` through `format_grammar` — the
+/// SAME door `surface.rs`'s pydantic `pattern=` compiles a `Field`
+/// constraint through — the pattern vocabulary this binding reuses
+/// rather than hand-building the concatenation/union forms a regex
+/// source already denotes. The pattern's own constructs (character
+/// classes, `?`, alternation, `*`/`+`) are all supported forms
+/// (`regex_compiler.rs`'s own `test_anchored_classes_and_quantifiers_
+/// compile`); a compile failure here is an impossible state — panics
+/// rather than silently widening to an unconstrained string set, so a
+/// future change to the supported regex subset that actually broke this
+/// pattern fails loudly at the first call instead of quietly degrading
+/// every stdout reading to residue.
+fn json_number_grammar_set() -> RefinedSet {
+    let compiled = format_grammar(&("^".to_owned() + JSON_NUMBER_GRAMMAR_PATTERN + "$"), "");
+    if !compiled.ok {
+        panic!("JSON_NUMBER_GRAMMAR_PATTERN does not compile: {}", compiled.unsupported);
+    }
+    compiled.set
+}
+
+/// The SERIALIZED form of a discharged crossing's return cases — the
+/// string-sorted set the intermediate captured-stdout reading (`result
+/// .stdout` for `ResultRead::StdoutAttribute`, or the bound name itself
+/// for `ResultRead::Bare`) actually holds, read structurally off what
+/// the target's own JSON encoder can spell for that return.
+///
+/// The only derivable shape today is a return whose every PRESENT case
+/// is number-sorted: the harness writes exactly one JSON number followed
+/// by one newline, so the serialized set is `json_number_grammar_set()`
+/// — the WINDOWLESS general JSON-number grammar, not a tightened
+/// per-window grammar the case's own bounds might suggest (that
+/// tightening needs a number-to-JSON-text theory this tree does not
+/// have yet). The windowless grammar is still a REAL claim — it
+/// excludes every non-numeric text ("abc", an empty stdout, a bare
+/// token like "Infinity") — and a weaker true claim beats no claim at
+/// all.
+///
+/// `None` for an empty cases list, or a cases list carrying any
+/// NON-NUMBER case (string, boolean, object) — the JSON text a mixed or
+/// non-numeric return spells is a different, wider question this
+/// derivation does not attempt, so the caller leaves the stdout reading
+/// unbound rather than guess. A NULL case riding alongside a number
+/// case ALSO answers `None` — `json.dumps(None)` writes the bare token
+/// `null`, not a JSON number, and covering that second literal
+/// alongside the number grammar is not part of what this derivation
+/// states. Mirrors the Go twin's `foreignStdoutSerializedValue` exactly.
+fn foreign_stdout_serialized_value(cases: &[ForeignCase]) -> Option<AbstractValue> {
+    if cases.is_empty() {
+        return None;
+    }
+    if !cases.iter().all(|case| matches!(case, ForeignCase::Number(_))) {
+        return None;
+    }
+    Some(known_set(json_number_grammar_set(), None, TrustSpec, SetKindTag::None))
 }
 
 /* ── recognition ──────────────────────────────────────────────────── */
@@ -3546,6 +3673,91 @@ fn foreign_parse_calls_in(
     });
 }
 
+/// The intermediate captured-stdout READING's own node — `json.loads(...)`'s
+/// sole ARGUMENT, one layer inside the call `sole_parse_consumer_from`
+/// already found and proved unique (`ParseConsumer::Found`'s own
+/// `count == 1` guarantee, re-run here rather than threaded through,
+/// since this asks a strictly narrower question of the identical node).
+/// `ResultRead::StdoutAttribute` answers the `<name>.stdout` attribute-
+/// access node; `ResultRead::Bare` answers the bound name's own node —
+/// the `Expr::Name` `json.loads(...)` actually reads, UNDER any
+/// `.decode()` wrapper (the wrapper call itself is never the override
+/// target: `evaluate_expression`'s node-override seam matches by exact
+/// range, and only the inner `Expr::Name` is the node a plain `<name>`
+/// read — or `<name>.decode()`'s own inner operand — evaluates through).
+/// `None` for `ResultRead::FileRead`, which never reaches `json.loads`
+/// at all (`is_foreign_parse_of`'s own `false` arm), and `None` when no
+/// such node is found (the caller's own `ParseConsumer::Found` already
+/// guarantees one exists on every live call path; `None` here is inert
+/// rather than a caller-visible failure).
+fn foreign_parse_argument_range_of(statements: &[Stmt], name: &str, result_read: &ResultRead) -> Option<TextRange> {
+    let mut found: Option<TextRange> = None;
+    for statement in statements {
+        visit_statement_exprs(statement, &mut |expression| {
+            if found.is_some() {
+                return;
+            }
+            if let Some(argument_range) = foreign_parse_argument_range(expression, name, result_read) {
+                found = Some(argument_range);
+            }
+        });
+        if found.is_some() {
+            break;
+        }
+    }
+    found
+}
+
+/// The argument-range half of `is_foreign_parse_of`'s own match — kept
+/// as a SEPARATE reader rather than widening `is_foreign_parse_of`
+/// itself to return the range, so that function's existing bool
+/// contract (and every caller matching on it) is untouched.
+fn foreign_parse_argument_range(expression: &Expr, name: &str, result_read: &ResultRead) -> Option<TextRange> {
+    let Expr::Call(call) = expression else {
+        return None;
+    };
+    let Expr::Attribute(attribute) = call.func.as_ref() else {
+        return None;
+    };
+    let Expr::Name(module_name) = attribute.value.as_ref() else {
+        return None;
+    };
+    if module_name.id.as_str() != "json" || attribute.attr.as_str() != "loads" {
+        return None;
+    }
+    if !call.arguments.keywords.is_empty() {
+        return None;
+    }
+    let [argument] = call.arguments.args.as_ref() else {
+        return None;
+    };
+    match result_read {
+        ResultRead::StdoutAttribute => {
+            let Expr::Attribute(result_attribute) = argument else {
+                return None;
+            };
+            let Expr::Name(result_name) = result_attribute.value.as_ref() else {
+                return None;
+            };
+            if result_name.id.as_str() != name || result_attribute.attr.as_str() != "stdout" {
+                return None;
+            }
+            Some(argument.range())
+        }
+        ResultRead::Bare => {
+            let unwrapped = unwrap_bytes_decode(argument);
+            let Expr::Name(result_name) = unwrapped else {
+                return None;
+            };
+            if result_name.id.as_str() != name {
+                return None;
+            }
+            Some(unwrapped.range())
+        }
+        ResultRead::FileRead { .. } => None,
+    }
+}
+
 /// Whether a node is exactly `json.loads(<name>.stdout)` (`result_read
 /// == StdoutAttribute`) or `json.loads(<name>)`, OPTIONALLY
 /// `.decode()`-wrapped (`result_read == Bare`) — the awaited asyncio
@@ -4047,6 +4259,110 @@ mod tests {
             }
             ForeignEdgeOutcome::Decline { message, .. } => panic!("wanted an override, got a decline: {message}"),
             ForeignEdgeOutcome::Fired { message, .. } => panic!("wanted an override, got a fire: {message}"),
+        }
+    }
+
+    /// Whether `literal` is admitted by `set` — a single-string
+    /// singleton (`string_tuple`) asked against `set` through the
+    /// kernel's own `seq_subset` decider, the same routing `foreign_
+    /// scalar_subset` uses for a string-shaped pair. Panics on a kernel
+    /// refusal: every literal this module's own tests ask about sits
+    /// squarely inside the JSON-number grammar's supported shape, so a
+    /// refusal would itself be the finding, not a reason to skip.
+    fn literal_string_admitted_by(kernel: &Arc<RefinedTSKernel>, literal: &str, set: &RefinedSet) -> bool {
+        let singleton = refined_sets::codepoint_sets::string_tuple(literal);
+        crate::kernel_ask::ask_kernel(|| (kernel.seq_subset)(&singleton, set))
+            .expect("seq_subset decides a literal singleton against the JSON-number grammar")
+    }
+
+    /* ── the intermediate captured-stdout reading's own override ─────── */
+
+    /// DISCHARGED CROSSING, `ResultRead::StdoutAttribute`
+    /// (`subprocess.run`'s own `result.stdout` shape): `audio_level_ts_
+    /// artifact`'s return is entirely number-sorted
+    /// (`integer, >= 0, <= 1`), so `stdout_override` binds — the `result
+    /// .stdout` attribute-access node inside `json.loads(result.stdout)`
+    /// reads as the JSON-number-grammar string set, admitting a text the
+    /// harness's own serializer actually writes ("0.5\n") and excluding
+    /// both a non-numeric token ("abc") and the SAME digits without the
+    /// harness's own trailing newline ("0.5") — the anchored `$` end
+    /// pins the newline as load-bearing, not optional padding.
+    #[test]
+    fn a_discharged_stdout_attribute_crossing_binds_the_serialized_stdout_reading() {
+        register_fixture_artifact("./audio_level.ts", audio_level_ts_artifact());
+        let Some(kernel) = loaded_kernel() else { return };
+        let body = def_body(FIXTURE_SOURCE);
+        let environment = env_with(&[("boosted", boosted_sequence_value())]);
+        let outcome = foreign_edge_at(&body, 0, &environment, &kernel, None).expect("the shape recognizes");
+        let ForeignEdgeOutcome::Override { stdout_override, .. } = outcome else {
+            panic!("wanted an override");
+        };
+        let (_, stdout_value) = stdout_override.expect("a number-only return binds the intermediate stdout reading");
+        assert_eq!(stdout_value.kind, Kind::Set);
+        assert!(literal_string_admitted_by(&kernel, "0.5\n", &stdout_value.set), "the grammar must admit a serialized JSON number plus newline");
+        assert!(!literal_string_admitted_by(&kernel, "abc", &stdout_value.set), "the grammar must exclude non-numeric text");
+        assert!(!literal_string_admitted_by(&kernel, "0.5", &stdout_value.set), "the grammar must exclude the digits without the harness's own trailing newline");
+    }
+
+    /// DISCHARGED CROSSING, `ResultRead::Bare` (`subprocess.check_output`'s
+    /// own direct-return shape): the same number-only return binds the
+    /// intermediate reading at the bound name's own node inside `json
+    /// .loads(result)`, admitting/excluding the identical texts the
+    /// `StdoutAttribute` pin checks.
+    #[test]
+    fn a_discharged_bare_check_output_crossing_binds_the_serialized_stdout_reading() {
+        register_fixture_artifact("./audio_level.ts", audio_level_ts_artifact());
+        let Some(kernel) = loaded_kernel() else { return };
+        let source = concat!(
+            "def f(boosted):\n",
+            "    result = subprocess.check_output(\n",
+            "        [\"node\", \"./audio_level.ts\"],\n",
+            "        input=json.dumps(boosted),\n",
+            "        text=True,\n",
+            "    )\n",
+            "    return json.loads(result)\n",
+        );
+        let body = def_body(source);
+        let environment = env_with(&[("boosted", boosted_sequence_value())]);
+        let outcome = foreign_edge_at(&body, 0, &environment, &kernel, None).expect("the shape recognizes");
+        let ForeignEdgeOutcome::Override { stdout_override, .. } = outcome else {
+            panic!("wanted an override");
+        };
+        let (_, stdout_value) = stdout_override.expect("a number-only return binds the intermediate stdout reading");
+        assert_eq!(stdout_value.kind, Kind::Set);
+        assert!(literal_string_admitted_by(&kernel, "0.5\n", &stdout_value.set), "the grammar must admit a serialized JSON number plus newline");
+        assert!(!literal_string_admitted_by(&kernel, "abc", &stdout_value.set), "the grammar must exclude non-numeric text");
+        assert!(!literal_string_admitted_by(&kernel, "0.5", &stdout_value.set), "the grammar must exclude the digits without the harness's own trailing newline");
+    }
+
+    /// FIRED CROSSING: unchanged behavior — `stdout_override` is never
+    /// populated on a `Fired` outcome at all (the field lives only on
+    /// `Override`; a refuted outbound leg answers `ForeignEdgeOutcome::
+    /// Fired` per `check_outbound_leg`'s own fit refutation, with no
+    /// `stdout_override` field to check), and the `Fired.consumer` pin
+    /// this module already keeps (`a_too_wide_outbound_argument_fires`
+    /// and its siblings) is untouched by this addition.
+    #[test]
+    fn a_fired_crossing_carries_no_stdout_override_field_at_all() {
+        register_fixture_artifact("./audio_level.ts", audio_level_ts_artifact());
+        let Some(kernel) = loaded_kernel() else { return };
+        let body = def_body(FIXTURE_SOURCE);
+        // the entry admits -2.0 .. 2.0; this argument's own element set is
+        // the full ray, well outside it — the SAME too-wide construction
+        // `a_too_wide_outbound_argument_fires` uses.
+        let too_wide = known_set(
+            make_refined_set(vec![star(make_refined_set(vec![at_least(-1000.0), at_most(1000.0)]))]),
+            None,
+            TrustProved,
+            SetKindTag::None,
+        );
+        let environment = env_with(&[("boosted", too_wide)]);
+        match foreign_edge_at(&body, 0, &environment, &kernel, None).expect("the shape recognizes") {
+            ForeignEdgeOutcome::Fired { message, .. } => {
+                assert!(message.contains("audioLevel"), "{message}");
+            }
+            ForeignEdgeOutcome::Override { .. } => panic!("wanted a fire — an unbounded float list must not fit [-2, 2]"),
+            ForeignEdgeOutcome::Decline { message, .. } => panic!("wanted a fire, got a decline: {message}"),
         }
     }
 
