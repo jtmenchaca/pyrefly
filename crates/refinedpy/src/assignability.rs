@@ -17,6 +17,7 @@ use refined_domain::abstract_value::AbstractValue;
 use refined_domain::abstract_value::Kind;
 use refined_domain::abstract_value::PrimitiveKind;
 use refined_kernel::kernel_interface::RefinedTSKernel;
+use refined_sets::codepoint_sets::is_codepoint_alphabet;
 use refined_sets::codepoint_sets::is_string_ground;
 use refined_sets::format_string_shapes::format_py_number;
 use refined_sets::refinement_forms::on_one_tuple_layer;
@@ -493,8 +494,28 @@ pub fn judge(
         // (the corpus's "a string key is not in the set"), while `Grade`'s
         // integer-less union of one-codepoint OneOfs still declines to the
         // membership ask below.
+        //
+        // ONE CARVE-OUT inside that: `is_codepoint_alphabet` — the
+        // declared set being STRUCTURALLY the codepoint alphabet itself
+        // (`codepoint_sets::codepoints()`), not merely a narrower
+        // Integer-bounded window inside it. This is what `SingleCharacter
+        // = Annotated[str, Field(min_length=1, max_length=1)]` compiles
+        // to: `repetition_window_forms::repetition`'s own (1,1) collapse
+        // hands back the bare codepoint-ground element (its documented
+        // "a 1-element sequence IS the scalar layer" rule), so the
+        // sequence marker that would otherwise gate this law
+        // (`states_sequence`) never survives the collapse, and the
+        // element's own `Form::Integer` (part of the codepoint alphabet's
+        // definition, not a declared int base) makes `requires_integer`
+        // true exactly the way `Age`'s genuine int base does. The two are
+        // representationally identical except for their BOUNDS: `Age`'s
+        // window is a strict subset of the alphabet, the collapsed
+        // element IS the alphabet — `is_codepoint_alphabet` is the one
+        // test that tells them apart, so the fire below is reached only
+        // for a declared set that is NOT the alphabet outright.
         if is_string
             && on_one_tuple_layer(&declared.set)
+            && !is_codepoint_alphabet(&declared.set)
             && (requires_integer(&declared.set)
                 || states_sequence(&declared.set)
                 || !within_codepoint_door(&declared.set, false))
@@ -599,8 +620,12 @@ pub fn judge(
         // source.
         // the same `requires_integer` opening as the Values-side law —
         // an explicit Integer form is numeric intent no string set carries
+        // — and the same `is_codepoint_alphabet` carve-out inside it (see
+        // the Values-side law's doc comment for the collapsed-
+        // `SingleCharacter` shape this protects).
         if is_string_sorted_set
             && on_one_tuple_layer(&declared.set)
+            && !is_codepoint_alphabet(&declared.set)
             && (requires_integer(&declared.set)
                 || states_sequence(&declared.set)
                 || !within_codepoint_door(&declared.set, false))
@@ -1344,6 +1369,105 @@ mod tests {
         let message = fire_message(judge(&value, &declared, &kernel));
         assert!(message.contains("\"F\""), "{message}");
         assert!(message.contains("'Grade'"), "{message}");
+    }
+
+    /// `type SingleCharacter = Annotated[str, Field(min_length=1,
+    /// max_length=1)]` — showcase.py's own alias, built through the real
+    /// `repetition()` function (not hand-rolled) so this pins the exact
+    /// shape `annotated_expression_set` compiles: `repetition`'s own
+    /// `(1, 1)` collapse ("a 1-element sequence IS the scalar layer")
+    /// hands back the bare codepoint-ground element, `Integer ∧
+    /// ((>=0 ∧ <=0xD7FF) ∪ (>=0xE000 ∧ <=0x10FFFF))`, with no surviving
+    /// Repeat/Concatenation/Star form.
+    fn single_character_refinement() -> DeclaredRefinement {
+        let set = refined_sets::repetition_window_forms::repetition(
+            refined_sets::codepoint_sets::codepoints(),
+            1,
+            Some(1),
+        );
+        DeclaredRefinement {
+            set,
+            spelling: "SingleCharacter".to_owned(),
+            admits_none: false,
+            element: None,
+            element_length: None,
+            generator: None,
+            members: None,
+            positions: None,
+        }
+    }
+
+    /// The bug this fix closes: showcase.py:258's own row, `initial("🎉")`
+    /// — one codepoint, a genuine member of `SingleCharacter`'s collapsed
+    /// codepoint-ground element. Before the `is_codepoint_alphabet`
+    /// carve-out, `requires_integer` read the collapsed element's own
+    /// `Form::Integer` (part of the codepoint alphabet's definition, not
+    /// a declared int base) the same way it reads `Age`'s genuine int
+    /// base, and fired "a string where an integer is expected" on a
+    /// value that IS a member. Silent now: the alphabet identity check
+    /// lets this fall through to the ordinary whole-word kernel
+    /// membership ask, which the tuple-pun law already trusts for
+    /// `Grade`'s narrower codepoint-doored sets.
+    #[test]
+    fn a_single_codepoint_string_inside_the_character_set_is_silent() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let declared = single_character_refinement();
+        let value = known_values(hi_points("🎉"), PrimitiveKind::String, TrustProved);
+        assert!(matches!(judge(&value, &declared, &kernel), Verdict::Silent));
+    }
+
+    /// `type LowerAsciiChar = Annotated[str, Field(pattern=r"^[a-z]$")]`
+    /// — a NARROWER character class than `SingleCharacter`'s bare length
+    /// window: `regex_compiler.rs`'s own `[a-z]` compilation, `Integer ∧
+    /// AtLeast(0x61) ∧ AtMost(0x7A)`, wholly inside the codepoint door but
+    /// not equal to the full alphabet (`is_codepoint_alphabet` is false
+    /// for it, unlike `single_character_refinement`'s own set), so this
+    /// pins the ordinary in-door, non-alphabet membership path stays
+    /// exercised by the fix.
+    fn lower_ascii_char_refinement() -> DeclaredRefinement {
+        DeclaredRefinement {
+            set: make_refined_set(vec![integer(), at_least(0x61 as f64), at_most(0x7A as f64)]),
+            spelling: "LowerAsciiChar".to_owned(),
+            admits_none: false,
+            element: None,
+            element_length: None,
+            generator: None,
+            members: None,
+            positions: None,
+        }
+    }
+
+    /// A single codepoint OUTSIDE a character set: `"5"` (not a-z)
+    /// against `LowerAsciiChar` fires via the ordinary whole-word kernel
+    /// ask, quoting the string readably — never the sort law's "is not
+    /// allowed here" wording, matching `Grade`'s own non-member pin.
+    #[test]
+    fn a_single_codepoint_string_outside_the_character_set_fires() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let declared = lower_ascii_char_refinement();
+        let value = known_values(hi_points("5"), PrimitiveKind::String, TrustProved);
+        let message = fire_message(judge(&value, &declared, &kernel));
+        assert!(message.contains("\"5\""), "{message}");
+        assert!(message.contains("'LowerAsciiChar'"), "{message}");
+    }
+
+    /// showcase.py:260's own designated sibling: `initial("👨‍👩‍👧")`, a
+    /// 5-codepoint ZWJ family emoji — the OUT-OF-SET leg this fix must
+    /// leave untouched. Reaches the identical whole-word kernel
+    /// membership ask the in-set leg above now also reaches (both fall
+    /// through the same `is_codepoint_alphabet` carve-out), refused on
+    /// length rather than range, with the ordinary `refutation()`
+    /// sentence — never the sort law's "is not allowed here" wording the
+    /// bug fired on the in-set leg.
+    #[test]
+    fn a_multi_codepoint_string_against_the_character_set_fires_with_the_length_based_sentence() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let declared = single_character_refinement();
+        let value = known_values(hi_points("👨‍👩‍👧"), PrimitiveKind::String, TrustProved);
+        let message = fire_message(judge(&value, &declared, &kernel));
+        assert!(message.contains("is not assignable to type"), "{message}");
+        assert!(message.contains("'SingleCharacter'"), "{message}");
+        assert!(!message.contains("is not allowed here"), "{message}");
     }
 
     /// `type Grade = Literal["A", "B", "C"]` — o-grammar-refinements.py's
