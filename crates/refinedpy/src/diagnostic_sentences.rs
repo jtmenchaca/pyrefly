@@ -109,6 +109,16 @@ pub struct Sentences {
     pub value_not_readable: &'static str,
     pub typed_dict_position: &'static str,
     pub tuple_position: &'static str,
+    /// A temporal-declared position (`date`/`timedelta`/`datetime`/
+    /// `AwareDatetime`/`NaiveDatetime`) holds a flowing value this table
+    /// does not yet read as one of the three recognized constructions
+    /// (`datetime_date`/`datetime_timedelta`/`datetime_datetime`).
+    pub temporal_position: &'static str,
+    /// A temporal position's own exact instant/date/duration could not
+    /// be proved against the declared window at all — a kernel refusal,
+    /// or a construction (`TzinfoKind::OtherAware`) with no exact
+    /// offset to compare.
+    pub temporal_unprovable_instant: &'static str,
 }
 
 pub const SENTENCE: Sentences = Sentences {
@@ -117,6 +127,8 @@ pub const SENTENCE: Sentences = Sentences {
     value_not_readable: "the flowing value is not yet readable",
     typed_dict_position: "a TypedDict-declared position holds a value this table does not yet read",
     tuple_position: "a fixed-arity-tuple-declared position holds a value this table does not yet read",
+    temporal_position: "a temporal-declared position holds a value this table does not yet read as a date/timedelta/datetime construction",
+    temporal_unprovable_instant: "the flowing instant is not provable against the declared calendar window",
 };
 
 /// `os.system`'s own undetermined reason for a command whose runner and
@@ -511,6 +523,26 @@ pub fn loop_accumulation_did_not_stabilize(name: &str) -> String {
     )
 }
 
+/// A `for` loop iterating a dict directly (`for k in d:`/`for k in
+/// d.keys():`/`for v in d.values():`/`for k, v in d.items():`) whose own
+/// body provably CHANGES THAT SAME DICT'S SIZE on every reachable pass —
+/// `del d[key]`, `d.pop(...)`, `d.popitem()`, `d.clear()` —
+/// `loops.rs::dict_size_changing_mutation_range`'s own recognized set.
+/// CPython raises `RuntimeError` the moment the size changes mid-
+/// iteration (library/stdtypes.rst, dict views: "the dictionary should
+/// not be modified during iteration... it is safe... only if you don't
+/// add or remove entries"), a defined behavior this checker states as a
+/// provable raise, matching `binop_provable_raise`'s own "every operand
+/// known, every run raises" discipline. Names the iterated dict so the
+/// reader does not have to re-derive which name the loop reads from the
+/// mutation alone.
+pub fn dict_changed_size_during_iteration(dict_name: &str) -> String {
+    format!(
+        "this expression provably raises RuntimeError: dictionary '{dict_name}' changed size during \
+        iteration — the loop body changes the same dict's size on every reachable pass"
+    )
+}
+
 /// The generic `value_not_readable` sentence's own NAMED replacement, for
 /// the one shape that generic wording leaves anonymous: a flowing value
 /// that reached a sink undetermined because it was produced by a call
@@ -604,6 +636,21 @@ pub fn manifest_entry_names_no_producer(module_name: &str, function_name: &str, 
         (the manifest names the producer symbol '{producer_symbol}', and no C++/native adapter has exported a \
         fact for it yet)"
     )
+}
+
+/// The generic `value_not_readable` sentence's own NAMED replacement for
+/// the generator-body boundary q-decline-names.py's own
+/// `generator_body_never_summarized` row teaches: a value read off a
+/// generator (directly, or through `next`/`anext`) whose body
+/// `instances::generator_yields` declined to summarize (a conditional
+/// `yield`, or any other shape outside the straight-line reading that
+/// function's own doc describes) — never the plain absence of a model
+/// `unmodeled_module_call` names, since the generator IS a same-module
+/// def this checker recognizes and attempted to summarize. Mirrors
+/// `unmodeled_module_call`'s own naming-unit precedent: the generic
+/// wording is sharpened to name the ONE construct that blocked the read.
+pub fn generator_body_never_summarized() -> String {
+    "the generator body was never summarized, so its yield is unread".to_owned()
 }
 
 #[cfg(test)]
@@ -923,6 +970,27 @@ mod tests {
         let message = unmodeled_module_call("torch");
         assert!(message.contains("'torch'"), "{message}");
         assert!(message.contains("no model for"), "{message}");
+    }
+
+    /// The dict-changed-size-during-iteration sentence names the raise,
+    /// the raising dict, and the invariant the loop body breaks.
+    #[test]
+    fn the_dict_changed_size_during_iteration_sentence_names_the_dict_and_the_raise() {
+        let message = dict_changed_size_during_iteration("counts");
+        assert!(message.contains("RuntimeError"), "{message}");
+        assert!(message.contains("'counts'"), "{message}");
+        assert!(message.contains("changed size during"), "{message}");
+    }
+
+    /// The generator-body-never-summarized sentence names the generator's
+    /// own yield as the unread construct, distinct from
+    /// `unmodeled_module_call`'s "no model at all" wording.
+    #[test]
+    fn the_generator_body_never_summarized_sentence_names_the_yield() {
+        let message = generator_body_never_summarized();
+        assert!(message.contains("generator body"), "{message}");
+        assert!(message.contains("never summarized"), "{message}");
+        assert!(message.contains("yield is unread"), "{message}");
     }
 
     /// The manifest-names-no-entry sentence names both the module and the

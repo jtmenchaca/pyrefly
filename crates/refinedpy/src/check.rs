@@ -31,7 +31,7 @@ use refined_domain::abstract_value::{
     known_set, known_values, possibly_absent, unknown, AbsentFlavor, AbstractValue, Kind, ObjectKey, PrimitiveKind,
     SetKindTag,
 };
-use refined_domain::known_constructors::{known_list, known_object};
+use refined_domain::known_constructors::{known_dict_star, known_list, known_object};
 use refined_domain::trust_grades::{TrustProved, TrustSpec};
 use refined_kernel::kernel_interface::RefinedTSKernel;
 use refined_sets::refinement_forms::{make_refined_set, on_one_tuple_layer, one_of, repeat_of, requires_integer, RefinedSet};
@@ -45,10 +45,10 @@ use ruff_text_size::{Ranged, TextRange, TextSize};
 use crate::assignability::{judge, states_sequence, Verdict};
 use crate::bytes_models::{self, BytesAnswer};
 use crate::collection_models::{dict_get_result, dict_with_item, dict_without_item, list_literal_value, list_with_item, mutated_receiver, subscript_read};
-use crate::cross_module::{module_surface, ModuleResolver, IMPORT_DEPTH_CAP};
+use crate::cross_module::{module_surface, ModuleResolver};
 use crate::diagnostic_sentences::{empty_set, loop_accumulation_did_not_stabilize, unhonorable_annotation};
 use crate::env::Environment;
-use crate::expressions::{binary_arithmetic_value, evaluate_expression, fieldless_exception_value, math_from_imports, possible_raise, provable_raise, register_retained_callables};
+use crate::expressions::{binary_arithmetic_value_with_kernel, evaluate_expression, fieldless_exception_value, math_from_imports, possible_raise, provable_raise, register_retained_callables};
 use crate::foreign_edge;
 use crate::function_table::{function_table, merged, FunctionTable};
 use crate::instances;
@@ -96,6 +96,15 @@ struct WalkContext<'a> {
     /// `expressions.rs`'s datetime gates answer by canonical identity
     /// rather than the literal `datetime`/`date`/`timedelta` spelling.
     datetime_imports: Arc<crate::expressions::DatetimeImports>,
+    /// Whether this module never calls `locale.setlocale` anywhere in
+    /// its own source (`expressions::module_never_calls_setlocale`'s
+    /// own doc), built once here the same "built once before any body
+    /// walk" posture `datetime_imports` takes, and layered onto each
+    /// body's own `Environment` (`walk_body_with_self_binding`) so
+    /// `datetime.strptime`'s `%a` reading can answer the C-locale
+    /// premise without a signature change anywhere along the call
+    /// chain.
+    locale_never_set: bool,
     module_bindings: HashMap<String, AbstractValue>,
     /// Every MODULE-LEVEL callable-variable's own return refinement:
     /// `name: Callable[[...], R] = ...` (or `| None`) at the module's
@@ -214,24 +223,29 @@ pub fn findings_for_module_at(
     kernel: &Arc<RefinedTSKernel>,
     entry_directory: Option<&std::path::Path>,
 ) -> Vec<Finding> {
-    let aliases = compile_aliases(module);
+    let surface = module_surface(module, resolver, kernel);
+    // The module's own aliases, plus every alias an import pulled in
+    // under a local name (`from support import Age`); an own alias wins
+    // a spelling collision, matching every other merge in this function.
+    let mut aliases = surface.aliases.clone();
+    for (name, alias) in compile_aliases(module) {
+        aliases.insert(name, alias);
+    }
     let imports = surface_imports(module);
     if aliases.is_empty()
         && imports.annotated_names.is_empty()
         && imports.literal_names.is_empty()
     {
-        // No module-level `type X = Annotated[...]` alias, no
-        // recognized `Annotated` import, and no `Literal` import — no
-        // statement in this module can carry refinement vocabulary
-        // this checker reads, so this is the fast, zero-cost early
-        // return. A module whose only vocabulary is an inline
-        // `Annotated[...]` or `Literal[...]` annotation still has the
-        // matching import set populated (`surface_imports` reads only
-        // import statements, cheap before any walk), so it reaches
-        // the walk below rather than being skipped without judgment.
+        // No refinement alias (own or imported), no recognized
+        // `Annotated` import, and no `Literal` import — no statement in
+        // this module can carry refinement vocabulary this checker
+        // reads, so nothing is judged. A module whose only vocabulary is
+        // an inline `Annotated[...]` or `Literal[...]` annotation still
+        // has the matching import set populated (`surface_imports` reads
+        // only import statements), so it reaches the walk below rather
+        // than being skipped without judgment.
         return Vec::new();
     }
-    let surface = module_surface(module, resolver, kernel, IMPORT_DEPTH_CAP);
     let own_functions = function_table(module);
     let functions = Arc::new(merged(&own_functions, surface.functions.as_ref()));
     let own_classes = class_table(module, &aliases, &imports, kernel);
@@ -285,6 +299,7 @@ pub fn findings_for_module_at(
         functions,
         classes: Arc::new(classes),
         datetime_imports: Arc::new(crate::expressions::datetime_imports(module)),
+        locale_never_set: crate::expressions::module_never_calls_setlocale(module),
         module_bindings: module_bindings_with_math_imports(surface.bindings, module),
         module_callable_returns,
         strict_int_aliases: &strict_int_aliases,
@@ -323,22 +338,25 @@ pub fn refined_set_at_position(
     kernel: &Arc<RefinedTSKernel>,
     position: TextSize,
 ) -> Option<RefinedSet> {
-    let aliases = compile_aliases(module);
+    let surface = module_surface(module, resolver, kernel);
+    let mut aliases = surface.aliases.clone();
+    for (name, alias) in compile_aliases(module) {
+        aliases.insert(name, alias);
+    }
     let imports = surface_imports(module);
     if aliases.is_empty()
         && imports.annotated_names.is_empty()
         && imports.literal_names.is_empty()
     {
         // Same gate `findings_for_module_at` takes, and for the same
-        // reason: a module with no `type` alias, no recognized
-        // `Annotated` import, and no `Literal` import carries no
-        // refinement vocabulary at all.
+        // reason: a module with no refinement alias (own or imported),
+        // no recognized `Annotated` import, and no `Literal` import
+        // carries no refinement vocabulary at all.
         return None;
     }
     if let Some(stated) = stated_refinement_at(module, &aliases, &imports, position) {
         return Some(stated);
     }
-    let surface = module_surface(module, resolver, kernel, IMPORT_DEPTH_CAP);
     let own_functions = function_table(module);
     let functions = Arc::new(merged(&own_functions, surface.functions.as_ref()));
     let own_classes = class_table(module, &aliases, &imports, kernel);
@@ -367,6 +385,7 @@ pub fn refined_set_at_position(
         functions,
         classes: Arc::new(classes),
         datetime_imports: Arc::new(crate::expressions::datetime_imports(module)),
+        locale_never_set: crate::expressions::module_never_calls_setlocale(module),
         module_bindings: module_bindings_with_math_imports(surface.bindings, module),
         module_callable_returns,
         strict_int_aliases: &strict_int_aliases,
@@ -833,6 +852,7 @@ fn walk_body_with_self_binding(
     environment.set_functions(Arc::new(merged(&local_function_table(body), &context.functions)));
     environment.set_classes(merged_classes_for_body(body, context));
     environment.set_datetime_imports(context.datetime_imports.clone());
+    environment.set_locale_never_set(context.locale_never_set);
     if let Some(entry_directory) = context.entry_directory.clone() {
         environment.set_entry_directory(Arc::new(entry_directory));
     }
@@ -879,6 +899,35 @@ fn walk_body_with_self_binding(
         let mut variadic_names = HashSet::new();
         if let Some(vararg) = parameters.vararg.as_ref() {
             variadic_names.insert(vararg.name.id.as_str().to_owned());
+            // `*rest: int` collects zero or more `int` arguments into a
+            // tuple CPython builds at call time (functions.rst, "if the
+            // syntax `*identifier` is present") — the same unbounded-
+            // length shape `list[X]`/`Sequence[X]` seeds below
+            // (`is_sequence_container`'s own repetition window), built
+            // from the SCALAR sort `base_sort_return_refinement` reads
+            // off the vararg's own bare annotation rather than a
+            // container annotation (a vararg is never itself spelled
+            // `list[int]`). `iterable_values`/`repetition_window_element_
+            // pass` (loops.rs) already read this exact `Kind::Set`-over-
+            // `repeat_of` shape for `for value in rest:`, so seeding it
+            // here is what lets a body walked WITHOUT a call site (this
+            // def's own straight-line walk, not `summaries::bind_
+            // parameters`'s call-site tuple) iterate its own rest
+            // parameter. An annotation this reader does not recognize
+            // (a non-`int`/`float`/`str` bare name, or none at all)
+            // leaves the vararg unseeded, unchanged from before this
+            // law — an unrecognized element sort states nothing sound
+            // to repeat.
+            if let Some(annotation) = vararg.annotation.as_deref() {
+                if let Some(declared) = base_sort_return_refinement(annotation) {
+                    let sort = if requires_integer(&declared.set) { PrimitiveKind::Integer } else { PrimitiveKind::Float };
+                    let sequence = AbstractValue {
+                        kind_tag: Some(sort),
+                        ..known_set(make_refined_set(vec![repeat_of(declared.set, 0, None)]), None, TrustSpec, SetKindTag::None)
+                    };
+                    environment.bind(vararg.name.id.as_str(), sequence);
+                }
+            }
         }
         if let Some(kwarg) = parameters.kwarg.as_ref() {
             variadic_names.insert(kwarg.name.id.as_str().to_owned());
@@ -1402,6 +1451,25 @@ fn seed_parameters(parameters: &Parameters, enclosing_def_name: Option<&str>, co
                 }
             }
         }
+        // A `dict[str, X]` PARAMETER (`declared.element` Some, spelling
+        // `"dict[str, …]"` — `typereading.rs`'s own dict arm) seeds an
+        // unbounded-key object: `dict_star_value_seed` (below) reads X —
+        // scalar, or itself another `dict[str, Y]` — and wraps it as the
+        // claim every STRING key, if present, reads back as, the dict
+        // twin of the sequence-star seed just above, but keyed by string
+        // identity rather than position.
+        // `collection_models.rs::dict_get_result`/`subscript_read` read
+        // an `ObjectStar` receiver by unwrapping the element back off
+        // this same shape.
+        let is_dict_container = declared.spelling.starts_with("dict[str, ");
+        if is_dict_container {
+            if let Some(element) = &declared.element {
+                if let Some(star) = dict_star_value_seed(element) {
+                    environment.bind(parameter.parameter.name.id.as_str(), star);
+                    continue;
+                }
+            }
+        }
         // A FIXED-ARITY `tuple[X, Y]` PARAMETER (`declared.positions`
         // Some — typereading's own per-position table) seeds a
         // KNOWN-LENGTH `Kind::List` whose slot `i` is `known_set` over
@@ -1421,6 +1489,26 @@ fn seed_parameters(parameters: &Parameters, enclosing_def_name: Option<&str>, co
                 .collect();
             let tuple = known_list(items, TrustSpec);
             environment.bind(parameter.parameter.name.id.as_str(), tuple);
+            continue;
+        }
+        // A temporal declaration (`declared.temporal` Some, `declared.set`
+        // unused/empty — the same "one active field" convention every
+        // other container shape here keeps) seeds a WINDOW value, tagged
+        // `source = "temporal_flow"` — `assignability.rs`'s own temporal
+        // law reads this tag to route through `bounds_imply` (window vs
+        // window: does THIS parameter's own declared bound sit inside a
+        // narrower call target's bound) rather than `bounds_verdict_of`
+        // (point vs window, the shape a CONSTRUCTION's own exact value
+        // takes). Carries the SAME `TemporalAnnotation` the declaration
+        // itself states — `record_visit`'s own `narrow(p)` row is exactly
+        // this: `p`'s seeded value is Period's own [2020, 2024] window,
+        // checked against `narrow`'s own Visit-declared [2021, 2021]
+        // parameter.
+        if let Some(declared_temporal) = &declared.temporal {
+            let mut instance = known_object(Vec::new(), None, true, TrustSpec, false);
+            instance.source = "temporal_flow".to_owned();
+            instance.temporal = Some(Box::new(declared_temporal.clone()));
+            environment.bind(parameter.parameter.name.id.as_str(), instance);
             continue;
         }
         // A scalar declared set carries its own numeric sort onto the
@@ -1469,6 +1557,70 @@ fn seed_parameters(parameters: &Parameters, enclosing_def_name: Option<&str>, co
             seeded
         };
         environment.bind(parameter.parameter.name.id.as_str(), seeded);
+    }
+}
+
+/// The unbounded-key dict-star value a `dict[str, X]` PARAMETER's own
+/// VALUE SLOT declaration (`element`, a `DeclaredRefinement`) seeds —
+/// `seed_parameters`' own dict arm calls this, and it recurses for a
+/// NESTED `dict[str, Y]` value slot (`dict[str, dict[str, int]]`, or
+/// (via `Optional`) `dict[str, Optional[dict[str, int]]]` —
+/// c-reads-and-values.py's own `read_optional_chain_deeper_step` row),
+/// since `element` itself carries the identical `DeclaredRefinement`
+/// shape a top-level `dict[str, X]` parameter's own `declared` does.
+///
+/// Two value shapes:
+/// - SCALAR (`element.set` non-empty — a plain/refined `int`/`str`/
+///   alias value, never another container): `known_dict_star` wraps the
+///   value's own set directly, tagged with its numeric sort when the
+///   set is numeric-ground (the same `requires_integer` gate the
+///   sequence-star seed above applies).
+/// - NESTED DICT (`element.spelling` itself starts `"dict[str, "` —
+///   `element.element` is Some, `element.set` empty, the same "one
+///   active field" convention every container declaration keeps): this
+///   function recurses on `element.element` to build the INNER
+///   dict-star first, then wraps THAT as the outer star's own element —
+///   `dict[str, dict[str, int]]`'s outer star holds an inner star at
+///   every string key, exactly as a `list[list[int]]` parameter would
+///   nest two star levels if this crate modeled that shape.
+///
+/// Either way, `element.admits_none` (`dict[str, Optional[X]]`) wraps
+/// the starred element in the maybe carrier first, `NullOnly` —
+/// Python's `None`, the same admission `seed_parameters`' own
+/// scalar-parameter tail wraps with — so a present key's own value may
+/// itself be `None`, matching `dict[str, Optional[dict[str, int]]]`'s
+/// own declared admission. `None` when `element` is neither shape this
+/// function reads (an element that is itself a `list[X]`/tuple/
+/// TypedDict/generator declaration, none of which nest inside a dict
+/// value slot today) — the caller's own job to leave the parameter
+/// unseeded in that case, never to guess.
+fn dict_star_value_seed(element: &DeclaredRefinement) -> Option<AbstractValue> {
+    let value_seed = if !element.set.forms.is_empty() {
+        let sort = if requires_integer(&element.set) {
+            PrimitiveKind::Integer
+        } else {
+            PrimitiveKind::Float
+        };
+        AbstractValue {
+            kind_tag: Some(sort),
+            ..known_set(element.set.clone(), None, TrustSpec, SetKindTag::None)
+        }
+    } else if element.spelling.starts_with("dict[str, ") {
+        let nested = element.element.as_deref()?;
+        dict_star_value_seed(nested)?
+    } else {
+        return None;
+    };
+    let value_seed = if element.admits_none {
+        possibly_absent(value_seed, AbsentFlavor::NullOnly, Some(TrustSpec), false)
+    } else {
+        value_seed
+    };
+    let (star, ok) = known_dict_star(value_seed, TrustSpec);
+    if ok {
+        Some(star)
+    } else {
+        None
     }
 }
 
@@ -1885,7 +2037,7 @@ fn walk_statement(
         }
         Stmt::For(_) | Stmt::While(_) => {
             provably_unbound.clear();
-            walk_loop(stmt, return_refinement, yield_refinement, context, environment, aug_assign_refinements, blocked, out);
+            return walk_loop(stmt, return_refinement, yield_refinement, context, environment, aug_assign_refinements, blocked, out);
         }
         Stmt::Match(match_stmt) => {
             provably_unbound.clear();
@@ -2034,7 +2186,7 @@ fn walk_return(
         }),
         Verdict::Silent => {}
         Verdict::Undetermined(sentence) => {
-            let sentence = name_unmodeled_call_sentence(sentence, Some(value_expr), environment);
+            let sentence = name_unmodeled_call_sentence(sentence, Some(value_expr), Some(&value), environment);
             record_blocker(blocked, value_expr.range(), sentence, out);
         }
     }
@@ -2150,7 +2302,7 @@ fn judge_at(
         Verdict::Fire(message) => out.push(Finding { range, code: "RTS7001", message }),
         Verdict::Silent => {}
         Verdict::Undetermined(sentence) => {
-            let sentence = name_unmodeled_call_sentence(sentence, source_expr, environment);
+            let sentence = name_unmodeled_call_sentence(sentence, source_expr, Some(value), environment);
             record_blocker(blocked, range, sentence, out);
         }
     }
@@ -2315,7 +2467,7 @@ pub fn derived_return_values_at(
     {
         return DerivedReturns { values: HashMap::new(), blockers: HashMap::new() };
     }
-    let surface = module_surface(module, resolver, kernel, IMPORT_DEPTH_CAP);
+    let surface = module_surface(module, resolver, kernel);
     let own_functions = function_table(module);
     let functions = Arc::new(merged(&own_functions, surface.functions.as_ref()));
     let own_classes = class_table(module, &aliases, &imports, kernel);
@@ -2343,6 +2495,7 @@ pub fn derived_return_values_at(
         functions,
         classes: Arc::new(classes),
         datetime_imports: Arc::new(crate::expressions::datetime_imports(module)),
+        locale_never_set: crate::expressions::module_never_calls_setlocale(module),
         module_bindings: module_bindings_with_math_imports(surface.bindings, module),
         module_callable_returns,
         strict_int_aliases: &strict_int_aliases,
@@ -2716,17 +2869,29 @@ fn walk_if(
         arms.push((clause.test.as_ref(), clause.body.as_slice()));
     }
 
+    // The PATH environment: the state in which the NEXT arm's test is
+    // evaluated. An arm's body runs only when its test is true, and the
+    // next test is evaluated only when this one's was false — so after
+    // each tested arm, the path assumes that test false. This is what
+    // makes an early-exit arm narrow the fall-through (`if x < k:
+    // return` leaves x ∈ [k, ∞) below) and an elif arm carry the
+    // earlier tests' complements.
+    let mut path = environment.fork();
     let mut surviving: Vec<Environment> = Vec::new();
+    // Set when an arm's test proves TRUE under the path (every earlier
+    // test already assumed false): no later arm and no fall-through can
+    // run, so the post-if state is the join of the surviving arms alone.
+    let mut chain_exhausted = false;
     for (test, body) in &arms {
         if let Some(test) = test {
-            let test_value = evaluate_expression(test, environment, context.kernel);
+            let test_value = evaluate_expression(test, &mut path, context.kernel);
             // WALRUS BINDING: `if (age := 40) > 0:` binds `age` into the
-            // ENCLOSING environment BEFORE any arm forks from it — CPython
-            // evaluates the test (and its own walrus assignment) once,
-            // regardless of which arm the truth value takes, so the bound
-            // name is visible both inside the taken arm's body and after
-            // the whole `if` (a-statements.py's `walrus_in_condition`).
-            bind_walrus_targets(test, context, aug_assign_refinements, environment, out);
+            // path BEFORE any arm forks from it — CPython evaluates the
+            // test (and its own walrus assignment) once, regardless of
+            // which arm the truth value takes, so the bound name is
+            // visible both inside the taken arm's body and after the
+            // whole `if` (a-statements.py's `walrus_in_condition`).
+            bind_walrus_targets(test, context, aug_assign_refinements, &mut path, out);
             let (truthy, known) = refined_domain::lattice_operations::truthiness(&test_value);
             if known && !truthy && !is_admits_none_peel_test(test, aug_assign_refinements) {
                 out.push(Finding {
@@ -2737,7 +2902,7 @@ fn walk_if(
                 continue;
             }
             if known && truthy {
-                let mut arm_environment = environment.fork();
+                let mut arm_environment = path.fork();
                 arm_environment = assume(test, arm_environment, context.kernel, true);
                 // A fresh, empty PROVABLY-UNBOUND-READS set per arm body:
                 // the outer body's own set was already cleared by
@@ -2773,11 +2938,19 @@ fn walk_if(
                     arm_environment.set_evaluated_node(Vec::new());
                     foreign_edge_overrides.remove(&position);
                 }
-                *environment = if arm_terminates(body) { environment.fork() } else { arm_environment };
-                return;
+                // The arm provably runs, but only on the forks where every
+                // EARLIER test was false — an earlier maybe-taken arm's
+                // surviving environment is still a live possibility, so
+                // this arm JOINS `surviving` like any other rather than
+                // replacing the whole statement's answer.
+                if !arm_terminates(body) {
+                    surviving.push(arm_environment);
+                }
+                chain_exhausted = true;
+                break;
             }
         }
-        let mut arm_environment = environment.fork();
+        let mut arm_environment = path.fork();
         if let Some(test) = test {
             arm_environment = assume(test, arm_environment, context.kernel, true);
         }
@@ -2809,18 +2982,25 @@ fn walk_if(
         if !arm_terminates(body) {
             surviving.push(arm_environment);
         }
+        // Below this arm, its test was false — the next arm's test (and
+        // the fall-through) live in that complement.
+        if let Some(test) = test {
+            path = assume(test, path, context.kernel, false);
+        }
     }
 
-    // `if` with no `else`/final catch-all arm falls through to the
-    // post-if point unnarrowed whenever the condition is false — that
-    // implicit empty arm always survives.
+    // `if` with no `else`/final catch-all arm falls through whenever
+    // every test was false — the implicit empty arm survives carrying
+    // exactly those complements (`if x < k: return` leaves x ∈ [k, ∞)
+    // at the post-if point). An exhausted chain (a test proved true)
+    // provably never falls through, so no such survivor is added.
     let has_catch_all = arms.last().map(|(test, _)| test.is_none()).unwrap_or(false);
-    if !has_catch_all {
-        surviving.push(environment.fork());
+    if !has_catch_all && !chain_exhausted {
+        surviving.push(path.fork());
     }
 
     *environment = match surviving.len() {
-        0 => environment.fork(),
+        0 => path,
         1 => surviving.into_iter().next().unwrap(),
         _ => {
             let mut joined = surviving.remove(0);
@@ -3306,15 +3486,39 @@ fn walk_loop(
     aug_assign_refinements: &mut HashMap<String, DeclaredRefinement>,
     blocked: &mut bool,
     out: &mut Vec<Finding>,
-) {
+) -> bool {
     let mut judged_fires: Vec<(TextRange, String)> = Vec::new();
     let result = loop_final_environment(stmt, environment, context.kernel, aug_assign_refinements, &mut judged_fires);
+    // A fire recorded ALONGSIDE a decline is `loops.rs`'s one shape that
+    // proves the loop's FIRST iteration unconditionally raises (the
+    // iterator-invalidation check, `for_loop_final_environment`'s own
+    // doc: checked before any element runs, so this can only be non-empty
+    // when the raise is proved regardless of what the body does). That
+    // makes everything past this statement in the current body
+    // UNREACHABLE — the same "no fall-through path exists" fact
+    // `arm_terminates_or_provably_raises` already states for a `return`/
+    // `raise`-terminated arm, just proved by a different construct. This
+    // is checked BEFORE the blocker record below so a proved-unreachable
+    // loop never reports a spurious "not yet walked" — the raise IS the
+    // full account of every real execution, not an unread remainder.
+    let raise_terminates = result.is_none() && !judged_fires.is_empty();
     for (range, message) in judged_fires {
         out.push(Finding {
             range,
             code: "RTS7001",
             message,
         });
+    }
+    if raise_terminates {
+        // Nothing after this statement in the current body ever runs —
+        // the same bottom environment `walk_try` forks when its own
+        // `nothing_survives`. Names this statement bound/mutated are
+        // forgotten too: a later read past unreachable code must not
+        // resolve to a stale pre-loop value.
+        forget_names_bound_by_stmt(stmt, environment);
+        forget_mutated_receivers_in_stmt(stmt, environment);
+        *environment = environment.fork();
+        return true;
     }
     if let Some(LoopAnswer { environment: final_env, else_runs, returned, widened_names }) = result {
         *environment = final_env;
@@ -3363,7 +3567,7 @@ fn walk_loop(
             _ => &[],
         };
         if orelse.is_empty() {
-            return;
+            return false;
         }
         if !else_runs {
             out.push(Finding {
@@ -3371,7 +3575,7 @@ fn walk_loop(
                 code: "RTS7001",
                 message: "this else arm provably never runs: the loop above always breaks".to_owned(),
             });
-            return;
+            return false;
         }
         let mut orelse_provably_unbound: HashSet<String> = HashSet::new();
         for orelse_stmt in orelse {
@@ -3387,7 +3591,7 @@ fn walk_loop(
                 out,
             );
         }
-        return;
+        return false;
     }
     record_blocker(
         blocked,
@@ -3397,6 +3601,7 @@ fn walk_loop(
     );
     forget_names_bound_by_stmt(stmt, environment);
     forget_mutated_receivers_in_stmt(stmt, environment);
+    false
 }
 
 /// `match subject: case ... case ...` (compound_stmts.rst, "The `match`
@@ -3489,6 +3694,12 @@ fn walk_match(
 
     let mut surviving: Vec<Environment> = Vec::new();
     let mut every_case_nameable = true;
+    // The literals every GUARDLESS earlier arm's pattern proved — a
+    // later arm runs only when every earlier pattern failed
+    // (compound_stmts.rst, the match statement), so its subject cannot
+    // hold any of these. A guarded literal arm sheds nothing: it can
+    // fail on its guard with the literal still live.
+    let mut shed_literals: Vec<f64> = Vec::new();
     for case in &match_stmt.cases {
         if !every_case_nameable {
             // an earlier case's own captures could not be named — CPython
@@ -3513,6 +3724,24 @@ fn walk_match(
             continue;
         };
         let mut arm_env = environment.fork();
+        // SHED-LITERAL RESIDUAL: this arm runs only when every earlier
+        // guardless literal arm failed, so a Set-kind subject's integer
+        // window trims those literals off its EDGES here — `case 150:`
+        // over `[150, 151]` leaves the wildcard arm `[151, 151]`. An
+        // interior literal is a hole one window cannot state and trims
+        // nothing (the over-approximating sound side — the same law the
+        // C++ adapter's flowingWindow default arm keeps). A literal
+        // arm's own pattern-proved narrowing below overwrites this
+        // residual with its tighter intersection.
+        if let Some(subject_name) = subject_name {
+            if !shed_literals.is_empty() {
+                if let Some(current) = arm_env.read(subject_name).cloned() {
+                    if let Some(trimmed) = integer_window_minus_edge_literals(&current, &shed_literals) {
+                        arm_env.bind(subject_name, trimmed);
+                    }
+                }
+            }
+        }
         // PATTERN-PROVED NARROWING: every capture `pattern_bound_
         // captures` names binds to what its own position/key/field (or,
         // for a literal/singleton/or/as pattern with none of those, the
@@ -3566,6 +3795,13 @@ fn walk_match(
         if !arm_terminates(&case.body) {
             surviving.push(arm_env);
         }
+        if case.guard.is_none() {
+            if let Some(proved) = match_arms::pattern_proved_value(&case.pattern, environment, context.kernel) {
+                if proved.kind == Kind::Values {
+                    shed_literals.extend(proved.values.iter().copied());
+                }
+            }
+        }
     }
 
     if !every_case_nameable {
@@ -3582,6 +3818,69 @@ fn walk_match(
             joined
         }
     };
+}
+
+/// A Set-kind binding's integer window with `shed` literals trimmed off
+/// its EDGES — the residual a match's later arms see once earlier
+/// guardless literal arms are behind them. A literal equal to the
+/// window's own floor (`atLeast`) raises it by one; one equal to the
+/// ceiling (`atMost`) lowers it by one, to a fixpoint. An interior
+/// literal is a hole one window cannot state and trims nothing — the
+/// over-approximating sound side. `None` when nothing trimmed, when the
+/// binding is not a Set of exactly atLeast/atMost/integer forms this
+/// reader states, or when trimming empties the window (the arm is then
+/// unreachable — no residual claim is owed, and the unnarrowed subject
+/// stands).
+fn integer_window_minus_edge_literals(current: &AbstractValue, shed: &[f64]) -> Option<AbstractValue> {
+    use refined_sets::refinement_forms::Form;
+    if current.kind != Kind::Set {
+        return None;
+    }
+    if !current.set.forms.iter().any(|form| form.form == Form::Integer) {
+        return None;
+    }
+    let mut lo: Option<f64> = None;
+    let mut hi: Option<f64> = None;
+    for form in &current.set.forms {
+        match form.form {
+            Form::AtLeast => lo = Some(form.a),
+            Form::AtMost => hi = Some(form.a),
+            Form::Integer => {}
+            _ => return None,
+        }
+    }
+    let (Some(mut lo), Some(mut hi)) = (lo, hi) else {
+        return None;
+    };
+    let mut changed = true;
+    let mut trimmed_any = false;
+    while changed && lo <= hi {
+        changed = false;
+        for literal in shed {
+            if *literal == lo {
+                lo += 1.0;
+                changed = true;
+                trimmed_any = true;
+            }
+            if *literal == hi {
+                hi -= 1.0;
+                changed = true;
+                trimmed_any = true;
+            }
+        }
+    }
+    if !trimmed_any || lo > hi {
+        return None;
+    }
+    let mut narrowed = current.clone();
+    for form in &mut narrowed.set.forms {
+        match form.form {
+            Form::AtLeast => form.a = lo,
+            Form::AtMost => form.a = hi,
+            _ => {}
+        }
+    }
+    Some(narrowed)
 }
 
 /// `with EXPRESSION as TARGET: SUITE` (compound_stmts.rst, "The `with`
@@ -4090,6 +4389,18 @@ fn judge_and_bind(
     judge_and_bind_naming(name, value, declared, fire_range, None, context, environment, out)
 }
 
+/// The `.source` tag `expressions::evaluate_call`'s own generator-call
+/// arm sets on the value a `def`-recognized generator's call answers
+/// when `instances::generator_yields` declines to summarize its body
+/// (a conditional `yield`, or any other shape outside the straight-line
+/// reading that function's own doc describes) — the DECLINE twin of the
+/// `"generator"` tag the SUCCESS path already sets
+/// (`collection_models::list_literal_value`'s result, `value.source =
+/// "generator"`). Read here, not set: the tag's producer lives in
+/// `expressions.rs`/`builtin_models.rs`, outside this file's own scope
+/// (see `generator_declined_sentence`'s own doc for the exact handoff).
+const GENERATOR_DECLINED_SOURCE_TAG: &str = "generator-declined";
+
 /// `judge_and_bind`'s own body, plus the ONE naming step
 /// `python-c-extension-boundary.md`'s naming unit adds: when the verdict
 /// is the GENERIC undetermined sentence (`SENTENCE.value_not_readable` —
@@ -4154,18 +4465,38 @@ fn judge_and_bind_naming(
             None
         }
         Verdict::Undetermined(sentence) => {
+            let sentence = name_unmodeled_call_sentence(sentence, source_expr, Some(&value), environment);
             environment.forget(name);
-            Some(name_unmodeled_call_sentence(sentence, source_expr, environment))
+            Some(sentence)
         }
     }
 }
 
 /// The one naming step `judge_and_bind_naming` applies: `sentence`
 /// unchanged UNLESS it is the exact generic `value_not_readable` wording
-/// AND `source_expr` names a call this file recognizes SOMETHING about —
-/// in which case a narrower sentence replaces it. Two rungs, tried in
-/// order (`python-c-extension-boundary.md`'s recognition ladder):
+/// AND either `value` or `source_expr` names something this file
+/// recognizes — in which case a narrower sentence replaces it. Three
+/// rungs, tried in order (`python-c-extension-boundary.md`'s recognition
+/// ladder, plus the generator-body rung q-decline-names.py's own
+/// `generator_body_never_summarized` row teaches):
 ///
+/// 0. THE GENERATOR RUNG — `value`'s own `.source` carries
+///    `GENERATOR_DECLINED_SOURCE_TAG`: the undetermined value traces back
+///    to a same-module generator's call whose body `instances::
+///    generator_yields` declined to summarize. Checked first and against
+///    `value` directly rather than `source_expr`'s own syntax, because the
+///    blocked read is usually NOT the call itself — `first = next(it);
+///    return first` blocks at the bare-Name `return first`, two
+///    statements downstream of the actual `age_generator()` call — and the
+///    tag survives exactly that far because `walk_assign`'s untyped-target
+///    arm binds an evaluated RHS value verbatim (`environment.bind(name,
+///    value.clone())`, no declared refinement to judge or forget against).
+///    NOT YET WIRED at its producer: `expressions::evaluate_call`'s own
+///    generator-call arm still answers a bare `unknown()` (expressions.rs,
+///    the `is_generator_def(def)` arm's `None => unknown()` row) rather
+///    than a value carrying this tag — this rung is written against the
+///    tag name in advance of that producer landing (see this file's own
+///    module doc / the handoff this unit reports).
 /// 1. RUNG 2 — a call on a manifested module's own LISTED function
 ///    (`binding_manifest::discover_manifest` finds a manifest AND it
 ///    names an entry for the called function): the manifest states the
@@ -4179,13 +4510,22 @@ fn judge_and_bind_naming(
 /// 2. RUNG 1 — every other unmodeled-module call
 ///    (`expressions::unmodeled_module_call_name`'s own recognition).
 ///
-/// Factored out so the two direct `judge(...)` call sites that also have
-/// a source expression in scope (`walk_return`'s own return-position
-/// judge, `judge_at`) can apply the identical rule without duplicating
-/// it.
-fn name_unmodeled_call_sentence(sentence: String, source_expr: Option<&Expr>, environment: &Environment) -> String {
+/// Factored out so the several direct `judge(...)`/`judge_at` call sites
+/// that also have a source expression and the judged value in scope can
+/// apply the identical rule without duplicating it.
+fn name_unmodeled_call_sentence(
+    sentence: String,
+    source_expr: Option<&Expr>,
+    value: Option<&AbstractValue>,
+    environment: &Environment,
+) -> String {
     if sentence != crate::diagnostic_sentences::SENTENCE.value_not_readable {
         return sentence;
+    }
+    if let Some(value) = value {
+        if value.source == GENERATOR_DECLINED_SOURCE_TAG {
+            return crate::diagnostic_sentences::generator_body_never_summarized();
+        }
     }
     let Some(source_expr) = source_expr else {
         return sentence;
@@ -4314,7 +4654,7 @@ fn walk_name_aug_assign(
     bind_walrus_targets(assign.value.as_ref(), context, aug_assign_refinements, environment, out);
     let current = environment.read(name).cloned().unwrap_or_else(unknown);
     let operand = evaluate_expression(assign.value.as_ref(), environment, context.kernel);
-    let updated = binary_arithmetic_value(assign.op, &current, &operand);
+    let updated = binary_arithmetic_value_with_kernel(assign.op, &current, &operand, context.kernel);
 
     match aug_assign_refinements.get(name) {
         // An Undetermined verdict already forgets the name inside
@@ -4371,7 +4711,7 @@ fn walk_field_aug_assign(
     let field = attribute.attr.as_str();
     let current = evaluate_expression(&Expr::Attribute(attribute.clone()), environment, context.kernel);
     let operand = evaluate_expression(assign.value.as_ref(), environment, context.kernel);
-    let updated = binary_arithmetic_value(assign.op, &current, &operand);
+    let updated = binary_arithmetic_value_with_kernel(assign.op, &current, &operand, context.kernel);
     write_named_field(receiver_name, field, &updated, assign.range(), context, environment, out);
 }
 
@@ -4436,7 +4776,7 @@ fn walk_subscript_aug_assign(
         return;
     };
     let operand = evaluate_expression(assign.value.as_ref(), environment, context.kernel);
-    let updated = binary_arithmetic_value(assign.op, &current, &operand);
+    let updated = binary_arithmetic_value_with_kernel(assign.op, &current, &operand, context.kernel);
     if receiver_value.kind == Kind::List && receiver_value.kind_word.is_some() {
         match bytes_models::bytes_write_answer(&receiver_value, &updated) {
             Some(BytesAnswer::Raises(_)) => return,
@@ -4686,7 +5026,7 @@ fn walk_ann_assign(
             }),
             Verdict::Silent => {}
             Verdict::Undetermined(sentence) => {
-                let sentence = name_unmodeled_call_sentence(sentence, Some(value_expr), environment);
+                let sentence = name_unmodeled_call_sentence(sentence, Some(value_expr), Some(&value), environment);
                 record_blocker(blocked, value_expr.range(), sentence, out);
             }
         }
@@ -4848,6 +5188,8 @@ fn direct_alias_annotation(
             generator: None,
             members: None,
             positions: None,
+            temporal: None,
+            temporal_awareness: crate::surface::TemporalAwareness::Any,
         })
     });
     let container_spelling = match (entry.head, &element) {
@@ -4863,6 +5205,8 @@ fn direct_alias_annotation(
         generator: None,
         members: None,
         positions: None,
+        temporal: entry.temporal.clone(),
+        temporal_awareness: entry.temporal_awareness,
     })
 }
 
@@ -5116,6 +5460,22 @@ fn write_named_field(
     // between could have rebound it.
     let instance = environment.read(receiver_name).expect("checked Some above").clone();
     if let Some(updated) = instances::field_write(&instance, write_target, value.clone()) {
+        // ALIASING: `same = account; same.balance = -20` must leave
+        // `account`'s own slot reading the written-through instance too
+        // — `Environment` tracks a value per NAME, so the direct rebind
+        // below only ever touches `receiver_name`'s own slot.
+        // `instance_identity` (`instances::judge_construction`'s own
+        // per-construction tag) is how two different names holding the
+        // SAME construction are told apart from two names holding two
+        // separate `Holder()` calls of the same class; `rebind_aliases_
+        // of_instance` finds every OTHER name carrying the identical id
+        // and brings it back in step with this write. An instance with
+        // no `instance_identity` at all (built some way other than
+        // `judge_construction`) has no alias set to reconcile, and the
+        // sweep below is then simply a no-op for every other name.
+        if let Some(identity) = instance.instance_identity {
+            environment.rebind_aliases_of_instance(identity, receiver_name, &updated);
+        }
         environment.bind(receiver_name, updated);
     }
     true
@@ -5710,6 +6070,34 @@ fn judge_one_call_argument(
     let Some(annotation) = parameter.parameter.annotation.as_deref() else {
         return;
     };
+    // A CLASS-TYPED PARAMETER (`v: Vitals`, a self-authored/pydantic
+    // model — `declared_refinement`'s `Expr::Name` arm only ever reads
+    // `context.aliases`, never `context.classes`, so a class name
+    // answers `None` there and is not a scalar/sequence/tuple
+    // refinement this table judges). The parameter itself states no
+    // FURTHER scalar set past "an instance of this class" — but the
+    // ARGUMENT expression may still be a nested construction call
+    // (`Vitals(heart_rate=72, spo2=130)`) whose own per-field crossing
+    // is exactly what `construction_call_verdict`/`judge_construction`
+    // already check. Without this arm, `declared_refinement` returning
+    // `None` for the class name falls straight past the whole function
+    // (the ordinary early-return below), and a construction's own
+    // out-of-set field never reaches a Finding: showcase.py's own
+    // `record_vitals(Vitals(heart_rate=72, spo2=130))` row. Surfaces
+    // ONLY the construction's own field fires — there is no outer
+    // scalar `judge` call afterward, since a class-typed parameter has
+    // no scalar set for the built instance to cross into.
+    if let Expr::Name(class_name) = annotation {
+        let classes = environment.classes().unwrap_or(&context.classes);
+        if classes.contains_key(class_name.id.as_str()) {
+            if let Some(verdict) = construction_call_verdict(argument, context, environment) {
+                for (range, message) in verdict.fires {
+                    out.push(Finding { range, code: "RTS7001", message });
+                }
+            }
+            return;
+        }
+    }
     let Some(declared) = declared_refinement(annotation, context.aliases, context.imports, environment) else {
         return;
     };
@@ -5727,8 +6115,21 @@ fn judge_one_call_argument(
         }
         None => evaluate_expression(argument, environment, context.kernel),
     };
-    if let Verdict::Fire(message) = judge(&value, &declared, context.kernel) {
-        out.push(Finding { range: argument.range(), code: "RTS7001", message });
+    // A call argument crossing that the checker cannot decide is an
+    // UNDETERMINED position, per the project's own DETERMINED-or-
+    // UNDETERMINED doctrine — this argument's own name binds the
+    // parameter's declared refinement, and an unprovable containment
+    // there is exactly as much a defect as an unprovable one anywhere
+    // else this crate already reports RTS7002 for; it must never be
+    // silently dropped the way this call site did before.
+    match judge(&value, &declared, context.kernel) {
+        Verdict::Fire(message) => {
+            out.push(Finding { range: argument.range(), code: "RTS7001", message });
+        }
+        Verdict::Undetermined(message) => {
+            out.push(Finding { range: argument.range(), code: "RTS7002", message });
+        }
+        Verdict::Silent => {}
     }
 }
 
@@ -6174,9 +6575,49 @@ fn adapter_alias_verdict(
         generator: None,
         members: None,
         positions: None,
+        temporal: declared_entry.temporal.clone(),
+        temporal_awareness: declared_entry.temporal_awareness,
     };
     let range = argument_expr.range();
     let mut value = evaluate_expression(argument_expr, environment, context.kernel);
+    // A TEMPORAL alias (`declared.temporal` Some) reads its own STRING
+    // argument as pydantic's own ISO-8601 parse — `TypeAdapter(FollowUp)
+    // .validate_python("P30D")` parses a `timedelta`, an `Instant`-chart
+    // alias parses a `datetime` — rather than judging the raw string
+    // against the alias's own (empty, `declared.set` unused) scalar set.
+    // Any other value shape (already-evaluated to a temporal
+    // construction — a `datetime.date(...)`/`timedelta(...)`/
+    // `datetime.datetime(...)` argument expression the ordinary
+    // `evaluate_expression` path already tagged) reaches `judge`'s own
+    // temporal law unchanged.
+    if let Some(declared_temporal) = declared.temporal.clone() {
+        if let Some(text) = caller_exact_string_text(&value) {
+            match pydantic_temporal_parse(&text, declared_temporal.chart) {
+                Some(parsed) => value = parsed,
+                // THE GRAMMAR FIRE: a Duration-chart alias whose own
+                // argument text is not even loosely ISO-8601-duration-
+                // shaped (`pydantic_duration_value`'s own decline) is a
+                // pydantic-core PARSE ERROR — "not a duration"
+                // (showcase.py's own row), a designated fire this
+                // function decides directly rather than leaving `judge`
+                // to read the unparsed string as an ordinary structural
+                // mismatch against the (empty) declared set.
+                None if declared_temporal.chart == refined_sets::calendar_interpreter::TemporalChart::Duration => {
+                    return Some(ConstructionVerdict {
+                        fires: vec![(
+                            range,
+                            format!(
+                                "a value of type '\"{text}\"' is not assignable to type '{}' — {text:?} is not ISO 8601 duration grammar",
+                                class_name.id.as_str(),
+                            ),
+                        )],
+                        instance: declared_set_instance(&declared),
+                    });
+                }
+                None => {}
+            }
+        }
+    }
     // LAX INT COERCION: pydantic's own `int` field (never `StrictInt`,
     // execution-verified 2026-08-17 against pydantic 2.13.4 —
     // `TypeAdapter(Age).validate_python("40")` coerces to `40`,
@@ -6245,6 +6686,162 @@ fn adapter_alias_verdict(
     }
 }
 
+/// pydantic's own ISO-8601 duration/datetime parse — `TypeAdapter(<a
+/// temporal alias>).validate_python(<string>)`'s own reading, ahead of
+/// `judge`'s ordinary scalar path (`adapter_alias_verdict`'s own call
+/// site). `chart` names which of the two grammars applies (a
+/// `PlainDate`-chart alias never reaches this function — a `date` base
+/// carries no separate string parse row this crate models beyond
+/// `date.fromisoformat`, which `expressions.rs` already owns for the
+/// CONSTRUCTOR-call shape).
+///
+/// `Duration`: pydantic's own month/year substitution — AGENT-BRIEF.md's
+/// pydantic-surface-facts, execution-verified against pydantic 2.13.4:
+/// "`timedelta` fields parse ISO 8601 duration strings ... Month/year
+/// designators are NOT rejected: pydantic-core substitutes fixed spans
+/// (`P1M` → exactly 30 days, `P1Y` → exactly 365 days)." Read here by
+/// rewriting a `PnY`/`PnM` designator to its own fixed-day equivalent
+/// BEFORE the text ever reaches the kernel's own calendar seam (the
+/// kernel's `duration_fields` reads Y/M as their own separate raw
+/// components — the standard ISO reading, not pydantic's substitution —
+/// so the rewrite must happen here, not there). Any other duration
+/// shape (weeks/days/hours/minutes/seconds, fractional seconds) is
+/// pydantic-core's ordinary ISO-8601 duration grammar, read UNCHANGED —
+/// the same grammar `refined_sets::calendar_interpreter::duration_
+/// fields` already parses, so passing the text straight through lets
+/// the kernel's own asks decide the rest (`FollowUp`'s own microsecond-
+/// resolution rows). A string that fails EVEN the loose recognition
+/// this function applies (no leading `P`/`p`) is not a duration at all
+/// — pydantic-core RAISES on it (showcase.py's own `"not a duration"`
+/// row) — read here as a GRAMMAR FIRE: the instance built carries no
+/// `.temporal` at all, which `judge`'s own temporal law reads as "not a
+/// temporal construction" (`is_temporal_construction` false) and
+/// answers Undetermined — the caller's own `judge` call still reports
+/// SOMETHING, but not a designated Fire this function does not itself
+/// decide grammar-invalid text against; `pydantic_duration_grammar_
+/// fire` below is what actually fires it, checked by the caller ahead
+/// of this function's own parse.
+///
+/// `Instant`: pydantic's own `datetime` parse (execution-verified: an
+/// offset-bearing ISO string parses aware at that exact offset; an
+/// offset-free string parses NAIVE — `AwareDatetime`'s own refusal of
+/// it is `assignability.rs`'s temporal admission law, not this
+/// function's concern). RFC 9557 `[Zone/Name]` bracket suffixes do NOT
+/// parse under stock pydantic (AGENT-BRIEF.md, same section) — read
+/// here as a decline (`None`), the same "this table cannot read it"
+/// answer any other unrecognized shape gives.
+fn pydantic_temporal_parse(text: &str, chart: refined_sets::calendar_interpreter::TemporalChart) -> Option<AbstractValue> {
+    use refined_sets::calendar_interpreter::TemporalChart;
+    match chart {
+        TemporalChart::Duration => pydantic_duration_value(text),
+        TemporalChart::Instant => pydantic_datetime_string_value(text),
+        _ => None,
+    }
+}
+
+/// pydantic's own `PnY`/`PnM` substitution, applied to the ISO text
+/// BEFORE the kernel ever sees it — `pydantic_temporal_parse`'s own
+/// doc. Every OTHER duration shape (days/weeks/time fields, or no
+/// Y/M designator at all) is returned as pydantic-core's own grammar,
+/// unrewritten. `None` when the text does not even open with a `P`/`p`
+/// sign-prefixed designator (`DURATION_SIGN_PREFIX_RE`'s own shape,
+/// mirrored here) — not a duration at all, the grammar-fire case this
+/// function's own caller checks separately.
+fn pydantic_duration_days_normalized(text: &str) -> Option<String> {
+    let (sign, rest) = match text.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", text.strip_prefix('+').unwrap_or(text)),
+    };
+    let rest = rest.strip_prefix('P').or_else(|| rest.strip_prefix('p'))?;
+    // A bare `PnY` or `PnM` (an all-digit count immediately followed by
+    // exactly one of `Y`/`y`/`M`/`m`, and nothing else) — the one shape
+    // pydantic substitutes; every other duration (`P30D`, `P1DT2H`, a
+    // combined `P1Y2M3D`, …) is returned unchanged, since pydantic-core's
+    // own substitution is documented only for the bare single-designator
+    // form this crate's own showcase row (`P2M`) exercises.
+    let (count_str, unit) = rest.split_at(rest.len().saturating_sub(1));
+    if count_str.is_empty() || !count_str.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let count: i64 = count_str.parse().ok()?;
+    let days = match unit {
+        "Y" | "y" => count.checked_mul(365)?,
+        "M" | "m" => count.checked_mul(30)?,
+        _ => return None,
+    };
+    Some(format!("{sign}P{days}D"))
+}
+
+/// `TypeAdapter(<Duration-chart alias>).validate_python(<text>)` — a
+/// tagged `datetime_timedelta` `Kind::Object` carrying the normalized
+/// ISO text as its own `.temporal` window (`Duration` chart, both
+/// `min`/`max` the same point — an exact value, not a range), the same
+/// shape `expressions.rs::timedelta_construction_value` builds for a
+/// `timedelta(days=n)` CONSTRUCTOR call. `None` when the text is not a
+/// Y/M-substitutable duration (`pydantic_duration_days_normalized`
+/// declines) — the ORIGINAL text still rides through, unrewritten,
+/// since a `P30D`/`P1DT2H` shape needs no substitution and is still a
+/// duration the kernel's own `duration_fields` reads directly.
+fn pydantic_duration_value(text: &str) -> Option<AbstractValue> {
+    let normalized = pydantic_duration_days_normalized(text).unwrap_or_else(|| text.to_owned());
+    if !normalized.starts_with('P') && !normalized.starts_with('p') && !normalized.starts_with('-') && !normalized.starts_with('+') {
+        return None;
+    }
+    let mut instance = known_object(Vec::new(), None, true, TrustSpec, false);
+    instance.source = "datetime_timedelta".to_owned();
+    instance.temporal = Some(Box::new(refined_sets::calendar_interpreter::TemporalAnnotation {
+        chart: refined_sets::calendar_interpreter::TemporalChart::Duration,
+        min: Some(normalized.clone()),
+        max: Some(normalized),
+    }));
+    Some(instance)
+}
+
+/// `TypeAdapter(<Instant-chart alias>).validate_python(<text>)` — a
+/// tagged `datetime_datetime` `Kind::Object` carrying the text AS ITS
+/// OWN ISO spelling directly (pydantic's own `datetime` string parse
+/// accepts the same grammar `calendar_interpreter.rs`'s own `Instant`
+/// chart reader does — an offset-bearing string parses aware at that
+/// exact offset, an offset-free string parses naive). `instance.aware`
+/// is read from the TEXT's own trailing offset marker (`Z`/`+HH:MM`/
+/// `-HH:MM` — a bare offset spelling, never `Z` folded to a named
+/// zone), matching `assignability.rs`'s own `aware`-field admission
+/// law: `0` naive, `1` aware (this reader never distinguishes UTC from
+/// a non-UTC exact offset the way `expressions.rs`'s own construction
+/// path does — a parsed string with ANY offset is `1`, since pydantic
+/// itself resolves the exact instant from the string's own offset
+/// regardless of whether that offset happens to be zero). A
+/// zone-bracket suffix (`[Zone/Name]`) declines (`None`) — RFC 9557
+/// does not parse under stock pydantic (`pydantic_temporal_parse`'s
+/// own doc).
+fn pydantic_datetime_string_value(text: &str) -> Option<AbstractValue> {
+    if text.contains('[') {
+        return None;
+    }
+    let has_offset = text.ends_with('Z')
+        || text.ends_with('z')
+        || text[1..].contains('+')
+        || text[1..].rfind('-').is_some_and(|index| index > 9);
+    let mut instance = known_object(
+        vec![ObjectKey {
+            name: "aware".to_owned(),
+            numeric: false,
+            value: known_values(vec![if has_offset { 1.0 } else { 0.0 }], PrimitiveKind::Integer, TrustSpec),
+        }],
+        None,
+        true,
+        TrustSpec,
+        false,
+    );
+    instance.source = "datetime_datetime".to_owned();
+    instance.temporal = Some(Box::new(refined_sets::calendar_interpreter::TemporalAnnotation {
+        chart: refined_sets::calendar_interpreter::TemporalChart::Instant,
+        min: Some(text.to_owned()),
+        max: Some(text.to_owned()),
+    }));
+    Some(instance)
+}
+
 /// A declared set as a bound value, tagged with its numeric sort when
 /// the ground is provably numeric — the same guarded rule
 /// `seed_parameters` applies to a declared set: `on_one_tuple_layer`
@@ -6254,6 +6851,22 @@ fn adapter_alias_verdict(
 /// arms, which both keep the declared set rather than the value this
 /// table refused or could not read.
 fn declared_set_instance(declared: &DeclaredRefinement) -> AbstractValue {
+    // A TEMPORAL declaration (`declared.set` unused/empty, `declared.
+    // temporal` Some) — the same `"temporal_flow"`-tagged WINDOW value
+    // `seed_parameters` seeds a temporal parameter with, carrying the
+    // declaration's OWN bound. `assignability.rs`'s temporal law reads
+    // this tag through `bounds_imply` (a later sink judging this
+    // instance a second time against the SAME or a wider declaration
+    // still proves, exactly the same self-match every other declared-
+    // set fallback here already gives). Checked FIRST, mirroring the
+    // "one active field" convention every other container-shaped
+    // declaration's own fallback already keeps.
+    if let Some(declared_temporal) = &declared.temporal {
+        let mut instance = known_object(Vec::new(), None, true, TrustSpec, false);
+        instance.source = "temporal_flow".to_owned();
+        instance.temporal = Some(Box::new(declared_temporal.clone()));
+        return instance;
+    }
     if on_one_tuple_layer(&declared.set) && !states_sequence(&declared.set) {
         let sort = if requires_integer(&declared.set) {
             PrimitiveKind::Integer
@@ -7917,6 +8530,42 @@ mod tests {
         assert!(findings[0].message.contains("'2.0'") || findings[0].message.contains("'2'"), "{}", findings[0].message);
     }
 
+    /// showcase.py's own `Vitals`/`record_vitals` shape (examples/
+    /// showcase.py:305-307): a CLASS-TYPED parameter (`v: Vitals`) whose
+    /// own argument is a nested construction call
+    /// (`Vitals(heart_rate=72, spo2=130)`). `declared_refinement`
+    /// answers `None` for a class name (it only ever reads `context.
+    /// aliases`, never `context.classes`), so before `judge_one_call_
+    /// argument`'s class-typed-parameter arm, the whole function
+    /// returned at that `None` with no judging at all — the
+    /// construction's own out-of-set `spo2=130` field never reached a
+    /// Finding, even though `judge_construction` proves it escapes.
+    #[test]
+    fn a_construction_nested_in_a_class_typed_call_argument_fires_on_its_own_field() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "from typing import Annotated\n",
+            "from pydantic import BaseModel, Field\n",
+            "class Vitals(BaseModel):\n",
+            "    heart_rate: Annotated[int, Field(ge=20, le=250)]\n",
+            "    spo2: Annotated[float, Field(ge=0, le=100)]\n",
+            "def record_vitals(v: Vitals) -> int:\n",
+            "    return 0\n",
+            "record_vitals(Vitals(heart_rate=72, spo2=98))\n",
+            "record_vitals(Vitals(heart_rate=72, spo2=130))\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        let fires: Vec<&Finding> = findings.iter().filter(|f| f.code == "RTS7001").collect();
+        assert_eq!(
+            fires.len(),
+            1,
+            "the in-set spo2=98 construction must stay silent, and only the \
+             out-of-set spo2=130 construction must fire: {:?}",
+            findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+        );
+        assert!(fires[0].message.contains("'130'"), "{}", fires[0].message);
+    }
+
     /// A module with neither a `type` alias nor a recognized `Annotated`
     /// import — ordinary Python this checker has no vocabulary for —
     /// still returns empty through the same zero-cost early return, never
@@ -8761,6 +9410,7 @@ mod tests {
             functions,
             classes,
             datetime_imports: Arc::new(crate::expressions::datetime_imports(&module)),
+            locale_never_set: crate::expressions::module_never_calls_setlocale(&module),
             module_bindings: HashMap::new(),
             module_callable_returns: Arc::new(HashMap::new()),
             strict_int_aliases: &HashSet::new(),
@@ -11608,6 +12258,42 @@ mod tests {
             findings.iter().map(|f| &f.message).collect::<Vec<_>>()
         );
         assert!(fires[0].message.contains("'200'"), "{}", fires[0].message);
+    }
+
+    /// q-decline-names.py:131-144's own `sum_rest`/`rest_parameter_
+    /// coverage` shape: a `for value in rest:` loop over a `*rest: int`
+    /// vararg, walked as `sum_rest`'s OWN straight-line body — no call
+    /// site here for `summaries::bind_parameters` to seed the tuple from
+    /// (that path is exercised by `a_vararg_def_interprets_concretely_
+    /// instead_of_firing_the_coarse_fallback` above). `seed_parameters`
+    /// must seed `rest` itself as an unbounded int-sorted repetition
+    /// window so `loops.rs::repetition_window_element_pass` can iterate
+    /// it, rather than leaving `rest` unbound and declining the whole
+    /// loop with the coarse "a for statement is not yet walked" blocker.
+    #[test]
+    fn a_vararg_rest_parameter_iterates_in_its_own_straight_line_body() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Age = Annotated[int, Field(ge=0, le=120)]\n",
+            "def sum_rest(first: int, *rest: int) -> int:\n",
+            "    total = first\n",
+            "    for value in rest:\n",
+            "        total = total + value\n",
+            "    return total\n",
+            "def rest_parameter_coverage() -> Age:\n",
+            "    ok: Age = sum_rest(40, 0)\n",
+            "    del ok\n",
+            "    return sum_rest(200, 0)\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        let blockers: Vec<&Finding> = findings.iter().filter(|f| f.code == "RTS7002").collect();
+        assert!(
+            blockers.is_empty(),
+            "the vararg's own body walk must not decline the for loop over `rest`: {:?}",
+            findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+        );
     }
 
     /// e-class-and-function.py's own `unpack_first`/`unpacking_in_body`

@@ -523,6 +523,8 @@ pub fn model_members_refinement(model: &ClassModel) -> DeclaredRefinement {
         generator: None,
         members: Some(members),
         positions: None,
+        temporal: None,
+        temporal_awareness: crate::surface::TemporalAwareness::Any,
     }
 }
 
@@ -1777,8 +1779,29 @@ pub fn generator_yields(
 }
 
 /// `generator_yields`'s own body walk, over `def.body` — see that
-/// function's own doc for the two accepted statement shapes and why a
-/// CONDITIONAL yield is never one of them.
+/// function's own doc for the two straight-line-yield shapes, PLUS the
+/// one CONDITIONAL shape this function now summarizes: `if <test>: yield
+/// <expr>` with no `elif`/`else` clause and no other statement in the
+/// `if`'s own body. CPython's real generator-iterator protocol either
+/// runs that `yield` (the test is true on this pass) or skips straight to
+/// whatever statement follows it (the test is false) — this function has
+/// no way to decide WHICH, so it states the sound over-approximation for
+/// "the next value `__next__` could produce at this position": the JOIN
+/// of the conditional yield's own value with whatever value the REST of
+/// the body would produce if this position were skipped entirely
+/// (`yields_of_body`'s own recursive call over the statements after the
+/// `if`). A conditional yield followed by more yields therefore never
+/// widens the overall yielded COUNT — it only widens the VALUE at the one
+/// position where the branch and its continuation compete to be "the
+/// value read there" (`age_generator`'s own row: `if bool([]): yield 40`
+/// then `yield 41` answers ONE position, `join(40, 41)`, never two
+/// separate positions). A conditional yield with NOTHING after it (no
+/// unconditional yield anywhere later in the body) still declines — the
+/// join needs a second value to join against, and a length-zero-or-one
+/// generator is a shape this function does not spell (its own `Vec` return
+/// has no way to say "zero or one," only "exactly N" — the caller reading
+/// `items.first()` for `next()` would otherwise wrongly treat a possibly-
+/// empty position as always-present).
 ///
 /// A LEADING docstring (a bare string-literal `Expr` statement,
 /// `summaries::first_non_docstring_statement`'s own shape) is skipped
@@ -1794,8 +1817,49 @@ fn yields_of_body(body: &[Stmt], environment: &mut Environment, kernel: &Arc<Ref
     let skip = body.iter().position(|stmt| std::ptr::eq(stmt, first)).expect("first came from this same body");
     let body = &body[skip..];
     let mut yields = Vec::new();
-    for stmt in body {
+    for (position, stmt) in body.iter().enumerate() {
         match stmt {
+            // `if <test>: yield <expr>` — no `elif`/`else`, exactly one
+            // statement in the `if`'s own body — this function's own doc
+            // states the join this arm computes. `continuation` is every
+            // statement AFTER this `if` in source order, summarized
+            // recursively (a FRESH docstring-skip is harmless here: there
+            // is no docstring mid-body to skip, `first_non_docstring_
+            // statement` simply returns the continuation's own first
+            // statement unchanged). `None` from EITHER the conditional
+            // arm's own value or the continuation still declines the
+            // whole body — this join is sound only when both sides of it
+            // are themselves fully known.
+            Stmt::If(if_stmt) if if_stmt.elif_else_clauses.is_empty() => {
+                let [Stmt::Expr(if_body_expr_stmt)] = if_stmt.body.as_slice() else {
+                    return None;
+                };
+                let Expr::Yield(if_yield_expr) = if_body_expr_stmt.value.as_ref() else {
+                    return None;
+                };
+                let conditional_value = match if_yield_expr.value.as_deref() {
+                    Some(value_expr) => evaluate_expression(value_expr, environment, kernel),
+                    None => refined_domain::abstract_value::null_value(),
+                };
+                if conditional_value.kind == Kind::Unknown {
+                    return None;
+                }
+                let continuation = yields_of_body(&body[position + 1..], environment, kernel)?;
+                let mut continuation = continuation.into_iter();
+                let Some(next_value) = continuation.next() else {
+                    // nothing yielded after this conditional position — the
+                    // real generator sometimes yields nothing AT ALL past
+                    // here (StopIteration on the very first `__next__`
+                    // call), a length-zero-or-one shape this function's own
+                    // `Vec` return cannot spell (see this function's own
+                    // doc) — decline rather than claim a length this
+                    // reading did not prove.
+                    return None;
+                };
+                yields.push(refined_domain::lattice_operations::join_known(conditional_value, next_value));
+                yields.extend(continuation);
+                return Some(yields);
+            }
             Stmt::Expr(expr_stmt) => {
                 let Expr::Yield(yield_expr) = expr_stmt.value.as_ref() else {
                     return None;
@@ -1998,6 +2062,8 @@ mod tests {
 
     fn age_declared() -> DeclaredRefinement {
         DeclaredRefinement {
+            temporal: None,
+            temporal_awareness: crate::surface::TemporalAwareness::Any,
             set: make_refined_set(vec![integer(), at_least(0.0), at_most(120.0)]),
             spelling: "Age".to_owned(),
             admits_none: false,
@@ -2971,15 +3037,17 @@ mod tests {
         assert!(generator_yields(&def, &[unknown()], None, &kernel, 0).is_none());
     }
 
-    // --- generator_yields: the conditional-yield shape stays a decline ---
+    // --- generator_yields: a conditional yield joins with its continuation ---
 
     /// q-decline-names.py's own `age_generator` shape: `if bool([]): yield
-    /// 40` with NO `else`, followed by an unconditional `yield 41`. This
-    /// row is one of the corpus's own two genuine soundness boundaries —
-    /// the conditional yield must decline the WHOLE body, never join the
-    /// if-branch's value with what follows it.
+    /// 40` with NO `else`, followed by an unconditional `yield 41`. Neither
+    /// branch of the `if` is provably taken, so the position `next()` would
+    /// read first is the JOIN of both outcomes — `{40, 41}` — never a
+    /// decline: this is exactly the sound over-approximation
+    /// `yields_of_body`'s own doc states for a conditional yield followed
+    /// by an unconditional one.
     #[test]
-    fn generator_yields_declines_a_conditional_yield() {
+    fn generator_yields_joins_a_conditional_yield_with_its_continuation() {
         let Some(kernel) = loaded_kernel() else { return };
         let module = parsed(concat!(
             "def age_generator():\n",
@@ -2988,9 +3056,33 @@ mod tests {
             "    yield 41\n",
         ));
         let def = module.body.into_iter().next().expect("one top-level def").function_def_stmt().expect("is a def");
+        let yields = generator_yields(&def, &[], None, &kernel, 0).expect("the conditional-then-unconditional shape must join");
+        let [joined] = yields.as_slice() else {
+            panic!("want exactly one joined position, got {}", yields.len());
+        };
+        assert_eq!(joined.kind, Kind::Values);
+        let mut values = joined.values.clone();
+        values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(values, vec![40.0, 41.0]);
+    }
+
+    /// A conditional yield with NOTHING unconditional after it has no
+    /// continuation to join against — the real generator sometimes
+    /// produces nothing at all past this point, a length-zero-or-one
+    /// shape `yields_of_body`'s own `Vec` return cannot spell. Still a
+    /// genuine decline, distinct from the joined case above.
+    #[test]
+    fn generator_yields_declines_a_conditional_yield_with_no_continuation() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "def maybe_yields():\n",
+            "    if bool([]):\n",
+            "        yield 40\n",
+        ));
+        let def = module.body.into_iter().next().expect("one top-level def").function_def_stmt().expect("is a def");
         assert!(
             generator_yields(&def, &[], None, &kernel, 0).is_none(),
-            "a yield under a condition is a permanent decline, not a shape this function joins"
+            "a conditional yield with no unconditional yield after it has no continuation to join against"
         );
     }
 

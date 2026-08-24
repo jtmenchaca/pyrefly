@@ -216,6 +216,20 @@ pub struct Environment {
     /// threaded through) — those gates fall back to the literal
     /// `datetime.*` spelling only.
     datetime_imports: Option<Arc<crate::expressions::DatetimeImports>>,
+    /// Whether this module never calls `locale.setlocale` anywhere in
+    /// its own source (`expressions::module_never_calls_setlocale`'s
+    /// own doc) — the C-locale premise `%a`'s weekday-abbreviation
+    /// reading in `datetime.strptime` needs. Rides the environment for
+    /// the same reason `datetime_imports` does: computed once per
+    /// module (`check.rs`'s module-setup site,
+    /// `walk_body_with_self_binding`) and read at the call-evaluation
+    /// site with no signature change anywhere along the call chain.
+    /// `None` for a walk that never set one (a test environment, or a
+    /// body reached before the fact is threaded through) — the caller
+    /// (`evaluate_attribute_call`'s `%a` arm) treats `None` the same as
+    /// `Some(false)`: the premise is not KNOWN true, so `%a` stays
+    /// undetermined rather than assuming the C locale.
+    locale_never_set: Option<bool>,
     /// The checked file's own directory, if this environment's walk has
     /// one to offer. Rides the environment for the same reason
     /// `functions`/`classes`/`datetime_imports` do: `expressions.rs`'s
@@ -369,6 +383,7 @@ impl Environment {
             functions: None,
             classes: None,
             datetime_imports: None,
+            locale_never_set: None,
             entry_directory: None,
             callable_returns: None,
             call_depth: 0,
@@ -433,6 +448,20 @@ impl Environment {
     /// carries one.
     pub fn datetime_imports(&self) -> Option<&Arc<crate::expressions::DatetimeImports>> {
         self.datetime_imports.as_ref()
+    }
+
+    /// Attaches the module's own `locale.setlocale`-never-called fact
+    /// so `datetime.strptime`'s `%a` reading, evaluated against this
+    /// environment (and any environment forked from it), can read the
+    /// C-locale premise (`module_never_calls_setlocale`'s own doc).
+    pub fn set_locale_never_set(&mut self, locale_never_set: bool) {
+        self.locale_never_set = Some(locale_never_set);
+    }
+
+    /// The module's own `locale.setlocale`-never-called fact, if this
+    /// environment carries one.
+    pub fn locale_never_set(&self) -> Option<bool> {
+        self.locale_never_set
     }
 
     /// Attaches the checked file's own directory so a call evaluated
@@ -663,6 +692,34 @@ impl Environment {
         self.bindings.remove(name);
     }
 
+    /// ALIASING: rebind every name currently holding a class instance
+    /// with the given `identity` (`AbstractValue::instance_identity`,
+    /// `instances::judge_construction`'s own per-construction tag) to
+    /// `updated` — the SAME instance read back through a DIFFERENT name.
+    /// `Environment` tracks a value per NAME, so `same = account;
+    /// same.balance = -20` writing through `same`'s own slot alone
+    /// leaves `account`'s slot holding the pre-write instance; this is
+    /// what `check.rs::write_named_field` calls, after its own write
+    /// updates `receiver_name`'s slot directly, to bring every OTHER
+    /// alias of the identical runtime object back in step (showcase.py's
+    /// own `same = account; same.balance = -20; spend(account.balance)`
+    /// row — written through `same`, read through `account`). Skips
+    /// `receiver_name` itself (the caller's own direct rebind already
+    /// covers that slot, and re-cloning `updated` into it here would be
+    /// redundant, not wrong) and any name whose bound value carries no
+    /// `instance_identity` at all (an ordinary object with no per-
+    /// construction id can never alias one that has one).
+    pub fn rebind_aliases_of_instance(&mut self, identity: u32, receiver_name: &str, updated: &AbstractValue) {
+        for (name, bound) in self.bindings.iter_mut() {
+            if name == receiver_name {
+                continue;
+            }
+            if bound.instance_identity == Some(identity) {
+                *bound = updated.clone();
+            }
+        }
+    }
+
     /// A copy of this environment for walking one branch arm — same
     /// locally-bound set, same current bindings, same function, class,
     /// and callable-return tables (`Arc` clones, cheap: both arms of
@@ -682,6 +739,8 @@ impl Environment {
             retained_callables: self.retained_callables.clone(),
             retained_callable_counter: self.retained_callable_counter.clone(),
             lambda_keys_by_range: self.lambda_keys_by_range.clone(),
+            // a module-level premise, identical in every arm of the module
+            locale_never_set: self.locale_never_set,
             // a fork walks part of the SAME statement (a comprehension's
             // own element pass, a branch arm), so the published nodes
             // travel with it
@@ -719,6 +778,7 @@ impl Environment {
         let retained_callables = a.retained_callables;
         let retained_callable_counter = a.retained_callable_counter;
         let lambda_keys_by_range = a.lambda_keys_by_range;
+        let locale_never_set = a.locale_never_set;
         // both arms forked from one environment, so they hold the SAME
         // recorder `Arc` — carrying `a`'s carries both arms' recordings
         let returned_values = a.returned_values;
@@ -746,6 +806,7 @@ impl Environment {
             retained_callables,
             retained_callable_counter,
             lambda_keys_by_range,
+            locale_never_set,
             // a join lands past the statement whose walk published a
             // node, so nothing carries forward
             evaluated_node: Vec::new(),

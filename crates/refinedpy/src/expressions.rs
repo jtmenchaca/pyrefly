@@ -60,6 +60,8 @@ use ruff_python_ast::Number;
 use ruff_python_ast::Operator;
 use ruff_python_ast::Stmt;
 use ruff_python_ast::UnaryOp;
+use ruff_python_ast::visitor::walk_expr;
+use ruff_python_ast::visitor::Visitor;
 use ruff_text_size::Ranged;
 use ruff_text_size::TextRange;
 
@@ -73,6 +75,7 @@ use crate::env;
 use crate::env::Environment;
 use crate::foreign_edge;
 use crate::instances;
+use crate::json_grammar;
 use crate::math_models;
 use crate::narrowing;
 use crate::string_models;
@@ -970,7 +973,7 @@ fn evaluate_boolop(boolop: &ruff_python_ast::ExprBoolOp, environment: &Environme
 /// conversion (`!s`/`!r`/`!a`) and no format spec (`:...`) — either one
 /// changes the spelling in ways this file does not compute exactly, so
 /// their presence declines the WHOLE f-string rather than composing a
-/// partially-wrong string. Two tiers, mirroring refined-ts-go's
+/// partially-wrong string. Three tiers, mirroring refined-ts-go's
 /// `evaluateTemplate` (walk/literal_values.go): when every interpolation
 /// is EXACTLY readable (a known string, a single known Integer-sorted
 /// value spelled bare, or a single known Float-sorted value spelled via
@@ -982,20 +985,28 @@ fn evaluate_boolop(boolop: &ruff_python_ast::ExprBoolOp, environment: &Environme
 /// PATTERN: every part (literal text, an exact interpolation's spelling,
 /// or a set interpolation's own admitted spellings) is a `RefinedSet`,
 /// folded by `refinement_forms::concatenation` right to left into one
-/// set the checker can still judge a declared max-length against. Only
-/// when a part is truly UNREADABLE (`evaluate_expression` answers a
-/// shape with no exact spelling and no known sort at all — INCLUDING
-/// `Kind::Null`, which this function does not yet compose as the exact
-/// word "None" the way CPython's own `str(None)` spells it; see this
-/// unit's own report) does the whole f-string stay `unknown()`. NOTE:
-/// b-body-expressions.py's own `fstring_unread_substitution`
-/// (`f"n={unread_number()}"` against `Label`, max_length=8) is NOT moved
-/// by this tier — `unread_number`'s ellipsis-only body is not a decline
-/// at all (`summaries::return_sort_fallback`'s own doc), so the call
-/// answers `Kind::Null` and this f-string still declines to `unknown()`
-/// for it, same as before this wave. An implicitly concatenated f-string
-/// (`f"a" f"b"`) is not modeled — only the single-part form
-/// (`as_single_part_fstring`) is read.
+/// set the checker can still judge a declared max-length against. An
+/// interpolation with NO readable value at all (`Kind::Null` — an unread
+/// same-module call whose own summary answers nothing, e.g. an
+/// ellipsis-only body, `summaries::return_sort_fallback`'s own doc — or
+/// any other shape none of the readers above accept) still contributes
+/// to the pattern rather than losing the whole f-string: CPython's own
+/// `str()` of whatever the interpolation holds at runtime is SOME
+/// string, so it folds in the unbounded top-string ground `strings()` —
+/// the same encoding a bare `str` annotation seeds
+/// (`check.rs::seed_parameters`) — exactly as a set interpolation's own
+/// spelling folds. b-body-expressions.py's own
+/// `fstring_unread_substitution` (`f"n={unread_number()}"` against
+/// `Label`, max_length=8) is this row: `unread_number`'s ellipsis-only
+/// body answers `Kind::Null`, the fold reaches `concatenation("n=",
+/// strings())`, and `seq_subset` DECIDES that against `Label`'s
+/// max-length window (assignability.rs's own
+/// `an_unbounded_string_set_against_a_max_length_window_fires_containment`
+/// pin) — a decided containment refutation, not a kernel refusal, so the
+/// row fires. `unknown()` remains the answer only for the two declines
+/// above this tier (a conversion or format-spec interpolation) and for
+/// an implicitly concatenated f-string (`f"a" f"b"`, not modeled — only
+/// the single-part form `as_single_part_fstring` is read).
 fn evaluate_fstring(fstring: &ruff_python_ast::ExprFString, environment: &Environment, kernel: &Arc<RefinedTSKernel>) -> AbstractValue {
     let Some(single) = fstring.as_single_part_fstring() else {
         return unknown();
@@ -1057,7 +1068,32 @@ fn evaluate_fstring(fstring: &ruff_python_ast::ExprFString, environment: &Enviro
                     grade = refined_domain::trust_grades::min_trust_level(grade, TrustSpec);
                     parts.push(part);
                 } else {
-                    return unknown();
+                    // NO readable value at all (`Kind::Null` — an unread
+                    // same-module call whose own summary answers nothing,
+                    // `summaries::return_sort_fallback`'s own doc — or any
+                    // other shape none of the readers above accept):
+                    // CPython's own `str()` of whatever this interpolation
+                    // holds at runtime is SOME string, so this contributes
+                    // the unbounded top-string ground `strings()` — the
+                    // same encoding a bare `str` annotation seeds
+                    // (`check.rs::seed_parameters`) and `__name__`'s own
+                    // read already carries — rather than lose the whole
+                    // f-string to `unknown()`. Untagged (`kind_tag: None`),
+                    // the same String/None convention
+                    // `spellings_of_known_set` folds through its own
+                    // `set_kind_tag == SetKindTag::None` arm. `seq_subset`
+                    // DECIDES an unbounded `strings()` part against a
+                    // declared max-length window (assignability.rs's own
+                    // `an_unbounded_string_set_against_a_max_length_window_
+                    // fires_containment` pin: the kernel's sequence-
+                    // containment decider proves `strings() ⊄
+                    // repeat_of(codepoints(), 0, Some(n))`, firing the
+                    // containment-refutation message) — this is not a
+                    // shape the kernel refuses today, so composing it here
+                    // reaches a real fire rather than staying silent.
+                    has_exact = false;
+                    grade = refined_domain::trust_grades::min_trust_level(grade, TrustSpec);
+                    parts.push(strings());
                 }
             }
         }
@@ -2009,6 +2045,75 @@ pub(crate) fn datetime_imports(module: &ModModule) -> DatetimeImports {
     table
 }
 
+/// The `Visitor` `module_never_calls_setlocale` drives — records
+/// whether ANY `locale.setlocale(...)` call appears anywhere in the
+/// module (a top-level statement, or nested inside any function/
+/// method/class body: `setlocale` can be called from anywhere, unlike
+/// `datetime_imports`'s own top-level-only import statements, so this
+/// walk must descend into every body the way `CallSiteCollector`
+/// (function_table.rs) already does, rather than iterating
+/// `module.body` directly). Recognizes both the qualified
+/// `locale.setlocale(...)` call and a bare `setlocale(...)` call
+/// reached through `from locale import setlocale` — the same
+/// no-import-identity-table convention `is_utc_tzinfo_expression`
+/// already takes (matched by literal callee spelling, since this
+/// premise does not need a full import-identity table the way
+/// `DatetimeImports` does: a module that merely SHADOWS the name
+/// with an unrelated `setlocale` function would be a vanishingly
+/// rare false decline, never a false "safe to assume C locale").
+struct SetlocaleCallFinder {
+    found: bool,
+}
+
+impl<'a> Visitor<'a> for SetlocaleCallFinder {
+    fn visit_expr(&mut self, expr: &'a Expr) {
+        if self.found {
+            return;
+        }
+        if let Expr::Call(call) = expr {
+            let callee_name = match call.func.as_ref() {
+                Expr::Name(name) => Some(name.id.as_str()),
+                Expr::Attribute(attribute) => Some(attribute.attr.as_str()),
+                _ => None,
+            };
+            if callee_name == Some("setlocale") {
+                self.found = true;
+                return;
+            }
+        }
+        walk_expr(self, expr);
+    }
+}
+
+/// Whether `module` never calls `locale.setlocale` anywhere in its own
+/// source — the premise `%a`'s C-locale weekday-abbreviation reading
+/// needs (locale.rst:326-327: "a program which has not called
+/// `setlocale(LC_ALL, '')` runs using the portable `'C'` locale",
+/// whose weekday abbreviations are the fixed ASCII set
+/// `read_weekday_abbreviation_field` already reads). Built once per
+/// module (`DatetimeImports`'s own "one table, read once" pattern),
+/// riding `Environment` the same way (`env.rs`'s
+/// `set_locale_never_set`/`locale_never_set`, `check.rs`'s
+/// module-setup site). A module this walk cannot fully account for
+/// (none today — every statement/expression shape `SetlocaleCallFinder`
+/// does not specifically recognize still walks through the ordinary
+/// `walk_expr` default) is not a concern here the way it is for a
+/// value-carrying reader: a `visit_expr` override that returns `Some`
+/// only for recognized call shapes still descends into every OTHER
+/// expression through the default walk, so a `setlocale` call nested
+/// arbitrarily deep (inside a lambda, a comprehension, a nested `def`)
+/// is still found.
+pub(crate) fn module_never_calls_setlocale(module: &ModModule) -> bool {
+    let mut finder = SetlocaleCallFinder { found: false };
+    for stmt in &module.body {
+        finder.visit_stmt(stmt);
+        if finder.found {
+            break;
+        }
+    }
+    !finder.found
+}
+
 /// Whether `callee` names the `datetime.datetime` class, NOT locally
 /// shadowed — resolved by CANONICAL import identity through
 /// `environment`'s own `DatetimeImports` table (`datetime_imports`'s
@@ -2055,82 +2160,289 @@ fn is_datetime_datetime_attribute(callee: &Expr, environment: &Environment) -> b
     imports.datetime_class_names.contains(name.id.as_str()) && environment.read(name.id.as_str()).is_none()
 }
 
-/// `datetime.datetime(year, month, day, hour=0, minute=0, second=0, ...,
-/// tzinfo=...)` — a tagged `Kind::Object` (`source = "datetime_datetime"`)
-/// carrying `year`/`month`/`day`/`hour`/`minute`/`second` as Integer
-/// `ObjectKey`s, PLUS an `aware_utc` marker (a Boolean `ObjectKey`) —
-/// datetime.rst, `class:: datetime(year, month, day, hour=0, minute=0,
-/// second=0, microsecond=0, tzinfo=None, *, fold=0)`. Modeled ONLY when
-/// every positional/keyword argument this file reads is a known Integer
+/// The four tzinfo shapes `datetime_construction_value` distinguishes
+/// — datetime.rst, `class:: datetime(..., tzinfo=None, ...)`: `Naive`
+/// (no `tzinfo=`, "a naive object does not contain enough information
+/// to unambiguously locate itself"), `Utc` (`tzinfo=` reads exactly
+/// `datetime.timezone.utc`/`datetime.UTC`, `is_utc_tzinfo_expression`'s
+/// own recognition), `FixedOffset(seconds)` (`tzinfo=timezone(timedelta
+/// (hours=…))` — datetime.rst, `class:: timezone(offset, name=None)`,
+/// "offset ... representing the difference between the local time and
+/// UTC" — read SYNTACTICALLY off the `timedelta(...)` argument's own
+/// literal `hours=`/`minutes=` fields, the SAME no-import-identity
+/// convention `is_utc_tzinfo_expression` already takes for `timezone`
+/// itself), and `OtherAware` (`tzinfo=` reads a recognized tzinfo
+/// CONSTRUCTOR this file cannot resolve to an exact offset — today only
+/// `zoneinfo.ZoneInfo(...)`). `Utc` and `FixedOffset` both carry an
+/// EXACTLY known offset, so the instant is provable to the microsecond
+/// either way; `OtherAware`'s own "aware" definition needs only a
+/// non-None `tzinfo`, not a resolvable offset, so `AwareDatetime`'s own
+/// admission test (assignability.rs's temporal arm) reads it as aware
+/// while `bounds_verdict_of`'s own exact-instant comparison still
+/// cannot be proved for it — `Unprovable`, never a guess.
+#[derive(Clone, PartialEq, Eq)]
+enum TzinfoKind {
+    Naive,
+    Utc,
+    FixedOffset(i64),
+    /// `zoneinfo.ZoneInfo("<Area>/<Location>")` with a string-literal
+    /// zone name this file cannot resolve to an offset SYNTACTICALLY —
+    /// `datetime_construction_value` resolves it once the wall-clock
+    /// fields are known, reading the system's own tzdata
+    /// (`tzif::utc_offset_seconds_for_wall_time`). Kept distinct from
+    /// `OtherAware` so a `ZoneInfo(...)` call with a NON-literal or
+    /// unrecognized argument (this variant's own construction never
+    /// applies) still falls back to `OtherAware`'s unresolved reading.
+    ZoneName(String),
+    OtherAware,
+}
+
+/// `datetime.datetime(year, month, day, hour=0, minute=0, second=0,
+/// microsecond=0, tzinfo=...)` — a tagged `Kind::Object` (`source =
+/// "datetime_datetime"`) carrying `year`/`month`/`day`/`hour`/
+/// `minute`/`second`/`microsecond` as Integer `ObjectKey`s, PLUS an
+/// `aware_utc` marker (a Boolean `ObjectKey`, kept for
+/// `datetime_timestamp_value`'s own existing reader) — datetime.rst,
+/// `class:: datetime(year, month, day, hour=0, minute=0, second=0,
+/// microsecond=0, tzinfo=None, *, fold=0)`. Modeled ONLY when every
+/// positional/keyword argument this file reads is a known Integer
 /// literal (year/month/day always positional in this corpus;
-/// hour/minute/second read from EITHER a positional slot or a keyword,
-/// defaulting to 0 when absent, matching the constructor's own
-/// defaults) — a `microsecond`/`fold` argument, or ANY argument this
-/// file cannot read as a known Integer, declines the WHOLE construction
-/// (never a partially-built datetime). `tzinfo=` is read SYNTACTICALLY
-/// (the keyword's own value expression, not its evaluated AbstractValue
-/// — `datetime.timezone.utc`/`datetime.UTC` have no abstract value this
-/// file tracks): `aware_utc` is `true` only when the keyword's value
-/// expression is exactly `datetime.timezone.utc` or `datetime.UTC`
-/// (datetime.rst's own "Alias for the UTC time zone singleton
-/// datetime.timezone.utc" — `UTC` added 3.11, `timezone.utc` older),
-/// `false` when `tzinfo` is absent (a NAIVE datetime), and the whole
-/// construction declines for any OTHER `tzinfo=` expression (a
-/// non-UTC/non-recognized timezone this file cannot prove an exact UTC
-/// offset for).
+/// hour/minute/second/microsecond read from EITHER a positional slot
+/// or a keyword, defaulting to 0 when absent, matching the
+/// constructor's own defaults) — a `fold` argument, or ANY argument
+/// this file cannot read as a known Integer, declines the WHOLE
+/// construction (never a partially-built datetime). `tzinfo=` is read
+/// SYNTACTICALLY (`TzinfoKind`'s own doc); the whole construction
+/// declines for any OTHER `tzinfo=` expression this reader does not
+/// recognize as one of the three kinds.
+///
+/// `instance.temporal` carries the construction's own ISO spelling on
+/// the `Instant` chart — `"YYYY-MM-DDTHH:MM:SS[.ffffff]Z"` for a
+/// UTC-aware construction (the exact offset lets the microsecond
+/// fraction ride the ISO text `duration`/`compare_on_chart`'s own
+/// fractional-second grammar already reads), the offset-free
+/// `"YYYY-MM-DDTHH:MM:SS[.ffffff]"` for a NAIVE construction (still
+/// spelled, so a naive-vs-AwareDatetime refusal is decided from the
+/// construction's own fields rather than falling through undetermined)
+/// — `None` for `OtherAware` (no exact offset this file can spell,
+/// `chart_reading`'s own `Instant` arm would read it as `Unprovable`
+/// regardless, so the wasted ask is skipped).
 fn datetime_construction_value(
     call: &ruff_python_ast::ExprCall,
     environment: &Environment,
     kernel: &Arc<RefinedTSKernel>,
 ) -> Option<AbstractValue> {
-    let positional_names = ["year", "month", "day", "hour", "minute", "second"];
+    let positional_names = ["year", "month", "day", "hour", "minute", "second", "microsecond"];
     let mut fields: Vec<Option<i64>> = vec![None; positional_names.len()];
     for (index, arg) in call.arguments.args.iter().enumerate() {
         let slot = fields.get_mut(index)?;
         *slot = Some(datetime_field_argument(arg, environment, kernel)?);
     }
-    let mut aware_utc: Option<bool> = None;
+    let mut tzinfo_kind = TzinfoKind::Naive;
     for keyword in &call.arguments.keywords {
         let Some(arg_name) = keyword.arg.as_ref() else {
             return None;
         };
         if arg_name.as_str() == "tzinfo" {
-            if !is_utc_tzinfo_expression(&keyword.value) {
-                // a tzinfo this file cannot prove is exactly UTC —
-                // decline the whole construction rather than guess an
-                // offset (datetime_construction_value's own doc)
-                return None;
-            }
-            aware_utc = Some(true);
+            tzinfo_kind = classify_tzinfo_expression(&keyword.value, environment, kernel)?;
             continue;
         }
         let Some(position) = positional_names.iter().position(|name| *name == arg_name.as_str()) else {
-            // `microsecond=`/`fold=` (or any other keyword) — not
-            // modeled, decline the whole construction
+            // `fold=` (or any other keyword) — not modeled, decline the
+            // whole construction
             return None;
         };
         let slot = fields.get_mut(position)?;
         *slot = Some(datetime_field_argument(&keyword.value, environment, kernel)?);
     }
     // year/month/day have no default (positional-required per the
-    // constructor's own signature); hour/minute/second default to 0
+    // constructor's own signature); hour/minute/second/microsecond
+    // default to 0
     let mut keys = Vec::with_capacity(positional_names.len() + 1);
+    let mut resolved = [0i64; 7];
     for (index, name) in positional_names.iter().enumerate() {
         let value = match fields[index] {
             Some(value) => value,
             None if index < 3 => return None,
             None => 0,
         };
+        resolved[index] = value;
         keys.push(integer_object_key(name, value));
+    }
+    // A `ZoneInfo("<zone>")` tzinfo resolves to an exact offset HERE,
+    // now that the wall-clock fields (`resolved`) are known — a
+    // literal instant in a literal zone name has a tzdata-determined
+    // offset (`tzif::utc_offset_seconds_for_wall_time`, reading the
+    // system's own compiled zoneinfo). Once resolved it behaves
+    // exactly like `TzinfoKind::FixedOffset` below (an EXACTLY known
+    // offset, `aware_tag = 1`, an ISO-suffixed `instance.temporal`);
+    // an unresolvable zone name (unknown zone, a wall time tzdata's
+    // own transition table cannot settle) falls back to `OtherAware`
+    // — the same unresolved reading `ZoneInfo(...)` always gave before
+    // this reader existed, never a guess.
+    if let TzinfoKind::ZoneName(zone_name) = &tzinfo_kind {
+        let [year, month, day, hour, minute, second, _microsecond] = resolved;
+        let epoch_seconds_as_utc = crate::tzif::wall_clock_epoch_seconds(year, month, day, hour, minute, second);
+        tzinfo_kind = match crate::tzif::utc_offset_seconds_for_wall_time(zone_name, epoch_seconds_as_utc) {
+            Some(offset_seconds) => TzinfoKind::FixedOffset(offset_seconds),
+            None => TzinfoKind::OtherAware,
+        };
     }
     keys.push(ObjectKey {
         name: "aware_utc".to_owned(),
         numeric: false,
-        value: known_values(vec![if aware_utc.unwrap_or(false) { 1.0 } else { 0.0 }], PrimitiveKind::Boolean, TrustProved),
+        value: known_values(vec![if tzinfo_kind == TzinfoKind::Utc { 1.0 } else { 0.0 }], PrimitiveKind::Boolean, TrustProved),
     });
+    // `aware`: 0 = naive, 1 = aware with an EXACTLY known offset (UTC or
+    // a fixed `timezone(timedelta(...))` offset), 2 = aware with an
+    // UNRESOLVED exact offset (`TzinfoKind::OtherAware`) —
+    // assignability.rs's own temporal admission law reads this to
+    // decide `AwareDatetime`/`NaiveDatetime`'s designated-fire rule
+    // without re-parsing `instance.temporal`'s ISO text (which is
+    // `None` for `OtherAware` and offset-ambiguous between `Naive`/
+    // `Utc`/`FixedOffset` on its own).
+    let aware_tag = match &tzinfo_kind {
+        TzinfoKind::Naive => 0,
+        TzinfoKind::Utc | TzinfoKind::FixedOffset(_) => 1,
+        TzinfoKind::OtherAware => 2,
+        // resolved to `FixedOffset`/`OtherAware` above — never reaches
+        // here still holding a zone name
+        TzinfoKind::ZoneName(_) => unreachable!("ZoneName is resolved to FixedOffset/OtherAware before this match"),
+    };
+    keys.push(integer_object_key("aware", aware_tag));
     let mut instance = known_object(keys, None, true, TrustProved, false);
     instance.source = "datetime_datetime".to_owned();
+    if tzinfo_kind != TzinfoKind::OtherAware {
+        let [year, month, day, hour, minute, second, microsecond] = resolved;
+        let zone = match &tzinfo_kind {
+            TzinfoKind::Utc => "Z".to_owned(),
+            TzinfoKind::FixedOffset(seconds) => offset_iso_suffix(*seconds),
+            _ => String::new(),
+        };
+        let point = if microsecond == 0 {
+            format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}{zone}")
+        } else {
+            format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{microsecond:06}{zone}")
+        };
+        instance.temporal = Some(Box::new(refined_sets::calendar_interpreter::TemporalAnnotation {
+            chart: refined_sets::calendar_interpreter::TemporalChart::Instant,
+            min: Some(point.clone()),
+            max: Some(point),
+        }));
+    }
     Some(instance)
+}
+
+/// A whole-second UTC offset, spelled the ISO 8601 sign-hour-minute
+/// suffix `calendar_interpreter.rs`'s own `read_offset` accepts
+/// (`OFFSET_RE`: `^([+-])(\d{2})(?::?(\d{2})...)`) — `TzinfoKind::
+/// FixedOffset`'s own ISO spelling. Seconds beyond a whole minute are
+/// dropped (`timezone(timedelta(...))`'s own offset argument is always
+/// a whole number of minutes in this crate's corpus; a sub-minute
+/// remainder would need a third `:SS` segment this reader does not
+/// build, since nothing in showcase.py or the pydantic surface needs
+/// one).
+fn offset_iso_suffix(seconds: i64) -> String {
+    let sign = if seconds < 0 { '-' } else { '+' };
+    let magnitude = seconds.unsigned_abs();
+    let hours = magnitude / 3600;
+    let minutes = (magnitude % 3600) / 60;
+    format!("{sign}{hours:02}:{minutes:02}")
+}
+
+/// `tzinfo=`'s own value expression, read SYNTACTICALLY as one of the
+/// three `TzinfoKind`s — see that enum's own doc for the exact
+/// recognized spellings. `None` for a `tzinfo=` expression this reader
+/// recognizes as none of the three (a computed value, an unrecognized
+/// constructor) — the whole construction declines rather than guess.
+fn classify_tzinfo_expression(expr: &Expr, environment: &Environment, kernel: &Arc<RefinedTSKernel>) -> Option<TzinfoKind> {
+    if is_utc_tzinfo_expression(expr) {
+        return Some(TzinfoKind::Utc);
+    }
+    if let Expr::Call(call) = expr {
+        let callee_name = match call.func.as_ref() {
+            Expr::Name(name) => Some(name.id.as_str()),
+            Expr::Attribute(attribute) => Some(attribute.attr.as_str()),
+            _ => None,
+        };
+        // `timezone(timedelta(hours=…))` — read by bare callee name
+        // only, the same no-import-identity convention this file's own
+        // datetime gates take when no import table exists; the single
+        // positional argument must itself be a recognized
+        // `timedelta(...)` call this file can evaluate to a known
+        // `datetime_timedelta`-tagged instance (`timedelta_construction_
+        // value`'s own reading), read back to whole seconds via its
+        // `days` field (a `timedelta(hours=N)` construction, N a
+        // multiple of 24, is the only shape this file's own `timedelta`
+        // constructor recognizes today — `timedelta_construction_value`
+        // reads ONLY `days=`, so an `hours=`-keyed offset reaches here
+        // through `offset_seconds_of_timedelta_call` instead, which
+        // reads the `hours=`/`minutes=` fields directly off the AST
+        // rather than through the `days`-only constructor).
+        if callee_name == Some("timezone") {
+            if let [offset_arg] = call.arguments.args.as_ref() {
+                if let Some(seconds) = offset_seconds_of_timedelta_call(offset_arg, environment, kernel) {
+                    return Some(TzinfoKind::FixedOffset(seconds));
+                }
+            }
+            return Some(TzinfoKind::OtherAware);
+        }
+        // `zoneinfo.ZoneInfo(...)` / a bare aliased `ZoneInfo(...)` —
+        // read by bare callee name only, the same no-import-identity
+        // convention already taken above; this file tracks no
+        // `zoneinfo` import table (unlike `datetime`'s own
+        // `DatetimeImports`), so the recognition is syntactic. A
+        // single string-literal positional argument names the zone
+        // (`ZoneInfo("Europe/Paris")`, the IANA key form the stdlib
+        // documents) — `ZoneName` carries the key for
+        // `datetime_construction_value` to resolve against tzdata
+        // once the wall-clock fields are known; any other argument
+        // shape (computed, keyword, multiple args) falls back to
+        // `OtherAware`, unresolved.
+        if callee_name == Some("ZoneInfo") {
+            if let [Expr::StringLiteral(literal)] = call.arguments.args.as_ref() {
+                return Some(TzinfoKind::ZoneName(literal.value.to_str().to_owned()));
+            }
+            return Some(TzinfoKind::OtherAware);
+        }
+    }
+    None
+}
+
+/// `timedelta(hours=…)` / `timedelta(minutes=…)` (optionally combined),
+/// read as its own exact SECOND count — `classify_tzinfo_expression`'s
+/// own `timezone(timedelta(...))` arm. Unlike `timedelta_construction_
+/// value` (which reads ONLY `days=`, the duration-VALUE shape this
+/// file's own `FollowUp`-style rows need), a `timezone`'s own offset
+/// argument is conventionally spelled in `hours=`/`minutes=` — read
+/// directly off the literal keyword arguments here rather than routing
+/// through that narrower constructor. `None` for any other keyword
+/// (`days=`, `weeks=`, …), a positional argument, or a non-literal
+/// value — this reader never guesses an offset.
+fn offset_seconds_of_timedelta_call(expr: &Expr, environment: &Environment, kernel: &Arc<RefinedTSKernel>) -> Option<i64> {
+    let Expr::Call(call) = expr else {
+        return None;
+    };
+    let Expr::Name(callee) = call.func.as_ref() else {
+        return None;
+    };
+    if callee.id.as_str() != "timedelta" || !call.arguments.args.is_empty() {
+        return None;
+    }
+    let mut seconds: i64 = 0;
+    for keyword in &call.arguments.keywords {
+        let Some(name) = keyword.arg.as_ref() else {
+            return None;
+        };
+        let value = datetime_field_argument(&keyword.value, environment, kernel)?;
+        match name.as_str() {
+            "hours" => seconds = seconds.checked_add(value.checked_mul(3600)?)?,
+            "minutes" => seconds = seconds.checked_add(value.checked_mul(60)?)?,
+            "seconds" => seconds = seconds.checked_add(value)?,
+            _ => return None,
+        }
+    }
+    Some(seconds)
 }
 
 /// One `ObjectKey` carrying a known Integer field — the small builder
@@ -2230,14 +2542,26 @@ fn is_utc_tzinfo_expression(expr: &Expr) -> bool {
                 }
             }
         }
-        // datetime.timezone.utc — a three-level chain,
-        // `Name("datetime").timezone.utc`
         if outer.attr.as_str() == "utc" {
+            // datetime.timezone.utc — a three-level chain,
+            // `Name("datetime").timezone.utc`
             if let Expr::Attribute(middle) = outer.value.as_ref() {
                 if middle.attr.as_str() == "timezone" {
                     if let Expr::Name(name) = middle.value.as_ref() {
-                        return name.id.as_str() == "datetime";
+                        if name.id.as_str() == "datetime" {
+                            return true;
+                        }
                     }
+                }
+            }
+            // `timezone.utc` — a two-level chain, `Name("timezone").utc`,
+            // the shape `from datetime import timezone` gives (showcase.py's
+            // own spelling); recognized by bare name only, the same
+            // no-import-identity convention this function already takes
+            // for `datetime.UTC`/`datetime.timezone.utc`.
+            if let Expr::Name(name) = outer.value.as_ref() {
+                if name.id.as_str() == "timezone" {
+                    return true;
                 }
             }
         }
@@ -2454,6 +2778,12 @@ fn date_construction_value(
     let keys = field_names.iter().zip([year, month, day]).map(|(name, value)| integer_object_key(name, value)).collect();
     let mut instance = known_object(keys, None, true, TrustProved, false);
     instance.source = "datetime_date".to_owned();
+    let point = format!("{year:04}-{month:02}-{day:02}");
+    instance.temporal = Some(Box::new(refined_sets::calendar_interpreter::TemporalAnnotation {
+        chart: refined_sets::calendar_interpreter::TemporalChart::PlainDate,
+        min: Some(point.clone()),
+        max: Some(point),
+    }));
     Some(instance)
 }
 
@@ -2515,6 +2845,12 @@ fn timedelta_construction_value(
     let instance_keys = vec![integer_object_key("days", days)];
     let mut instance = known_object(instance_keys, None, true, TrustProved, false);
     instance.source = "datetime_timedelta".to_owned();
+    let point = format!("P{days}D");
+    instance.temporal = Some(Box::new(refined_sets::calendar_interpreter::TemporalAnnotation {
+        chart: refined_sets::calendar_interpreter::TemporalChart::Duration,
+        min: Some(point.clone()),
+        max: Some(point),
+    }));
     Some(instance)
 }
 
@@ -2583,7 +2919,73 @@ fn date_fromisoformat_value(text: &str, kernel: &Arc<RefinedTSKernel>) -> Option
     let keys = vec![integer_object_key("year", year), integer_object_key("month", month), integer_object_key("day", day)];
     let mut instance = known_object(keys, None, true, TrustProved, false);
     instance.source = "datetime_date".to_owned();
+    let point = format!("{year:04}-{month:02}-{day:02}");
+    instance.temporal = Some(Box::new(refined_sets::calendar_interpreter::TemporalAnnotation {
+        chart: refined_sets::calendar_interpreter::TemporalChart::PlainDate,
+        min: Some(point.clone()),
+        max: Some(point),
+    }));
     Some(instance)
+}
+
+/// Whether `date.fromisoformat(text)` provably RAISES `ValueError`, for a
+/// KNOWN exact `text` argument — the raise-dispatch twin of
+/// `date_fromisoformat_value`'s own value dispatch, read the SAME way
+/// `call_provable_raise`'s existing `math.sqrt`/`int(<string>)` rows pair
+/// their own value-side reader with a raise-side classifier. datetime.rst
+/// states `fromisoformat` "will raise a `ValueError`" on a string it does
+/// not accept — CPython's own implementation note (`Changed in version
+/// 3.11: ... Previously, this method only supported the format YYYY-MM-DD`)
+/// backs the strict `YYYY-MM-DD` grammar date.3's own row already commits
+/// this file to reading, so a string OUTSIDE that grammar (`"13:45"`, a
+/// clock time with no date fields at all) is exactly as much a raise as a
+/// syntactically-shaped but calendrically-invalid one (`"2023-02-29"`,
+/// `"2023-04-31"`) — CPython's own `_parse_isoformat_date` raises
+/// `ValueError: Invalid isoformat string` on the former and the
+/// `datetime.date` CONSTRUCTOR raises on the latter, and neither
+/// distinction changes what a caller can safely assume: the call raises
+/// either way.
+///
+/// Returns `Some(true)` only where the string is PROVABLY malformed or
+/// PROVABLY calendrically invalid (every kernel ask involved answered,
+/// never refused) — `Some(false)` for a provably VALID date (mirrors
+/// `date_fromisoformat_value`'s own `Some` case exactly, so the two
+/// functions never disagree on the same string), and `None` wherever a
+/// kernel ask this reads (`python_year_in_range`/`valid_civil_date`)
+/// itself declines to answer — an honest "cannot tell" rather than a
+/// guessed raise.
+fn date_fromisoformat_raises(text: &str, kernel: &Arc<RefinedTSKernel>) -> Option<bool> {
+    let mut parts = text.split('-');
+    let Some(year_text) = parts.next() else {
+        return Some(true);
+    };
+    let Some(month_text) = parts.next() else {
+        return Some(true);
+    };
+    let Some(day_text) = parts.next() else {
+        return Some(true);
+    };
+    if parts.next().is_some() {
+        return Some(true);
+    }
+    if year_text.len() != 4 || month_text.len() != 2 || day_text.len() != 2 {
+        return Some(true);
+    }
+    if !year_text.bytes().all(|b| b.is_ascii_digit())
+        || !month_text.bytes().all(|b| b.is_ascii_digit())
+        || !day_text.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Some(true);
+    }
+    let Ok(year) = year_text.parse::<i64>() else { return Some(true) };
+    let Ok(month) = month_text.parse::<i64>() else { return Some(true) };
+    let Ok(day) = day_text.parse::<i64>() else { return Some(true) };
+    let year_ok = python_year_in_range(year, kernel)?;
+    if !year_ok {
+        return Some(true);
+    }
+    let date_ok = valid_civil_date(year, month, day, kernel)?;
+    Some(!date_ok)
 }
 
 /// The kernel's `epochDays` answer for a tagged `datetime_date`
@@ -2826,6 +3228,98 @@ fn read_microsecond_field(rest: &str) -> Option<(i64, &str)> {
     Some((value, tail))
 }
 
+/// `%z` — datetime.rst note (6)'s own STRPTIME grammar (the aware-object
+/// paragraph, ":strptime" versionchanged 3.7 note): `±HHMM[SS[.ffffff]]`,
+/// where `HH`/`MM`/`SS` are each exactly 2 digits and `ffffff` is exactly
+/// 6, OR the bare literal `'Z'` ("providing `'Z'` is identical to
+/// `'+00:00'`"). The same versionchanged note adds that "the UTC offsets
+/// can have a colon as a separator between hours, minutes and seconds"
+/// (`'+01:00:00'` parses as one hour) — an optional `:` is accepted
+/// before `MM`, before `SS`, and before `ffffff`, independently of
+/// whether an earlier one was present, matching CPython's own `_strptime.
+/// py` regex (`(?P<z>[+-]\d\d:?[0-5]\d(:?[0-5]\d(\.\d{1,6})?)?|Z)`).
+/// Returns the offset's total signed magnitude in SECONDS (microseconds
+/// dropped — this stage's own tagged instance carries no sub-second
+/// field, matching `%f`'s own "read but not carried" convention above) —
+/// exactly `0` for `'Z'` or any spelling of `+00:00[:00[.000000]]`, the
+/// one value `strptime2_parse`'s own `aware_utc` marker can set `true`
+/// for; every other value still parses (the offset is consumed and the
+/// construction still succeeds), but the instance answers `aware_utc:
+/// false`, the same "an aware-but-non-UTC construction is not modeled
+/// past this field" boundary `datetime_construction_value`'s own
+/// `tzinfo=` gate already draws for the forward direction.
+fn read_utc_offset_field(rest: &str) -> Option<(i64, &str)> {
+    if let Some(tail) = rest.strip_prefix('Z') {
+        return Some((0, tail));
+    }
+    let sign = match rest.as_bytes().first() {
+        Some(b'+') => 1i64,
+        Some(b'-') => -1i64,
+        _ => return None,
+    };
+    let rest = &rest[1..];
+    let (hours_text, rest) = take_fixed_digits(rest, 2)?;
+    let hours: i64 = hours_text.parse().ok()?;
+    let rest = rest.strip_prefix(':').unwrap_or(rest);
+    let (minutes_text, rest) = take_fixed_digits(rest, 2)?;
+    let minutes: i64 = minutes_text.parse().ok()?;
+    let mut total_seconds = hours * 3600 + minutes * 60;
+    let mut tail = rest;
+    if let Some(after_colon) = rest.strip_prefix(':') {
+        if let Some((seconds_text, seconds_tail)) = take_fixed_digits(after_colon, 2) {
+            let seconds: i64 = seconds_text.parse().ok()?;
+            total_seconds += seconds;
+            tail = seconds_tail;
+        }
+    } else if let Some((seconds_text, seconds_tail)) = take_fixed_digits(rest, 2) {
+        let seconds: i64 = seconds_text.parse().ok()?;
+        total_seconds += seconds;
+        tail = seconds_tail;
+    }
+    // the optional `.ffffff` microsecond tail, read and discarded — this
+    // stage carries no sub-second field on the constructed instance
+    // (matching `%f`'s own convention), and a fractional offset never
+    // changes whether the WHOLE offset is zero (a nonzero `ffffff` can
+    // only sit alongside an `SS` already read above)
+    if let Some(after_dot) = tail.strip_prefix('.') {
+        if let Some((_, fraction_tail)) = take_variable_digits(after_dot, 1, 6) {
+            tail = fraction_tail;
+        }
+    }
+    Some((sign * total_seconds, tail))
+}
+
+/// `%a` under the PORTABLE `'C'` LOCALE — datetime.rst note (1) marks
+/// `%a` locale-dependent ("Weekday as locale's abbreviated name"), and
+/// its own table row shows the `en_US` spelling `Sun, Mon, ..., Sat`. A
+/// program that never calls `locale.setlocale` runs under the C locale
+/// (locale.rst:326-327, "According to POSIX, a program which has not
+/// called `setlocale(LC_ALL, '')` runs using the portable `'C'` locale"),
+/// whose weekday abbreviations are this same fixed ASCII set (the C
+/// locale IS the `en_US`/POSIX default this table's own example row
+/// shows) — a closed, host-independent set this reader can therefore
+/// name exactly, gated on that premise by this function's own caller
+/// (`strptime2_module_never_calls_setlocale`) rather than assumed here.
+/// Case-sensitive, matching CPython's own `_strptime.py` locale-time
+/// table exactly (no case-folding on the input).
+const C_LOCALE_WEEKDAY_ABBREVIATIONS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+/// Reads one of `C_LOCALE_WEEKDAY_ABBREVIATIONS` off the front of `rest`,
+/// or `None` when no member matches. The value itself is not folded into
+/// the constructed instance — `%U`/`%W`'s own doc: a weekday name alone
+/// (with no `%Y`-anchored week-number calculation alongside it) does
+/// nothing to the constructed date either, matching this stage's existing
+/// "read but not carried" convention for a directive whose value this
+/// stage's tagged shape has no field for.
+fn read_weekday_abbreviation_field(rest: &str) -> Option<&str> {
+    for candidate in C_LOCALE_WEEKDAY_ABBREVIATIONS {
+        if let Some(tail) = rest.strip_prefix(candidate) {
+            return Some(tail);
+        }
+    }
+    None
+}
+
 /// Exactly `width` ASCII digits off the front of `rest`, or `None` if
 /// fewer than `width` digits are available or a non-digit byte sits
 /// inside that span. `date_fromisoformat_value`'s own `year_text`/
@@ -2853,39 +3347,66 @@ fn take_variable_digits(rest: &str, min_width: usize, max_width: usize) -> Optio
     Some((&rest[..width], &rest[width..]))
 }
 
-/// The two decline reasons date.12 STAGE 2 names, per the AGENT-BRIEF's
-/// own split: an UNREAD directive (`%z %Z %I %G %u %V`, this round's
-/// named remainder — not yet transcribed against the spec, but a
-/// host-independent set is buildable once it is) versus a LOCALE
-/// directive (`%a %A %b %B %p %c %x %X`, datetime.rst note (1): "the
-/// format depends on the current locale... Field orderings will vary...
-/// and the output may contain non-ASCII characters") — a genuinely
-/// different construct, since a locale directive has no host-independent
-/// value set to derive AT ALL, not merely one this round left unread.
+/// The three decline reasons date.12 STAGE 2 names, per the AGENT-BRIEF's
+/// own split: an UNREAD directive (`%Z %I %G %u %V`, this round's named
+/// remainder — not yet transcribed against the spec, but a host-
+/// independent set is buildable once it is); a LOCALE directive (`%A %b
+/// %B %p %c %x %X`, datetime.rst note (1): "the format depends on the
+/// current locale... Field orderings will vary... and the output may
+/// contain non-ASCII characters") — a genuinely different construct,
+/// since a locale directive has no host-independent value set to derive
+/// AT ALL, not merely one this round left unread; and `WeekdayAbbreviation`
+/// (`%a` alone, split out from the other six locale directives) — under
+/// the PORTABLE `'C'` locale POSIX runs by default (locale.rst:326-327),
+/// `%a`'s own value set IS host-independent (`read_weekday_abbreviation_
+/// field`'s own doc), so this format is not a permanent decline the way
+/// the other five locale directives are — the caller
+/// (`evaluate_attribute_call`) reads the module's own C-locale premise
+/// (`environment.locale_never_set()`, `module_never_calls_setlocale`'s
+/// own doc) and passes it to `strptime2_scan_format` as
+/// `accept_weekday_abbreviation`, so a `WeekdayAbbreviation` outcome
+/// from THIS scanner only ever happens when the premise does not hold
+/// — the scanner treats `%a` as transcribed and never returns this
+/// variant at all when the caller passes `accept_weekday_abbreviation
+/// = true`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Strptime2Decline {
     UnreadDirective(char),
     LocaleDirective(char),
+    WeekdayAbbreviation,
 }
 
-/// Whether `letter` is one of the six locale-dependent directives
-/// datetime.rst note (1) names — `%a %A %b %B %p %c %x %X`.
+/// Whether `letter` is one of the six PERMANENTLY locale-dependent
+/// directives datetime.rst note (1) names, EXCLUDING `%a` — split out as
+/// `Strptime2Decline::WeekdayAbbreviation`'s own case, since the C-locale
+/// premise makes `%a` alone determinable while these five stay a genuine
+/// decline (no host-independent full-weekday-name/month-name/AM-PM/
+/// locale-composite set exists for any of `%A %b %B %p %c %x %X`).
 fn is_locale_directive(letter: char) -> bool {
-    matches!(letter, 'a' | 'A' | 'b' | 'B' | 'p' | 'c' | 'x' | 'X')
+    matches!(letter, 'A' | 'b' | 'B' | 'p' | 'c' | 'x' | 'X')
 }
 
 /// STAGE 2's directive transcription: every letter this round reads
 /// against datetime.rst's format-codes table (`%Y %m %d %H %M %S %f %j
-/// %U %W %y`, plus `%%`'s literal-percent escape, :2474-2475) answers
+/// %U %W %y %z`, plus `%%`'s literal-percent escape, :2474-2475) answers
 /// `Ok(())`; `Err` names the FIRST directive letter this round does NOT
-/// transcribe, distinguishing the locale boundary from the plain
-/// not-yet-read one (`Strptime2Decline`'s own doc) — the AGENT-BRIEF's
-/// own requirement that an unread directive names ITSELF, never the
-/// whole format string. Run as its own pre-pass before `strptime2_parse`
-/// so a format's decline reason is named even when the TEXT does not
-/// match at all (`strptime2_parse` has no reason channel of its own,
-/// only `None`).
-fn strptime2_scan_format(format: &str) -> Result<(), Strptime2Decline> {
+/// transcribe outright, distinguishing the locale boundary, the weekday-
+/// abbreviation boundary, and the plain not-yet-read one
+/// (`Strptime2Decline`'s own doc) — the AGENT-BRIEF's own requirement
+/// that an unread directive names ITSELF, never the whole format string.
+/// Run as its own pre-pass before `strptime2_parse` so a format's decline
+/// reason is named even when the TEXT does not match at all
+/// (`strptime2_parse` has no reason channel of its own, only `None`).
+///
+/// `accept_weekday_abbreviation` is the caller's own C-locale premise
+/// (`module_never_calls_setlocale`'s own doc): `true` treats `%a` as a
+/// TRANSCRIBED directive, the same as `%Y`/`%m`/etc — the scan continues
+/// past it rather than stopping, so a LATER genuinely-locale directive
+/// in the same format (`%a %A`) still surfaces its own
+/// `LocaleDirective` reason rather than being masked by `%a`'s earlier
+/// position. `false` keeps the original behavior: `%a` itself is the
+/// first-blocking directive, named `WeekdayAbbreviation`.
+fn strptime2_scan_format(format: &str, accept_weekday_abbreviation: bool) -> Result<(), Strptime2Decline> {
     let mut chars = format.chars().peekable();
     while let Some(ch) = chars.next() {
         if ch != '%' {
@@ -2895,7 +3416,9 @@ fn strptime2_scan_format(format: &str) -> Result<(), Strptime2Decline> {
             continue; // a trailing lone '%' — no directive follows, nothing to name
         };
         match letter {
-            '%' | 'Y' | 'y' | 'm' | 'd' | 'H' | 'M' | 'S' | 'f' | 'j' | 'U' | 'W' => continue,
+            '%' | 'Y' | 'y' | 'm' | 'd' | 'H' | 'M' | 'S' | 'f' | 'j' | 'U' | 'W' | 'z' => continue,
+            'a' if accept_weekday_abbreviation => continue,
+            'a' => return Err(Strptime2Decline::WeekdayAbbreviation),
             other if is_locale_directive(other) => return Err(Strptime2Decline::LocaleDirective(other)),
             other => return Err(Strptime2Decline::UnreadDirective(other)),
         }
@@ -2907,29 +3430,35 @@ fn strptime2_scan_format(format: &str) -> Result<(), Strptime2Decline> {
 /// literal span byte-for-byte and each directive through its own reader
 /// above, then folds the read fields into a tagged instance the SAME way
 /// `datetime_construction_value` does (`year`/`month`/`day`/`hour`/
-/// `minute`/`second` Integer `ObjectKey`s, `aware_utc` false — no `%z`/
-/// `%Z` reaches here, so every STAGE 2 result is naive) — the fields
-/// this stage's own construct feeds are read FROM a string here, the
-/// mirror of `datetime_construction_value` reading them FROM already-
-/// known Integer arguments. Absent fields (an `%H:%M:%S`-less format)
-/// default to 0, `datetime.strptime`'s own default-value rule
-/// (datetime.rst:2527-2529: "the default value is `1900-01-01T00:00:00.
-/// 000`: any components not specified in the format string will be
-/// pulled from the default value") restricted to the six components this
-/// file tracks — `year`/`month`/`day` are NOT required by a directive in
-/// the format (a bare `"%H:%M:%S"` format is modeled, defaulting to
-/// 1900-01-01, matching `test_strptime_stage_2_derives_a_time_of_day_
-/// only_format`'s own pin). Declines (`None`) on any text
-/// that does not match the literal/directive sequence, a repeated field
-/// kind (two `%Y`s), or a value that fails the SAME two kernel asks
-/// `date_fromisoformat_value` poses (`pyYearInRange` then `validDate`).
-/// `%f`'s microsecond is read but not carried on the constructed
-/// instance — `datetime_construction_value`'s own tagged shape has no
-/// `microsecond` field (its own doc: "a `microsecond`/`fold` argument...
-/// declines the WHOLE construction" for the FORWARD constructor, so this
-/// reverse direction matches by simply not adding one), so `%f` is
-/// recognized and its digits validated (1-6 digits, note 5) but its
-/// resolved value does not reach the returned instance.
+/// `minute`/`second` Integer `ObjectKey`s, `aware_utc` true only when a
+/// recognized `%z` read an exactly-zero offset — `read_utc_offset_field`'s
+/// own doc; every other case, including a naive format with no `%z` at
+/// all, answers `aware_utc: false`) — the fields this stage's own
+/// construct feeds are read FROM a string here, the mirror of
+/// `datetime_construction_value` reading them FROM already-known Integer
+/// arguments. Absent fields (an `%H:%M:%S`-less format) default to 0,
+/// `datetime.strptime`'s own default-value rule (datetime.rst:2527-2529:
+/// "the default value is `1900-01-01T00:00:00.000`: any components not
+/// specified in the format string will be pulled from the default
+/// value") restricted to the six components this file tracks —
+/// `year`/`month`/`day` are NOT required by a directive in the format (a
+/// bare `"%H:%M:%S"` format is modeled, defaulting to 1900-01-01,
+/// matching `test_strptime_stage_2_derives_a_time_of_day_only_format`'s
+/// own pin). Declines (`None`) on any text that does not match the
+/// literal/directive sequence, a repeated field kind (two `%Y`s), or a
+/// value that fails the SAME two kernel asks `date_fromisoformat_value`
+/// poses (`pyYearInRange` then `validDate`). `%f`'s microsecond is read
+/// but not carried on the constructed instance — `datetime_construction_
+/// value`'s own tagged shape has no `microsecond` field (its own doc: "a
+/// `microsecond`/`fold` argument... declines the WHOLE construction" for
+/// the FORWARD constructor, so this reverse direction matches by simply
+/// not adding one), so `%f` is recognized and its digits validated (1-6
+/// digits, note 5) but its resolved value does not reach the returned
+/// instance. `%a`'s weekday abbreviation is likewise read and range-
+/// checked (against the caller's own C-locale premise gate — this
+/// function itself poses no premise question, matching `%U`/`%W`'s own
+/// "read but not carried" convention) but never folded into the
+/// constructed date, the same as those two directives.
 fn strptime2_parse(format: &str, text: &str, kernel: &Arc<RefinedTSKernel>) -> Option<AbstractValue> {
     let mut year: Option<i64> = None;
     let mut month: Option<i64> = None;
@@ -2937,6 +3466,7 @@ fn strptime2_parse(format: &str, text: &str, kernel: &Arc<RefinedTSKernel>) -> O
     let mut hour: Option<i64> = None;
     let mut minute: Option<i64> = None;
     let mut second: Option<i64> = None;
+    let mut utc_offset_seconds: Option<i64> = None;
 
     let mut format_chars = format.chars().peekable();
     let mut remaining_text = text;
@@ -3020,6 +3550,15 @@ fn strptime2_parse(format: &str, text: &str, kernel: &Arc<RefinedTSKernel>) -> O
                 }
                 remaining_text = tail;
             }
+            'z' => {
+                let (offset_seconds, tail) = read_utc_offset_field(remaining_text)?;
+                set_once(&mut utc_offset_seconds, offset_seconds)?;
+                remaining_text = tail;
+            }
+            'a' => {
+                let tail = read_weekday_abbreviation_field(remaining_text)?;
+                remaining_text = tail;
+            }
             // every other letter is caught by strptime2_scan_format's own
             // pre-pass before this function is ever called — unreachable
             // here by construction, matching this file's own convention
@@ -3049,6 +3588,14 @@ fn strptime2_parse(format: &str, text: &str, kernel: &Arc<RefinedTSKernel>) -> O
     if !valid_civil_date(year, month, day, kernel)? {
         return None;
     }
+    // `aware_utc` is true only when a recognized `%z` read EXACTLY the
+    // zero offset (`'Z'`, `'+0000'`, `'+00:00'`, …) — the one shape
+    // `read_utc_offset_field`'s own doc names as this stage's own
+    // determinable aware case; every other offset still parses
+    // (the text is consumed, the construction still succeeds) but the
+    // instance answers naive, matching `datetime_construction_value`'s
+    // own forward-direction boundary at a non-UTC `tzinfo=`.
+    let aware_utc = utc_offset_seconds == Some(0);
     let keys = vec![
         integer_object_key("year", year),
         integer_object_key("month", month),
@@ -3059,7 +3606,7 @@ fn strptime2_parse(format: &str, text: &str, kernel: &Arc<RefinedTSKernel>) -> O
         ObjectKey {
             name: "aware_utc".to_owned(),
             numeric: false,
-            value: known_values(vec![0.0], PrimitiveKind::Boolean, TrustProved),
+            value: known_values(vec![if aware_utc { 1.0 } else { 0.0 }], PrimitiveKind::Boolean, TrustProved),
         },
     ];
     let mut instance = known_object(keys, None, true, TrustProved, false);
@@ -3345,7 +3892,24 @@ fn evaluate_call(call: &ruff_python_ast::ExprCall, environment: &Environment, ke
                                 value.source = "generator".to_owned();
                                 value
                             }
-                            None => unknown(),
+                            // The DECLINE twin of the tagged success above:
+                            // `generator_yields` could not summarize this
+                            // body (a conditional `yield`, or any other
+                            // shape outside its own straight-line reading).
+                            // Tagged `source = GENERATOR_DECLINED_SOURCE_TAG`
+                            // (`check.rs`'s own constant, mirrored here as a
+                            // literal since `expressions.rs` is upstream of
+                            // `check.rs` in this crate's dependency order —
+                            // matching the SAME literal spelling, not the
+                            // constant itself) rather than a bare unknown,
+                            // so `check.rs::name_unmodeled_call_sentence`'s
+                            // generator rung can trace an undetermined read
+                            // this call feeds back to its own cause, instead
+                            // of the generic "value not readable" wording.
+                            None => AbstractValue {
+                                source: "generator-declined".to_owned(),
+                                ..unknown()
+                            },
                         };
                     }
                     // CLOSURE READS: `def` may be a NESTED def (this
@@ -4422,10 +4986,22 @@ fn evaluate_attribute_call(
             // shapes (`json_dumps_value`'s own doc) — every other value
             // shape (Float, Boolean, a nested list, an unknown value)
             // declines the whole call.
+            //
+            // A `Kind::Object` this exact reading cannot fully resolve
+            // (a member carries a SET rather than one concrete value —
+            // a windowed int, a `Literal[...]` string union) falls to
+            // `json_grammar::dumps_grammar` instead: the serialized
+            // text's GRAMMAR, composed member by member from the same
+            // conversion table, wrapped as a string-sorted `Kind::Set`
+            // so a downstream length/pattern sink still judges it
+            // (`json_grammar.rs`'s own doc states the full rule).
             if attribute.attr.as_str() == "dumps" {
                 if let [value] = arguments {
                     if let Some(text) = json_dumps_value(value) {
                         return string_models::string_literal_value(&text);
+                    }
+                    if let Some(grammar) = json_grammar::dumps_grammar(value, &mut json_dumps_value) {
+                        return grammar;
                     }
                 }
                 return unknown();
@@ -4556,16 +5132,27 @@ fn evaluate_attribute_call(
     // outright rather than re-deriving its parse). Every OTHER
     // literal format is read by STAGE 2's directive scanner
     // (`strptime2_scan_format`): a format whose every directive is
-    // one of `%Y %m %d %H %M %S %f %j %U %W %y %%` is parsed by
+    // one of `%Y %m %d %H %M %S %f %j %U %W %y %z %%` is parsed by
     // `strptime2_parse` against the SAME two kernel asks STAGE 1
     // poses (`pyYearInRange` then `validDate`); a format naming a
-    // directive this round does not transcribe declines, naming that
-    // ONE directive rather than the whole format string — split into
-    // the two decline shapes `Strptime2Decline` states: a locale
-    // directive (`%a %A %b %B %p %c %x %X`, datetime.rst note (1) —
-    // no host-independent value set exists for these AT ALL) reads as
-    // its own distinct reason from an unread directive (`%z %Z %I %G
-    // %u %V` — not yet transcribed against the spec, but buildable).
+    // directive this round does not transcribe outright declines,
+    // naming that ONE directive rather than the whole format string —
+    // split into the three decline shapes `Strptime2Decline` states: a
+    // locale directive (`%A %b %B %p %c %x %X`, datetime.rst note (1)
+    // — no host-independent value set exists for these AT ALL); an
+    // unread directive (`%Z %I %G %u %V` — not yet transcribed against
+    // the spec, but buildable); and `%a` alone, its own
+    // `WeekdayAbbreviation` case — its C-locale value set IS host-
+    // independent (`read_weekday_abbreviation_field`'s own doc), so
+    // `%a` is scanned as an ACCEPTED directive exactly when this
+    // module's own `locale_never_set` premise holds
+    // (`environment.locale_never_set()`, `module_never_calls_setlocale`'s
+    // own doc — POSIX runs the portable `'C'` locale, whose weekday
+    // abbreviations ARE this fixed ASCII set, unless the module ever
+    // calls `locale.setlocale`); `None`/`Some(false)` both keep `%a`
+    // as a first-blocking directive the same as before this premise
+    // existed, never assuming the C locale without the fact in hand.
+    let accept_weekday_abbreviation = environment.locale_never_set().unwrap_or(false);
     if is_datetime_datetime_attribute(attribute.value.as_ref(), environment) && attribute.attr.as_str() == "strptime" {
         if let [text, format] = arguments {
             if let (Some(text_points), Some(format_points)) = (exact_string_values(text), exact_string_values(format)) {
@@ -4576,7 +5163,7 @@ fn evaluate_attribute_call(
                             None => unknown(),
                         };
                     }
-                    if strptime2_scan_format(&format_spelling).is_ok() {
+                    if strptime2_scan_format(&format_spelling, accept_weekday_abbreviation).is_ok() {
                         return match strptime2_parse(&format_spelling, &text_spelling, kernel) {
                             Some(value) => value,
                             None => unknown(),
@@ -4679,6 +5266,27 @@ fn evaluate_attribute_call(
             Some(value) => value,
             None => unknown(),
         };
+    }
+    // `dict[str, X]` PARAMETER'S own unbounded-key receiver
+    // (`Kind::ObjectStar` — `check.rs::seed_parameters`'
+    // `dict_star_value_seed`/`known_dict_star`): `.get(key)` is the ONE
+    // method this shape answers (`collection_models::dict_get_result`'s
+    // own dict-star arm) — checked ahead of, and separately from, the
+    // `Kind::Object` block below, since `.setdefault`/the dict-view
+    // methods that block also handles all assume a CLOSED receiver
+    // (`mutated_receiver`/`dict_with_item`/`dict_view_method_result`
+    // all read `container.keys` directly) and must never see an
+    // unbounded-key receiver.
+    if receiver.kind == Kind::ObjectStar && attribute.attr.as_str() == "get" {
+        let key = arguments.first();
+        let default = arguments.get(1);
+        if let Some(key) = key {
+            return match collection_models::dict_get_result(&receiver, key, default) {
+                Some(value) => value,
+                None => unknown(),
+            };
+        }
+        return unknown();
     }
     if receiver.kind == Kind::Object {
         if attribute.attr.as_str() == "get" {
@@ -5010,6 +5618,26 @@ fn evaluate_attribute_read(
                 return value;
             }
         }
+        // `sys.maxsize` — library/sys.rst: "the value of the largest
+        // Py_ssize_t... usually 2**31 - 1 on a 32-bit platform and
+        // 2**63 - 1 on a 64-bit platform", and always at least
+        // 2**31 - 1: the SPEC floor is the determinable claim, so the
+        // read answers the integer ray at or above it rather than
+        // pinning a platform's own exact value.
+        if module_name.id.as_str() == "sys" && environment.read("sys").is_none() && attribute.attr.as_str() == "maxsize" {
+            return AbstractValue {
+                kind_tag: Some(PrimitiveKind::Integer),
+                ..known_set(
+                    make_refined_set(vec![
+                        refined_sets::refinement_forms::integer(),
+                        refined_sets::refinement_forms::at_least(2147483647.0),
+                    ]),
+                    None,
+                    TrustSpec,
+                    SetKindTag::None,
+                )
+            };
+        }
     }
     // `super().<name>` READ, no call — functions.rst's `super()` entry:
     // "a typical superclass call looks like this: `super().method(arg)`."
@@ -5297,20 +5925,30 @@ fn comprehension_target_and_star_element<'a>(
 /// The star-shaped result of a list/set/generator comprehension over an
 /// unknown-length, known-element-set iterable
 /// (`comprehension_target_and_star_element`'s own doc): binds the
-/// target to the ONE element abstraction, evaluates every `if`
-/// condition against that single binding, and evaluates `elt` once —
+/// target to the ONE element abstraction and evaluates `elt` once —
 /// there is no per-element enumeration to run since the source length
-/// is unstated. `None` when a filter's truthiness cannot be decided FOR
-/// THE WHOLE ELEMENT SET (unlike the concrete path, which drops
-/// individual elements, a filter here either keeps every position or
-/// the comprehension is undecidable, since one shared element stands
-/// for all of them). A comprehension preserves the source's own length
-/// (mapping every position through `elt` changes no position's
-/// presence) — the result carries the SAME `{lo, hi}` window the source
-/// read back — UNLESS an `if` clause is present, in which case a filter
-/// can drop positions down to zero, so `lo` widens to 0 whenever
-/// `conditions` is non-empty; `hi` is unaffected either way (a filter
-/// only ever removes positions, never adds them).
+/// is unstated. The `if` clauses are NEVER evaluated for their
+/// truthiness here (unlike the concrete path, which drops individual
+/// elements one at a time): whether a given filter keeps or drops any
+/// one position is unknowable from a single shared element abstraction
+/// standing for the whole source, but that unknowability is exactly
+/// what the `lo` widening below already states — "some positions may
+/// not survive" — so a filter this file cannot decide narrows nothing
+/// FURTHER than a filter it could. `c-reads-and-values.py`'s own
+/// `math_min_max_over_declared_element_set` doc states the general
+/// law this composes: "every item the real call could draw IS a member
+/// of [the element set] (the star grammar's own definition)" — a
+/// filter can only ever SHRINK which positions of that same element
+/// set survive, never admit a value the source's own element set did
+/// not already admit, so the mapped result's window is sound whether
+/// or not the filter's own truthiness is legible. A comprehension
+/// preserves the source's own length (mapping every position through
+/// `elt` changes no position's presence) — the result carries the SAME
+/// `{lo, hi}` window the source read back — UNLESS an `if` clause is
+/// present, in which case a filter can drop positions down to zero, so
+/// `lo` widens to 0 whenever `conditions` is non-empty; `hi` is
+/// unaffected either way (a filter only ever removes positions, never
+/// adds them).
 ///
 /// SOUNDNESS LINE for `AbstractValue::same_length_as`: the result's
 /// length is proved EQUAL to the source's own length -- not merely
@@ -5332,9 +5970,6 @@ fn comprehension_star_elements(
         comprehension_target_and_star_element(generators, environment, kernel)?;
     let mut fork = environment.fork();
     if !bind_comprehension_target(&mut fork, &target_names, &element) {
-        return None;
-    }
-    if !conditions.is_empty() && comprehension_conditions_hold(conditions, &fork, kernel).is_none() {
         return None;
     }
     let mapped = evaluate_expression(element_expr, &fork, kernel);
@@ -5569,22 +6204,16 @@ fn evaluate_unary(
 /// does not pose. A kernel refusal reads as `None` through the same
 /// `catch_unwind` discipline `transfer_over_sets` keeps.
 fn negate_over_set(op: UnaryOp, operand: &AbstractValue, kernel: &Arc<RefinedTSKernel>) -> Option<AbstractValue> {
-    use refined_kernel::transfer_questions::TransferQuestionOp;
     if op != UnaryOp::USub || operand.kind != Kind::Set {
         return None;
     }
-    let (operand_set, sort) = transferable_numeric_operand(operand)?;
-    if sort != PrimitiveKind::Integer {
-        return None;
-    }
-    let grade = refined_domain::trust_grades::derived_trust_level(TrustProved, std::slice::from_ref(operand));
-    int_transfer_answer(
-        TransferQuestionOp::IntNeg,
-        operand_set,
-        make_refined_set(vec![]),
-        grade,
-        kernel,
-    )
+    // `-x` IS `0 - x` on every numeric operand (arith.11's negation is
+    // arith.1's exact subtraction from zero), so the same
+    // int-theory-first, float-window-fallback ladder the binary `-`
+    // rides (`transfer_over_sets`) answers the negation — including
+    // the general WINDOW arm the one-operand `int.neg` row lacks.
+    let zero = known_values(vec![0.0], PrimitiveKind::Integer, TrustProved);
+    transfer_over_sets(Operator::Sub, &zero, operand, kernel)
 }
 
 /// The single numeric value a known abstract value carries, if it
@@ -5913,6 +6542,17 @@ fn transferable_numeric_operand(value: &AbstractValue) -> Option<(RefinedSet, Pr
             Some(PrimitiveKind::Float) => PrimitiveKind::Float,
             Some(PrimitiveKind::Boolean) => PrimitiveKind::Integer,
             Some(PrimitiveKind::Number) => PrimitiveKind::Float,
+            // An untagged Set whose FORMS prove the integer sort — a
+            // bare `int` parameter's seed carries the `integer` form
+            // and no tag, and the form is the stronger claim anyway.
+            None if value
+                .set
+                .forms
+                .iter()
+                .any(|form| form.form == refined_sets::refinement_forms::Form::Integer) =>
+            {
+                PrimitiveKind::Integer
+            }
             _ => return None,
         };
         return Some((value.set.clone(), sort));
@@ -6197,6 +6837,28 @@ fn int_transfer_over_sets(
 /// land inside the f64-exact 2^53 window, or the singleton this builds
 /// would not be the number it names — the same window every other
 /// exactness gate in this file keeps.
+///
+/// `int.mul` (`boundary/python.lean`) only ever matches `exactIntOf`
+/// on BOTH sides — there is no general-window arm the way
+/// `int.floorDiv` carries (`intFloorDivWindow`), so `x << n` over a
+/// non-singleton `left_set` (the ordinary case: a seeded parameter
+/// range, never one known value) always reads back `.unknown` from
+/// `int.mul` and would decline outright with no further attempt. `x >>
+/// n` never needs this fallback — `int.floorDiv`'s own window arm
+/// already narrows a bounded integer dividend against the single-signed
+/// non-zero singleton divisor `factor_set` states.
+///
+/// The fallback asks the FLOAT image instead (`TransferQuestionOp::Mul`,
+/// `binary64.mul`'s enclosure decider, the same row `count * 2` already
+/// rides when `int.mul` declines on it — `transfer_over_sets`'s own
+/// `admitted_transfer_op` fallthrough). Multiplying an integer-sorted
+/// window by an exact power-of-two singleton already inside the
+/// f64-exact window (`factor`'s own gate above) never rounds — every
+/// product the float enclosure narrows to is the same exact integer
+/// `int.mul` would have named, had it read windows at all — so the
+/// answer re-tags Integer-sorted unconditionally, the identical
+/// `both_int` re-tagging `transfer_over_sets`'s general path performs
+/// for `Add`/`Sub`/`Mult` today.
 fn shift_as_int_composition(
     op: Operator,
     left_set: &RefinedSet,
@@ -6211,12 +6873,69 @@ fn shift_as_int_composition(
         return None;
     }
     let factor_set = make_refined_set(vec![one_of(&[factor])]);
-    let transfer_op = if op == Operator::LShift {
-        TransferQuestionOp::IntMul
-    } else {
-        TransferQuestionOp::IntFloorDiv
+    if op == Operator::RShift {
+        return int_transfer_answer(TransferQuestionOp::IntFloorDiv, left_set.clone(), factor_set, grade, kernel);
+    }
+    if let Some(answer) = int_transfer_answer(TransferQuestionOp::IntMul, left_set.clone(), factor_set.clone(), grade, kernel) {
+        return Some(answer);
+    }
+    float_mul_as_shift_fallback(left_set, &factor_set, grade, kernel)
+}
+
+/// The float-image `Mul` retry `shift_as_int_composition` takes for
+/// `<<` alone, once `int.mul`'s exact-singleton-only arm has already
+/// declined on a non-singleton `left_set`. Asks `binary64.mul`
+/// (`TransferQuestionOp::Mul`) the same two sets and re-tags whatever
+/// enclosure or exact values it narrows to as Integer-sorted — sound
+/// because `factor` is already gated to an exact power of two inside
+/// the f64-exact 2^53 window before this is ever called, so the float
+/// product of an integer-window dividend by that singleton never
+/// rounds away from the integer `int.mul` would have named. A
+/// non-integral or out-of-window float answer still declines
+/// (`int_transfer_answer`'s own guard, mirrored here since this
+/// function bypasses that helper to reuse the float `Mul` row instead
+/// of an `int.*` one).
+fn float_mul_as_shift_fallback(
+    left_set: &RefinedSet,
+    factor_set: &RefinedSet,
+    grade: TrustLevel,
+    kernel: &Arc<RefinedTSKernel>,
+) -> Option<AbstractValue> {
+    use refined_kernel::transfer_questions::TransferQuestionOp;
+    use refined_kernel::transfer_questions::TransferAnswerKind;
+    let nan_operand = refined_kernel::transfer_questions::PowOperandWire {
+        kind: refined_kernel::transfer_questions::PowOperandKind::NaN,
+        set: make_refined_set(vec![]),
     };
-    int_transfer_answer(transfer_op, left_set.clone(), factor_set, grade, kernel)
+    let asked = crate::kernel_ask::ask_kernel(|| {
+        (kernel.transfer)(&refined_kernel::transfer_questions::TransferQuestion {
+            op: TransferQuestionOp::Mul,
+            a: left_set.clone(),
+            b: factor_set.clone(),
+            c: 0.0,
+            base: nan_operand.clone(),
+            exp: nan_operand,
+        })
+    });
+    let answer = asked.ok()?;
+    match answer.kind {
+        TransferAnswerKind::Values => {
+            if answer.values.iter().any(|v| v.fract() != 0.0 || v.abs() >= 2f64.powi(53)) {
+                return None;
+            }
+            Some(known_values(answer.values, PrimitiveKind::Integer, grade))
+        }
+        TransferAnswerKind::Set => {
+            if !requires_integer(&answer.set) {
+                return None;
+            }
+            Some(AbstractValue {
+                kind_tag: Some(PrimitiveKind::Integer),
+                ..known_set(answer.set, None, grade, SetKindTag::None)
+            })
+        }
+        TransferAnswerKind::NaN | TransferAnswerKind::Unknown => None,
+    }
 }
 
 /// The SET path over `binary_arithmetic_value`'s own two-known-values
@@ -6393,6 +7112,139 @@ fn union_transfer_answers(
     }
 }
 
+/// `x ** k` over a SET-shaped `left_set` (a seeded parameter range, or a
+/// bounded set another transfer already produced) and a KNOWN exact
+/// integer exponent — `transfer_over_sets`'s own `Pow` row, once neither
+/// `binary_arithmetic_value`'s two-known-values path nor
+/// `int_transfer_over_sets`'s `int.pow` arm has already answered.
+/// `int.pow` (`boundary/python.lean`) matches `exactIntOf A` on the
+/// base only — a closed singleton, never a window — so an int-sorted
+/// range base (e.g. `x: Age` in `x**2`) always reads back `.unknown`
+/// from it and reaches here needing a different row entirely.
+///
+/// Poses the LANGUAGE-NEUTRAL `pow` wire question directly
+/// (`TransferQuestionOp::Pow`, `PowOperandWire::Set` on both `base` and
+/// `exp` — `transfer_questions.rs`'s own wire test is the citation for
+/// this shape) rather than a `python.` or `js.`-namespaced row: pow.lean's
+/// `transferPow` is ECMA-262-shaped in its NaN/unpinned branches, but its
+/// two WINDOW-READING sub-deciders are pure real-number math with no
+/// language dependence at all —
+///
+/// - `transferIntegerPow` (`theories/pow/binary64.lean`): an
+///   INTEGER-sorted base window (`A.int`) under an exact nonnegative
+///   integer exponent — repeated multiplication, exact while the
+///   corners fit `2^53`. This is the exact `int.pow` row Python's own
+///   boundary elects, generalized from a singleton base to a window
+///   one — the same "ask the shared theory when the language-owned arm
+///   has no window form of its own" composition
+///   `float_mul_as_shift_fallback` already performs for `<<`.
+/// - `transferRealPow` (`languages/javascript/powers_and_roots/
+///   approx_window.lean`): a NONNEGATIVE real (Float) base window under
+///   an exact integer exponent `1 ≤ k ≤ 64` — the corner powers bracket
+///   the true value, widened by the k-ulp approximation envelope. This
+///   is `m ** 2` (`Meters` in showcase.py's `bmi`): `m`'s own window is
+///   `[0.5, 2.5]`, entirely nonnegative, so the real-base branch serves
+///   it directly. A base window straddling or beneath zero is OUTSIDE
+///   what `transferRealPow` reads (`0 ≤ dl.num` its own gate) — Python's
+///   `**` on a negative float base and integer exponent is still real
+///   (unlike a fractional exponent, which goes complex), but proving that
+///   corner sound is future work; this composition declines it rather
+///   than guess.
+///
+/// The exponent must be a KNOWN exact integer in `[1, 64]`
+/// (`exact_nonnegative_integer`'s own f64-exact gate, further narrowed
+/// to the `1..=64` window both Lean deciders share) — a set-shaped or
+/// out-of-window exponent gives neither decider a `PowArg.value` to
+/// match, so this declines outright rather than pose a question neither
+/// row can answer. `x ** 0` is its own pinned branch below (answered
+/// directly, no kernel round trip — see that branch's own doc for why).
+/// A negative exponent is `binary_arithmetic_pair`'s own row when both
+/// operands are single values, and stays `unknown()` here for a SET
+/// base — outside this function's declared scope.
+fn pow_over_sets(
+    left_set: &RefinedSet,
+    left_sort: PrimitiveKind,
+    right: &AbstractValue,
+    grade: TrustLevel,
+    kernel: &Arc<RefinedTSKernel>,
+) -> Option<AbstractValue> {
+    use refined_kernel::transfer_questions::PowOperandKind;
+    use refined_kernel::transfer_questions::PowOperandWire;
+    use refined_kernel::transfer_questions::TransferAnswerKind;
+    use refined_kernel::transfer_questions::TransferQuestion;
+    use refined_kernel::transfer_questions::TransferQuestionOp;
+
+    let exponent = exact_nonnegative_integer(right)?;
+    // `x ** 0` is exactly `1` for EVERY `x` — expressions.rst's power
+    // operator row states no exception (unlike `0 ** negative`, which
+    // raises `ZeroDivisionError`, or a negative base under a fractional
+    // exponent, which goes complex): this is a closed pinned fact, not a
+    // window computation, so it answers directly rather than asking
+    // either Lean decider — neither `transferIntegerPow`
+    // (`A.int` only) nor `transferRealPow` (`1 ≤ k ≤ 64`, nonnegative
+    // base only) reads `k = 0` at all, and the shared classifier's own
+    // `k = 0` cell (`powCells`'s `e.may zero → addVal vs 1`) sits behind
+    // ECMA-shaped NaN/unpinned guards (`powNaN`'s own finite-negative-
+    // base branch) that do not hold for Python's own `**` — Python
+    // raises rather than answers NaN on the corner ECMA's classifier
+    // reads as NaN, so trusting that branch here would risk claiming a
+    // value on an input Python actually raises on. Answering `1`
+    // directly for `k = 0` sidesteps both: no base reading is needed at
+    // all for this one exponent value. Result sort matches the base's
+    // own sort exactly as the two-known-values `binary_arithmetic_pair`
+    // row already states for this same corner.
+    if exponent == 0.0 {
+        return Some(known_values(vec![1.0], left_sort, grade));
+    }
+    if exponent < 1.0 || exponent > 64.0 {
+        return None;
+    }
+    let exp_set = make_refined_set(vec![one_of(&[exponent])]);
+    let base_forms = if left_sort == PrimitiveKind::Integer {
+        let mut forms = left_set.forms.clone();
+        if !requires_integer(left_set) {
+            forms.push(integer());
+        }
+        forms
+    } else {
+        left_set.forms.clone()
+    };
+    let base_set = make_refined_set(base_forms);
+
+    let asked = crate::kernel_ask::ask_kernel(|| {
+        (kernel.transfer)(&TransferQuestion {
+            op: TransferQuestionOp::Pow,
+            a: make_refined_set(vec![]),
+            b: make_refined_set(vec![]),
+            c: 0.0,
+            base: PowOperandWire { kind: PowOperandKind::Set, set: base_set },
+            exp: PowOperandWire { kind: PowOperandKind::Set, set: exp_set },
+        })
+    })
+    .ok()?;
+
+    match asked.kind {
+        TransferAnswerKind::Values => {
+            if left_sort == PrimitiveKind::Integer
+                && asked.values.iter().any(|v| v.fract() != 0.0 || v.abs() >= 2f64.powi(53))
+            {
+                return None;
+            }
+            Some(known_values(asked.values, left_sort, grade))
+        }
+        TransferAnswerKind::Set => {
+            if left_sort == PrimitiveKind::Integer && !requires_integer(&asked.set) {
+                return None;
+            }
+            Some(AbstractValue {
+                kind_tag: Some(left_sort),
+                ..known_set(asked.set, None, grade, SetKindTag::None)
+            })
+        }
+        TransferAnswerKind::NaN | TransferAnswerKind::Unknown => None,
+    }
+}
+
 fn transfer_over_sets(
     op: Operator,
     left: &AbstractValue,
@@ -6426,6 +7278,18 @@ fn transfer_over_sets(
         if let Some(answer) = int_transfer_over_sets(op, right, &left_set, &right_set, grade, kernel) {
             return Some(answer);
         }
+    }
+    // `**` is absent from `admitted_transfer_op` (that row's own doc:
+    // "`Pow` has no float binary-arithmetic-transfer row in this
+    // family... a different question shape from the plain two-`RefinedSet`
+    // rows this function poses") — falling through to `admitted_transfer_op(op)?`
+    // below would decline `**` outright for any SET-shaped base, never
+    // asking the kernel at all. `pow_over_sets` poses the real `pow` wire
+    // question (`TransferQuestionOp::Pow`, `PowOperandWire::Set` on both
+    // sides) instead, so this returns here rather than joining the
+    // `admitted_transfer_op` dispatch.
+    if op == Operator::Pow {
+        return pow_over_sets(&left_set, left_sort, right, grade, kernel);
     }
     let transfer_op = admitted_transfer_op(op)?;
     // `Div`'s always-float override (arith.9: "the type is widened even
@@ -6528,6 +7392,19 @@ fn evaluate_binop(
 ) -> AbstractValue {
     let left = evaluate_expression(&binop.left, environment, kernel);
     let right = evaluate_expression(&binop.right, environment, kernel);
+    // `x ^ x` over ONE name is exactly {0}: any int XORed with itself
+    // (stdtypes.rst's binary bitwise table). Gated on the operand
+    // reading as an integer sort — a non-int operand raises TypeError
+    // at runtime instead of producing a value.
+    if binop.op == Operator::BitXor {
+        if let (Expr::Name(l), Expr::Name(r)) = (binop.left.as_ref(), binop.right.as_ref()) {
+            if l.id == r.id
+                && matches!(transferable_numeric_operand(&left), Some((_, PrimitiveKind::Integer)))
+            {
+                return known_values(vec![0.0], PrimitiveKind::Integer, TrustSpec);
+            }
+        }
+    }
     if let Some(value) = date_timedelta_binop_value(binop.op, &left, &right, kernel) {
         return value;
     }
@@ -7273,6 +8150,32 @@ fn call_provable_raise(
                 }
             }
         }
+        // `date.fromisoformat(<known malformed or calendrically invalid
+        // string>)` provably raises `ValueError` — see
+        // `date_fromisoformat_raises`'s own doc for the exact grammar and
+        // why a malformed string (`"13:45"`) raises the same as a
+        // syntactically-shaped but invalid one (`"2023-02-29"`). Reads the
+        // SAME receiver recognition (`is_datetime_date_attribute`) and
+        // argument shape (a single keyword-free positional) the value
+        // dispatch's own `date.fromisoformat` row uses, so the two
+        // dispatches agree on exactly which calls this construct owns.
+        if is_datetime_date_attribute(attribute.value.as_ref(), environment) && attribute.attr.as_str() == "fromisoformat" {
+            if let [text] = &*call.arguments.args {
+                if call.arguments.keywords.is_empty() {
+                    let argument = evaluate_expression(text, environment, kernel);
+                    if let Some(code_points) = exact_string_values(&argument) {
+                        if let Some(spelling) = code_points_to_string(code_points) {
+                            if date_fromisoformat_raises(&spelling, kernel) == Some(true) {
+                                return Some((
+                                    call.range(),
+                                    "this expression provably raises ValueError: Invalid isoformat string".to_owned(),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // `math.log`/`log2`/`log10`/`log1p`/`asin`/`acos`/`atanh`/`acosh`
         // of a KNOWN operand whose window is ENTIRELY inside CPython's
         // own raise domain provably raises `ValueError: math domain
@@ -7310,11 +8213,30 @@ fn call_provable_raise(
         // operand through the same domain gate the value rows use
         // (`integral_domain_admits`), so the value dispatch and this
         // raise dispatch agree on exactly which rounding calls raise.
+        //
+        // `rounding_argument_raises` reads a `Kind::Values` operand only
+        // (`single_numeric_operand`'s own gate) — a NaN-PRODUCING argument
+        // (`float("nan")`, `math.inf - math.inf`, …) never reaches that
+        // shape at all: `refinement_forms::element` refuses NaN at
+        // construction, so the domain answers the distinct `Kind::NaN`
+        // state (`nan_value()`) instead of a `Kind::Values` list holding a
+        // NaN element. This arm reads that state directly, the same
+        // pairing `binary_arithmetic_value`'s `inf - inf` row keeps for
+        // its own callers.
         if matches!(attribute.attr.as_str(), "floor" | "ceil" | "trunc") {
             if let Expr::Name(module_name) = attribute.value.as_ref() {
                 if module_name.id.as_str() == "math" && environment.read("math").is_none() {
                     let arguments: Vec<AbstractValue> =
                         call.arguments.args.iter().map(|arg| evaluate_expression(arg, environment, kernel)).collect();
+                    if let [only] = arguments.as_slice() {
+                        if only.kind == Kind::NaN {
+                            return Some((
+                                call.range(),
+                                "this expression provably raises ValueError: cannot convert float NaN to integer"
+                                    .to_owned(),
+                            ));
+                        }
+                    }
                     if let Some((exception, detail)) =
                         math_models::rounding_argument_raises(attribute.attr.as_str(), &arguments)
                     {
@@ -8074,6 +8996,113 @@ mod tests {
         let seven = known_values(vec![7.0], PrimitiveKind::Float, TrustProved);
         let result = binary_arithmetic_value_with_kernel(Operator::Mod, &age, &seven, &kernel);
         assert_eq!(result.kind, Kind::Unknown);
+    }
+
+    /// `count << 1` where `count` is a seeded Integer-sorted set `[0, 10]`
+    /// (`SmallCount` in `b-body-expressions.py`) — `shift_as_int_composition`
+    /// lowers `LShift` as `int.mul` against the singleton `{2**1}` (bits.2)
+    /// first, but `int.mul` (`boundary/python.lean`) only ever matches
+    /// `exactIntOf` on BOTH sides — it has no general-window arm the way
+    /// `int.floorDiv` does, so a non-singleton `left_set` like this one
+    /// always reads back `.unknown` from `int.mul` itself. The row this
+    /// test actually pins is the FALLBACK: `float_mul_as_shift_fallback`
+    /// retries the same two sets against the float image's `Mul`
+    /// (`binary64.mul`), which DOES narrow a bounded window times a
+    /// singleton, and re-tags the result Integer-sorted (sound: `factor`
+    /// is gated to an exact power of two inside the f64-exact window, so
+    /// the float product never rounds away from the integer `int.mul`
+    /// would have named). The fixture's own
+    /// `int_left_shift_over_declared_range` row states the window this
+    /// pins: "`count << 1` is `count * 2`, 0..20" — worked by hand,
+    /// `binary64.mul([0, 10], {2})` is the exact range `[0, 20]`.
+    #[test]
+    fn test_left_shift_over_an_int_sorted_set_serves_the_float_mul_fallback() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let count = known_set(
+            make_refined_set(vec![integer(), at_least(0.0), refined_sets::refinement_forms::at_most(10.0)]),
+            None,
+            TrustProved,
+            SetKindTag::None,
+        );
+        let count = AbstractValue { kind_tag: Some(PrimitiveKind::Integer), ..count };
+        let one = known_values(vec![1.0], PrimitiveKind::Integer, TrustProved);
+        let result = binary_arithmetic_value_with_kernel(Operator::LShift, &count, &one, &kernel);
+        assert_eq!(result.kind, Kind::Set);
+        assert_eq!(result.kind_tag, Some(PrimitiveKind::Integer));
+        let want = make_refined_set(vec![integer(), at_least(0.0), refined_sets::refinement_forms::at_most(20.0)]);
+        assert!((kernel.scalar_subset)(&result.set, &want), "result {:?} not ⊆ want {:?}", result.set, want);
+        assert!((kernel.scalar_subset)(&want, &result.set), "want {:?} not ⊆ result {:?}", want, result.set);
+    }
+
+    /// `n >> 1` — the same composition on the OTHER shift, `int.floorDiv`
+    /// against `{2**1}` (bits.1). `count` reuses `int_left_shift...`'s own
+    /// `[0, 10]` set; `int.floorDiv([0, 10], {2})` is `[0, 5]`.
+    #[test]
+    fn test_right_shift_over_an_int_sorted_set_serves_the_floor_div_composition() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let count = known_set(
+            make_refined_set(vec![integer(), at_least(0.0), refined_sets::refinement_forms::at_most(10.0)]),
+            None,
+            TrustProved,
+            SetKindTag::None,
+        );
+        let count = AbstractValue { kind_tag: Some(PrimitiveKind::Integer), ..count };
+        let one = known_values(vec![1.0], PrimitiveKind::Integer, TrustProved);
+        let result = binary_arithmetic_value_with_kernel(Operator::RShift, &count, &one, &kernel);
+        assert_eq!(result.kind, Kind::Set);
+        assert_eq!(result.kind_tag, Some(PrimitiveKind::Integer));
+        let want = make_refined_set(vec![integer(), at_least(0.0), refined_sets::refinement_forms::at_most(5.0)]);
+        assert!((kernel.scalar_subset)(&result.set, &want), "result {:?} not ⊆ want {:?}", result.set, want);
+        assert!((kernel.scalar_subset)(&want, &result.set), "want {:?} not ⊆ result {:?}", want, result.set);
+    }
+
+    /// `m ** 2` where `m` is a Float-sorted set `[0.5, 2.5]` (showcase.py's
+    /// `Meters`, `bmi`'s own `m**2` step) — `pow_over_sets`' nonnegative-
+    /// real-base composition (`transferRealPow`): `pow([0.5, 2.5], {2})`
+    /// widens by the k-ulp approximation envelope around the exact
+    /// corners `0.25`/`6.25`. This is the row that was UNREACHABLE before
+    /// this wave's own wire-op fix (`transfer_questions.rs::transfer_wire`
+    /// spelled the `Pow` op `"pow"`, never matching the boundary's own
+    /// `"pow.binary64"` dispatch arm — every `Pow` transfer question, from
+    /// any caller, silently read back `.unknown` regardless of the
+    /// operand shape).
+    #[test]
+    fn test_float_pow_over_a_set_base_serves_the_real_pow_window() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let m = known_set(
+            make_refined_set(vec![at_least(0.5), refined_sets::refinement_forms::at_most(2.5)]),
+            None,
+            TrustProved,
+            SetKindTag::None,
+        );
+        let m = AbstractValue { kind_tag: Some(PrimitiveKind::Float), ..m };
+        let two = known_values(vec![2.0], PrimitiveKind::Integer, TrustProved);
+        let result = binary_arithmetic_value_with_kernel(Operator::Pow, &m, &two, &kernel);
+        assert_eq!(result.kind, Kind::Set);
+        assert_eq!(result.kind_tag, Some(PrimitiveKind::Float));
+        // the k-ulp envelope widens slightly past the exact corners —
+        // asserting CONTAINMENT of the exact window rather than equality,
+        // since the precise widened bound is the kernel's own approximated
+        // step, not a value this file computes independently
+        let exact = make_refined_set(vec![at_least(0.25), refined_sets::refinement_forms::at_most(6.25)]);
+        assert!((kernel.scalar_subset)(&exact, &result.set), "exact window {:?} not ⊆ result {:?}", exact, result.set);
+    }
+
+    /// `x ** 0` is exactly `1` for EVERY `x`, including an UNBOUNDED
+    /// Float-sorted set — `pow_over_sets`' own pinned `k = 0` branch,
+    /// answered directly rather than through either Lean window decider
+    /// (neither reads an exponent of `0`). showcase.py's own
+    /// `anything_to_the_zeroth(x: float) -> ExactlyOne` is this row: `x`
+    /// carries no declared bound at all.
+    #[test]
+    fn test_pow_zero_exponent_over_an_unbounded_set_answers_one() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let x = AbstractValue { kind_tag: Some(PrimitiveKind::Float), ..known_set(make_refined_set(vec![]), None, TrustProved, SetKindTag::None) };
+        let zero = known_values(vec![0.0], PrimitiveKind::Integer, TrustProved);
+        let result = binary_arithmetic_value_with_kernel(Operator::Pow, &x, &zero, &kernel);
+        assert_eq!(result.kind, Kind::Values);
+        assert_eq!(result.kind_tag, Some(PrimitiveKind::Float));
+        assert_eq!(result.values, vec![1.0]);
     }
 
     /// Two known single values over an admitted operator (`+`) still
@@ -9407,6 +10436,47 @@ mod tests {
         assert!(provable_raise_of("math.sqrt(4)").is_none());
     }
 
+    /// `date.fromisoformat("2023-02-29")`/`"2023-04-31"` — syntactically
+    /// `YYYY-MM-DD`-shaped but calendrically invalid (2023 is not a leap
+    /// year; April has 30 days). `test_date_fromisoformat_of_a_
+    /// calendrically_invalid_string_declines` already pins the VALUE side
+    /// (`Kind::Unknown`); this pins the matching RAISE-side determination
+    /// `date_fromisoformat_raises` adds.
+    #[test]
+    fn test_provable_raise_date_fromisoformat_of_a_calendrically_invalid_string() {
+        for source in ["datetime.date.fromisoformat(\"2023-02-29\")", "datetime.date.fromisoformat(\"2023-04-31\")"] {
+            let Some(found) = provable_raise_of(source) else {
+                if loaded_kernel().is_none() {
+                    return;
+                }
+                panic!("{source} must provably raise");
+            };
+            assert!(found.1.contains("ValueError"), "{source}: {}", found.1);
+        }
+    }
+
+    /// `date.fromisoformat("13:45")` — a clock time, not a date: no
+    /// hyphens at all, so the strict `YYYY-MM-DD` split never even
+    /// produces three parts. CPython's own `fromisoformat` raises
+    /// `ValueError` on any string outside its accepted grammar, the same
+    /// as a calendrically invalid one — `date_fromisoformat_raises`'s own
+    /// doc states why both shapes fire the identical row.
+    #[test]
+    fn test_provable_raise_date_fromisoformat_of_a_non_date_string() {
+        let Some(found) = provable_raise_of("datetime.date.fromisoformat(\"13:45\")") else {
+            if loaded_kernel().is_none() {
+                return;
+            }
+            panic!("datetime.date.fromisoformat(\"13:45\") must provably raise");
+        };
+        assert!(found.1.contains("ValueError"), "{}", found.1);
+    }
+
+    #[test]
+    fn test_provable_raise_date_fromisoformat_of_a_valid_string_declines() {
+        assert!(provable_raise_of("datetime.date.fromisoformat(\"2024-03-01\")").is_none());
+    }
+
     /// `math.log(-2)`/`math.log2(-2)`/`math.log10(-2)`: a KNOWN operand
     /// entirely inside CPython's raise domain (`x <= 0`) fires the
     /// determined "math domain error" finding, one shared row per
@@ -10345,37 +11415,87 @@ mod tests {
         assert_eq!(datetime_field(&value, "year"), Some(1969.0));
     }
 
-    /// `datetime.datetime.strptime("2024-03-01 +0000", "%Y-%m-%d %z")` —
-    /// `%z` is named in the AGENT-BRIEF's own unread-directive list; this
-    /// format's `%Y`/`%m`/`%d` are each transcribed, but `%z` itself is
-    /// not, so `strptime2_scan_format` declines the WHOLE format,
-    /// naming `%z` specifically (`Strptime2Decline::UnreadDirective('z')`)
-    /// rather than treating the format as an unrecognized sequence in
-    /// general — this test exists to prove the decline names ONE
-    /// directive, not the whole string, even though this file has no
-    /// channel today to surface that name as a diagnostic (the dispatch
-    /// site's own comment states the same standing limitation STAGE 1
-    /// already carries).
+    /// `datetime.datetime.strptime("2024-03-01", "%G-%m-%d")` — `%G`
+    /// (the ISO 8601 year) is not in `strptime2_scan_format`'s
+    /// transcribed-directive list and is not a locale directive; this
+    /// format's `%m`/`%d` are each transcribed, but `%G` itself is not,
+    /// so `strptime2_scan_format` declines the WHOLE format, naming `%G`
+    /// specifically (`Strptime2Decline::UnreadDirective('G')`) rather
+    /// than treating the format as an unrecognized sequence in general —
+    /// this test exists to prove the decline names ONE directive, not
+    /// the whole string, even though this file has no channel today to
+    /// surface that name as a diagnostic (the dispatch site's own
+    /// comment states the same standing limitation STAGE 1 already
+    /// carries).
     #[test]
-    fn test_strptime_stage_2_names_an_unread_directive_z_and_declines() {
-        let format = "%Y-%m-%d %z";
-        assert_eq!(strptime2_scan_format(format), Err(Strptime2Decline::UnreadDirective('z')));
-        let Some(value) = eval("datetime.datetime.strptime(\"2024-03-01 +0000\", \"%Y-%m-%d %z\")") else { return };
+    fn test_strptime_stage_2_names_an_unread_directive_g_and_declines() {
+        let format = "%G-%m-%d";
+        assert_eq!(strptime2_scan_format(format, false), Err(Strptime2Decline::UnreadDirective('G')));
+        let Some(value) = eval("datetime.datetime.strptime(\"2024-03-01\", \"%G-%m-%d\")") else { return };
         assert_eq!(value.kind, Kind::Unknown);
     }
 
-    /// `datetime.datetime.strptime("Mon 2024-03-01", "%a %Y-%m-%d")` —
-    /// `%a` is a LOCALE directive (datetime.rst note (1)): a genuinely
-    /// distinct construct from an unread-but-buildable directive, since
-    /// no host-independent value set exists for it at all. This test
-    /// pins that `strptime2_scan_format` answers the LOCALE decline
-    /// shape specifically (`Strptime2Decline::LocaleDirective('a')`),
-    /// never the plain unread-directive shape `%z`'s own test pins.
+    /// `datetime.datetime.strptime("Mon 2024-03-01", "%a %Y-%m-%d")`,
+    /// evaluated in a plain environment with no `locale_never_set`
+    /// premise set (`eval`'s own `empty_environment`, matching every
+    /// module this checker has not yet proved never calls
+    /// `locale.setlocale`). `strptime2_scan_format` still names `%a`'s
+    /// own distinct reason (`WeekdayAbbreviation`, never the six-
+    /// directive `LocaleDirective` shape `%A`/`%b`/etc. take) when the
+    /// caller does not accept it — the premise gate at the dispatch
+    /// site decides determined vs. undetermined, not this scan alone.
     #[test]
-    fn test_strptime_stage_2_names_the_locale_directive_a_as_its_own_distinct_reason() {
+    fn test_strptime_stage_2_names_the_weekday_abbreviation_a_as_its_own_distinct_reason() {
         let format = "%a %Y-%m-%d";
-        assert_eq!(strptime2_scan_format(format), Err(Strptime2Decline::LocaleDirective('a')));
+        assert_eq!(strptime2_scan_format(format, false), Err(Strptime2Decline::WeekdayAbbreviation));
         let Some(value) = eval("datetime.datetime.strptime(\"Mon 2024-03-01\", \"%a %Y-%m-%d\")") else { return };
+        assert_eq!(value.kind, Kind::Unknown);
+    }
+
+    /// The SAME `"Mon 2024-03-01"` / `"%a %Y-%m-%d"` pair, now
+    /// evaluated against an environment carrying the C-locale premise
+    /// (`locale_never_set = true` — this module never calls
+    /// `locale.setlocale`, `module_never_calls_setlocale`'s own doc).
+    /// `%a`'s own value set IS host-independent under that premise
+    /// (POSIX's portable `'C'` locale, `read_weekday_abbreviation_
+    /// field`'s own fixed ASCII table), so the SAME format that stays
+    /// `Unknown` above now determines a real construction — `strptime2_
+    /// scan_format`'s own `accept_weekday_abbreviation = true` arm
+    /// treats `%a` as a transcribed directive, so `strptime2_parse` runs
+    /// (`%a`'s own weekday value is read and range-checked but not
+    /// folded into the constructed instance, `strptime2_parse`'s own
+    /// doc — the same "read but not carried" convention `%U`/`%W`
+    /// already take).
+    #[test]
+    fn test_strptime_stage_2_reads_weekday_abbreviation_under_the_c_locale_premise() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let parsed = parse_expression("datetime.datetime.strptime(\"Mon 2024-03-01\", \"%a %Y-%m-%d\")").expect("test source parses");
+        let expression = parsed.into_expr();
+        let mut environment = empty_environment();
+        environment.set_locale_never_set(true);
+        let value = evaluate_expression(&expression, &environment, &kernel);
+        assert_eq!(value.kind, Kind::Object);
+        assert_eq!(datetime_field(&value, "year"), Some(2024.0));
+        assert_eq!(datetime_field(&value, "month"), Some(3.0));
+        assert_eq!(datetime_field(&value, "day"), Some(1.0));
+    }
+
+    /// A weekday abbreviation the C-locale table does not recognize
+    /// (`"Xyz"`, not one of `Sun`/`Mon`/…/`Sat`) — even under the
+    /// premise, `read_weekday_abbreviation_field` returns `None` for
+    /// text it cannot match, so `strptime2_parse` itself declines this
+    /// text/format pair (`None`, not a wrong weekday folded in), and the
+    /// dispatch's own `unknown()` fallback answers — proving the premise
+    /// widens WHICH FORMATS are attempted, never what a mismatched text
+    /// is allowed to mean.
+    #[test]
+    fn test_strptime_stage_2_declines_an_unrecognized_weekday_abbreviation_even_under_the_premise() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let parsed = parse_expression("datetime.datetime.strptime(\"Xyz 2024-03-01\", \"%a %Y-%m-%d\")").expect("test source parses");
+        let expression = parsed.into_expr();
+        let mut environment = empty_environment();
+        environment.set_locale_never_set(true);
+        let value = evaluate_expression(&expression, &environment, &kernel);
         assert_eq!(value.kind, Kind::Unknown);
     }
 
@@ -11567,51 +12687,37 @@ mod tests {
     /// without panicking and keeps the length-based fallback exactly as
     /// if the `[:n]` arm had never matched.
     ///
-    /// This test's original premise (before this rewrite) built the
-    /// declining operand as a `Union` of two SCALAR string tuples
-    /// (`string_tuple("a")`, `string_tuple("b")`), citing
-    /// `prefix_read.lean`'s doc that "a Union operand is not read." That
-    /// doc names `seqWindowOf`'s own top-level match on `R = Union A B`
-    /// — it does not cover a Union appearing as a `Concatenation`
-    /// operand. `Refinement.Union A B => A.scalarB && B.scalarB`
-    /// (`emptiness.lean`) makes a Union of two scalar sets itself
-    /// scalar, so `seqWindowOf`'s `if R.scalarB then some (R, 1, some 1)`
-    /// fast path recognized that operand directly — the kernel measured
-    /// `Some(...)`, not `None`, so the original premise was stale, not a
-    /// regression (`packages/refinedpy/rust/refined_sets/src/../.. /
-    /// set_functions/emptiness.lean:40`, `prefix_read.lean:238-252`).
-    ///
-    /// The genuinely-declining shape is a Union of two NON-scalar
-    /// window operands (two `Repeat`s over different alphabets):
-    /// `Refinement.Union`'s scalar check fails (neither side is
-    /// scalar), so the bare `Union` never matches `seqWindowOf`'s
-    /// `if R.scalarB` fast path, and `seqWindowOf`'s own `match R with`
-    /// has no arm for a bare `Union` at all — it falls to the wildcard
-    /// `_ => none`. Nested as the `Concatenation`'s left operand, the
-    /// recursive `seqWindowOf A` call on that Union gets `none` back,
-    /// so the whole ask still declines.
+    /// The declining shape is a `Difference` operand nested inside a
+    /// `Concatenation`: `seqWindowOf` (`prefix_read.lean`) reads scalar
+    /// sets, the empty tuple, `Star`/`Repeat` of a scalar set, and
+    /// folds `Concatenation`/`Union` of recognized operands — its own
+    /// doc names `Difference` as the permanent decline ("no window
+    /// claim is safe there since the removed piece can itself be
+    /// unbounded"), so the recursive `seqWindowOf A` call on the
+    /// `Difference` operand gets `none` back and the whole ask
+    /// declines.
     #[test]
     fn test_slice_prefix_completes_without_panic_when_the_kernel_itself_declines() {
         let Some(kernel) = loaded_kernel() else { return };
         let window_a = make_refined_set(vec![repeat_of(one_char_of("ab"), 1, Some(4))]);
         let window_b = make_refined_set(vec![repeat_of(one_char_of("cd"), 1, Some(4))]);
-        let unrecognized_union_operand =
-            make_refined_set(vec![refined_sets::refinement_forms::union(window_a, window_b)]);
+        let unrecognized_difference_operand =
+            make_refined_set(vec![refined_sets::refinement_forms::difference(window_a, window_b)]);
         let literal = refined_sets::codepoint_sets::string_tuple("xxxxxxxx");
-        let concatenation_with_a_union_operand = make_refined_set(vec![
-            refined_sets::refinement_forms::concatenation(unrecognized_union_operand, literal),
+        let concatenation_with_a_difference_operand = make_refined_set(vec![
+            refined_sets::refinement_forms::concatenation(unrecognized_difference_operand, literal),
         ]);
         // pin the ask-level premise directly: seqWindowOf must still
         // decline this shape, or the rest of the test would be testing
         // nothing
         assert_eq!(
-            (kernel.seq_prefix)(&concatenation_with_a_union_operand, 3),
+            (kernel.seq_prefix)(&concatenation_with_a_difference_operand, 3),
             None,
-            "a Concatenation over a Union of non-scalar window operands must still decline (seqWindowOf's own named edge)"
+            "a Concatenation over a Difference operand must still decline (seqWindowOf's own named permanent decline)"
         );
         let receiver = AbstractValue {
             kind_tag: None,
-            ..known_set(concatenation_with_a_union_operand, None, TrustProved, SetKindTag::None)
+            ..known_set(concatenation_with_a_difference_operand, None, TrustProved, SetKindTag::None)
         };
         let mut environment = empty_environment();
         environment.bind("padded", receiver);

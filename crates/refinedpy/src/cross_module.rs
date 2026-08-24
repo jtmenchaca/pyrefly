@@ -47,7 +47,7 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use refined_domain::abstract_value::{AbstractValue, ObjectKey};
@@ -65,7 +65,7 @@ use crate::function_table::{
     function_table_from_module, merged, FunctionTable, ENTRY_MODULE,
 };
 use crate::instances::{class_table, ClassModel};
-use crate::surface::{compile_aliases, surface_imports};
+use crate::surface::{compile_aliases, surface_imports, AliasEntry};
 
 /// How a module NAME becomes a parsed module: the CLI resolves a
 /// sibling `.py` file on disk (`disk_resolver`), the LSP resolves
@@ -74,26 +74,24 @@ use crate::surface::{compile_aliases, surface_imports};
 /// closure, so the surface reader stays host-agnostic.
 pub type ModuleResolver<'a> = &'a dyn Fn(&str) -> Option<ModModule>;
 
-/// How deep an import chain is followed before `module_surface` stops
-/// resolving further imports (a re-export chain, a star-reexport of a
-/// star-reexport, …). A cap rather than cycle detection: the corpus's
-/// deepest chain (`d-module-surface.py` → `d_star_reexport.py` →
-/// `d_helper.py`, two hops) is far inside it, and a cap is the simpler
-/// answer to the same "stop eventually" requirement a visited-set would
-/// give, with no `HashSet` threaded through every recursive call.
-pub const IMPORT_DEPTH_CAP: u32 = 8;
-
 /// One module's readable surface: its own top-level plain bindings
 /// (`x = value`, string-annotated `AnnAssign`s), its own top-level
 /// `def`s (via `FunctionTable`), its own top-level classes (via
-/// `ClassModel`), AND every binding/function/class an import statement
-/// pulled in under a local name — a `from X import a` lands `a` in
-/// `bindings`/`functions`/`classes` exactly where a same-module `def`
-/// or plain assignment would.
+/// `ClassModel`), its own refinement aliases (`type Age = Annotated[…]`),
+/// AND every binding/function/class/alias an import statement pulled in
+/// under a local name — a `from X import a` lands `a` in
+/// `bindings`/`functions`/`classes`/`aliases` exactly where a
+/// same-module declaration would.
+///
+/// An import chain is followed to its end; a module already on the
+/// chain being built (an import cycle) contributes only what it had
+/// declared so far, the way the import system itself leaves a partially
+/// initialized module — never a guess, never a depth cap.
 pub struct ModuleSurface {
     pub bindings: HashMap<String, AbstractValue>,
     pub functions: Arc<FunctionTable>,
     pub classes: Arc<HashMap<String, ClassModel>>,
+    pub aliases: HashMap<String, AliasEntry>,
 }
 
 /// The pre-`FunctionTable` accumulator this file builds while folding
@@ -125,24 +123,26 @@ pub fn module_surface(
     module: &ModModule,
     resolver: ModuleResolver,
     kernel: &Arc<RefinedTSKernel>,
-    depth: u32,
 ) -> ModuleSurface {
-    module_surface_of(module, ENTRY_MODULE, resolver, kernel, depth)
+    let mut visiting = vec![ENTRY_MODULE.to_owned()];
+    module_surface_of(module, ENTRY_MODULE, resolver, kernel, &mut visiting)
 }
 
 /// `module_surface`'s own construction for a module whose NAME is known
 /// — the name a resolver was asked for. Every def this module declares
 /// itself is stamped with that name, so its summary key names the module
 /// it really came from; an imported def keeps the stamp of ITS own
-/// source module, one hop further out.
+/// source module, one hop further out. `visiting` is the chain of module
+/// names whose surfaces are being built right now; an import naming one
+/// of them is a cycle and is not followed.
 pub fn module_surface_of(
     module: &ModModule,
     module_name: &str,
     resolver: ModuleResolver,
     kernel: &Arc<RefinedTSKernel>,
-    depth: u32,
+    visiting: &mut Vec<String>,
 ) -> ModuleSurface {
-    let aliases = compile_aliases(module);
+    let mut aliases = compile_aliases(module);
     let imports = surface_imports(module);
     let mut classes = class_table(module, &aliases, &imports, kernel);
 
@@ -164,17 +164,17 @@ pub fn module_surface_of(
 
     let mut defs: DefsByLocalName = own_top_level_defs(module, module_name);
 
-    if depth > 0 {
-        for stmt in module.body.iter() {
-            match stmt {
-                Stmt::ImportFrom(import) if import.level == 0 => {
-                    fold_import_from(import, resolver, kernel, depth, &mut bindings, &mut defs, &mut classes);
-                }
-                Stmt::Import(import) => {
-                    fold_import(import, resolver, kernel, depth, &mut bindings);
-                }
-                _ => {}
+    for stmt in module.body.iter() {
+        match stmt {
+            Stmt::ImportFrom(import) => {
+                fold_import_from(
+                    import, resolver, kernel, visiting, &mut bindings, &mut defs, &mut classes, &mut aliases,
+                );
             }
+            Stmt::Import(import) => {
+                fold_import(import, resolver, kernel, visiting, &mut bindings);
+            }
+            _ => {}
         }
     }
 
@@ -184,7 +184,28 @@ pub fn module_surface_of(
         bindings,
         functions,
         classes: Arc::new(classes),
+        aliases,
     }
+}
+
+/// Resolves and builds the surface of an imported module unless it is
+/// already being built (an import cycle), in which case it contributes
+/// nothing — the same answer the import system gives a module read
+/// before its body finished.
+fn imported_surface(
+    source_name: &str,
+    resolver: ModuleResolver,
+    kernel: &Arc<RefinedTSKernel>,
+    visiting: &mut Vec<String>,
+) -> Option<(ModModule, ModuleSurface)> {
+    if visiting.iter().any(|name| name == source_name) {
+        return None;
+    }
+    let source_module = resolver(source_name)?;
+    visiting.push(source_name.to_owned());
+    let surface = module_surface_of(&source_module, source_name, resolver, kernel, visiting);
+    visiting.pop();
+    Some((source_module, surface))
 }
 
 /// This module's own top-level `def`s, cloned out under their OWN
@@ -303,28 +324,32 @@ fn fold_import_from(
     import: &StmtImportFrom,
     resolver: ModuleResolver,
     kernel: &Arc<RefinedTSKernel>,
-    depth: u32,
+    visiting: &mut Vec<String>,
     bindings: &mut HashMap<String, AbstractValue>,
     defs: &mut DefsByLocalName,
     classes: &mut HashMap<String, ClassModel>,
+    aliases: &mut HashMap<String, AliasEntry>,
 ) {
-    let Some(source_name) = import.module.as_ref() else {
+    // The resolver key carries the relative level as leading dots, the
+    // way the source spells it: `from ..a.b import x` resolves "..a.b".
+    let dotted = import.module.as_ref().map(|name| name.id.to_string()).unwrap_or_default();
+    let source_name = format!("{}{}", ".".repeat(import.level as usize), dotted);
+    if source_name.is_empty() {
+        return;
+    }
+    let Some((source_module, source_surface)) = imported_surface(&source_name, resolver, kernel, visiting)
+    else {
         return;
     };
-    let Some(source_module) = resolver(source_name.id.as_str()) else {
-        return;
-    };
-    let source_surface =
-        module_surface_of(&source_module, source_name.id.as_str(), resolver, kernel, depth - 1);
 
     for alias in &import.names {
         let imported_name = alias.name.id.as_str();
         if imported_name == "*" {
-            fold_star_import(&source_module, &source_surface, bindings, defs, classes);
+            fold_star_import(&source_module, &source_surface, bindings, defs, classes, aliases);
             continue;
         }
         let local_name = alias.asname.as_ref().unwrap_or(&alias.name).id.as_str();
-        pull_member(imported_name, local_name, &source_surface, bindings, defs, classes);
+        pull_member(imported_name, local_name, &source_surface, bindings, defs, classes, aliases);
     }
 }
 
@@ -345,9 +370,13 @@ fn pull_member(
     bindings: &mut HashMap<String, AbstractValue>,
     defs: &mut DefsByLocalName,
     classes: &mut HashMap<String, ClassModel>,
+    aliases: &mut HashMap<String, AliasEntry>,
 ) {
     if let Some(value) = source.bindings.get(imported_name) {
         bindings.insert(local_name.to_owned(), value.clone());
+    }
+    if let Some(alias) = source.aliases.get(imported_name) {
+        aliases.insert(local_name.to_owned(), alias.clone());
     }
     if let Some(def) = source.functions.def(imported_name) {
         // the def keeps the module stamp `source`'s own table holds for
@@ -412,20 +441,26 @@ fn fold_star_import(
     bindings: &mut HashMap<String, AbstractValue>,
     defs: &mut DefsByLocalName,
     classes: &mut HashMap<String, ClassModel>,
+    aliases: &mut HashMap<String, AliasEntry>,
 ) {
     match literal_dunder_all(source_module) {
         Some(names) => {
             for name in &names {
-                pull_member(name, name, source, bindings, defs, classes);
+                pull_member(name, name, source, bindings, defs, classes, aliases);
             }
         }
         None => {
-            let public_binding_names: Vec<String> =
-                source.bindings.keys().filter(|name| !name.starts_with('_')).cloned().collect();
-            let public_class_names: Vec<String> =
-                source.classes.keys().filter(|name| !name.starts_with('_')).cloned().collect();
-            for name in public_binding_names.iter().chain(public_class_names.iter()) {
-                pull_member(name, name, source, bindings, defs, classes);
+            let public = |name: &&String| !name.starts_with('_');
+            let names: Vec<String> = source
+                .bindings
+                .keys()
+                .filter(public)
+                .chain(source.classes.keys().filter(public))
+                .chain(source.aliases.keys().filter(public))
+                .cloned()
+                .collect();
+            for name in &names {
+                pull_member(name, name, source, bindings, defs, classes, aliases);
             }
         }
     }
@@ -485,16 +520,14 @@ fn fold_import(
     import: &StmtImport,
     resolver: ModuleResolver,
     kernel: &Arc<RefinedTSKernel>,
-    depth: u32,
+    visiting: &mut Vec<String>,
     bindings: &mut HashMap<String, AbstractValue>,
 ) {
     for alias in &import.names {
         let module_name = alias.name.id.as_str();
-        let Some(source_module) = resolver(module_name) else {
+        let Some((_, source_surface)) = imported_surface(module_name, resolver, kernel, visiting) else {
             continue;
         };
-        let source_surface =
-            module_surface_of(&source_module, module_name, resolver, kernel, depth - 1);
         let local_name = alias.asname.as_ref().unwrap_or(&alias.name).id.as_str();
         let entries: Vec<ObjectKey> = source_surface
             .bindings
@@ -520,14 +553,48 @@ fn fold_import(
 /// treat "unresolved" as "contributes nothing."
 pub fn disk_resolver(entry_directory: PathBuf) -> impl Fn(&str) -> Option<ModModule> {
     move |module_name: &str| {
-        if module_name.contains('.') {
-            return None;
-        }
-        let path = entry_directory.join(format!("{module_name}.py"));
+        let path = module_path(&entry_directory, module_name)?;
         let source = fs::read_to_string(&path).ok()?;
         let parsed = ruff_python_parser::parse_module(&source).ok()?;
         Some(parsed.into_syntax())
     }
+}
+
+/// Maps a module name to a file the way the import system does. Leading
+/// dots are the relative level (one dot is the entry directory itself,
+/// each further dot one parent up). An absolute dotted name is looked up
+/// against the entry directory and then each of its ancestors in turn —
+/// the nearest ancestor that contains the path is the import root. Each
+/// segment is a directory, the last one a `.py` file or a package's
+/// `__init__.py`.
+fn module_path(entry_directory: &Path, module_name: &str) -> Option<PathBuf> {
+    let level = module_name.bytes().take_while(|byte| *byte == b'.').count();
+    let segments: Vec<&str> = module_name[level..].split('.').filter(|s| !s.is_empty()).collect();
+    if segments.is_empty() {
+        return None;
+    }
+    if level > 0 {
+        let mut base = entry_directory.to_path_buf();
+        for _ in 1..level {
+            base = base.parent()?.to_path_buf();
+        }
+        return module_under(&base, &segments);
+    }
+    entry_directory.ancestors().find_map(|root| module_under(root, &segments))
+}
+
+fn module_under(root: &Path, segments: &[&str]) -> Option<PathBuf> {
+    let mut path = root.to_path_buf();
+    for segment in &segments[..segments.len() - 1] {
+        path = path.join(segment);
+    }
+    let last = segments[segments.len() - 1];
+    let file = path.join(format!("{last}.py"));
+    if file.is_file() {
+        return Some(file);
+    }
+    let package = path.join(last).join("__init__.py");
+    package.is_file().then_some(package)
 }
 
 #[cfg(test)]
@@ -569,7 +636,7 @@ mod tests {
         let Some(kernel) = loaded_kernel() else { return };
         let module = parsed("forty = 40\n");
         let resolver = map_resolver(HashMap::new());
-        let surface = module_surface(&module, &resolver, &kernel, IMPORT_DEPTH_CAP);
+        let surface = module_surface(&module, &resolver, &kernel);
         assert_eq!(surface.bindings.get("forty"), Some(&integer(40.0)));
     }
 
@@ -582,7 +649,7 @@ mod tests {
         sources.insert("helper", "forty = 40\n");
         let entry = parsed("from helper import forty\n");
         let resolver = map_resolver(sources);
-        let surface = module_surface(&entry, &resolver, &kernel, IMPORT_DEPTH_CAP);
+        let surface = module_surface(&entry, &resolver, &kernel);
         assert_eq!(surface.bindings.get("forty"), Some(&integer(40.0)));
     }
 
@@ -595,7 +662,7 @@ mod tests {
         sources.insert("helper", "forty = 40\n");
         let entry = parsed("from helper import forty as renamed\n");
         let resolver = map_resolver(sources);
-        let surface = module_surface(&entry, &resolver, &kernel, IMPORT_DEPTH_CAP);
+        let surface = module_surface(&entry, &resolver, &kernel);
         assert_eq!(surface.bindings.get("renamed"), Some(&integer(40.0)));
         assert!(surface.bindings.get("forty").is_none());
     }
@@ -610,7 +677,7 @@ mod tests {
         sources.insert("a_reexport", "from b_helper import forty as re_forty\n");
         let entry = parsed("from a_reexport import re_forty\n");
         let resolver = map_resolver(sources);
-        let surface = module_surface(&entry, &resolver, &kernel, IMPORT_DEPTH_CAP);
+        let surface = module_surface(&entry, &resolver, &kernel);
         assert_eq!(surface.bindings.get("re_forty"), Some(&integer(40.0)));
     }
 
@@ -627,7 +694,7 @@ mod tests {
         );
         let entry = parsed("from star_helper import forty, over\n");
         let resolver = map_resolver(sources);
-        let surface = module_surface(&entry, &resolver, &kernel, IMPORT_DEPTH_CAP);
+        let surface = module_surface(&entry, &resolver, &kernel);
         assert_eq!(surface.bindings.get("forty"), Some(&integer(40.0)));
         assert_eq!(surface.bindings.get("over"), Some(&integer(200.0)));
     }
@@ -641,7 +708,7 @@ mod tests {
         sources.insert("helper", "forty = 40\n_private = 1\n");
         let entry = parsed("from helper import *\n");
         let resolver = map_resolver(sources);
-        let surface = module_surface(&entry, &resolver, &kernel, IMPORT_DEPTH_CAP);
+        let surface = module_surface(&entry, &resolver, &kernel);
         assert_eq!(surface.bindings.get("forty"), Some(&integer(40.0)));
         assert!(surface.bindings.get("_private").is_none());
     }
@@ -655,7 +722,7 @@ mod tests {
         sources.insert("helper", "forty = 40\nover = 200\n");
         let entry = parsed("import helper as h\n");
         let resolver = map_resolver(sources);
-        let surface = module_surface(&entry, &resolver, &kernel, IMPORT_DEPTH_CAP);
+        let surface = module_surface(&entry, &resolver, &kernel);
         let module_object = surface.bindings.get("h").expect("h binds a module object");
         assert_eq!(module_object.kind, Kind::Object);
         assert_eq!(
@@ -671,34 +738,36 @@ mod tests {
         );
     }
 
-    // --- depth cap ---
+    // --- unbounded, cycle-safe resolution ---
 
     #[test]
-    fn depth_zero_resolves_no_imports_but_still_reads_local_bindings() {
+    fn a_local_binding_and_a_from_import_both_land_on_the_surface() {
         let Some(kernel) = loaded_kernel() else { return };
         let mut sources = HashMap::new();
         sources.insert("helper", "forty = 40\n");
         let entry = parsed("local = 1\nfrom helper import forty\n");
         let resolver = map_resolver(sources);
-        let surface = module_surface(&entry, &resolver, &kernel, 0);
+        let surface = module_surface(&entry, &resolver, &kernel);
         assert_eq!(surface.bindings.get("local"), Some(&integer(1.0)));
-        assert!(surface.bindings.get("forty").is_none());
+        assert_eq!(surface.bindings.get("forty"), Some(&integer(40.0)));
     }
 
+    /// Two modules importing each other: the chain terminates (the
+    /// `visiting` stack refuses the re-entry) and the cycled-back import
+    /// contributes only what its module had declared so far — the same
+    /// answer the import system gives a module read before its body
+    /// finished. The binding that does not depend on the cycle still
+    /// resolves all the way through.
     #[test]
-    fn depth_one_resolves_exactly_one_hop() {
+    fn an_import_cycle_terminates_and_still_resolves_the_acyclic_binding() {
         let Some(kernel) = loaded_kernel() else { return };
         let mut sources = HashMap::new();
-        sources.insert("b_helper", "forty = 40\n");
-        sources.insert("a_reexport", "from b_helper import forty as re_forty\n");
-        let entry = parsed("from a_reexport import re_forty\n");
+        sources.insert("a_mod", "from b_mod import forty\nforty_one = 41\n");
+        sources.insert("b_mod", "from a_mod import forty_one\nforty = 40\n");
+        let entry = parsed("from a_mod import forty\n");
         let resolver = map_resolver(sources);
-        // depth 1: entry -> a_reexport resolves (hop 1), but a_reexport's
-        // OWN from-import of b_helper needs depth 0 there and resolves
-        // nothing, so re_forty is never actually bound inside a_reexport's
-        // own surface either.
-        let surface = module_surface(&entry, &resolver, &kernel, 1);
-        assert!(surface.bindings.get("re_forty").is_none());
+        let surface = module_surface(&entry, &resolver, &kernel);
+        assert_eq!(surface.bindings.get("forty"), Some(&integer(40.0)));
     }
 
     #[test]
@@ -709,7 +778,7 @@ mod tests {
         sources.insert("a_reexport", "from b_helper import forty as re_forty\n");
         let entry = parsed("from a_reexport import re_forty\n");
         let resolver = map_resolver(sources);
-        let surface = module_surface(&entry, &resolver, &kernel, 2);
+        let surface = module_surface(&entry, &resolver, &kernel);
         assert_eq!(surface.bindings.get("re_forty"), Some(&integer(40.0)));
     }
 
@@ -722,7 +791,7 @@ mod tests {
         let Some(kernel) = loaded_kernel() else { return };
         let module = parsed("def scale(x):\n    return x * 2\n");
         let resolver = map_resolver(HashMap::new());
-        let surface = module_surface(&module, &resolver, &kernel, IMPORT_DEPTH_CAP);
+        let surface = module_surface(&module, &resolver, &kernel);
         assert_eq!(surface.functions.module_of("scale"), Some(ENTRY_MODULE));
     }
 
@@ -736,7 +805,7 @@ mod tests {
         sources.insert("audio_level", "def scale(x):\n    return x * 2\n");
         let entry = parsed("from audio_level import scale\n");
         let resolver = map_resolver(sources);
-        let surface = module_surface(&entry, &resolver, &kernel, IMPORT_DEPTH_CAP);
+        let surface = module_surface(&entry, &resolver, &kernel);
         assert!(surface.functions.def("scale").is_some(), "the imported def is reachable");
         assert_eq!(surface.functions.module_of("scale"), Some("audio_level"));
     }
@@ -754,7 +823,7 @@ mod tests {
         sources.insert("video_level", identical);
         let entry = parsed("from audio_level import scale\nfrom video_level import scale as other\n");
         let resolver = map_resolver(sources);
-        let surface = module_surface(&entry, &resolver, &kernel, IMPORT_DEPTH_CAP);
+        let surface = module_surface(&entry, &resolver, &kernel);
         let first = surface.functions.def("scale").expect("scale imports");
         let second = surface.functions.def("other").expect("other imports");
         assert_eq!(
@@ -774,7 +843,7 @@ mod tests {
         sources.insert("audio_level", "def scale(x):\n    return x * 2\n");
         let entry = parsed("from audio_level import scale as boost\n");
         let resolver = map_resolver(sources);
-        let surface = module_surface(&entry, &resolver, &kernel, IMPORT_DEPTH_CAP);
+        let surface = module_surface(&entry, &resolver, &kernel);
         assert_eq!(surface.functions.module_of("boost"), Some("audio_level"));
     }
 
@@ -789,7 +858,7 @@ mod tests {
         sources.insert("a_reexport", "from b_helper import scale\n");
         let entry = parsed("from a_reexport import scale\n");
         let resolver = map_resolver(sources);
-        let surface = module_surface(&entry, &resolver, &kernel, IMPORT_DEPTH_CAP);
+        let surface = module_surface(&entry, &resolver, &kernel);
         assert_eq!(surface.functions.module_of("scale"), Some("b_helper"));
     }
 
@@ -807,7 +876,7 @@ mod tests {
         sources.insert("video_level", "def other(x):\n    return x * 3\n");
         let entry = parsed("from audio_level import scale\nfrom video_level import other\ndef scale(x):\n    return x * 4\n");
         let resolver = map_resolver(sources);
-        let surface = module_surface(&entry, &resolver, &kernel, IMPORT_DEPTH_CAP);
+        let surface = module_surface(&entry, &resolver, &kernel);
         let own = function_table_from_module(&entry, ENTRY_MODULE);
         let table = merged(&own, surface.functions.as_ref());
         assert_eq!(table.module_of("scale"), Some(ENTRY_MODULE), "the local def wins, with its own stamp");

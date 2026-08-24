@@ -145,10 +145,19 @@ fn single_known_numeric_element(element: &AbstractValue) -> Option<(f64, Primiti
 /// length-bounded, `as_repetition` reads either window shape uniformly
 /// (`collection_models::star_element_read`'s own doc — the same window
 /// reading, never a second reader) — and the element set itself must be
-/// built ONLY from `AtLeast`/`Above`/`AtMost`/`Below` rays (an outer
+/// built ONLY from `AtLeast`/`Above`/`AtMost`/`Below` rays, PLUS the
+/// `Integer`/`MultipleOf` markers (`math_models.rs`'s own
+/// `enclosure_is_provably_finite` keeps the identical exception: these
+/// two forms narrow WHICH values the ray admits but state no bound of
+/// their own, so they carry no `lo`/`hi` contribution to fold — an
+/// int-sorted element like `Age`'s own `[AtLeast(0), AtMost(120),
+/// Integer]` (`check.rs::seed_parameters`'s own scalar seeding, which
+/// tags `Integer` onto the outer value's `kind_tag` and states the
+/// SAME marker on the element set that produced it) is exactly this
+/// shape, not a different one this reader has never walked). An outer
 /// sound hull: `Above`/`Below`'s own strict bound still bounds the
 /// closed `f64` hull correctly, even though the true infimum/supremum
-/// is never attained there) — any other element form (a union, `OneOf`,
+/// is never attained there — any other element form (a union, `OneOf`,
 /// a pattern-compiled set) answers `None` rather than guess a hull for a
 /// shape this reader does not walk. Each caller states its own
 /// requirement on which side(s) must be finite.
@@ -166,6 +175,7 @@ fn star_numeric_hull(iterable: &AbstractValue) -> Option<(f64, f64)> {
         match form.form {
             Form::AtLeast | Form::Above => lo = lo.max(form.a),
             Form::AtMost | Form::Below => hi = hi.min(form.a),
+            Form::Integer | Form::MultipleOf => {}
             _ => return None,
         }
     }
@@ -344,7 +354,22 @@ fn min_max_over_star(arguments: &[AbstractValue]) -> Option<AbstractValue> {
         _ => return None,
     };
     let grade = derived_trust_level(TrustSpec, &[iterable.clone()]);
-    let window = make_refined_set(vec![at_least(element_lo), at_most(element_hi)]);
+    // the returned window must carry its own `Integer` FORM, not just the
+    // outer value's `kind_tag`, when the element sort is Integer — the
+    // SAME "a Set answer must additionally carry its own integrality"
+    // discipline `int_transfer_answer`'s own doc states for a kernel-
+    // answered enclosure (`expressions.rs`): assignability's containment
+    // ask (`scalar_subset`) reads the SET's own forms against `Age`'s
+    // declared set (which itself carries `Integer`), never the outer
+    // `kind_tag` alone — an untagged `[0, 120]` window is not provably a
+    // subset of `[0, 120] && integer` even though every element the star
+    // grammar admits genuinely is one, since the kernel has no way to
+    // read that fact off `kind_tag`.
+    let mut forms = vec![at_least(element_lo), at_most(element_hi)];
+    if sort == PrimitiveKind::Integer {
+        forms.push(refined_sets::refinement_forms::integer());
+    }
+    let window = make_refined_set(forms);
     Some(AbstractValue {
         kind_tag: Some(sort),
         ..known_set(window, None, grade, SetKindTag::None)
@@ -506,6 +531,22 @@ fn iter_call(arguments: &[AbstractValue]) -> Option<AbstractValue> {
 fn next_call(arguments: &[AbstractValue]) -> Option<AbstractValue> {
     let [only] = arguments else { return None };
     if only.kind != Kind::List {
+        // A generator call whose body `instances::generator_yields`
+        // declined to summarize answers an Unknown tagged
+        // `source == "generator-declined"` (`expressions::evaluate_call`'s
+        // own generator-call arm) rather than a List — `next(it)` on
+        // THAT receiver still has no element to answer, but the tag
+        // itself must survive the call so `check.rs::
+        // name_unmodeled_call_sentence`'s generator rung can trace a
+        // later blocked read (`first = next(it); return first`) back to
+        // the generator body that was never summarized, instead of the
+        // generic "value not readable" wording. Any other non-List,
+        // non-tagged receiver keeps declining outright — this is not a
+        // general "next answers Unknown" widening, only the one tag's
+        // own onward carry.
+        if only.kind == Kind::Unknown && only.source == "generator-declined" {
+            return Some(only.clone());
+        }
         return None;
     }
     only.items.first().cloned()
@@ -716,6 +757,144 @@ fn int_call(arguments: &[AbstractValue]) -> Option<AbstractValue> {
     }
     let grade = derived_trust_level(TrustSpec, arguments);
     Some(known_values(vec![value.trunc()], PrimitiveKind::Integer, grade))
+}
+
+/// `int(x)` on a KNOWN NUMERIC SET (a seeded range, or a bounded set
+/// another transfer already produced — e.g. `int(math.sqrt(x))`,
+/// `math.sqrt`'s own Float-sorted enclosure over a declared parameter
+/// range, `math_models.rs`'s `sqrt_call_over_set`): `int_call`'s own
+/// row only reads a single known numeric value
+/// (`single_known_numeric`), so a Set-shaped argument declines there
+/// with no further attempt. This asks the kernel's own `Trunc`
+/// transfer directly — the exact mirror of `abs_call_over_set` above
+/// (same `TransferQuestion` construction, same `catch_unwind` refusal
+/// discipline, same `TransferAnswerKind` match) — library/
+/// functions.html#int: "For floating-point numbers, this truncates
+/// towards zero," the same trunc-toward-zero rule `int_call`'s
+/// single-value row already applies, here posed to `binary64.trunc`
+/// (`TransferQuestionOp::Trunc`) instead of computed locally. Unlike
+/// `abs_call_over_set` (which preserves the operand's own sort), the
+/// result is Integer sort UNCONDITIONALLY — `int(x)` always returns an
+/// `int` regardless of its argument's sort, the same rule `int_call`'s
+/// own `known_values(..., PrimitiveKind::Integer, ...)` return states.
+///
+/// The answer must additionally be provably finite
+/// (`enclosure_is_provably_finite`): the same non-finite gate
+/// `int_call`'s single-value row keeps (`int(float('nan'))`/
+/// `int(float('inf'))` both RAISE `ValueError`/`OverflowError` in
+/// CPython, never returning a value), read here off a kernel-answered
+/// SET rather than one known value.
+fn int_call_over_set(value: &AbstractValue, kernel: &Arc<RefinedTSKernel>) -> Option<AbstractValue> {
+    if value.kind != Kind::Set {
+        return None;
+    }
+    if !matches!(
+        value.kind_tag,
+        Some(PrimitiveKind::Integer) | Some(PrimitiveKind::Float) | Some(PrimitiveKind::Boolean) | Some(PrimitiveKind::Number)
+    ) {
+        return None;
+    }
+    let nan_operand = PowOperandWire { kind: PowOperandKind::NaN, set: make_refined_set(vec![]) };
+    let asked = crate::kernel_ask::ask_kernel(|| {
+        (kernel.transfer)(&TransferQuestion {
+            op: TransferQuestionOp::Trunc,
+            a: value.set.clone(),
+            b: make_refined_set(vec![]),
+            c: 0.0,
+            base: nan_operand.clone(),
+            exp: nan_operand,
+        })
+    })
+    .ok()?;
+    let grade = derived_trust_level(TrustSpec, std::slice::from_ref(value));
+    match asked.kind {
+        TransferAnswerKind::Values => {
+            if !asked.values.iter().all(|v| v.is_finite()) {
+                return None;
+            }
+            Some(known_values(asked.values, PrimitiveKind::Integer, grade))
+        }
+        TransferAnswerKind::Set => {
+            if !enclosure_is_provably_finite(&asked.set) {
+                return None;
+            }
+            Some(AbstractValue {
+                kind_tag: Some(PrimitiveKind::Integer),
+                ..known_set(asked.set, None, grade, SetKindTag::None)
+            })
+        }
+        TransferAnswerKind::NaN | TransferAnswerKind::Unknown => None,
+    }
+}
+
+/// Whether a set the kernel answered describes only FINITE values — the
+/// set-shaped twin of `is_finite`, for `int_call_over_set`'s own arm
+/// that reads a kernel enclosure back as a Python `int` result. A
+/// private copy of `math_models.rs`'s identically-named helper: this
+/// file's own header states the file-ownership convention already kept
+/// for `int_call`'s validity check ("the two files stay independent...
+/// the rule is written twice rather than shared across the boundary").
+///
+/// `±inf` ARE elements of the grammar (`refinement_forms`'s own module
+/// note: "+-infinity are elements of R-bar and are admitted"), so a
+/// bound or an admitted value can be infinite and the set is still
+/// well-formed — it just describes a result no Python `int` can hold.
+/// NaN cannot appear at all (`element` panics on it at construction), so
+/// there is nothing to check for it here.
+///
+/// This reads the set's OWN top-level forms, looking through
+/// `Union`/`Difference`. A form this recognizer does not understand
+/// answers `false` — an unread shape declines rather than being assumed
+/// finite, which is the direction that keeps the gate honest.
+fn enclosure_is_provably_finite(set: &RefinedSet) -> bool {
+    if set.forms.is_empty() {
+        // the unconstrained set — every real AND both infinities
+        return false;
+    }
+    let mut bounded_below = false;
+    let mut bounded_above = false;
+    for form in &set.forms {
+        match form.form {
+            Form::AtLeast | Form::Above => {
+                if !form.a.is_finite() {
+                    // `atLeast(-inf)` constrains nothing; `atLeast(+inf)`
+                    // admits only +inf
+                    return false;
+                }
+                bounded_below = true;
+            }
+            Form::AtMost | Form::Below => {
+                if !form.a.is_finite() {
+                    return false;
+                }
+                bounded_above = true;
+            }
+            // an explicit value list is finite exactly when every value is
+            Form::OneOf => {
+                return form.w.iter().all(|v| v.is_finite());
+            }
+            Form::Union => {
+                let (Some(left), Some(right)) = (form.a_.as_ref(), form.b.as_ref()) else {
+                    return false;
+                };
+                // a union is finite only if BOTH arms are
+                return enclosure_is_provably_finite(left) && enclosure_is_provably_finite(right);
+            }
+            // a difference is finite when its left arm is — removing
+            // values never adds an infinity
+            Form::Difference => {
+                let Some(left) = form.a_.as_ref() else {
+                    return false;
+                };
+                return enclosure_is_provably_finite(left);
+            }
+            // `Integer`/`MultipleOf` narrow but do not bound; the
+            // sequence shapes are not scalar sets at all
+            Form::Integer | Form::MultipleOf => {}
+            _ => return false,
+        }
+    }
+    bounded_below && bounded_above
 }
 
 /// `int(string, base=10)`'s exact parsed value, for the base-10
@@ -1083,8 +1262,10 @@ pub fn builtin_call_result(function: &str, arguments: &[AbstractValue]) -> Optio
 /// call to Python builtin `function`, `kernel` in hand for the row
 /// families that need it — `min`/`max`'s two-or-more-argument form when
 /// at least one argument is a `Kind::Set` (`min_max_call_over_sets`'s
-/// own doc, including the NaN-discharge citation), and `abs`'s single
-/// Set-seeded operand (`abs_call_over_set`'s own doc). Every other
+/// own doc, including the NaN-discharge citation), `abs`'s single
+/// Set-seeded operand (`abs_call_over_set`'s own doc), and `int`'s
+/// single Set-seeded operand (`int_call_over_set`'s own doc — e.g.
+/// `int(math.sqrt(x))` over a declared parameter range). Every other
 /// builtin routes straight through the pure-Rust `builtin_call_result`
 /// above, tried FIRST so a known-scalar call never pays a kernel round
 /// trip it does not need.
@@ -1100,7 +1281,33 @@ pub fn builtin_call_result_with_kernel(
             let [only] = arguments else { return None };
             abs_call_over_set(only, kernel)
         }
+        "int" => {
+            let [only] = arguments else { return None };
+            int_call_over_set(only, kernel).or_else(|| int_image())
+        }
         _ => None,
+    })
+}
+
+/// `int(<anything the rows above declined>)`'s own IMAGE: wherever the
+/// call returns at all, it returns an int (library/functions.rst — a
+/// non-convertible operand raises instead), so an operand no concrete
+/// or kernel row reads still answers the unbounded integer sort. The
+/// raise arm is `call_provable_raise`'s business — a provably-raising
+/// call's value is unreachable, and an unreachable value carrying the
+/// image is sound either way.
+fn int_image() -> Option<AbstractValue> {
+    Some(AbstractValue {
+        kind_tag: Some(PrimitiveKind::Integer),
+        ..known_set(
+            make_refined_set(vec![
+                refined_sets::refinement_forms::integer(),
+                at_least(f64::NEG_INFINITY),
+            ]),
+            None,
+            TrustSpec,
+            SetKindTag::None,
+        )
     })
 }
 
@@ -1230,6 +1437,33 @@ mod tests {
         let string_argument = string_value("-7");
         let got = builtin_call_result("int", &[string_argument]).expect("int(\"-7\") models");
         assert_eq!(got.values, vec![-7.0]);
+    }
+
+    /// `int()` over a Float-sorted Set operand asks the kernel's `Trunc`
+    /// transfer (`int_call_over_set`'s own doc) — the same shape
+    /// `int(math.sqrt(x))` builds over a declared parameter range
+    /// (`c-reads-and-values.py`'s `math_sqrt_over_declared_range`: `x`
+    /// is `[0, 100]`, `math.sqrt(x)` is `[0, 10]`, `int(...)` of that
+    /// stays `[0, 10]` — already integral, so truncation changes
+    /// nothing at either endpoint).
+    #[test]
+    fn int_over_a_set_operand_asks_the_kernel() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let window = make_refined_set(vec![at_least(0.0), at_most(10.0)]);
+        let operand = AbstractValue {
+            kind_tag: Some(PrimitiveKind::Float),
+            ..known_set(window, None, TrustSpec, SetKindTag::None)
+        };
+        let got = builtin_call_result_with_kernel("int", &[operand], &kernel)
+            .expect("int([0, 10]) over a Float Set operand models through the kernel");
+        assert_eq!(got.kind, Kind::Set);
+        assert_eq!(got.kind_tag, Some(PrimitiveKind::Integer), "int(...) is always Integer-sorted, regardless of its argument's own sort");
+        // `Trunc`'s answer over an already-integral window carries its own
+        // `Integer` form — `binary64.trunc` proves the whole result is a
+        // whole number here, not just this row's own sort tag
+        let want = make_refined_set(vec![at_least(0.0), at_most(10.0), refined_sets::refinement_forms::integer()]);
+        assert!((kernel.scalar_subset)(&got.set, &want), "result {:?} not ⊆ want {:?}", got.set, want);
+        assert!((kernel.scalar_subset)(&want, &got.set), "want {:?} not ⊆ result {:?}", want, got.set);
     }
 
     #[test]

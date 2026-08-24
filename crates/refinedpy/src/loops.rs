@@ -87,10 +87,13 @@ use refined_kernel::loop_questions::LoopEffectKind;
 use refined_kernel::loop_questions::LoopEffectOp;
 use refined_kernel::loop_questions::LoopQuestion;
 use refined_kernel::loop_questions::LoopVarAnswerKind;
+use refined_sets::refinement_forms::at_least;
 use refined_sets::refinement_forms::at_most;
 use refined_sets::refinement_forms::below;
+use refined_sets::refinement_forms::integer;
 use refined_sets::refinement_forms::make_refined_set;
 use refined_sets::refinement_forms::one_of;
+use refined_sets::refinement_forms::Form;
 use refined_sets::refinement_forms::RefinedSet;
 use refined_sets::repetition_window_forms::as_repetition;
 use ruff_python_ast::CmpOp;
@@ -296,6 +299,29 @@ fn for_loop_final_environment(
     judge_context: &mut JudgeContext,
 ) -> Option<LoopAnswer> {
     if let Some(elements) = iterable_values(for_stmt.iter.as_ref(), environment, kernel) {
+        // ITERATOR INVALIDATION: a dict iterated DIRECTLY (`iterated_dict_
+        // name`) whose own body provably changes that same dict's size on
+        // every reachable pass (`dict_size_changing_mutation_range`) raises
+        // `RuntimeError` on CPython's first such pass — checked here, before
+        // any element runs, so an EMPTY dict (no elements, the `for` never
+        // executes its body at all) never raises, matching real CPython
+        // exactly. A non-empty dict's raise is provable regardless of what
+        // ELSE the body does: this fire is recorded and the whole loop
+        // still declines (`None`, below) — the loop's own decline is
+        // secondary to the raise this checker can now state exactly, the
+        // "fires propagate unconditionally" convention `loop_final_
+        // environment`'s own doc already keeps for a fire discovered on a
+        // run that later declines.
+        if !elements.is_empty() {
+            if let Some(dict_name) = iterated_dict_name(for_stmt.iter.as_ref(), environment) {
+                if let Some(range) = dict_size_changing_mutation_range(&for_stmt.body, dict_name) {
+                    judge_context
+                        .fires
+                        .push((range, crate::diagnostic_sentences::dict_changed_size_during_iteration(dict_name)));
+                    return None;
+                }
+            }
+        }
         let mut current = environment.fork();
         let mut broke = false;
         for element in elements {
@@ -323,6 +349,7 @@ fn for_loop_final_environment(
     abstract_element_sort_pass(for_stmt, environment, kernel, judge_context)
         .or_else(|| custom_iterator_element_pass(for_stmt, environment, kernel, judge_context))
         .or_else(|| repetition_window_element_pass(for_stmt, environment, kernel, judge_context))
+        .or_else(|| windowed_range_element_pass(for_stmt, environment, kernel, judge_context))
 }
 
 /// `for`/`async for` over a CUSTOM ITERATOR — a class instance whose own
@@ -473,6 +500,149 @@ fn repetition_window_element_pass(
         judge_context,
     )?;
     Some(LoopAnswer { environment: joined, else_runs: true, returned: None, widened_names })
+}
+
+/// WINDOWED-RANGE PASS: `for i in range(<expr>)` where the stop
+/// expression evaluates to a SET or a multi-member Values binding
+/// rather than one known number (`iterable_values`' concrete path
+/// already declined — A1.xfer.loop's own `for i in range(n)` under
+/// `n: Wide`). `range`'s elements are the integers `0 <= i < stop`
+/// (library/stdtypes.html#range, "range(stop)"), so across every stop
+/// the binding admits, the target's element set is
+/// `integer ∧ [0, max(stop) - 1]` — bounded below by 0 always, and
+/// above by the stop set's own upper form when it carries one (an
+/// unbounded stop leaves the element set unbounded above, still sound).
+/// The element binds once and the body runs the SAME one judged pass +
+/// pre-loop join every abstract pass here uses, so a body return of the
+/// counter reaches `check.rs`'s return judgment carrying the window —
+/// the row's own fire or silence.
+///
+/// `None` when the iterable is not a one-positional-argument `range`
+/// call, when the evaluated stop is neither a Set nor an all-integer
+/// Values binding, or when a Set stop does not prove integer sort
+/// (`range` accepts only int arguments — a float-sorted stop raises,
+/// which this pass never vouches for). A stop provably at most 0 runs
+/// the body ZERO times: the answer is the pre-loop environment
+/// unchanged, `else_runs: true` — real CPython, an empty range.
+fn windowed_range_element_pass(
+    for_stmt: &StmtFor,
+    environment: &Environment,
+    kernel: &Arc<RefinedTSKernel>,
+    judge_context: &mut JudgeContext,
+) -> Option<LoopAnswer> {
+    let Expr::Call(call) = for_stmt.iter.as_ref() else {
+        return None;
+    };
+    let Expr::Name(callee) = call.func.as_ref() else {
+        return None;
+    };
+    if callee.id.as_str() != "range" {
+        return None;
+    }
+    if !call.arguments.keywords.is_empty() || call.arguments.args.len() != 1 {
+        return None;
+    }
+    let stop = evaluate_expression(&call.arguments.args[0], environment, kernel);
+    let element_upper = range_stop_element_upper(&stop)?;
+    if let Some(upper) = element_upper {
+        if upper < 0.0 {
+            // every admitted stop is <= 0: the body never runs.
+            return Some(LoopAnswer { environment: environment.fork(), else_runs: true, returned: None, widened_names: Vec::new() });
+        }
+    }
+    let mut forms = vec![at_least(0.0), integer()];
+    if let Some(upper) = element_upper {
+        forms.push(at_most(upper));
+    }
+    let element = AbstractValue {
+        kind_tag: Some(PrimitiveKind::Integer),
+        ..known_set(make_refined_set(forms), None, trust_level_of(&stop), SetKindTag::None)
+    };
+
+    let mut one_pass = environment.fork();
+    if !bind_for_target(for_stmt.target.as_ref(), &element, &mut one_pass) {
+        return None;
+    }
+    match run_body_once(&for_stmt.body, &mut one_pass, kernel, judge_context)? {
+        BodyOutcome::Fell | BodyOutcome::Continued | BodyOutcome::Broke => {}
+        BodyOutcome::Returned(value, range) => {
+            return Some(LoopAnswer {
+                environment: one_pass,
+                else_runs: false,
+                returned: Some((value, range)),
+                widened_names: Vec::new(),
+            });
+        }
+    }
+    let (joined, widened_names) = stabilized_join(
+        environment,
+        &one_pass,
+        &for_stmt.body,
+        for_stmt.target.as_ref(),
+        &element,
+        kernel,
+        judge_context,
+    )?;
+    Some(LoopAnswer { environment: joined, else_runs: true, returned: None, widened_names })
+}
+
+/// The largest element `range(stop)` can yield across every stop a
+/// binding admits, read off the binding itself:
+/// - a Values binding of known integers answers `max - 1` exactly;
+/// - a Set binding must prove integer sort (an `Integer` form, or an
+///   Integer kind tag) and answers the largest admitted stop minus 1:
+///   `atMost a` admits stops up to `⌊a⌋`, `below a` up to `a - 1` when
+///   `a` is itself an integer (`⌊a⌋` otherwise), `oneOf w` up to
+///   `max(w)`; several forms intersect, so the tightest wins;
+/// - `Ok(None)` (outer `Some(None)`) when the set proves integer sort
+///   but carries no upper form — unbounded above, still walkable.
+/// `None` declines: not a Set/Values shape, a non-integer member, or a
+/// Set with no integer proof.
+fn range_stop_element_upper(stop: &AbstractValue) -> Option<Option<f64>> {
+    match stop.kind {
+        Kind::Values => {
+            if stop.values.is_empty() {
+                return None;
+            }
+            if stop.values.iter().any(|member| !member.is_finite() || member.fract() != 0.0) {
+                return None;
+            }
+            let max = stop.values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            Some(Some(max - 1.0))
+        }
+        Kind::Set => {
+            let integer_sorted = stop.kind_tag == Some(PrimitiveKind::Integer)
+                || stop.set.forms.iter().any(|form| form.form == Form::Integer);
+            if !integer_sorted {
+                return None;
+            }
+            let mut upper: Option<f64> = None;
+            let mut tighten = |candidate: f64| {
+                upper = Some(match upper {
+                    Some(held) => held.min(candidate),
+                    None => candidate,
+                });
+            };
+            for form in &stop.set.forms {
+                match form.form {
+                    // stop <= a, stop an integer: stop <= ⌊a⌋.
+                    Form::AtMost => tighten(form.a.floor() - 1.0),
+                    // stop < a, stop an integer: stop <= a - 1 when a is
+                    // itself an integer, ⌊a⌋ otherwise.
+                    Form::Below => tighten(if form.a.fract() == 0.0 { form.a - 2.0 } else { form.a.floor() - 1.0 }),
+                    Form::OneOf => {
+                        if form.w.is_empty() || form.w.iter().any(|member| !member.is_finite() || member.fract() != 0.0) {
+                            return None;
+                        }
+                        tighten(form.w.iter().copied().fold(f64::NEG_INFINITY, f64::max) - 1.0);
+                    }
+                    _ => {}
+                }
+            }
+            Some(upper)
+        }
+        _ => None,
+    }
 }
 
 /// ABSTRACT SORT-ELEMENT PASS: `for`/`async for` over a same-module
@@ -1329,6 +1499,100 @@ fn dict_view_call_values(
     }
 }
 
+/// The dict name a `for` loop iterates DIRECTLY over its own entries —
+/// `for k in d:`/`for k in d.keys():`/`for v in d.values():`/`for k, v
+/// in d.items():` — bound to a known `Kind::Object` in `environment`.
+/// `Some(name)` only for a bare-Name receiver (a fresh dict literal or a
+/// computed expression has no single WRITABLE name a body statement
+/// could mutate through, so `dict_size_changing_mutation_range` has
+/// nothing to match against); every other iterable shape (a list/tuple
+/// display, `range(...)`, a generator call, a dict LITERAL display) is
+/// `None` — this reader exists only to feed the iterator-invalidation
+/// check below, never `iterable_values`'s own element-reading contract.
+fn iterated_dict_name<'a>(iterable: &'a Expr, environment: &Environment) -> Option<&'a str> {
+    let receiver_expr = match iterable {
+        Expr::Name(name) => name.id.as_str(),
+        Expr::Call(call) => {
+            let Expr::Attribute(attribute) = call.func.as_ref() else {
+                return None;
+            };
+            if !matches!(attribute.attr.as_str(), "keys" | "values" | "items") {
+                return None;
+            }
+            let Expr::Name(name) = attribute.value.as_ref() else {
+                return None;
+            };
+            name.id.as_str()
+        }
+        _ => return None,
+    };
+    let receiver = environment.read(receiver_expr)?;
+    if receiver.kind != Kind::Object {
+        return None;
+    }
+    Some(receiver_expr)
+}
+
+/// Whether `expr` is one of the four dict methods that provably change a
+/// dict's own SIZE — `.pop(...)`/`.popitem()`/`.clear()` — called on a
+/// bare Name equal to `dict_name`, or a `del <dict_name>[...]` subscript
+/// target reads the identical shape one level up in
+/// `dict_size_changing_mutation_range`. `d[key] = value` and `.update(...)`
+/// are deliberately EXCLUDED: an existing-key assignment never changes
+/// size at all (library/stdtypes.rst never raises there), and `.update`'s
+/// own size delta is not staticaly provable from its argument alone — this
+/// function only ever names a mutation CPython's own dict-views note
+/// states unconditionally changes size ("don't add or remove entries").
+fn is_dict_size_changing_method_call(expr: &Expr, dict_name: &str) -> bool {
+    let Expr::Call(call) = expr else {
+        return false;
+    };
+    let Expr::Attribute(attribute) = call.func.as_ref() else {
+        return false;
+    };
+    let Expr::Name(receiver) = attribute.value.as_ref() else {
+        return false;
+    };
+    if receiver.id.as_str() != dict_name {
+        return false;
+    }
+    matches!(attribute.attr.as_str(), "pop" | "popitem" | "clear")
+}
+
+/// Scans `body`'s own TOP-LEVEL statements (mirroring `run_statement_once`'s
+/// own straight-line scope — a mutation nested inside an `if`/`for`/`try`
+/// one level down is not proved to run on EVERY reachable pass, so it is
+/// outside this function's provable claim) for a statement that provably
+/// changes `dict_name`'s own size: `del dict_name[...]`,
+/// `dict_name.pop(...)`, `dict_name.popitem()`, `dict_name.clear()`
+/// (`is_dict_size_changing_method_call`'s own set, as an expression
+/// statement). `Some(range)` names the FIRST such statement's own range —
+/// the first-blocker-wins convention this file's own `already_fired`
+/// dedupe and `check.rs`'s `record_blocker` both keep; `None` when no
+/// top-level statement in this body provably changes the dict's size.
+fn dict_size_changing_mutation_range(body: &[Stmt], dict_name: &str) -> Option<TextRange> {
+    for stmt in body {
+        match stmt {
+            Stmt::Delete(delete) => {
+                for target in &delete.targets {
+                    if let Expr::Subscript(subscript) = target {
+                        if let Expr::Name(receiver) = subscript.value.as_ref() {
+                            if receiver.id.as_str() == dict_name {
+                                return Some(stmt.range());
+                            }
+                        }
+                    }
+                }
+            }
+            Stmt::Expr(expr_stmt) if is_dict_size_changing_method_call(expr_stmt.value.as_ref(), dict_name) => {
+                return Some(stmt.range());
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// `some_generator(args...)` — a bare-Name call to a SAME-MODULE `def`
 /// (sync or async: `async def stream(): ...` still parses as
 /// `StmtFunctionDef`, ruff carries `is_async` as a flag on the def, not
@@ -2061,6 +2325,8 @@ fn run_setdefault_append_once(
 mod tests {
     use std::collections::HashSet;
 
+    use refined_domain::abstract_value::ObjectKey;
+    use refined_domain::known_constructors::known_object;
     use refined_kernel::kernel_bridge::dylib_path;
     use refined_kernel::kernel_bridge::kernel_artifacts_present;
     use refined_kernel::kernel_bridge::load_kernel;
@@ -2131,6 +2397,8 @@ mod tests {
     /// fixture in spirit).
     fn age_refinement() -> DeclaredRefinement {
         DeclaredRefinement {
+            temporal: None,
+            temporal_awareness: crate::surface::TemporalAwareness::Any,
             set: make_refined_set(vec![integer_form(), at_least(0.0), at_most(120.0)]),
             spelling: "Age".to_owned(),
             admits_none: false,
@@ -3150,5 +3418,129 @@ mod tests {
         assert_eq!(out.len(), 1, "the redeclared write still fires against Age's own declared entry: {out:?}");
         let total = answer.environment.read("total").expect("total stays bound to the declared set");
         assert_eq!(total.kind, Kind::Set);
+    }
+
+    // --- iterator invalidation: dict-changed-size-during-iteration ---
+
+    /// A known two-entry dict, `{"a": 10, "b": 20}` — the fixture every
+    /// iterator-invalidation test below iterates over.
+    fn two_entry_dict() -> AbstractValue {
+        known_object(
+            vec![
+                ObjectKey { name: "a".to_owned(), numeric: false, value: integer(10.0) },
+                ObjectKey { name: "b".to_owned(), numeric: false, value: integer(20.0) },
+            ],
+            None,
+            true,
+            TrustProved,
+            false,
+        )
+    }
+
+    /// `for k in counts: del counts[k]` — CPython's own canonical
+    /// iterator-invalidation shape (library/stdtypes.rst's dict-views
+    /// note) provably raises `RuntimeError` on the first pass, never
+    /// runs the body's own `del`, and never returns a post-loop
+    /// environment — `loop_final_environment` answers `None`, with the
+    /// raise itself recorded in `out`.
+    #[test]
+    fn deleting_the_iterated_dicts_own_key_inside_the_loop_provably_raises() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let stmt = parsed_loop("for k in counts:\n    del counts[k]\n");
+        let mut environment = Environment::new(HashSet::from(["k".to_owned(), "counts".to_owned()]));
+        environment.bind("counts", two_entry_dict());
+        let declared = no_declared();
+        let mut out = Vec::new();
+        let answer = loop_final_environment(&stmt, &environment, &kernel, &declared, &mut out);
+        assert!(answer.is_none(), "the loop itself declines once the raise is proved");
+        assert_eq!(out.len(), 1, "exactly one raise is recorded: {out:?}");
+        assert!(out[0].1.contains("RuntimeError"), "{}", out[0].1);
+        assert!(out[0].1.contains("'counts'"), "{}", out[0].1);
+        assert!(out[0].1.contains("changed size during"), "{}", out[0].1);
+    }
+
+    /// The identical shape over `.keys()`/`.values()`/`.items()` view
+    /// calls — the raise is proved from the dict's OWN size change, not
+    /// from which view the loop happens to iterate.
+    #[test]
+    fn deleting_the_iterated_dicts_own_key_through_a_keys_view_provably_raises() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let stmt = parsed_loop("for k in counts.keys():\n    del counts[k]\n");
+        let mut environment = Environment::new(HashSet::from(["k".to_owned(), "counts".to_owned()]));
+        environment.bind("counts", two_entry_dict());
+        let declared = no_declared();
+        let mut out = Vec::new();
+        let answer = loop_final_environment(&stmt, &environment, &kernel, &declared, &mut out);
+        assert!(answer.is_none());
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(out[0].1.contains("RuntimeError"), "{}", out[0].1);
+    }
+
+    /// `.pop(k)` inside the loop body is the SAME provable raise as an
+    /// explicit `del` — both provably change the dict's own size.
+    #[test]
+    fn popping_the_iterated_dicts_own_key_inside_the_loop_provably_raises() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let stmt = parsed_loop("for k in counts:\n    counts.pop(k)\n");
+        let mut environment = Environment::new(HashSet::from(["k".to_owned(), "counts".to_owned()]));
+        environment.bind("counts", two_entry_dict());
+        let declared = no_declared();
+        let mut out = Vec::new();
+        let answer = loop_final_environment(&stmt, &environment, &kernel, &declared, &mut out);
+        assert!(answer.is_none());
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(out[0].1.contains("RuntimeError"), "{}", out[0].1);
+    }
+
+    /// `counts[k] = v` — reassigning an EXISTING key inside the loop
+    /// never changes the dict's own size, so CPython never raises here;
+    /// this shape stays outside the provable-raise scope on purpose
+    /// (`is_dict_size_changing_method_call`'s own doc: only `pop`/
+    /// `popitem`/`clear` are unconditionally size-changing). The loop
+    /// still runs concretely to completion — no raise, no decline.
+    #[test]
+    fn reassigning_an_existing_key_inside_the_loop_does_not_raise() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let stmt = parsed_loop("for k in counts:\n    counts[k] = 0\n");
+        let mut environment = Environment::new(HashSet::from(["k".to_owned(), "counts".to_owned()]));
+        environment.bind("counts", two_entry_dict());
+        let declared = no_declared();
+        let mut out = Vec::new();
+        let answer = loop_final_environment(&stmt, &environment, &kernel, &declared, &mut out);
+        assert!(out.is_empty(), "reassigning an existing key never changes size, so no raise fires: {out:?}");
+        let _ = answer;
+    }
+
+    /// An EMPTY dict never runs the loop body at all, so a `del` inside
+    /// it never executes and never raises — matching real CPython: `for
+    /// k in {}: del counts[k]` completes with zero iterations.
+    #[test]
+    fn an_empty_dict_never_raises_even_with_a_size_changing_body() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let stmt = parsed_loop("for k in counts:\n    del counts[k]\n");
+        let mut environment = Environment::new(HashSet::from(["k".to_owned(), "counts".to_owned()]));
+        environment.bind("counts", known_object(vec![], None, true, TrustProved, false));
+        let declared = no_declared();
+        let mut out = Vec::new();
+        let answer = loop_final_environment(&stmt, &environment, &kernel, &declared, &mut out);
+        assert!(out.is_empty(), "an empty dict runs zero iterations, so nothing raises: {out:?}");
+        assert!(answer.is_some(), "an empty-dict loop still completes concretely");
+    }
+
+    /// A `del`/`.pop` on a DIFFERENT name than the one iterated never
+    /// raises this construct — the mutation must target the SAME dict
+    /// the loop reads from.
+    #[test]
+    fn mutating_a_different_dict_inside_the_loop_does_not_raise() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let stmt = parsed_loop("for k in counts:\n    del other[k]\n");
+        let mut environment =
+            Environment::new(HashSet::from(["k".to_owned(), "counts".to_owned(), "other".to_owned()]));
+        environment.bind("counts", two_entry_dict());
+        environment.bind("other", two_entry_dict());
+        let declared = no_declared();
+        let mut out = Vec::new();
+        let _ = loop_final_environment(&stmt, &environment, &kernel, &declared, &mut out);
+        assert!(out.is_empty(), "a different dict's own mutation is not this construct: {out:?}");
     }
 }

@@ -78,10 +78,14 @@ use refined_kernel::kernel_interface::NarrowTree;
 use refined_kernel::kernel_interface::RefinedTSKernel;
 use refined_kernel::narrow_questions::NarrowCmpOp;
 use refined_kernel::narrow_questions::NarrowTreeKind;
+use refined_sets::codepoint_sets::strings;
 use refined_sets::refinement_forms::at_least;
 use refined_sets::refinement_forms::integer;
 use refined_sets::refinement_forms::make_refined_set;
+use refined_sets::refinement_forms::one_of;
+use refined_sets::refinement_forms::Form;
 use refined_sets::refinement_forms::RefinedSet;
+use refined_sets::regex_compiler::format_grammar;
 use ruff_python_ast::BoolOp;
 use ruff_python_ast::CmpOp;
 use ruff_python_ast::Expr;
@@ -348,7 +352,9 @@ fn narrow(condition: &Expr, environment: &mut Environment, kernel: &Arc<RefinedT
                 return;
             }
             narrow_isinstance_call(call, environment, truth);
+            narrow_regex_module_call(call, environment, truth);
         }
+        Expr::Name(_) => narrow_name_truthiness(condition, environment, truth),
         // Calls other than isinstance, attributes, walrus, string
         // comparisons, and everything else this wave does not read: no
         // narrowing, the honest default. (`Expr::Compare`'s own dispatch
@@ -372,6 +378,48 @@ fn narrow_bool_op(
     kernel: &Arc<RefinedTSKernel>,
     truth: bool,
 ) {
+    // `x is None or <tests on x>` under TRUTH (either operand order):
+    // the held disjunction admits the absent value OR a value the
+    // other side proves — the present part narrows by the other side's
+    // own truth while absence stays admitted. Read on a
+    // possibly-absent binding only; every other or-under-truth still
+    // narrows nothing (either arm alone could have made the whole
+    // true).
+    if bool_op.op == BoolOp::Or && truth && bool_op.values.len() == 2 {
+        for (absence_side, other_side) in [
+            (&bool_op.values[0], &bool_op.values[1]),
+            (&bool_op.values[1], &bool_op.values[0]),
+        ] {
+            let Some(name) = is_none_test_name(absence_side) else {
+                continue;
+            };
+            let Some(current) = environment.read(name).cloned() else {
+                break;
+            };
+            if current.kind != Kind::PossiblyUndefined {
+                break;
+            }
+            let inner = current
+                .inner
+                .as_deref()
+                .expect("Kind::PossiblyUndefined always carries an inner value")
+                .clone();
+            let mut fork = environment.fork();
+            fork.bind(name, inner);
+            // both channels, the same pair `assume` itself runs: the
+            // values channel first, then the set channel over the
+            // seeded Set-kind binding
+            narrow(other_side, &mut fork, kernel, true);
+            narrow_set_kind_names(other_side, &mut fork, kernel, true);
+            if let Some(narrowed) = fork.read(name) {
+                let mut rewrapped = current.clone();
+                rewrapped.inner = Some(Box::new(narrowed.clone()));
+                environment.bind(name, rewrapped);
+            }
+            break;
+        }
+        return;
+    }
     let conjunction = match (bool_op.op, truth) {
         (BoolOp::And, true) => true,
         (BoolOp::Or, false) => true,
@@ -422,7 +470,15 @@ fn narrow_compare(compare: &ruff_python_ast::ExprCompare, environment: &mut Envi
 fn narrow_one_comparison(left: &Expr, op: CmpOp, right: &Expr, environment: &mut Environment, truth: bool) {
     if matches!(op, CmpOp::Is | CmpOp::IsNot) {
         narrow_is_none(left, op, right, environment, truth);
+        narrow_bool_literal_comparison(left, op, right, environment, truth);
         return;
+    }
+    if matches!(op, CmpOp::Eq | CmpOp::NotEq) {
+        // `b == True` on a bool-domain binding — read by the same leaf as
+        // `b is True` (CPython interns the two bools, so the pair
+        // coincides there); the numeric paths below still read the same
+        // op for every other operand shape.
+        narrow_bool_literal_comparison(left, op, right, environment, truth);
     }
     if matches!(op, CmpOp::In | CmpOp::NotIn) {
         if let Some(name) = name_of(left) {
@@ -433,6 +489,14 @@ fn narrow_one_comparison(left: &Expr, op: CmpOp, right: &Expr, environment: &mut
     let Some(numeric_op) = numeric_cmp_op(op) else {
         return;
     };
+    if let (Some(name), Some(literal)) = (len_call_name(left), literal_number(right)) {
+        narrow_name_length_against_literal(name, numeric_op, literal, environment, truth);
+        return;
+    }
+    if let (Some(literal), Some(name)) = (literal_number(left), len_call_name(right)) {
+        narrow_name_length_against_literal(name, mirror_cmp_op(numeric_op), literal, environment, truth);
+        return;
+    }
     if let (Some(name), Some(literal)) = (name_of(left), literal_number(right)) {
         narrow_name_against_literal(name, numeric_op, literal, environment, truth);
         return;
@@ -440,6 +504,133 @@ fn narrow_one_comparison(left: &Expr, op: CmpOp, right: &Expr, environment: &mut
     if let (Some(literal), Some(name)) = (literal_number(left), name_of(right)) {
         narrow_name_against_literal(name, mirror_cmp_op(numeric_op), literal, environment, truth);
         return;
+    }
+}
+
+/// Whether `expression` is `len(<bare name>)` — the one shape
+/// `narrow_name_length_against_literal` reads on the tested side, the
+/// `len(...)`-wrapped twin of `name_of`'s bare-identifier restriction.
+/// `len` called on anything other than a single bare name (an
+/// attribute, a call, a literal) is not this leaf's business —
+/// `narrow_one_comparison` falls through unchanged for it, the same
+/// "narrows nothing" default every unread leaf shape keeps.
+fn len_call_name(expression: &Expr) -> Option<&str> {
+    let Expr::Call(call) = expression else { return None };
+    let Expr::Name(func_name) = call.func.as_ref() else { return None };
+    if func_name.id.as_str() != "len" {
+        return None;
+    }
+    let [only] = &*call.arguments.args else { return None };
+    name_of(only)
+}
+
+/// Narrows a Set-kind binding named `name` by `len(name) op literal`
+/// being `truth`: `ages: list[Age]` (no `min_length`/`max_length` in
+/// its own surface) seeds `check.rs::seed_parameters`'s star-repetition
+/// shape (`refined_sets::refinement_forms::repeat_of`, `lo` 0, `hi`
+/// `None` — the bare unbounded window, `typereading.rs`'s own doc for
+/// a length-unconstrained sequence parameter) — a window `min_max_over_
+/// star` (`builtin_models.rs`) REFUSES to read for `min`/`max` while
+/// `lo` could still be 0 (CPython's `ValueError` on an empty sequence).
+/// `if len(ages) >= 1:` is exactly the guard that fixture's own doc
+/// names as "what a real caller must write to make this call safe at
+/// all" — this is the narrowing that makes the checker SEE that guard:
+/// under `len(name) >= k` truth (or the mirrored `k <= len(name)`),
+/// `lo` tightens to `max(lo, k)`; under `len(name) <= k`/`== k`, `hi`
+/// tightens to `min(hi.unwrap_or(k), k)`; under `len(name) > k`, `lo`
+/// tightens to `max(lo, k + 1)`; under `len(name) < k`, `hi` tightens
+/// the same way one below `k`. Falsity mirrors through `satisfies`'
+/// own negation the same way `narrow_name_against_literal` does — a
+/// COMPARISON's false arm still states a fact (`not (len(ages) >= 1)`
+/// is `len(ages) < 1`, i.e. `len(ages) == 0`, the empty-window case).
+///
+/// Reads and rebuilds through `as_repetition`/`repeat_of`
+/// (`refined_sets::refinement_forms`, `repetition_window_forms`) — the
+/// same {element, lo, hi} triple `check.rs`'s own seeding and
+/// `min_max_over_star`'s own reading already agree on, so this adds no
+/// new window shape, only a narrower `lo`/`hi` on the existing one. A
+/// binding that is not `Kind::Set`, or a `Kind::Set` whose own top
+/// layer is not this exact repetition shape (a plain numeric range —
+/// `len` has no meaning there — or a fixed-arity `Kind::List` already
+/// read through the Values-shaped element channel), narrows nothing.
+fn narrow_name_length_against_literal(name: &str, op: NumericCmpOp, literal: f64, environment: &mut Environment, truth: bool) {
+    let Some(current) = environment.read(name).cloned() else {
+        return;
+    };
+    if current.kind != Kind::Set {
+        return;
+    }
+    let Some(repeated) = refined_sets::repetition_window_forms::as_repetition(&current.set) else {
+        return;
+    };
+    if literal < 0.0 || literal.fract() != 0.0 {
+        // a length is never negative or fractional; a comparison
+        // against one is either vacuous or a construct this leaf does
+        // not read — narrow nothing rather than guess
+        return;
+    }
+    let k = literal as i64;
+    // `op`/`truth` folds to the single EFFECTIVE operator this leaf
+    // narrows under — `satisfies`'s own truth-table, applied once at
+    // the operator level rather than per element (a length window has
+    // no member list to filter, only two bounds to tighten)
+    let effective = if truth { op } else { negate_numeric_cmp_op(op) };
+    let (mut lo, mut hi) = (repeated.lo, repeated.hi);
+    match effective {
+        NumericCmpOp::GtE => lo = lo.max(k),
+        NumericCmpOp::Gt => lo = lo.max(k + 1),
+        NumericCmpOp::LtE => hi = Some(hi.map_or(k, |current_hi| current_hi.min(k))),
+        NumericCmpOp::Lt => hi = Some(hi.map_or(k - 1, |current_hi| current_hi.min(k - 1))),
+        NumericCmpOp::Eq => {
+            lo = lo.max(k);
+            hi = Some(hi.map_or(k, |current_hi| current_hi.min(k)));
+        }
+        // `!=` excludes one point from an interval, which the {lo, hi}
+        // window vocabulary cannot state — narrows nothing, the same
+        // "no shape for this" decline `narrow_name_against_literal`'s
+        // own Values channel never needs (it filters pointwise instead)
+        NumericCmpOp::NotEq => return,
+    }
+    if let Some(h) = hi {
+        if h < lo {
+            // the window is now provably empty — every leaf in this
+            // file leaves an infeasible-branch binding UNCHANGED
+            // (`narrow_name_against_literal`'s own "zero survivors"
+            // comment states the twin case for a Values binding); the
+            // walk's own dead-branch handling is what skips the body,
+            // not a narrowed-to-empty rebind here
+            return;
+        }
+    }
+    let grade = trust_level_of(&current);
+    let narrowed_set = refined_sets::refinement_forms::make_refined_set(vec![refined_sets::refinement_forms::repeat_of(
+        repeated.element,
+        lo,
+        hi,
+    )]);
+    environment.bind(
+        name,
+        AbstractValue {
+            kind_tag: current.kind_tag,
+            ..known_set(narrowed_set, None, grade, SetKindTag::None)
+        },
+    );
+}
+
+/// The strict negation of one `NumericCmpOp` — `not (x >= k)` is
+/// `x < k`, etc. — the operator-level mirror of `satisfies`'s own
+/// per-element negation (`satisfies(value, op, literal) == truth`),
+/// needed here because a length window narrows by tightening a BOUND,
+/// not by filtering a member list, so the falsity case folds to a
+/// different effective operator up front rather than at each element.
+fn negate_numeric_cmp_op(op: NumericCmpOp) -> NumericCmpOp {
+    match op {
+        NumericCmpOp::Lt => NumericCmpOp::GtE,
+        NumericCmpOp::LtE => NumericCmpOp::Gt,
+        NumericCmpOp::Gt => NumericCmpOp::LtE,
+        NumericCmpOp::GtE => NumericCmpOp::Lt,
+        NumericCmpOp::Eq => NumericCmpOp::NotEq,
+        NumericCmpOp::NotEq => NumericCmpOp::Eq,
     }
 }
 
@@ -621,6 +812,26 @@ fn literal_numeric_collection(collection: &Expr) -> Option<Vec<f64>> {
 /// (including one already `Kind::Null`) passes through unchanged, per
 /// the mission's instruction that non-Values states pass through
 /// everywhere this wave.
+/// `P is None` as a single-pair comparison (either operand order) —
+/// the shape the cross-channel disjunction reader in `narrow_bool_op`
+/// recognizes as its absence side. The tested bare name, or None for
+/// any other shape.
+fn is_none_test_name(e: &Expr) -> Option<&str> {
+    let Expr::Compare(compare) = e else {
+        return None;
+    };
+    if compare.ops.len() != 1 || compare.ops[0] != CmpOp::Is {
+        return None;
+    }
+    if is_none_literal(&compare.comparators[0]) {
+        return name_of(&compare.left);
+    }
+    if is_none_literal(&compare.left) {
+        return name_of(&compare.comparators[0]);
+    }
+    None
+}
+
 fn narrow_is_none(left: &Expr, op: CmpOp, right: &Expr, environment: &mut Environment, truth: bool) {
     let is_not = op == CmpOp::IsNot;
     let name = if is_none_literal(right) {
@@ -671,6 +882,270 @@ fn narrow_is_none(left: &Expr, op: CmpOp, right: &Expr, environment: &mut Enviro
         let grade = trust_level_of(&current);
         environment.bind(name, known_values(Vec::new(), kind_tag, grade));
     }
+}
+
+/// `name is True` / `name is False` — and the `==`/`!=` spellings of
+/// the same pair — against a binding already scoped to the BOOL domain
+/// (every member 0 or 1: `bool` seeds `oneOf{0, 1}`, `Literal[...]`
+/// bool members and `isinstance(x, bool)` build the same two-value
+/// reading). CPython interns exactly two bool objects (datamodel.rst,
+/// "Booleans": "The two objects representing the values False and
+/// True"), so identity and equality coincide on this domain and one
+/// leaf reads all four operators. A binding admitting ANY other member
+/// declines whole: `1 is True` is False (distinct objects), so
+/// identity against a literal keeps nothing pointwise for a general
+/// int, and equality on a wider set is the numeric paths' own
+/// business. A filter that would empty the members also declines — an
+/// unreachable arm is the walk's provably-false business, not a
+/// narrowing claim.
+fn narrow_bool_literal_comparison(left: &Expr, op: CmpOp, right: &Expr, environment: &mut Environment, truth: bool) {
+    let bool_literal_value = |expr: &Expr| -> Option<f64> {
+        match expr {
+            Expr::BooleanLiteral(literal) => Some(if literal.value { 1.0 } else { 0.0 }),
+            _ => None,
+        }
+    };
+    let (name, literal) = match (name_of(left), bool_literal_value(right)) {
+        (Some(name), Some(literal)) => (name, literal),
+        _ => match (bool_literal_value(left), name_of(right)) {
+            (Some(literal), Some(name)) => (name, literal),
+            _ => return,
+        },
+    };
+    let keep_equal = matches!(op, CmpOp::Is | CmpOp::Eq) == truth;
+    let Some(current) = environment.read(name).cloned() else {
+        return;
+    };
+    let bool_domain = |members: &[f64]| members.iter().all(|member| *member == 0.0 || *member == 1.0);
+    if current.kind == Kind::Values {
+        if current.values.is_empty() || !bool_domain(&current.values) {
+            return;
+        }
+        let kept: Vec<f64> = current.values.iter().copied().filter(|member| (*member == literal) == keep_equal).collect();
+        if kept.is_empty() {
+            return;
+        }
+        let Some(kind_tag) = current.kind_tag else {
+            return;
+        };
+        environment.bind(name, known_values(kept, kind_tag, trust_level_of(&current)));
+        return;
+    }
+    if current.kind == Kind::Set {
+        let [form] = current.set.forms.as_slice() else {
+            return;
+        };
+        if form.form != Form::OneOf || form.w.is_empty() || !bool_domain(&form.w) {
+            return;
+        }
+        let kept: Vec<f64> = form.w.iter().copied().filter(|member| (*member == literal) == keep_equal).collect();
+        if kept.is_empty() {
+            return;
+        }
+        let narrowed = AbstractValue {
+            kind_tag: current.kind_tag,
+            ..known_set(make_refined_set(vec![one_of(&kept)]), None, trust_level_of(&current), current.set_kind_tag)
+        };
+        environment.bind(name, narrowed);
+    }
+}
+
+/// `re.fullmatch(pattern, name)` / `re.match` / `re.search` as the
+/// whole condition: a truthy match object proves `name`'s string is in
+/// the pattern's own language (library/re.html: `fullmatch` — "the
+/// whole string matches"; `match` — "at the beginning of the string";
+/// `search` — "the first location where"). The pattern compiles through
+/// the SAME `format_grammar` the pydantic `pattern=` kwarg uses
+/// (surface.rs), anchored to each function's own semantics: `fullmatch`
+/// pins both ends, `match` the start, `search` neither
+/// (`format_grammar` itself pads an unanchored side with C*). The
+/// narrowed binding meets the compiled set into the current one,
+/// dropping the bare C* string ground first — the kernel's aligned-
+/// segment pattern prover reads one chain, never a stack (surface.rs's
+/// own `pattern` branch documents the identical strip). The FALSE arm
+/// narrows nothing: "no match" has no complement this grammar states.
+/// A non-literal pattern, keyword or flag arguments, a non-name
+/// subject, a non-Set binding, or a pattern `format_grammar` refuses
+/// all decline — the honest default.
+fn narrow_regex_module_call(call: &ruff_python_ast::ExprCall, environment: &mut Environment, truth: bool) {
+    if !truth {
+        return;
+    }
+    let Expr::Attribute(attribute) = call.func.as_ref() else {
+        return;
+    };
+    if name_of(attribute.value.as_ref()) != Some("re") {
+        return;
+    }
+    let (anchor_start, anchor_end) = match attribute.attr.as_str() {
+        "fullmatch" => (true, true),
+        "match" => (true, false),
+        "search" => (false, false),
+        _ => return,
+    };
+    if !call.arguments.keywords.is_empty() || call.arguments.args.len() != 2 {
+        return;
+    }
+    let Expr::StringLiteral(literal) = &call.arguments.args[0] else {
+        return;
+    };
+    let Some(name) = name_of(&call.arguments.args[1]) else {
+        return;
+    };
+    let Some(current) = environment.read(name).cloned() else {
+        return;
+    };
+    if current.kind != Kind::Set {
+        return;
+    }
+    let mut pattern = literal.value.to_str().to_owned();
+    if anchor_start && !pattern.starts_with('^') {
+        pattern.insert(0, '^');
+    }
+    if anchor_end && !(pattern.ends_with('$') && !pattern.ends_with("\\$")) {
+        pattern.push('$');
+    }
+    let mut grammar = format_grammar(&pattern, "");
+    if !grammar.ok {
+        return;
+    }
+    let ground = strings();
+    let plain_ground = &ground.forms[0];
+    let mut combined: Vec<_> = current.set.forms.iter().filter(|form| *form != plain_ground).cloned().collect();
+    combined.extend(std::mem::take(&mut grammar.set.forms));
+    let narrowed = AbstractValue {
+        kind_tag: current.kind_tag,
+        ..known_set(make_refined_set(combined), None, trust_level_of(&current), current.set_kind_tag)
+    };
+    environment.bind(name, narrowed);
+}
+
+/// A bare name as the whole condition (`if x:`): Python truthiness.
+/// `x` truthy proves `x is not None` AND `x != 0` (`bool(None)` and
+/// `bool(0)` are both False; every other int/float, NaN included, is
+/// truthy). A `Kind::PossiblyUndefined` binding — an `Optional[X]`/
+/// `X | None` seed — unwraps to its inner value on the truthy arm,
+/// exactly as `narrow_is_none`'s not-None side does; a Values inner
+/// (or a bare Values binding) additionally keeps only its truthy
+/// members. The falsy arm keeps a wrapper unchanged when its inner
+/// could itself be falsy (0 in the annotated set) — None and a falsy
+/// inner member are then both live; when the inner is a Values set
+/// with no falsy member, falsity proves None exactly. A Set-kind or
+/// otherwise unread binding narrows nothing — the inner set may hold
+/// 0, and dropping nothing is conservative, never wrong.
+fn narrow_name_truthiness(condition: &Expr, environment: &mut Environment, truth: bool) {
+    let Some(name) = name_of(condition) else {
+        return;
+    };
+    let Some(current) = environment.read(name).cloned() else {
+        return;
+    };
+    let truthy_members = |value: &AbstractValue| -> AbstractValue {
+        if value.kind == Kind::Values {
+            if let Some(kind_tag) = value.kind_tag {
+                let kept: Vec<f64> = value.values.iter().copied().filter(|member| *member != 0.0).collect();
+                return known_values(kept, kind_tag, trust_level_of(value));
+            }
+        }
+        value.clone()
+    };
+    if current.kind == Kind::PossiblyUndefined {
+        let inner = current.inner.as_deref().expect("Kind::PossiblyUndefined always carries an inner value");
+        if truth {
+            environment.bind(name, truthy_members(inner));
+        } else if inner.kind == Kind::Values && inner.values.iter().all(|member| *member != 0.0) {
+            environment.bind(name, null_value());
+        }
+        return;
+    }
+    if current.kind == Kind::Set {
+        // Exact-member form first: a `oneOf` keeps the members whose
+        // truthiness matches (`b: bool` seeds `oneOf{0, 1}`, so
+        // `if not b:` proves `{0}`). A filter that would empty the
+        // members proves nothing this arm states (the arm is then
+        // unreachable — the walk's own provably-false business).
+        if current.set.forms.iter().any(|form| form.form == Form::OneOf) {
+            let mut forms = current.set.forms.clone();
+            let mut rewrote = false;
+            for form in &mut forms {
+                if form.form == Form::OneOf {
+                    let kept: Vec<f64> = form.w.iter().copied().filter(|member| (*member != 0.0) == truth).collect();
+                    if kept.is_empty() {
+                        return;
+                    }
+                    if kept.len() != form.w.len() {
+                        rewrote = true;
+                    }
+                    form.w = kept;
+                }
+            }
+            if rewrote {
+                let narrowed = AbstractValue {
+                    kind_tag: current.kind_tag,
+                    ..known_set(make_refined_set(forms), None, trust_level_of(&current), current.set_kind_tag)
+                };
+                environment.bind(name, narrowed);
+            }
+            return;
+        }
+        // WINDOW form ([atLeast, atMost, integer]): truthiness on the
+        // integer domain is exactly "≠ 0" (datamodel.rst, truth value
+        // testing — a zero of any numeric type is false). The TRUE arm
+        // trims a 0 edge off the window (an interior 0 is a hole one
+        // window cannot state and trims nothing); the FALSE arm IS the
+        // value 0 whenever the window admits it.
+        if !current.set.forms.iter().any(|form| form.form == Form::Integer) {
+            return;
+        }
+        let mut lo: Option<f64> = None;
+        let mut hi: Option<f64> = None;
+        for form in &current.set.forms {
+            match form.form {
+                Form::AtLeast => lo = Some(form.a),
+                Form::AtMost => hi = Some(form.a),
+                Form::Integer => {}
+                _ => return,
+            }
+        }
+        if truth {
+            let mut forms = current.set.forms.clone();
+            let mut rewrote = false;
+            for form in &mut forms {
+                if form.form == Form::AtLeast && form.a == 0.0 {
+                    form.a = 1.0;
+                    rewrote = true;
+                }
+                if form.form == Form::AtMost && form.a == 0.0 {
+                    form.a = -1.0;
+                    rewrote = true;
+                }
+            }
+            if rewrote {
+                let narrowed = AbstractValue {
+                    kind_tag: current.kind_tag,
+                    ..known_set(make_refined_set(forms), None, trust_level_of(&current), current.set_kind_tag)
+                };
+                environment.bind(name, narrowed);
+            }
+        } else {
+            let admits_zero = lo.is_none_or(|floor| floor <= 0.0) && hi.is_none_or(|ceiling| ceiling >= 0.0);
+            if admits_zero {
+                environment.bind(
+                    name,
+                    known_values(vec![0.0], current.kind_tag.unwrap_or(PrimitiveKind::Integer), trust_level_of(&current)),
+                );
+            }
+        }
+        return;
+    }
+    if current.kind != Kind::Values {
+        return;
+    }
+    let Some(kind_tag) = current.kind_tag else {
+        return;
+    };
+    let kept: Vec<f64> = current.values.iter().copied().filter(|member| (*member != 0.0) == truth).collect();
+    environment.bind(name, known_values(kept, kind_tag, trust_level_of(&current)));
 }
 
 /// Whether `call` is a same-module call to a function whose OWN return
@@ -1106,7 +1581,7 @@ fn condition_tree_of(condition: &Expr, place: &str) -> Option<NarrowTree> {
             Some(folded)
         }
         Expr::Compare(compare) => Some(compare_tree_of(compare, place)),
-        Expr::Call(call) => Some(isinstance_leaf_tree_of(call, place)),
+        Expr::Call(call) => Some(call_leaf_tree_of(call, place)),
         _ => Some(other_tree()),
     }
 }
@@ -1280,6 +1755,48 @@ fn membership_leaf_tree_of(collection: &Expr) -> Option<NarrowTree> {
         });
     }
     folded
+}
+
+/// The SET channel's own dispatcher for a bare `Expr::Call` test:
+/// `<place>.is_integer()` reads as the `IsInt AND IsFinite` leaf
+/// (`is_integer_leaf_tree_of`'s own doc); every other call, INCLUDING
+/// `isinstance(...)`, is `other_tree()` (`isinstance_leaf_tree_of`'s own
+/// doc — a sort claim the kernel's COMPARISON/MEMBERSHIP vocabulary
+/// cannot further express about a Set already scoped to that sort).
+fn call_leaf_tree_of(call: &ruff_python_ast::ExprCall, place: &str) -> NarrowTree {
+    if let Some(leaf) = is_integer_leaf_tree_of(call, place) {
+        return leaf;
+    }
+    isinstance_leaf_tree_of(call, place)
+}
+
+/// `<place>.is_integer()` as a `NarrowTree` leaf, `None` for any other
+/// call shape (a different method name, a non-empty argument list, or a
+/// receiver that is not the bare name `place`) — the SET-channel twin of
+/// `expressions.rs`'s own single-known-value `is_integer` row
+/// (`stdtypes.rst`, `float.is_integer()`: "Return True if the float
+/// instance is finite with integral value, and False otherwise"). A
+/// `place` currently bound `Kind::Set` has no one value to test that way,
+/// so this states the SAME two-part claim as a kernel leaf instead:
+/// `IsInt` (integral within ℝ̄) AND `IsFinite` (excludes both
+/// infinities) — `is_integer()` on `float('inf')` is `False` precisely
+/// because the finite half fails, so `IsInt` alone would overclaim on an
+/// unbounded-above parameter like `to_page_size`'s own `x: float`
+/// (showcase.py) the way this leaf's own construct citation names.
+fn is_integer_leaf_tree_of(call: &ruff_python_ast::ExprCall, place: &str) -> Option<NarrowTree> {
+    let Expr::Attribute(attribute) = call.func.as_ref() else { return None };
+    if attribute.attr.as_str() != "is_integer" {
+        return None;
+    }
+    if !call.arguments.args.is_empty() || !call.arguments.keywords.is_empty() {
+        return None;
+    }
+    if name_of(&attribute.value) != Some(place) {
+        return None;
+    }
+    let is_int = NarrowTree { kind: NarrowTreeKind::IsInt, ..other_tree() };
+    let is_finite = NarrowTree { kind: NarrowTreeKind::IsFinite, ..other_tree() };
+    Some(and_or_tree(NarrowTreeKind::And, is_int, is_finite))
 }
 
 /// `isinstance(place, ...)` as a `NarrowTree` leaf: the kernel's own

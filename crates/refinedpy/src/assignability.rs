@@ -17,6 +17,7 @@ use refined_domain::abstract_value::AbstractValue;
 use refined_domain::abstract_value::Kind;
 use refined_domain::abstract_value::PrimitiveKind;
 use refined_kernel::kernel_interface::RefinedTSKernel;
+use refined_sets::calendar_interpreter::TemporalAnnotation;
 use refined_sets::codepoint_sets::is_codepoint_alphabet;
 use refined_sets::codepoint_sets::is_string_ground;
 use refined_sets::format_string_shapes::format_py_number;
@@ -305,6 +306,95 @@ pub fn judge(
     if value.kind == Kind::PossiblyNaN {
         let inner = value.inner.as_deref().expect("Kind::PossiblyNaN always carries an inner value");
         return judge(inner, declared, kernel);
+    }
+    // THE TEMPORAL LAW: a `date`/`timedelta`/`datetime`/`AwareDatetime`/
+    // `NaiveDatetime` declaration (`declared.temporal` Some, `declared.
+    // set` unused/empty, the same "one active field" convention `element`/
+    // `positions`/`members` already keep) judges a flowing `Kind::Object`
+    // construction (`source` one of `"datetime_date"`/
+    // `"datetime_timedelta"`/`"datetime_datetime"` — expressions.rs's own
+    // three temporal constructors) against the declared calendar window,
+    // through the kernel's calendar seam (`bounds_verdict_of`,
+    // calendar_interpreter.rs). `None`'s `admits_none` check comes first,
+    // the same rule every other container-shaped declaration keeps.
+    if let Some(declared_temporal) = &declared.temporal {
+        if value.kind == Kind::Null {
+            return if declared.admits_none {
+                Verdict::Silent
+            } else {
+                Verdict::Fire(refutation("None", &declared.spelling, &declared.set))
+            };
+        }
+        // A WINDOW-FLOWING value (`source == "temporal_flow"` —
+        // `check.rs::seed_parameters`'s own temporal seed: a temporal-
+        // declared PARAMETER's own value, representing "any member of
+        // its own declared window," never one concrete construction) is
+        // judged by IMPLICATION (`bounds_imply`) rather than by exact-
+        // point containment: does every value the flowing window admits
+        // also sit inside the declared window. This is the shape a
+        // temporal parameter flowing into ANOTHER temporal-declared
+        // parameter takes (`record_visit`'s own `in_period(v)`,
+        // `backwards`'s own `narrow(p)`) — there is no single concrete
+        // instant to spell, only the flowing declaration's own bound.
+        if value.kind == Kind::Object && value.source == "temporal_flow" {
+            let Some(flowing_temporal) = &value.temporal else {
+                return Verdict::Undetermined(SENTENCE.temporal_position.to_owned());
+            };
+            let calendar_ask = refined_kernel::calendar_adapter::calendar_ask_of(kernel);
+            let asked = crate::kernel_ask::ask_kernel(|| {
+                refined_sets::calendar_interpreter::bounds_imply(&*calendar_ask, flowing_temporal, declared_temporal)
+            });
+            return match asked {
+                Ok(refined_sets::calendar_interpreter::BoundsVerdict::Proved) => Verdict::Silent,
+                Ok(refined_sets::calendar_interpreter::BoundsVerdict::Refuted(_side)) => {
+                    Verdict::Fire(temporal_refutation(flowing_temporal, declared, declared_temporal))
+                }
+                Ok(refined_sets::calendar_interpreter::BoundsVerdict::Alert(why)) => {
+                    Verdict::Undetermined(temporal_alert_sentence(&why))
+                }
+                Err(_) => Verdict::Undetermined(SENTENCE.temporal_unprovable_instant.to_owned()),
+            };
+        }
+        let is_temporal_construction = value.kind == Kind::Object
+            && matches!(value.source.as_str(), "datetime_date" | "datetime_timedelta" | "datetime_datetime");
+        if !is_temporal_construction {
+            return Verdict::Undetermined(SENTENCE.temporal_position.to_owned());
+        }
+        // THE AWARE/NAIVE ADMISSION LAW: `AwareDatetime` states its own
+        // documented refusal of a naive construction OUTRIGHT (pydantic's
+        // docs, cited at `temporal_admission_refusal`'s own call site) —
+        // decided from the construction's OWN fields (whether
+        // `instance.temporal` is populated at all — `datetime_construction_
+        // value`'s own doc: `None` only for `TzinfoKind::OtherAware`, never
+        // for `Naive`), checked BEFORE `bounds_verdict_of`, since a naive
+        // value has no exact instant to compare bounds against in the
+        // first place.
+        if let Some(fire) = temporal_admission_refusal(value, declared) {
+            return Verdict::Fire(fire);
+        }
+        let Some(value_temporal) = &value.temporal else {
+            // `TzinfoKind::OtherAware` (a recognized-but-unresolvable
+            // tzinfo, e.g. `zoneinfo.ZoneInfo(...)`) — admitted as AWARE
+            // by the law above, but its own exact instant is not provable
+            // against ANY bound (`chart_reading`'s own `Instant` arm would
+            // read it `Unprovable` regardless), so this position is
+            // undetermined rather than guessed either way.
+            return Verdict::Undetermined(SENTENCE.temporal_unprovable_instant.to_owned());
+        };
+        let calendar_ask = refined_kernel::calendar_adapter::calendar_ask_of(kernel);
+        let asked = crate::kernel_ask::ask_kernel(|| {
+            refined_sets::calendar_interpreter::bounds_verdict_of(&*calendar_ask, declared_temporal, value_temporal.min.as_deref().unwrap_or(""))
+        });
+        return match asked {
+            Ok(refined_sets::calendar_interpreter::BoundsVerdict::Proved) => Verdict::Silent,
+            Ok(refined_sets::calendar_interpreter::BoundsVerdict::Refuted(_side)) => {
+                Verdict::Fire(temporal_refutation(value_temporal, declared, declared_temporal))
+            }
+            Ok(refined_sets::calendar_interpreter::BoundsVerdict::Alert(why)) => {
+                Verdict::Undetermined(temporal_alert_sentence(&why))
+            }
+            Err(_) => Verdict::Undetermined(SENTENCE.temporal_unprovable_instant.to_owned()),
+        };
     }
     if let Some(element) = &declared.element {
         if value.kind == Kind::Null {
@@ -846,6 +936,91 @@ pub fn judge(
     Verdict::Undetermined(SENTENCE.value_not_readable.to_owned())
 }
 
+/// One numeric `ObjectKey` field's own value off a tagged temporal
+/// instance — the same by-name linear scan `expressions.rs::
+/// datetime_field` already keeps for the identical shape, mirrored
+/// locally (assignability.rs cannot import `expressions.rs` without
+/// cycling — `expressions.rs` itself already imports `assignability`).
+fn temporal_field(value: &AbstractValue, name: &str) -> Option<f64> {
+    let entry = value.keys.iter().find(|key| key.name == name)?;
+    entry.value.values.first().copied()
+}
+
+/// THE AWARE/NAIVE ADMISSION LAW: `pydantic.AwareDatetime` "will fail
+/// validation if the datetime doesn't have timezone info," and
+/// `pydantic.NaiveDatetime` "will fail validation if the datetime
+/// provided has timezone info" (pydantic docs, `pydantic.types` module
+/// reference, the `AwareDatetime`/`NaiveDatetime` entries — vendored at
+/// `specifications/python/pydantic-types.md`). Decided from the
+/// construction's own `aware` field (`expressions.rs::datetime_
+/// construction_value`'s own doc: `0` naive, `1` UTC-aware, `2` aware
+/// with an unresolved exact offset) — `RequireAware` fires on `aware ==
+/// 0`; `RequireNaive` fires on `aware` one of `1`/`2`. `Any` (bare
+/// `datetime`, or a non-`Instant`-chart declaration) never fires here.
+/// `None` when the declared chart does not match the flowing
+/// construction's own chart (`date`/`timedelta` values reaching an
+/// `Instant`-declared position, or the reverse) — that mismatch is a
+/// different, ORDINARY chart mismatch this function does not own;
+/// `bounds_verdict_of`'s own `chart_reading` would refuse it, so the
+/// caller's fallback (Undetermined, on a chart it cannot compare) is
+/// the honest answer there, never a designated fire this law does not
+/// state.
+fn temporal_admission_refusal(value: &AbstractValue, declared: &DeclaredRefinement) -> Option<String> {
+    use crate::surface::TemporalAwareness;
+    if declared.temporal_awareness == TemporalAwareness::Any {
+        return None;
+    }
+    let declared_temporal = declared.temporal.as_ref()?;
+    if declared_temporal.chart != refined_sets::calendar_interpreter::TemporalChart::Instant {
+        return None;
+    }
+    if value.source != "datetime_datetime" {
+        return None;
+    }
+    let aware = temporal_field(value, "aware")?;
+    let is_naive = aware == 0.0;
+    let fires = match declared.temporal_awareness {
+        TemporalAwareness::RequireAware => is_naive,
+        TemporalAwareness::RequireNaive => !is_naive,
+        TemporalAwareness::Any => false,
+    };
+    if !fires {
+        return None;
+    }
+    let (value_word, why) = if declared.temporal_awareness == TemporalAwareness::RequireAware {
+        ("a naive datetime", "AwareDatetime requires timezone info; this construction carries no tzinfo")
+    } else {
+        ("an aware datetime", "NaiveDatetime requires no timezone info; this construction carries a tzinfo")
+    };
+    Some(format!("{} — {why}", refutation(value_word, &declared.spelling, &declared.set)))
+}
+
+/// The sentence a temporal bounds REFUTATION earns — `bounds_verdict_of`
+/// proved the flowing instant sits outside the declared window.
+/// Mirrors `containment_refutation`'s own shape for the scalar case,
+/// spelled through `format_temporal` for both sides.
+fn temporal_refutation(value_temporal: &TemporalAnnotation, declared: &DeclaredRefinement, declared_temporal: &TemporalAnnotation) -> String {
+    format!(
+        "a value of type '{}' is not assignable to type '{}' ({})",
+        refined_sets::calendar_interpreter::format_temporal(value_temporal),
+        declared.spelling,
+        refined_sets::calendar_interpreter::format_temporal(declared_temporal),
+    )
+}
+
+/// The undetermined sentence for a temporal `BoundsVerdict::Alert` —
+/// `bounds_verdict_of`'s own `why` (a plain per-position reason: "the
+/// spelling did not split," "the exact time of a zone-named spelling
+/// needs the zone's data," …) reported as-is, matching the "every
+/// silent row speaks a plain per-position sentence" doctrine.
+fn temporal_alert_sentence(why: &str) -> String {
+    if why.is_empty() {
+        SENTENCE.temporal_unprovable_instant.to_owned()
+    } else {
+        format!("Type not yet determined. Narrow type for safe type inference. {why}.")
+    }
+}
+
 /// Whether the declared set names scalars or strings — the shapes a
 /// dict/list/None/opaque value can NEVER inhabit. Three recognizers:
 /// numeric 1-tuple forms (`on_one_tuple_layer`), the full string ground
@@ -1118,6 +1293,8 @@ mod tests {
     /// alias, the shape surface.rs's annotated_expression_set builds.
     fn age_refinement() -> DeclaredRefinement {
         DeclaredRefinement {
+            temporal: None,
+            temporal_awareness: crate::surface::TemporalAwareness::Any,
             set: make_refined_set(vec![integer(), at_least(0.0), at_most(120.0)]),
             spelling: "Age".to_owned(),
             admits_none: false,
@@ -1133,6 +1310,8 @@ mod tests {
     /// the declaration admits absence.
     fn optional_age_refinement() -> DeclaredRefinement {
         DeclaredRefinement {
+            temporal: None,
+            temporal_awareness: crate::surface::TemporalAwareness::Any,
             set: make_refined_set(vec![integer(), at_least(0.0), at_most(120.0)]),
             spelling: "Age | None".to_owned(),
             admits_none: true,
@@ -1201,6 +1380,8 @@ mod tests {
     fn a_float_tagged_value_into_a_float_sorted_alias_never_hits_the_sort_law() {
         let Some(kernel) = loaded_kernel() else { return };
         let declared = DeclaredRefinement {
+            temporal: None,
+            temporal_awareness: crate::surface::TemporalAwareness::Any,
             set: make_refined_set(vec![at_least(0.0)]),
             spelling: "Weight".to_owned(),
             admits_none: false,
@@ -1223,6 +1404,8 @@ mod tests {
         use refined_sets::codepoint_sets::codepoints;
         use refined_sets::refinement_forms::repeat_of;
         DeclaredRefinement {
+            temporal: None,
+            temporal_awareness: crate::surface::TemporalAwareness::Any,
             set: make_refined_set(vec![repeat_of(codepoints(), 0, Some(8))]),
             spelling: "Label".to_owned(),
             admits_none: false,
@@ -1241,6 +1424,8 @@ mod tests {
     fn any_string_refinement() -> DeclaredRefinement {
         use refined_sets::codepoint_sets::strings;
         DeclaredRefinement {
+            temporal: None,
+            temporal_awareness: crate::surface::TemporalAwareness::Any,
             set: strings(),
             spelling: "AnyString".to_owned(),
             admits_none: false,
@@ -1298,6 +1483,8 @@ mod tests {
             string_tuple("radial"),
         )]);
         DeclaredRefinement {
+            temporal: None,
+            temporal_awareness: crate::surface::TemporalAwareness::Any,
             set,
             spelling: "ChartLayout".to_owned(),
             admits_none: false,
@@ -1349,6 +1536,8 @@ mod tests {
     fn none_against_a_literal_union_that_does_not_admit_none_fires() {
         let Some(kernel) = loaded_kernel() else { return };
         let two_member_declared = DeclaredRefinement {
+            temporal: None,
+            temporal_awareness: crate::surface::TemporalAwareness::Any,
             set: make_refined_set(vec![refined_sets::refinement_forms::union(
                 refined_sets::codepoint_sets::string_tuple("horizontal"),
                 refined_sets::codepoint_sets::string_tuple("vertical"),
@@ -1434,6 +1623,8 @@ mod tests {
             Some(1),
         );
         DeclaredRefinement {
+            temporal: None,
+            temporal_awareness: crate::surface::TemporalAwareness::Any,
             set,
             spelling: "SingleCharacter".to_owned(),
             admits_none: false,
@@ -1474,6 +1665,8 @@ mod tests {
     /// exercised by the fix.
     fn lower_ascii_char_refinement() -> DeclaredRefinement {
         DeclaredRefinement {
+            temporal: None,
+            temporal_awareness: crate::surface::TemporalAwareness::Any,
             set: make_refined_set(vec![integer(), at_least(0x61 as f64), at_most(0x7A as f64)]),
             spelling: "LowerAsciiChar".to_owned(),
             admits_none: false,
@@ -1532,6 +1725,8 @@ mod tests {
             string_tuple("C"),
         )]);
         DeclaredRefinement {
+            temporal: None,
+            temporal_awareness: crate::surface::TemporalAwareness::Any,
             set,
             spelling: "Grade".to_owned(),
             admits_none: false,
@@ -1692,6 +1887,8 @@ mod tests {
     fn an_opaque_value_into_a_non_scalar_ground_alias_is_undetermined() {
         let Some(kernel) = loaded_kernel() else { return };
         let declared = DeclaredRefinement {
+            temporal: None,
+            temporal_awareness: crate::surface::TemporalAwareness::Any,
             set: make_refined_set(Vec::new()),
             spelling: "Anything".to_owned(),
             admits_none: false,
@@ -1838,6 +2035,8 @@ mod tests {
     fn a_float_sorted_set_overlapping_a_non_integer_sorted_alias_fires() {
         let Some(kernel) = loaded_kernel() else { return };
         let declared = DeclaredRefinement {
+            temporal: None,
+            temporal_awareness: crate::surface::TemporalAwareness::Any,
             set: make_refined_set(vec![at_least(0.0)]),
             spelling: "Weight".to_owned(),
             admits_none: false,
@@ -1964,6 +2163,8 @@ mod tests {
             string_tuple("outside"),
         )]);
         let declared = DeclaredRefinement {
+            temporal: None,
+            temporal_awareness: crate::surface::TemporalAwareness::Any,
             set: wider,
             spelling: "PositionLabel".to_owned(),
             admits_none: false,
@@ -2007,6 +2208,8 @@ mod tests {
             string_tuple("end"),
         )]);
         let declared = DeclaredRefinement {
+            temporal: None,
+            temporal_awareness: crate::surface::TemporalAwareness::Any,
             set: wider,
             spelling: "PositionLabel".to_owned(),
             admits_none: false,
@@ -2035,6 +2238,8 @@ mod tests {
         use refined_sets::codepoint_sets::string_tuple;
         use refined_sets::refinement_forms::union;
         let declared = DeclaredRefinement {
+            temporal: None,
+            temporal_awareness: crate::surface::TemporalAwareness::Any,
             set: make_refined_set(vec![union(string_tuple("node"), string_tuple("link"))]),
             spelling: "Tag".to_owned(),
             admits_none: false,
@@ -2081,6 +2286,8 @@ mod tests {
     fn a_boolean_true_into_a_non_integer_sorted_alias_is_unchanged() {
         let Some(kernel) = loaded_kernel() else { return };
         let declared = DeclaredRefinement {
+            temporal: None,
+            temporal_awareness: crate::surface::TemporalAwareness::Any,
             set: make_refined_set(vec![at_least(0.0)]),
             spelling: "Weight".to_owned(),
             admits_none: false,
@@ -2112,6 +2319,8 @@ mod tests {
         use refined_sets::refinement_forms::repeat_of;
         let digit_range = make_refined_set(vec![integer(), at_least(0x30 as f64), at_most(0x39 as f64)]);
         DeclaredRefinement {
+            temporal: None,
+            temporal_awareness: crate::surface::TemporalAwareness::Any,
             set: make_refined_set(vec![
                 repeat_of(digit_range, 1, None),
                 repeat_of(codepoints(), 1, Some(4)),
@@ -2168,6 +2377,8 @@ mod tests {
     /// the same `age_refinement` every other test in this file shares.
     fn dict_of_age_refinement() -> DeclaredRefinement {
         DeclaredRefinement {
+            temporal: None,
+            temporal_awareness: crate::surface::TemporalAwareness::Any,
             set: make_refined_set(Vec::new()),
             spelling: "dict[str, Age]".to_owned(),
             admits_none: false,
@@ -2272,10 +2483,14 @@ mod tests {
     fn ratings_refinement() -> DeclaredRefinement {
         let element_set = make_refined_set(vec![integer(), at_least(1.0), at_most(5.0)]);
         DeclaredRefinement {
+            temporal: None,
+            temporal_awareness: crate::surface::TemporalAwareness::Any,
             set: make_refined_set(Vec::new()),
             spelling: "list[Ratings]".to_owned(),
             admits_none: false,
             element: Some(Box::new(DeclaredRefinement {
+                temporal: None,
+                temporal_awareness: crate::surface::TemporalAwareness::Any,
                 set: element_set,
                 spelling: ">= 1 && <= 5 && integer".to_owned(),
                 admits_none: false,
@@ -2343,6 +2558,8 @@ mod tests {
     /// this file shares.
     fn person_dict_refinement() -> DeclaredRefinement {
         DeclaredRefinement {
+            temporal: None,
+            temporal_awareness: crate::surface::TemporalAwareness::Any,
             set: make_refined_set(Vec::new()),
             spelling: "PersonDict".to_owned(),
             admits_none: false,
@@ -2405,6 +2622,8 @@ mod tests {
     fn a_vitals_construction_with_spo2_out_of_set_fires_the_shown_words_key_wording() {
         let Some(kernel) = loaded_kernel() else { return };
         let heart_rate_refinement = || DeclaredRefinement {
+            temporal: None,
+            temporal_awareness: crate::surface::TemporalAwareness::Any,
             set: make_refined_set(vec![integer(), at_least(20.0), at_most(250.0)]),
             spelling: ">= 20 && <= 250 && integer".to_owned(),
             admits_none: false,
@@ -2415,6 +2634,8 @@ mod tests {
             positions: None,
         };
         let spo2_refinement = DeclaredRefinement {
+            temporal: None,
+            temporal_awareness: crate::surface::TemporalAwareness::Any,
             set: make_refined_set(vec![at_least(0.0), at_most(100.0)]),
             spelling: ">= 0 && <= 100".to_owned(),
             admits_none: false,
@@ -2425,6 +2646,8 @@ mod tests {
             positions: None,
         };
         let declared = DeclaredRefinement {
+            temporal: None,
+            temporal_awareness: crate::surface::TemporalAwareness::Any,
             set: make_refined_set(Vec::new()),
             spelling: "Vitals".to_owned(),
             admits_none: false,
@@ -2528,6 +2751,8 @@ mod tests {
     /// keeps its own set.
     fn age_label_tuple_refinement() -> DeclaredRefinement {
         DeclaredRefinement {
+            temporal: None,
+            temporal_awareness: crate::surface::TemporalAwareness::Any,
             set: make_refined_set(Vec::new()),
             spelling: "tuple[Age, Label]".to_owned(),
             admits_none: false,
@@ -2586,6 +2811,8 @@ mod tests {
         let Some(kernel) = loaded_kernel() else { return };
         fn channel_refinement() -> DeclaredRefinement {
             DeclaredRefinement {
+                temporal: None,
+                temporal_awareness: crate::surface::TemporalAwareness::Any,
                 set: make_refined_set(vec![integer(), at_least(0.0), at_most(255.0)]),
                 spelling: "Channel".to_owned(),
                 admits_none: false,
@@ -2597,6 +2824,8 @@ mod tests {
             }
         }
         let declared = DeclaredRefinement {
+            temporal: None,
+            temporal_awareness: crate::surface::TemporalAwareness::Any,
             set: make_refined_set(Vec::new()),
             spelling: "tuple[Channel, Channel, Channel]".to_owned(),
             admits_none: false,
@@ -2626,6 +2855,8 @@ mod tests {
         let Some(kernel) = loaded_kernel() else { return };
         fn channel_refinement() -> DeclaredRefinement {
             DeclaredRefinement {
+                temporal: None,
+                temporal_awareness: crate::surface::TemporalAwareness::Any,
                 set: make_refined_set(vec![integer(), at_least(0.0), at_most(255.0)]),
                 spelling: "Channel".to_owned(),
                 admits_none: false,
@@ -2637,6 +2868,8 @@ mod tests {
             }
         }
         let declared = DeclaredRefinement {
+            temporal: None,
+            temporal_awareness: crate::surface::TemporalAwareness::Any,
             set: make_refined_set(Vec::new()),
             spelling: "tuple[Channel, Channel, Channel]".to_owned(),
             admits_none: false,

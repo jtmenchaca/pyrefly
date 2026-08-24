@@ -251,6 +251,19 @@ pub fn call_result_with_enclosing(
                 environment.set_datetime_imports(datetime_imports.clone());
             }
         }
+        // LOCALE PREMISE: the same inherit-when-unset rule, for the
+        // identical reason — a same-module def interpreted here may
+        // itself call `datetime.strptime` with a `%a` directive, and
+        // that reading needs the caller's own module-wide
+        // `locale.setlocale`-never-called premise
+        // (`module_never_calls_setlocale`'s own doc), not a fresh
+        // `None` this interpreted body's own `Environment::new` would
+        // otherwise carry.
+        if environment.locale_never_set().is_none() {
+            if let Some(locale_never_set) = enclosing.locale_never_set() {
+                environment.set_locale_never_set(locale_never_set);
+            }
+        }
     }
     let Some(()) = bind_parameters(def, arguments, kernel, &mut environment, enclosing) else {
         return return_sort_fallback(def);

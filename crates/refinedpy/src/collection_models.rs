@@ -94,7 +94,7 @@
 use refined_domain::abstract_value::{
     known_set, known_values, null_value, unknown, AbstractValue, Kind, ObjectKey, PrimitiveKind, SetKindTag,
 };
-use refined_domain::known_constructors::{known_list, known_object};
+use refined_domain::known_constructors::{element_of_object_star, known_list, known_object};
 use refined_domain::lattice_operations::{join_known, set_of_known};
 use refined_domain::trust_grades::{min_trust_level, trust_level_of, TrustLevel, TrustProved};
 use refined_kernel::kernel_bridge::kernel_if_loaded;
@@ -712,6 +712,34 @@ fn star_element_read(container: &AbstractValue, index: &AbstractValue) -> Option
     })
 }
 
+/// `container[key]` on a `dict[str, X]` PARAMETER'S own unbounded-key
+/// receiver (`Kind::ObjectStar` — `check.rs::seed_parameters`' own
+/// `known_dict_star` seed, `element_of_object_star`'s doc): every
+/// STRING key, if present, reads the star's wrapped element — the same
+/// value `.get(k)` reads on its own present-key branch
+/// (`dict_get_result`'s dict-star arm below). Gated on a STRING key
+/// (`known_dict_key` proving a `numeric: false` identity) because the
+/// declaration is `dict[str, X]`, never an int key — an Integer- or
+/// unrecognized-sorted index answers `None`, the same "not this dict's
+/// key sort" decline `dict_key_read` gives a closed dict.
+///
+/// This does not itself prove the key is PRESENT (an unbounded dict
+/// states no fixed key set to check against) — it reads the value the
+/// declaration states EVERY present key holds, the same way a closed
+/// dict's own `dict_key_read` answers a value without separately
+/// proving the runtime dict was literally built with that key. CPython
+/// raises `KeyError` on a genuinely missing key either way
+/// (`stdtypes.rst`'s `d[key]` row); this domain carries no exception
+/// channel for that miss on a closed dict either, so an unbounded dict
+/// keeps the identical honesty.
+fn dict_star_index_read(container: &AbstractValue, index: &AbstractValue) -> Option<AbstractValue> {
+    let key = known_dict_key(index)?;
+    if key.numeric {
+        return None;
+    }
+    element_of_object_star(container)
+}
+
 /// `container[index]` — the subscription read (expressions.rst,
 /// "Subscriptions"): a known list/tuple (`Kind::List`) with a known
 /// Integer index, a known exact string (`Kind::Values` tagged
@@ -722,12 +750,14 @@ fn star_element_read(container: &AbstractValue, index: &AbstractValue) -> Option
 /// never the list/tuple positional-index path above: the two receiver
 /// kinds never share one dispatch arm), a dict keyed by a finite
 /// UNION of known strings where every named entry is present
-/// (`dict_key_set_read`'s own doc), or an unknown-length sequence whose
-/// element set is known (`star_element_read`'s own doc). Every other
-/// receiver shape or index/key shape answers `None` — an unknown
-/// receiver, a non-Integer index into a list or string, an unsupported
-/// key sort into a dict, or a slice — none of those are modeled here
-/// and this function declines honestly rather than guessing.
+/// (`dict_key_set_read`'s own doc), an unbounded-key `dict[str, X]`
+/// receiver with a known string key (`dict_star_index_read`'s own
+/// doc), or an unknown-length sequence whose element set is known
+/// (`star_element_read`'s own doc). Every other receiver shape or
+/// index/key shape answers `None` — an unknown receiver, a
+/// non-Integer index into a list or string, an unsupported key sort
+/// into a dict, or a slice — none of those are modeled here and this
+/// function declines honestly rather than guessing.
 pub fn subscript_read(container: &AbstractValue, index: &AbstractValue) -> Option<AbstractValue> {
     match container.kind {
         Kind::List => {
@@ -744,6 +774,7 @@ pub fn subscript_read(container: &AbstractValue, index: &AbstractValue) -> Optio
             Some(key) => dict_key_read(&container.keys, &key),
             None => dict_key_set_read(&container.keys, index),
         },
+        Kind::ObjectStar => dict_star_index_read(container, index),
         Kind::Set => star_element_read(container, index),
         _ => None,
     }
@@ -793,6 +824,37 @@ pub fn len_result(container: &AbstractValue) -> Option<AbstractValue> {
     ))
 }
 
+/// `dict.get(key, default=None, /)` on an UNBOUNDED-KEY `dict[str, X]`
+/// receiver (`Kind::ObjectStar` — `check.rs::seed_parameters`'
+/// `known_dict_star` seed): unlike a closed dict, this receiver states
+/// no fixed key set to prove the key present OR absent against, so
+/// `.get(k)` reads BOTH branches stdtypes.rst's `get` describes at
+/// once — the value if present (the star's own element,
+/// `element_of_object_star`), OR the miss-branch value if absent (the
+/// caller's own `default` argument when one was passed, else the null
+/// state standing in for Python's `None`, the same "default defaults to
+/// None" reading `dict_get_result`'s own closed-dict arm gives). Joined
+/// with `join_known` rather than wrapped as a maybe carrier around the
+/// element alone: a passed `default` is a REAL value the miss branch
+/// answers, not merely "absence," so dropping it and always claiming
+/// "element or None" would be UNSOUND the moment a caller passes a
+/// non-None default — `join_known` folds it in as an ordinary second
+/// arm the same way any other two-branch value join in this crate
+/// already would. A non-string key sort answers `None`, the same "not
+/// this dict's key sort" decline the closed-dict arm gives below.
+fn dict_star_get_result(container: &AbstractValue, key: &AbstractValue, default: Option<&AbstractValue>) -> Option<AbstractValue> {
+    let key = known_dict_key(key)?;
+    if key.numeric {
+        return None;
+    }
+    let element = element_of_object_star(container)?;
+    let miss_branch = match default {
+        Some(default_value) => default_value.clone(),
+        None => null_value(),
+    };
+    Some(join_known(element, miss_branch))
+}
+
 /// `dict.get(key, default=None, /)` — library/stdtypes.rst, dict's
 /// `method:: get`: "Return the value for key if key is in the
 /// dictionary, else default. If default is not given, it defaults to
@@ -801,14 +863,19 @@ pub fn len_result(container: &AbstractValue) -> Option<AbstractValue> {
 /// argument if one was passed, else the null state (`null_value`,
 /// `abstract_value.rs`) standing in for Python's `None` — the same
 /// exactly-null admission the Lean kernel's AbsentMark split carries
-/// (`null_value`'s own doc). Only a known-`Kind::Object` receiver
-/// with a known String- or Integer-sorted key (`known_dict_key`'s own
-/// doc) is modeled; every other shape answers `None`.
+/// (`null_value`'s own doc). A known-`Kind::Object` receiver with a
+/// known String- or Integer-sorted key (`known_dict_key`'s own doc),
+/// or an unbounded-key `dict[str, X]` receiver with a known string key
+/// (`dict_star_get_result`'s own doc), is modeled; every other shape
+/// answers `None`.
 pub fn dict_get_result(
     container: &AbstractValue,
     key: &AbstractValue,
     default: Option<&AbstractValue>,
 ) -> Option<AbstractValue> {
+    if container.kind == Kind::ObjectStar {
+        return dict_star_get_result(container, key, default);
+    }
     if container.kind != Kind::Object {
         return None;
     }

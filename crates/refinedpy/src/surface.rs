@@ -17,6 +17,8 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 
+use refined_sets::calendar_interpreter::TemporalAnnotation;
+use refined_sets::calendar_interpreter::TemporalChart;
 use refined_sets::codepoint_sets::{string_tuple, strings, without_string_ground};
 use refined_sets::format_for_diagnostics::format_for_diagnostics;
 use refined_sets::regex_compiler::format_grammar;
@@ -65,7 +67,7 @@ const INERT_FIELD_KWARGS: &[&str] = &[
 /// the IDENTICAL `DeclaredRefinement.spelling`
 /// (`check.rs::seed_parameters`'s `spelling.starts_with("list[")` gate
 /// reads either one the same way regardless).
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, Debug)]
 pub struct AliasEntry {
     pub set: RefinedSet,
     pub head: Option<&'static str>,
@@ -80,6 +82,84 @@ pub struct AliasEntry {
     /// `Optional[...]` wrapper is spelled inline at the parameter or
     /// hoisted into a module-level alias name.
     pub admits_none: bool,
+    /// A FIXED-ARITY `tuple[X, Y, Z]` alias's own per-position table —
+    /// mirrors `DeclaredRefinement::positions` (typereading.rs), the
+    /// same "one active field" convention `element` already keeps: a
+    /// tuple-shaped alias carries `set` empty and `element`/`head`/
+    /// `length_window` unset, since a fixed-arity tuple has no single
+    /// shared element or length window, only per-slot refinements keyed
+    /// by index. Each slot's own resolved set AND written spelling —
+    /// the same `(RefinedSet, String)` pair `element` carries for its
+    /// one shared slot — built through `element_set_and_spelling_for_
+    /// alias`'s identical fallback chain (a bare alias name, a bare
+    /// `int`/`float`/`str` base sort, a nested `Annotated[...]`, or a
+    /// `Literal[...]`), applied once per position instead of once for a
+    /// shared element. `None` for every other alias shape (scalar,
+    /// `list[X]`/`set[X]`/`Sequence[X]`, `Literal[...]`) — populated
+    /// ONLY when the alias's own RHS is a recognized fixed-arity tuple
+    /// subscript (`compile_aliases`' own tuple arm).
+    pub positions: Option<Vec<(RefinedSet, String)>>,
+    /// A `date`/`timedelta`/`datetime`/`AwareDatetime`/`NaiveDatetime`
+    /// base's own calendar window — the same "one active field"
+    /// convention every other container shape keeps: `set` carries
+    /// nothing for a temporal alias (a `Temporal*` value is never a
+    /// member of a numeric/string `RefinedSet`), so the calendar bound
+    /// lives here instead. `None` for every non-temporal alias.
+    /// `AliasEntry::admits_none`'s own `bool` still applies on top —
+    /// `type OptionalCutoff = Optional[Cutoff]` still means what it
+    /// means for a temporal alias exactly as for a scalar one.
+    pub temporal: Option<TemporalAnnotation>,
+    /// Which of pydantic's two AWARENESS-typed `datetime` bases (if
+    /// either) `temporal` was read from — `Any` for bare `datetime`
+    /// (either awareness admitted), `RequireAware` for `AwareDatetime`,
+    /// `RequireNaive` for `NaiveDatetime` (pydantic's own documented
+    /// distinction — cited at `assignability.rs`'s own admission-law
+    /// call site). Meaningless (and left `Any`) whenever `temporal` is
+    /// `None` or names a non-`Instant` chart (`date`/`timedelta` carry
+    /// no awareness concept at all).
+    pub temporal_awareness: TemporalAwareness,
+}
+
+/// Which of pydantic's aware/naive `datetime` bases a temporal
+/// declaration names — `AliasEntry::temporal_awareness`'s own doc.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum TemporalAwareness {
+    /// Bare `datetime` (or a non-`Instant`-chart declaration, where the
+    /// distinction does not apply) — either an aware or a naive
+    /// construction is admitted.
+    #[default]
+    Any,
+    /// `pydantic.AwareDatetime` — a naive construction is a designated
+    /// fire (assignability.rs's own admission law).
+    RequireAware,
+    /// `pydantic.NaiveDatetime` — an aware construction is a designated
+    /// fire (the mirror).
+    RequireNaive,
+}
+
+/// Hand-written: `TemporalAnnotation` (a sibling crate's type, out of
+/// this crate's reach under the orphan rule) derives only Debug/Clone,
+/// not PartialEq, so a blanket `#[derive(PartialEq)]` on `AliasEntry`
+/// does not compile once `temporal` is populated — the same situation
+/// `refined_domain::abstract_value::AbstractValue` already documents
+/// for its own `temporal` field. Every other field compares by its own
+/// derived/structural equality; `temporal` compares chart/min/max by
+/// hand.
+impl PartialEq for AliasEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.set == other.set
+            && self.head == other.head
+            && self.element == other.element
+            && self.length_window == other.length_window
+            && self.admits_none == other.admits_none
+            && self.positions == other.positions
+            && self.temporal_awareness == other.temporal_awareness
+            && match (&self.temporal, &other.temporal) {
+                (None, None) => true,
+                (Some(a), Some(b)) => a.chart == b.chart && a.min == b.min && a.max == b.max,
+                _ => false,
+            }
+    }
 }
 
 /// Every `type X = Annotated[int|float, Field(…)]` alias at the
@@ -169,6 +249,9 @@ pub fn compile_aliases(module: &ModModule) -> HashMap<String, AliasEntry> {
                     element: element.map(Box::new),
                     length_window,
                     admits_none: false,
+                    positions: None,
+                    temporal: None,
+                    temporal_awareness: TemporalAwareness::Any,
                 })
             })
             .or_else(|| {
@@ -196,6 +279,56 @@ pub fn compile_aliases(module: &ModModule) -> HashMap<String, AliasEntry> {
                     element: Some(Box::new(element)),
                     length_window: None,
                     admits_none: false,
+                    positions: None,
+                    temporal: None,
+                    temporal_awareness: TemporalAwareness::Any,
+                })
+            })
+            .or_else(|| {
+                // A bare-RHS FIXED-ARITY `tuple[X, Y, Z]` alias (`type
+                // Color = tuple[Channel, Channel, Channel]`,
+                // showcase.py's own row) — the same all-or-nothing,
+                // per-slot resolution `typereading.rs`'s inline
+                // `Expr::Subscript` tuple arm applies to a parameter
+                // spelled `tuple[X, Y, Z]` directly, mirrored here so an
+                // ALIASED fixed-arity tuple reads identically. `set`/
+                // `head`/`element`/`length_window` stay unset (the same
+                // "one active field" convention `positions` itself
+                // documents): a fixed-arity tuple has no single shared
+                // element or scalar set, only per-slot refinements.
+                tuple_alias_positions(value, &imports, &out).map(|positions| AliasEntry {
+                    set: make_refined_set(Vec::new()),
+                    head: None,
+                    element: None,
+                    length_window: None,
+                    admits_none: false,
+                    positions: Some(positions),
+                    temporal: None,
+                    temporal_awareness: TemporalAwareness::Any,
+                })
+            })
+            .or_else(|| {
+                // A temporal base (`date`/`timedelta`/`datetime`, or
+                // pydantic's `AwareDatetime`/`NaiveDatetime`) wrapped in
+                // `Annotated[...]` with `Field(ge=…/le=…/gt=…/lt=…)`
+                // bounds spelled as `date(...)`/`timedelta(...)`/
+                // `datetime(...)` literal calls, or a bare Name that
+                // resolves to a module-level `_cutoff = datetime(...)`
+                // assignment (showcase.py's own `Cutoff`/`Stamp` rows).
+                // `set`/`head`/`element`/`length_window`/`positions` stay
+                // unset — the same "one active field" convention every
+                // other container shape already keeps: a `Temporal*`
+                // value is never a member of a numeric/string
+                // `RefinedSet`.
+                temporal_alias_annotation(value, &imports, module).map(|(temporal, awareness)| AliasEntry {
+                    set: make_refined_set(Vec::new()),
+                    head: None,
+                    element: None,
+                    length_window: None,
+                    admits_none: false,
+                    positions: None,
+                    temporal: Some(temporal),
+                    temporal_awareness: awareness,
                 })
             })
             .or_else(|| {
@@ -205,6 +338,9 @@ pub fn compile_aliases(module: &ModModule) -> HashMap<String, AliasEntry> {
                     element: None,
                     length_window: None,
                     admits_none: false,
+                    positions: None,
+                    temporal: None,
+                    temporal_awareness: TemporalAwareness::Any,
                 })
             })
             .or_else(|| {
@@ -214,6 +350,9 @@ pub fn compile_aliases(module: &ModModule) -> HashMap<String, AliasEntry> {
                     element: None,
                     length_window: None,
                     admits_none: false,
+                    positions: None,
+                    temporal: None,
+                    temporal_awareness: TemporalAwareness::Any,
                 })
             })
             .or_else(|| {
@@ -331,6 +470,51 @@ fn element_set_and_spelling_for_alias(
         return Some((set, spelling));
     }
     None
+}
+
+/// A bare-RHS FIXED-ARITY `tuple[X, Y, Z]` alias's own per-position
+/// table — `typereading.rs`'s inline `Expr::Subscript` tuple arm's own
+/// recognition (bare-Name head `tuple`, a `Tuple`-wrapped multi-element
+/// slice or a single unwrapped slot for `tuple[X]`, `tuple[X, ...]`'s
+/// trailing bare `Expr::EllipsisLiteral` declining as a different,
+/// unbounded-length shape this reader does not carry), mirrored here so
+/// the ALIAS path resolves the identical shape an inline parameter
+/// annotation already does. Each slot resolves through `element_set_
+/// and_spelling_for_alias`'s own fallback chain — the SAME reader
+/// `element` itself uses for a `list[X]`/`set[X]`/`Sequence[X]` alias's
+/// one shared slot, applied once per position instead of once overall.
+/// `None` when the RHS is not a `tuple[...]` subscript, the slice ends
+/// in a bare `...`, or ANY position fails to resolve — the same all-
+/// or-nothing rule the inline arm and `element`'s own container arm
+/// both already take: a declined position declines the whole alias
+/// rather than guessing a narrower table.
+fn tuple_alias_positions(
+    value: &Expr,
+    imports: &SurfaceImports,
+    out: &HashMap<String, AliasEntry>,
+) -> Option<Vec<(RefinedSet, String)>> {
+    let Expr::Subscript(subscript) = value else {
+        return None;
+    };
+    let is_tuple = matches!(subscript.value.as_ref(), Expr::Name(head) if head.id.as_str() == "tuple");
+    if !is_tuple {
+        return None;
+    }
+    let slots: Vec<&Expr> = match subscript.slice.as_ref() {
+        Expr::Tuple(arguments) => {
+            if arguments.elts.iter().any(|element| matches!(element, Expr::EllipsisLiteral(_))) {
+                return None;
+            }
+            arguments.elts.iter().collect()
+        }
+        Expr::EllipsisLiteral(_) => return None,
+        other => vec![other],
+    };
+    let mut positions = Vec::with_capacity(slots.len());
+    for slot in slots {
+        positions.push(element_set_and_spelling_for_alias(slot, imports, out)?);
+    }
+    Some(positions)
 }
 
 /// Every `type X = Annotated[StrictInt, …]` alias name at the module's
@@ -718,6 +902,323 @@ pub fn annotated_expression_set(
     Some((make_refined_set(forms), None))
 }
 
+/// `Annotated[date|timedelta|datetime|AwareDatetime|NaiveDatetime,
+/// Field(ge=…/le=…/gt=…/lt=…)]` → the stated calendar window, resolved
+/// against the module's import identities. The base must be one of the
+/// five recognized temporal names (by import identity, the same
+/// discipline `annotated_expression_set` holds for `Annotated`/
+/// `StrictInt`); every metadata element must be a recognized `Field(…)`
+/// call whose `ge`/`le`/`gt`/`lt` value is itself a `date(...)`/
+/// `timedelta(...)`/`datetime(...)` literal call OR a bare Name
+/// resolving to a MODULE-LEVEL plain assignment of one (`_cutoff =
+/// datetime(...)` then `Field(ge=_cutoff)`, showcase.py's own `Cutoff`/
+/// `Stamp` rows) — any other kwarg, or a bound this reader cannot read
+/// as a temporal literal, refuses the whole alias, the same
+/// all-or-nothing discipline `annotated_expression_set` already holds
+/// for its own numeric/string kwargs.
+///
+/// `gt`/`lt` are read as `ge`/`le` — this table's `TemporalAnnotation`
+/// only carries `min`/`max` (calendar_interpreter.rs, no open/closed
+/// bit), the same rounding-free identification refined-ts-go's own
+/// temporal surface makes (`SPEC-boundaries.md`'s "the calendar
+/// carries no strict/non-strict distinction, only the ISO endpoint
+/// itself" convention); a strict bound stated at these positions and a
+/// non-strict one at the same value are indistinguishable this table's
+/// own kernel questions can decide (`compare_on_chart` compares two
+/// ISO points, never a strictness bit), matching every showcase.py row
+/// this table serves (`ge=`/`le=` only).
+fn temporal_alias_annotation(
+    value: &Expr,
+    imports: &SurfaceImports,
+    module: &ModModule,
+) -> Option<(TemporalAnnotation, TemporalAwareness)> {
+    temporal_annotation_of(value, imports, Some(module))
+}
+
+/// `temporal_alias_annotation`'s own recognition, usable with no module
+/// in hand — `typereading.rs::declared_refinement`'s own inline
+/// `Annotated[date|timedelta|datetime|AwareDatetime|NaiveDatetime,
+/// Field(…)]` arm (a PARAMETER annotation spelled directly, not
+/// through a module-level alias) never carries a `&ModModule` — every
+/// caller in that file passes only the annotation expression,
+/// `aliases`, and `imports`. A bare-Name bound (`Field(ge=_cutoff)`)
+/// is therefore unresolvable at that call site; a module-level
+/// `Cutoff`/`Stamp`-style alias reads through `compile_aliases`'s own
+/// `temporal_alias_annotation` instead, which DOES have the module.
+pub fn temporal_inline_annotation(value: &Expr, imports: &SurfaceImports) -> Option<(TemporalAnnotation, TemporalAwareness)> {
+    temporal_annotation_of(value, imports, None)
+}
+
+/// The shared recognition both `temporal_alias_annotation` (module-level
+/// alias RHS) and `temporal_inline_annotation` (inline parameter
+/// annotation) drive: see `temporal_alias_annotation`'s own doc for the
+/// full rule. `module` is `None` at an inline call site — a bare-Name
+/// bound simply fails to resolve there (`temporal_literal_iso`'s own
+/// `Option<&ModModule>` threading), rather than the whole function
+/// requiring a module it does not have.
+fn temporal_annotation_of(
+    value: &Expr,
+    imports: &SurfaceImports,
+    module: Option<&ModModule>,
+) -> Option<(TemporalAnnotation, TemporalAwareness)> {
+    let Expr::Subscript(subscript) = value else {
+        return None;
+    };
+    let Expr::Name(head) = subscript.value.as_ref() else {
+        return None;
+    };
+    if !imports.annotated_names.contains(head.id.as_str()) {
+        return None;
+    }
+    let Expr::Tuple(arguments) = subscript.slice.as_ref() else {
+        return None;
+    };
+    let (base, metadata) = arguments.elts.split_first()?;
+    let Expr::Name(base_name) = base else {
+        return None;
+    };
+    let (chart, awareness) = if imports.date_names.contains(base_name.id.as_str()) {
+        (TemporalChart::PlainDate, TemporalAwareness::Any)
+    } else if imports.timedelta_names.contains(base_name.id.as_str()) {
+        (TemporalChart::Duration, TemporalAwareness::Any)
+    } else if imports.datetime_names.contains(base_name.id.as_str()) {
+        (TemporalChart::Instant, TemporalAwareness::Any)
+    } else if imports.aware_datetime_names.contains(base_name.id.as_str()) {
+        (TemporalChart::Instant, TemporalAwareness::RequireAware)
+    } else if imports.naive_datetime_names.contains(base_name.id.as_str()) {
+        (TemporalChart::Instant, TemporalAwareness::RequireNaive)
+    } else {
+        return None;
+    };
+    let mut min: Option<String> = None;
+    let mut max: Option<String> = None;
+    for meta in metadata {
+        let Expr::Call(call) = meta else {
+            return None;
+        };
+        if !names_field(call.func.as_ref(), imports) {
+            return None;
+        }
+        for keyword in call.arguments.keywords.iter() {
+            let name = keyword.arg.as_ref()?;
+            match name.as_str() {
+                "ge" | "gt" => min = Some(temporal_literal_iso(&keyword.value, chart, imports, module)?),
+                "le" | "lt" => max = Some(temporal_literal_iso(&keyword.value, chart, imports, module)?),
+                other if INERT_FIELD_KWARGS.contains(&other) => {}
+                _ => return None,
+            }
+        }
+    }
+    if min.is_none() && max.is_none() {
+        return None;
+    }
+    Some((TemporalAnnotation { chart, min, max }, awareness))
+}
+
+/// One `Field(ge=…)`-style bound expression, read as the ISO spelling
+/// `calendar_interpreter.rs`'s own chart reader accepts for `chart`: a
+/// `date(...)`/`timedelta(...)`/`datetime(...)` call read directly
+/// (`temporal_construction_iso`), or — when a module is in hand — a
+/// bare Name resolved against the module's own TOP-LEVEL plain
+/// assignments (`_cutoff = datetime(...)`) first, falling back to the
+/// SAME construction reading on the resolved RHS. `None` for anything
+/// else: a computed expression, a bare Name with no module to resolve
+/// it against (the inline call site, `module: None`), an unresolvable
+/// name, or a construction this table cannot read.
+fn temporal_literal_iso(expr: &Expr, chart: TemporalChart, imports: &SurfaceImports, module: Option<&ModModule>) -> Option<String> {
+    if let Expr::Name(name) = expr {
+        let bound_value = top_level_plain_assignment(module?, name.id.as_str())?;
+        return temporal_construction_iso(bound_value, chart, imports);
+    }
+    temporal_construction_iso(expr, chart, imports)
+}
+
+/// The module's own top-level `name = <value>` plain assignment RHS
+/// (`Stmt::Assign` with a single bare-Name target) — the shape
+/// showcase.py's own `_cutoff = datetime(2024, 1, 1, 0, 0, 0,
+/// tzinfo=timezone.utc)` takes. `None` when no such assignment exists,
+/// or the target is not a single bare Name (a tuple-unpack assignment
+/// states no single RHS this reader could point at).
+fn top_level_plain_assignment<'a>(module: &'a ModModule, name: &str) -> Option<&'a Expr> {
+    for stmt in module.body.iter() {
+        let Stmt::Assign(assign) = stmt else {
+            continue;
+        };
+        let [Expr::Name(target)] = assign.targets.as_slice() else {
+            continue;
+        };
+        if target.id.as_str() == name {
+            return Some(assign.value.as_ref());
+        }
+    }
+    None
+}
+
+/// A `date(year, month, day)` / `timedelta(days=n)` /
+/// `datetime(year, month, day, hour=0, minute=0, second=0,
+/// tzinfo=...)` call, read as the ISO spelling its own chart expects:
+/// `date` → `"YYYY-MM-DD"`; `timedelta` → the ISO 8601 duration
+/// `"PnD"` (`duration_fields`'s own grammar, calendar_interpreter.rs —
+/// every field but `days` is 0 here, the same single-field scope
+/// `expressions.rs::timedelta_construction_value` already keeps);
+/// `datetime` → `"YYYY-MM-DDTHH:MM:SSZ"` when `tzinfo=` spells the UTC
+/// singleton (`datetime.timezone.utc`/`datetime.UTC`), or the offset-
+/// free `"YYYY-MM-DDTHH:MM:SS"` when no `tzinfo=` is given (a NAIVE
+/// spelling — `chart_reading`'s own `Instant` arm reads this as
+/// `Unprovable`, which `compare_on_chart` then reports through
+/// `BoundsVerdict::Alert` rather than a decided proof, matching a
+/// naive datetime's own documented unprovability against an exact
+/// instant). Every field is a literal int (or, for `days`, the same
+/// literal-int reading `Field`'s own numeric kwargs already take) —
+/// this reader never evaluates an expression, matching
+/// `annotated_expression_set`'s own literal-only discipline. Any other
+/// argument shape (a non-literal field, an unrecognized keyword, a
+/// non-UTC `tzinfo=`) declines.
+fn temporal_construction_iso(expr: &Expr, chart: TemporalChart, imports: &SurfaceImports) -> Option<String> {
+    let Expr::Call(call) = expr else {
+        return None;
+    };
+    let Expr::Name(callee) = call.func.as_ref() else {
+        return None;
+    };
+    match chart {
+        TemporalChart::PlainDate => {
+            if !imports.date_names.contains(callee.id.as_str()) {
+                return None;
+            }
+            let [year, month, day] = date_fields(call, &["year", "month", "day"])?;
+            Some(format!("{year:04}-{month:02}-{day:02}"))
+        }
+        TemporalChart::Duration => {
+            if !imports.timedelta_names.contains(callee.id.as_str()) {
+                return None;
+            }
+            if !call.arguments.args.is_empty() {
+                return None;
+            }
+            let [keyword] = call.arguments.keywords.as_slice() else {
+                return None;
+            };
+            if keyword.arg.as_ref().map(|name| name.as_str()) != Some("days") {
+                return None;
+            }
+            let days = literal_length(&keyword.value)?;
+            Some(format!("P{days}D"))
+        }
+        TemporalChart::Instant => {
+            if !imports.datetime_names.contains(callee.id.as_str())
+                && !imports.aware_datetime_names.contains(callee.id.as_str())
+                && !imports.naive_datetime_names.contains(callee.id.as_str())
+            {
+                return None;
+            }
+            let field_names = ["year", "month", "day", "hour", "minute", "second"];
+            let mut fields: Vec<Option<i64>> = vec![None; field_names.len()];
+            for (index, arg) in call.arguments.args.iter().enumerate() {
+                let slot = fields.get_mut(index)?;
+                *slot = Some(literal_length(arg)?);
+            }
+            let mut is_utc = false;
+            for keyword in &call.arguments.keywords {
+                let Some(arg_name) = keyword.arg.as_ref() else {
+                    return None;
+                };
+                if arg_name.as_str() == "tzinfo" {
+                    is_utc = is_utc_tzinfo_expr(&keyword.value);
+                    if !is_utc {
+                        // a tzinfo this reader cannot prove is exactly UTC
+                        // — decline rather than guess an offset, matching
+                        // `expressions.rs::datetime_construction_value`'s
+                        // own discipline.
+                        return None;
+                    }
+                    continue;
+                }
+                let Some(position) = field_names.iter().position(|name| *name == arg_name.as_str()) else {
+                    return None;
+                };
+                let slot = fields.get_mut(position)?;
+                *slot = Some(literal_length(&keyword.value)?);
+            }
+            let mut values = [0i64; 6];
+            for index in 0..field_names.len() {
+                values[index] = match fields[index] {
+                    Some(v) => v,
+                    None if index < 3 => return None,
+                    None => 0,
+                };
+            }
+            let [year, month, day, hour, minute, second] = values;
+            let zone = if is_utc { "Z" } else { "" };
+            Some(format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}{zone}"))
+        }
+        _ => None,
+    }
+}
+
+/// One `date(...)` constructor argument's own field triple, positional
+/// or keyword, read as literal ints — `temporal_construction_iso`'s own
+/// `PlainDate` arm, factored out so the field-order comment lives
+/// beside its one call site.
+fn date_fields(call: &ruff_python_ast::ExprCall, names: &[&str; 3]) -> Option<[i64; 3]> {
+    let mut fields: Vec<Option<i64>> = vec![None; names.len()];
+    for (index, arg) in call.arguments.args.iter().enumerate() {
+        let slot = fields.get_mut(index)?;
+        *slot = Some(literal_length(arg)?);
+    }
+    for keyword in &call.arguments.keywords {
+        let Some(arg_name) = keyword.arg.as_ref() else {
+            return None;
+        };
+        let position = names.iter().position(|name| *name == arg_name.as_str())?;
+        let slot = fields.get_mut(position)?;
+        *slot = Some(literal_length(&keyword.value)?);
+    }
+    Some([fields[0]?, fields[1]?, fields[2]?])
+}
+
+/// Whether `expr` is exactly `datetime.timezone.utc` or `datetime.UTC`
+/// — `expressions.rs::is_utc_tzinfo_expression`'s own twin, mirrored
+/// locally (this file cannot import `expressions.rs` without cycling:
+/// `expressions.rs` itself does not depend on `surface.rs` today, but
+/// `typereading.rs` — which `surface.rs` is imported BY — sits between
+/// them, and a fresh `surface.rs -> expressions.rs` edge would still
+/// need to route through the same module graph `literal_alias_set`'s
+/// own doc already declines to cross).
+fn is_utc_tzinfo_expr(expr: &Expr) -> bool {
+    if let Expr::Attribute(outer) = expr {
+        if outer.attr.as_str() == "UTC" {
+            if let Expr::Name(name) = outer.value.as_ref() {
+                if name.id.as_str() == "datetime" {
+                    return true;
+                }
+            }
+        }
+        if outer.attr.as_str() == "utc" {
+            // datetime.timezone.utc — a three-level chain.
+            if let Expr::Attribute(middle) = outer.value.as_ref() {
+                if middle.attr.as_str() == "timezone" {
+                    if let Expr::Name(name) = middle.value.as_ref() {
+                        if name.id.as_str() == "datetime" {
+                            return true;
+                        }
+                    }
+                }
+            }
+            // `timezone.utc` — a two-level chain, `Name("timezone").utc`
+            // (`from datetime import timezone`, showcase.py's own
+            // spelling) — the same recognition `expressions.rs::is_utc_
+            // tzinfo_expression`'s own twin arm now takes.
+            if let Expr::Name(name) = outer.value.as_ref() {
+                if name.id.as_str() == "timezone" {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// An `Annotated[...]` expression's own first tuple slot (the `base` every
 /// other reader in this file destructures from `value` directly) — the
 /// same `Subscript` → `Annotated` name check → `Tuple` → first-element
@@ -899,6 +1400,24 @@ pub struct SurfaceImports {
     annotated_types_multiple_of: HashSet<String>,
     annotated_types_min_len: HashSet<String>,
     annotated_types_max_len: HashSet<String>,
+    /// `from datetime import date[ as x]` — the local names that mean
+    /// the stdlib `date` class (datetime.rst, `class:: date(year,
+    /// month, day)`), read by `temporal_alias_annotation` the same
+    /// no-import-identity-required-elsewhere-but-checked-here way this
+    /// table already gates `Field`/`Annotated`/`StrictInt`.
+    pub(crate) date_names: HashSet<String>,
+    /// `from datetime import timedelta[ as x]`.
+    pub(crate) timedelta_names: HashSet<String>,
+    /// `from datetime import datetime[ as x]`.
+    pub(crate) datetime_names: HashSet<String>,
+    /// `from pydantic import AwareDatetime[ as x]` — a `datetime` typed
+    /// `AwareDatetime` REFUSES a naive construction outright (pydantic's
+    /// own documented behavior, cited at `temporal_alias_annotation`'s
+    /// own call site).
+    pub(crate) aware_datetime_names: HashSet<String>,
+    /// `from pydantic import NaiveDatetime[ as x]` — the mirror: refuses
+    /// an AWARE construction outright.
+    pub(crate) naive_datetime_names: HashSet<String>,
 }
 
 /// Reads the module's top-level `import`/`from … import …` statements
@@ -924,6 +1443,11 @@ pub fn surface_imports(module: &ModModule) -> SurfaceImports {
     let mut annotated_types_multiple_of = HashSet::new();
     let mut annotated_types_min_len = HashSet::new();
     let mut annotated_types_max_len = HashSet::new();
+    let mut date_names = HashSet::new();
+    let mut timedelta_names = HashSet::new();
+    let mut datetime_names = HashSet::new();
+    let mut aware_datetime_names = HashSet::new();
+    let mut naive_datetime_names = HashSet::new();
     for stmt in module.body.iter() {
         match stmt {
             Stmt::Import(StmtImport { names, .. }) => {
@@ -947,6 +1471,21 @@ pub fn surface_imports(module: &ModModule) -> SurfaceImports {
                     }
                     if source.id.as_str() == "pydantic" && alias.name.id.as_str() == "StrictInt" {
                         strict_int_names.insert(local.id.as_str().to_owned());
+                    }
+                    if source.id.as_str() == "pydantic" && alias.name.id.as_str() == "AwareDatetime" {
+                        aware_datetime_names.insert(local.id.as_str().to_owned());
+                    }
+                    if source.id.as_str() == "pydantic" && alias.name.id.as_str() == "NaiveDatetime" {
+                        naive_datetime_names.insert(local.id.as_str().to_owned());
+                    }
+                    if source.id.as_str() == "datetime" && alias.name.id.as_str() == "date" {
+                        date_names.insert(local.id.as_str().to_owned());
+                    }
+                    if source.id.as_str() == "datetime" && alias.name.id.as_str() == "timedelta" {
+                        timedelta_names.insert(local.id.as_str().to_owned());
+                    }
+                    if source.id.as_str() == "datetime" && alias.name.id.as_str() == "datetime" {
+                        datetime_names.insert(local.id.as_str().to_owned());
                     }
                     if (source.id.as_str() == "typing" || source.id.as_str() == "typing_extensions")
                         && alias.name.id.as_str() == "Annotated"
@@ -1006,6 +1545,11 @@ pub fn surface_imports(module: &ModModule) -> SurfaceImports {
         annotated_types_multiple_of,
         annotated_types_min_len,
         annotated_types_max_len,
+        date_names,
+        timedelta_names,
+        datetime_names,
+        aware_datetime_names,
+        naive_datetime_names,
     }
 }
 
@@ -1626,6 +2170,39 @@ mod tests {
         let (element_set, element_spelling) = compiled.element.as_deref().expect("Boosted carries an element");
         assert_eq!(element_set, &age);
         assert_eq!(element_spelling.as_str(), "Age");
+    }
+
+    // --- Fixed-arity tuple alias positions (Color-shaped) ---
+
+    /// showcase.py's own `Color = tuple[Channel, Channel, Channel]` row:
+    /// a bare-RHS fixed-arity tuple alias (no outer `Annotated[...]`
+    /// wrapper) compiles a per-position table, one entry per slot, each
+    /// resolving `Channel`'s own compiled set — never the container's
+    /// own `set` field, which stays empty (the same "the container
+    /// itself states nothing" convention every other container alias
+    /// keeps), and never `head`/`element`/`length_window`, which have
+    /// no meaning for a fixed-arity shape.
+    #[test]
+    fn a_fixed_arity_tuple_alias_compiles_one_position_per_slot() {
+        let module = parsed(
+            "from pydantic import Field\n\
+             from typing import Annotated\n\
+             type Channel = Annotated[int, Field(ge=0, le=255)]\n\
+             type Color = tuple[Channel, Channel, Channel]\n",
+        );
+        let out = compile_aliases(&module);
+        let channel = out.get("Channel").expect("Channel compiles").set.clone();
+        let compiled = out.get("Color").expect("Color compiles");
+        assert!(compiled.set.forms.is_empty(), "a fixed-arity tuple's own set states nothing");
+        assert_eq!(compiled.head, None);
+        assert_eq!(compiled.element, None);
+        assert_eq!(compiled.length_window, None);
+        let positions = compiled.positions.as_ref().expect("Color carries a per-position table");
+        assert_eq!(positions.len(), 3);
+        for (slot_set, slot_spelling) in positions {
+            assert_eq!(slot_set, &channel);
+            assert_eq!(slot_spelling.as_str(), "Channel");
+        }
     }
 
     /// All three alias spellings — the 3.12 `type X = ...` statement,

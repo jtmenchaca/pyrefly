@@ -18,6 +18,8 @@
 
 use std::collections::HashMap;
 
+use refined_sets::calendar_interpreter::format_temporal;
+use refined_sets::calendar_interpreter::TemporalAnnotation;
 use refined_sets::format_for_diagnostics::format_for_diagnostics;
 use refined_sets::refinement_forms::make_refined_set;
 use refined_sets::refinement_forms::one_of;
@@ -32,6 +34,7 @@ use crate::env::Environment;
 use crate::surface::AliasEntry;
 use crate::surface::SurfaceImports;
 use crate::surface::annotated_expression_set;
+use crate::surface::temporal_inline_annotation;
 
 /// A refinement an annotation states, with the spelling diagnostics
 /// use for it (the alias name, or the formatted set for inline forms).
@@ -98,6 +101,18 @@ pub struct DeclaredRefinement {
     /// the slice ending in a bare `...`) is a DIFFERENT shape this field
     /// does not carry — that subscript is read elsewhere or not at all.
     pub positions: Option<Vec<DeclaredRefinement>>,
+    /// A `date`/`timedelta`/`datetime`/`AwareDatetime`/`NaiveDatetime`
+    /// declaration's own calendar window — `surface::AliasEntry::
+    /// temporal`'s exact twin, the same "one active field" convention
+    /// every other container shape here already keeps: `set` carries
+    /// nothing for a temporal declaration (a `Temporal*` value is never
+    /// a member of a numeric/string `RefinedSet`). `None` for every
+    /// non-temporal declaration.
+    pub temporal: Option<TemporalAnnotation>,
+    /// `surface::AliasEntry::temporal_awareness`'s exact twin — which
+    /// of pydantic's aware/naive `datetime` bases `temporal` was read
+    /// from, `Any` for a non-temporal declaration.
+    pub temporal_awareness: crate::surface::TemporalAwareness,
 }
 
 /// The two checked positions a generator-shaped return annotation
@@ -155,15 +170,51 @@ pub fn declared_refinement(
                     generator: None,
                     members: None,
                     positions: None,
+                    temporal: None,
+                    temporal_awareness: crate::surface::TemporalAwareness::Any,
                 })
             });
             let container_spelling = match (entry.head, &element) {
                 (Some(head), Some(element_declared)) => Some(format!("{}[{}]", head, element_declared.spelling)),
                 _ => None,
             };
+            // A FIXED-ARITY `tuple[X, Y, Z]` alias (`entry.positions`
+            // Some, `surface::AliasEntry::positions`'s own doc — the
+            // same "one active field" convention `element` keeps
+            // against `positions`) seeds the IDENTICAL shape the inline
+            // `Expr::Subscript` tuple arm below builds: one scalar
+            // `DeclaredRefinement` per slot, each carrying the slot's
+            // own WRITTEN spelling (never a reformatting of its
+            // resolved set, the same fidelity `element`'s own spelling
+            // keeps), so `tuple[Channel, Channel, Channel]` reconstructs
+            // as `"tuple[Channel, Channel, Channel]"` whether the
+            // parameter spells the tuple inline or names an alias of it.
+            let positions = entry.positions.as_ref().map(|slots| {
+                slots
+                    .iter()
+                    .map(|(slot_set, slot_spelling)| DeclaredRefinement {
+                        set: slot_set.clone(),
+                        spelling: slot_spelling.clone(),
+                        admits_none: false,
+                        element: None,
+                        element_length: None,
+                        generator: None,
+                        members: None,
+                        positions: None,
+                        temporal: None,
+                    temporal_awareness: crate::surface::TemporalAwareness::Any,
+                    })
+                    .collect::<Vec<_>>()
+            });
+            let tuple_spelling = positions.as_ref().map(|slots| {
+                format!(
+                    "tuple[{}]",
+                    slots.iter().map(|position| position.spelling.as_str()).collect::<Vec<_>>().join(", ")
+                )
+            });
             Some(DeclaredRefinement {
                 set: entry.set.clone(),
-                spelling: container_spelling.unwrap_or_else(|| spelling.to_owned()),
+                spelling: container_spelling.or(tuple_spelling).unwrap_or_else(|| spelling.to_owned()),
                 // The alias's OWN admission (`type OptionalAge =
                 // Optional[Age]`, `surface::peel_alias_optional`) —
                 // never the element's; a container alias's admits_none
@@ -174,7 +225,9 @@ pub fn declared_refinement(
                 element_length: entry.length_window,
                 generator: None,
                 members: None,
-                positions: None,
+                positions,
+                temporal: entry.temporal.clone(),
+                temporal_awareness: entry.temporal_awareness,
             })
         }
         // `Optional[X]` reads X through the ordinary path and marks the
@@ -213,18 +266,18 @@ pub fn declared_refinement(
             // build a numeric `one_of` (`int_literal_members`); STRING
             // members build the union of each member's own singleton
             // string tuple (`string_literal_members` /
-            // `string_literal_set`) — the two wire shapes cannot share
-            // one reading, since a string member's code points would
-            // collide with `one_of`'s numeric encoding, so each sort
-            // gets its OWN member reader and only one of the two may
-            // recognize a given member list; a MIXED int/string
-            // `Literal[...]` matches neither reader (every element of
-            // `int_literal_members`'s map must be int, every element of
-            // `string_literal_members`'s map must be string) and
-            // declines whole. Any other non-literal member (a name, an
-            // expression, a bool, a float, a bytes literal) declines
-            // both readers too, same as `annotated_expression_set`'s
-            // own metadata gate.
+            // `string_literal_set`); BOOL members build the numeric
+            // `one_of` over the boolean domain's two values
+            // (`bool_literal_members` — True is 1, False is 0). The
+            // wire shapes cannot share one reading (a string member's
+            // code points would collide with `one_of`'s numeric
+            // encoding), so each sort gets its OWN member reader and
+            // only one may recognize a given member list; a MIXED-sort
+            // `Literal[...]` matches no reader (every element of each
+            // reader's map must be its own sort) and declines whole.
+            // Any other member (a name, an expression, a float, a
+            // bytes literal) declines every reader too, same as
+            // `annotated_expression_set`'s own metadata gate.
             let is_literal = matches!(subscript.value.as_ref(), Expr::Name(head) if head.id.as_str() == "Literal");
             if is_literal {
                 if let Some(members) = int_literal_members(subscript.slice.as_ref()) {
@@ -239,6 +292,8 @@ pub fn declared_refinement(
                         generator: None,
                         members: None,
                         positions: None,
+                        temporal: None,
+                    temporal_awareness: crate::surface::TemporalAwareness::Any,
                     });
                 }
                 if let Some(members) = string_literal_members(subscript.slice.as_ref()) {
@@ -253,6 +308,35 @@ pub fn declared_refinement(
                         generator: None,
                         members: None,
                         positions: None,
+                        temporal: None,
+                    temporal_awareness: crate::surface::TemporalAwareness::Any,
+                    });
+                }
+                // BOOL members (`Literal[True]`/`Literal[False]`/both):
+                // `bool`'s domain is the two exact values 0 and 1
+                // (`string_models.rs`'s `boolean_value` convention, the
+                // same reading `narrow_isinstance_call` seeds for
+                // `isinstance(x, bool)`), so the members build the same
+                // numeric `one_of` an int `Literal` does. The spelling
+                // keeps the annotation's own words — `format_for_
+                // diagnostics` would print the encoded numbers.
+                if let Some(members) = bool_literal_members(subscript.slice.as_ref()) {
+                    let set = make_refined_set(vec![one_of(&members)]);
+                    let spelling = format!(
+                        "Literal[{}]",
+                        members.iter().map(|member| if *member == 1.0 { "True" } else { "False" }).collect::<Vec<_>>().join(", ")
+                    );
+                    return Some(DeclaredRefinement {
+                        set,
+                        spelling,
+                        admits_none: false,
+                        element: None,
+                        element_length: None,
+                        generator: None,
+                        members: None,
+                        positions: None,
+                        temporal: None,
+                    temporal_awareness: crate::surface::TemporalAwareness::Any,
                     });
                 }
                 return None;
@@ -266,21 +350,28 @@ pub fn declared_refinement(
             // states a member law for) and whose SECOND member reads
             // through the ordinary `declared_refinement` recursion —
             // so `dict[str, Age]` reads `Age` exactly, including a
-            // nested `X | None` value slot. Any other shape (a
-            // non-`str` key, an unreadable value type, no `Tuple` at
-            // all) declines this arm and falls through to
-            // `annotated_expression_set` below, which also declines
-            // (its own head-identity gate never matches `dict`) — so
-            // the whole subscript states nothing, as it did before this
-            // arm existed.
+            // nested `X | None` value slot. The value position ALSO
+            // falls back to the bare `int`/`float`/`str` sort reading
+            // (`base_sort_return_refinement`) when the ordinary alias
+            // table has nothing for it — `dict[str, int]`'s value is
+            // `int`, which is not an alias name — the SAME narrow
+            // exception the `list[X]`/`set[X]`/`Sequence[X]` element arm
+            // below already takes, scoped to this one call site so a
+            // bare sort reaching here never turns an unrelated `-> int`
+            // return into a fresh blocker. Any other shape (a non-`str`
+            // key, an unreadable value type, no `Tuple` at all) declines
+            // this arm and falls through to `annotated_expression_set`
+            // below, which also declines (its own head-identity gate
+            // never matches `dict`) — so the whole subscript states
+            // nothing, as it did before this arm existed.
             let is_dict = matches!(subscript.value.as_ref(), Expr::Name(head) if head.id.as_str() == "dict");
             if is_dict {
                 if let Expr::Tuple(arguments) = subscript.slice.as_ref() {
                     if let [key, value] = arguments.elts.as_slice() {
                         let key_is_str = matches!(key, Expr::Name(sort) if sort.id.as_str() == "str");
                         if key_is_str {
-                            if let Some(value_declared) =
-                                declared_refinement(value, aliases, imports, environment)
+                            if let Some(value_declared) = declared_refinement(value, aliases, imports, environment)
+                                .or_else(|| base_sort_return_refinement(value))
                             {
                                 let spelling = format!("dict[str, {}]", value_declared.spelling);
                                 return Some(DeclaredRefinement {
@@ -292,6 +383,8 @@ pub fn declared_refinement(
                                     generator: None,
                                     members: None,
                                     positions: None,
+                                    temporal: None,
+                    temporal_awareness: crate::surface::TemporalAwareness::Any,
                                 });
                             }
                         }
@@ -346,6 +439,8 @@ pub fn declared_refinement(
                         generator: None,
                         members: None,
                         positions: None,
+                        temporal: None,
+                    temporal_awareness: crate::surface::TemporalAwareness::Any,
                     });
                 }
                 return None;
@@ -409,6 +504,8 @@ pub fn declared_refinement(
                         generator: None,
                         members: None,
                         positions: Some(positions),
+                        temporal: None,
+                    temporal_awareness: crate::surface::TemporalAwareness::Any,
                     });
                 }
             }
@@ -448,6 +545,8 @@ pub fn declared_refinement(
                         generator: Some(Box::new(generator)),
                         members: None,
                         positions: None,
+                        temporal: None,
+                    temporal_awareness: crate::surface::TemporalAwareness::Any,
                     });
                 }
             }
@@ -485,9 +584,45 @@ pub fn declared_refinement(
                         generator: None,
                         members: None,
                         positions: None,
+                        temporal: None,
+                    temporal_awareness: crate::surface::TemporalAwareness::Any,
                     });
                 }
                 return None;
+            }
+            // A temporal base (`date`/`timedelta`/`datetime`, or
+            // pydantic's `AwareDatetime`/`NaiveDatetime`) spelled INLINE
+            // at the parameter — `surface::temporal_alias_annotation`'s
+            // own recognition, reused here for the unaliased shape
+            // (`d: Annotated[date, Field(ge=date(1900, 1, 1), …)]`,
+            // showcase.py's own `DateOfBirth`/`Period`/`Visit`/
+            // `FollowUp`/`Cutoff`/`Stamp` rows, whichever of those a
+            // caller spells inline rather than through a module-level
+            // alias). `environment`'s own module is not reachable from
+            // here (typereading.rs never carries a `&ModModule` — every
+            // caller passes only the annotation expression, `aliases`,
+            // and `imports`), so a bare-Name bound (`Field(ge=_cutoff)`)
+            // is not resolved at this inline call site the way
+            // `compile_aliases`' own module-level scan resolves it; a
+            // module-level `type Cutoff = Annotated[AwareDatetime,
+            // Field(ge=_cutoff)]` alias (showcase.py's own spelling)
+            // reads through the `Expr::Name` arm above instead, which
+            // already carries `entry.temporal` resolved by
+            // `compile_aliases`.
+            if let Some((temporal, awareness)) = temporal_inline_annotation(annotation, imports) {
+                let spelling = format_temporal(&temporal);
+                return Some(DeclaredRefinement {
+                    set: make_refined_set(Vec::new()),
+                    spelling,
+                    admits_none: false,
+                    element: None,
+                    element_length: None,
+                    generator: None,
+                    members: None,
+                    positions: None,
+                    temporal: Some(temporal),
+                    temporal_awareness: awareness,
+                });
             }
             let sets_by_name: HashMap<String, RefinedSet> =
                 aliases.iter().map(|(name, entry)| (name.clone(), entry.set.clone())).collect();
@@ -502,6 +637,8 @@ pub fn declared_refinement(
                 generator: None,
                 members: None,
                 positions: None,
+                temporal: None,
+                temporal_awareness: crate::surface::TemporalAwareness::Any,
             })
         }
         // `X | None` / `None | X` (exactly one side a bare `None`
@@ -519,7 +656,13 @@ pub fn declared_refinement(
                 return None;
             }
             let other = if right_is_none { binop.left.as_ref() } else { binop.right.as_ref() };
-            let mut declared = declared_refinement(other, aliases, imports, environment)?;
+            // `int | None` / `float | None` / `bool | None` / `str |
+            // None`: the non-None side is a BARE SORT the general table
+            // deliberately does not read — inside the one-sided union
+            // the bare-sort seed applies, so the value reads as "whole
+            // sort, absence admitted" instead of nothing at all.
+            let mut declared = declared_refinement(other, aliases, imports, environment)
+                .or_else(|| base_sort_return_refinement(other))?;
             declared.admits_none = true;
             Some(declared)
         }
@@ -649,13 +792,15 @@ pub fn callable_return_refinement(
     }
 }
 
-/// The bare `int`/`float`/`str` return-annotation fallback, matched to
-/// `summaries.rs::return_sort_fallback`'s own sets exactly: `int` is
-/// the unbounded whole-number ray (`integer()` conjoined with the
-/// unbounded `at_least(NEG_INFINITY)` ray, the same "no ceiling/floor"
-/// shape that fallback builds), `float` is the unbounded real ray
-/// (`numbers()`, the same set `float_sorted_unknown()` carries), `str`
-/// is the whole-strings ground (`codepoint_sets::strings()`).
+/// The bare `int`/`float`/`str`/`bool` return-annotation fallback,
+/// matched to `summaries.rs::return_sort_fallback`'s own sets exactly:
+/// `int` is the unbounded whole-number ray (`integer()` conjoined with
+/// the unbounded `at_least(NEG_INFINITY)` ray, the same "no
+/// ceiling/floor" shape that fallback builds), `float` is the unbounded
+/// real ray (`numbers()`, the same set `float_sorted_unknown()`
+/// carries), `str` is the whole-strings ground
+/// (`codepoint_sets::strings()`), `bool` is the exact two-member domain
+/// (`oneOf{0, 1}`, the boolean-domain convention).
 /// EXPORTED for check.rs's parameter seeding ONLY: a bare-`int`
 /// parameter seeds the whole-int sort claim ("a whole int admits
 /// values outside the set", the corpus's own reason). The general
@@ -673,6 +818,11 @@ pub fn base_sort_return_refinement(returns: &Expr) -> Option<DeclaredRefinement>
         ]),
         "float" => refined_sets::refinement_forms::numbers(),
         "str" => refined_sets::codepoint_sets::strings(),
+        // `bool`'s whole domain is the two exact values 0 and 1 (the
+        // boolean-domain convention `bool_literal_members` and
+        // `narrow_isinstance_call` both read), so a bare `bool`
+        // parameter seeds the exact two-member set rather than a ray.
+        "bool" => make_refined_set(vec![refined_sets::refinement_forms::one_of(&[0.0, 1.0])]),
         _ => return None,
     };
     let spelling = sort.id.as_str().to_owned();
@@ -685,6 +835,8 @@ pub fn base_sort_return_refinement(returns: &Expr) -> Option<DeclaredRefinement>
         generator: None,
         members: None,
         positions: None,
+        temporal: None,
+        temporal_awareness: crate::surface::TemporalAwareness::Any,
     })
 }
 
@@ -714,6 +866,8 @@ pub fn typed_dict_return_refinement(
         generator: None,
         members: Some(members.clone()),
         positions: None,
+        temporal: None,
+        temporal_awareness: crate::surface::TemporalAwareness::Any,
     })
 }
 
@@ -798,6 +952,23 @@ fn int_literal_members(slice: &Expr) -> Option<Vec<f64>> {
     Some(vec![int_literal_value(slice)?])
 }
 
+/// `Literal[...]`'s slice read as a list of BOOL-literal members —
+/// `True` encodes 1 and `False` 0, the boolean-domain convention. `None`
+/// the moment any member is not a bare bool literal, the same
+/// all-or-nothing rule the int and string readers keep.
+fn bool_literal_members(slice: &Expr) -> Option<Vec<f64>> {
+    let bool_literal_value = |expr: &Expr| -> Option<f64> {
+        match expr {
+            Expr::BooleanLiteral(literal) => Some(if literal.value { 1.0 } else { 0.0 }),
+            _ => None,
+        }
+    };
+    if let Expr::Tuple(tuple) = slice {
+        return tuple.elts.iter().map(bool_literal_value).collect();
+    }
+    Some(vec![bool_literal_value(slice)?])
+}
+
 /// One `Literal[...]` member read as an int, with unary minus
 /// (`Literal[-1]`) — the same shape `surface.rs::literal_number` reads,
 /// but INTEGER ONLY: a `Number::Float` member declines, since a float
@@ -861,6 +1032,7 @@ mod tests {
     use std::collections::HashSet;
 
     use refined_sets::refinement_forms::at_least;
+    use refined_sets::refinement_forms::at_most;
     use refined_sets::refinement_forms::make_refined_set;
     use ruff_python_ast::ExprContext;
     use ruff_python_ast::ExprName;
@@ -911,11 +1083,14 @@ mod tests {
         aliases.insert(
             "PositiveInt".to_owned(),
             AliasEntry {
+                temporal: None,
+                temporal_awareness: crate::surface::TemporalAwareness::Any,
                 set: make_refined_set(vec![at_least(1.0)]),
                 head: None,
                 element: None,
                 length_window: None,
                 admits_none: false,
+                positions: None,
             },
         );
         let imports = no_imports();
@@ -1007,6 +1182,66 @@ mod tests {
         assert_eq!(positions[1].set, make_refined_set(vec![at_least(1.0)]));
     }
 
+    /// showcase.py's own `Color = tuple[Channel, Channel, Channel]` row:
+    /// a bare ALIAS NAME whose `AliasEntry` carries `positions` Some
+    /// (`surface::compile_aliases`'s own tuple arm) resolves through
+    /// this SAME bare-Name arm that reads `element`/`head` for a
+    /// `list[X]`-shaped alias — forwarding the alias's own per-position
+    /// table onto the returned `DeclaredRefinement`, spelled `"tuple[
+    /// Channel, Channel, Channel]"` (the alias's OWN slot spellings
+    /// joined, the identical spelling an inline `c: tuple[Channel,
+    /// Channel, Channel]` parameter would carry — `all_three_alias_
+    /// spellings_carry_the_identical_sequence_window`'s own doc states
+    /// the same equivalence for a `list[X]` alias). Before this
+    /// forwarding, the hardcoded `positions: None` here made `Color`
+    /// resolve as a scalar with an EMPTY set, so `paint((255, 300, 0))`
+    /// never reached the POSITIONS LAW at all.
+    #[test]
+    fn a_bare_alias_name_forwards_its_compiled_tuple_positions() {
+        let mut aliases = HashMap::new();
+        aliases.insert(
+            "Channel".to_owned(),
+            AliasEntry {
+                temporal: None,
+                temporal_awareness: crate::surface::TemporalAwareness::Any,
+                set: make_refined_set(vec![at_least(0.0), at_most(255.0)]),
+                head: None,
+                element: None,
+                length_window: None,
+                admits_none: false,
+                positions: None,
+            },
+        );
+        let channel_set = aliases.get("Channel").expect("just inserted").set.clone();
+        aliases.insert(
+            "Color".to_owned(),
+            AliasEntry {
+                temporal: None,
+                temporal_awareness: crate::surface::TemporalAwareness::Any,
+                set: make_refined_set(Vec::new()),
+                head: None,
+                element: None,
+                length_window: None,
+                admits_none: false,
+                positions: Some(vec![
+                    (channel_set.clone(), "Channel".to_owned()),
+                    (channel_set.clone(), "Channel".to_owned()),
+                    (channel_set, "Channel".to_owned()),
+                ]),
+            },
+        );
+        let imports = no_imports();
+        let environment = no_locals();
+
+        let got = declared_refinement(&name_expr("Color"), &aliases, &imports, &environment)
+            .expect("Color resolves through the alias table");
+        assert_eq!(got.spelling, "tuple[Channel, Channel, Channel]");
+        let positions = got.positions.expect("Color carries a per-position table, not a scalar set");
+        assert_eq!(positions.len(), 3);
+        assert_eq!(positions[1].spelling, "Channel");
+        assert_eq!(positions[1].set, aliases.get("Channel").expect("still present").set);
+    }
+
     /// `tuple[int, Unreadable]` — one position this table cannot read
     /// declines the WHOLE tuple, the same all-or-nothing rule
     /// `dict[str, Unreadable]` already takes for its own value slot.
@@ -1062,11 +1297,14 @@ mod tests {
         aliases.insert(
             "Age".to_owned(),
             AliasEntry {
+                temporal: None,
+                temporal_awareness: crate::surface::TemporalAwareness::Any,
                 set: make_refined_set(vec![at_least(0.0)]),
                 head: None,
                 element: None,
                 length_window: None,
                 admits_none: false,
+                positions: None,
             },
         );
         let imports = no_imports();
@@ -1203,6 +1441,8 @@ mod tests {
             generator: None,
             members: None,
             positions: None,
+            temporal: None,
+            temporal_awareness: crate::surface::TemporalAwareness::Any,
         };
         typed_dicts.insert("PersonDict".to_owned(), vec![("age".to_owned(), age_declared)]);
 
@@ -1226,11 +1466,14 @@ mod tests {
         aliases.insert(
             "PositiveInt".to_owned(),
             AliasEntry {
+                temporal: None,
+                temporal_awareness: crate::surface::TemporalAwareness::Any,
                 set: make_refined_set(vec![at_least(1.0)]),
                 head: None,
                 element: None,
                 length_window: None,
                 admits_none: false,
+                positions: None,
             },
         );
         let imports = no_imports();
@@ -1248,11 +1491,14 @@ mod tests {
         aliases.insert(
             "PositiveInt".to_owned(),
             AliasEntry {
+                temporal: None,
+                temporal_awareness: crate::surface::TemporalAwareness::Any,
                 set: make_refined_set(vec![at_least(1.0)]),
                 head: None,
                 element: None,
                 length_window: None,
                 admits_none: false,
+                positions: None,
             },
         );
         let imports = no_imports();
@@ -1325,21 +1571,27 @@ mod tests {
         aliases.insert(
             "Age".to_owned(),
             AliasEntry {
+                temporal: None,
+                temporal_awareness: crate::surface::TemporalAwareness::Any,
                 set: make_refined_set(vec![at_least(0.0)]),
                 head: None,
                 element: None,
                 length_window: None,
                 admits_none: false,
+                positions: None,
             },
         );
         aliases.insert(
             "Label".to_owned(),
             AliasEntry {
+                temporal: None,
+                temporal_awareness: crate::surface::TemporalAwareness::Any,
                 set: make_refined_set(vec![at_least(1.0)]),
                 head: None,
                 element: None,
                 length_window: None,
                 admits_none: false,
+                positions: None,
             },
         );
         aliases

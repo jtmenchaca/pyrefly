@@ -64,13 +64,27 @@ use ruff_python_ast::Stmt;
 use ruff_text_size::Ranged;
 use ruff_text_size::TextSize;
 
-fn check_file(path: &str, kernel: &Arc<RefinedTSKernel>) -> (usize, Vec<String>) {
+/// Where one judged file's time went: reading and parsing the source,
+/// the analysis walk, and — within the walk — the portion spent inside
+/// kernel asks (`kernel_ask_totals` deltas), with the ask count.
+struct FileTiming {
+    parse_ms: f64,
+    analysis_ms: f64,
+    kernel_ms: f64,
+    asks: u64,
+}
+
+const NO_TIME: FileTiming = FileTiming { parse_ms: 0.0, analysis_ms: 0.0, kernel_ms: 0.0, asks: 0 };
+
+fn check_file(path: &str, kernel: &Arc<RefinedTSKernel>) -> (usize, Vec<String>, FileTiming) {
+    let parse_started = std::time::Instant::now();
     let Ok(source) = std::fs::read_to_string(path) else {
-        return (1, vec![format!("{path}: the entry file did not parse")]);
+        return (1, vec![format!("{path}: the entry file did not parse")], NO_TIME);
     };
     let Ok(parsed) = ruff_python_parser::parse_module(&source) else {
-        return (1, vec![format!("{path}: the entry file did not parse")]);
+        return (1, vec![format!("{path}: the entry file did not parse")], NO_TIME);
     };
+    let parse_ms = parse_started.elapsed().as_secs_f64() * 1000.0;
     let module = parsed.into_syntax();
     // The entry file's own parent directory is where a sibling `.py`
     // module it imports lives (`disk_resolver`'s own contract) — a bare
@@ -78,12 +92,22 @@ fn check_file(path: &str, kernel: &Arc<RefinedTSKernel>) -> (usize, Vec<String>)
     // directory) resolves against `.` instead of an empty path.
     let entry_directory = Path::new(path).parent().filter(|dir| !dir.as_os_str().is_empty());
     let resolver = disk_resolver(entry_directory.unwrap_or_else(|| Path::new(".")).to_path_buf());
+    let (kernel_nanos_before, asks_before) = refinedpy::kernel_ask::kernel_ask_totals();
+    let analysis_started = std::time::Instant::now();
     let findings = findings_for_module_at(
         &module,
         &resolver,
         kernel,
         Some(entry_directory.unwrap_or_else(|| Path::new("."))),
     );
+    let analysis_ms = analysis_started.elapsed().as_secs_f64() * 1000.0;
+    let (kernel_nanos_after, asks_after) = refinedpy::kernel_ask::kernel_ask_totals();
+    let timing = FileTiming {
+        parse_ms,
+        analysis_ms,
+        kernel_ms: (kernel_nanos_after - kernel_nanos_before) as f64 / 1e6,
+        asks: asks_after - asks_before,
+    };
     let markers = markers_of(&source);
     let line_starts = line_starts_of(&source);
 
@@ -121,14 +145,14 @@ fn check_file(path: &str, kernel: &Arc<RefinedTSKernel>) -> (usize, Vec<String>)
             "{path}:{} # refinedpy: expect-error: {}",
             marker.marker_line,
             if marker.reason.is_empty() {
-                "expected a fire on the next line"
+                "an error was expected on the next line, and none was reported"
             } else {
                 &marker.reason
             }
         ));
     }
 
-    (printed, lines_output)
+    (printed, lines_output, timing)
 }
 
 /// One name to hover, at one byte offset — `label` is what prints in
@@ -381,7 +405,7 @@ fn export_file(path: &str, output: &Path, kernel: &Arc<RefinedTSKernel>) -> Exit
 /// `--project-root <path>`, when given, is read here and applied via
 /// `set_project_root_override` before any mode runs.
 enum Invocation {
-    Judge(Vec<String>),
+    Judge { files: Vec<String>, timing: bool },
     Export { file: String, output: PathBuf },
     Hover { file: String, names: Vec<String> },
 }
@@ -392,10 +416,15 @@ fn read_invocation(arguments: &[String]) -> Option<Invocation> {
     let mut hover_names: Vec<String> = Vec::new();
     let mut output: Option<PathBuf> = None;
     let mut project_root: Option<PathBuf> = None;
+    let mut timing = false;
     let mut files: Vec<String> = Vec::new();
     let mut index = 0;
     while index < arguments.len() {
         match arguments[index].as_str() {
+            "--timing" => {
+                timing = true;
+                index += 1;
+            }
             "--export-fact" => {
                 export_target = Some(arguments.get(index + 1)?.clone());
                 index += 2;
@@ -429,17 +458,17 @@ fn read_invocation(arguments: &[String]) -> Option<Invocation> {
         set_project_root_override(Some(root.clone()));
     }
     if let Some(file) = hover_target {
-        // --hover owns the whole line; --export-fact/-o/extra files
-        // alongside it would be silently ignored otherwise
-        if export_target.is_some() || output.is_some() || !files.is_empty() {
+        // --hover owns the whole line; --export-fact/-o/--timing/extra
+        // files alongside it would be silently ignored otherwise
+        if export_target.is_some() || output.is_some() || timing || !files.is_empty() {
             return None;
         }
         return Some(Invocation::Hover { file, names: hover_names });
     }
     if let Some(file) = export_target {
-        // extra positional files alongside --export-fact would be
-        // silently ignored, which is worse than refusing the line
-        if !files.is_empty() {
+        // extra positional files or --timing alongside --export-fact
+        // would be silently ignored, which is worse than refusing the line
+        if !files.is_empty() || timing {
             return None;
         }
         let output = output.unwrap_or_else(|| cache_artifact_path(&file));
@@ -448,13 +477,13 @@ fn read_invocation(arguments: &[String]) -> Option<Invocation> {
     if output.is_some() || files.is_empty() {
         return None;
     }
-    Some(Invocation::Judge(files))
+    Some(Invocation::Judge { files, timing })
 }
 
 fn main() -> ExitCode {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     let Some(invocation) = read_invocation(&arguments) else {
-        eprintln!("usage: refinedpy-check <file.py> [...] [--project-root <path>]");
+        eprintln!("usage: refinedpy-check <file.py> [...] [--timing] [--project-root <path>]");
         eprintln!("       refinedpy-check --export-fact <file.py> [-o <path>] [--project-root <path>]");
         eprintln!("       refinedpy-check --hover <file.py> [name ...]");
         return ExitCode::from(2);
@@ -463,6 +492,7 @@ fn main() -> ExitCode {
         eprintln!("refinedpy-check: kernel dylib not found (set REFINEDPY_KERNEL_DYLIB or build it: pnpm kernel:native)");
         return ExitCode::from(2);
     };
+    let load_started = std::time::Instant::now();
     let kernel = match load_kernel(&dylib) {
         Ok(kernel) => kernel,
         Err(err) => {
@@ -470,21 +500,39 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let kernel_load_ms = load_started.elapsed().as_secs_f64() * 1000.0;
     refinedpy::kernel_ask::install_kernel_seams(&kernel);
 
-    let files = match invocation {
+    let (files, timing) = match invocation {
         Invocation::Export { file, output } => return export_file(&file, &output, &kernel),
         Invocation::Hover { file, names } => return hover_file(&file, &names, &kernel),
-        Invocation::Judge(files) => files,
+        Invocation::Judge { files, timing } => (files, timing),
     };
 
     let mut total_printed = 0;
+    let mut totals = NO_TIME;
     for file in &files {
-        let (printed, lines) = check_file(file, &kernel);
+        let (printed, lines, file_timing) = check_file(file, &kernel);
         total_printed += printed;
         for line in lines {
             println!("{line}");
         }
+        if timing {
+            eprintln!(
+                "timing: {file} parse_ms={:.2} analysis_ms={:.2} kernel_ms={:.2} asks={}",
+                file_timing.parse_ms, file_timing.analysis_ms, file_timing.kernel_ms, file_timing.asks
+            );
+            totals.parse_ms += file_timing.parse_ms;
+            totals.analysis_ms += file_timing.analysis_ms;
+            totals.kernel_ms += file_timing.kernel_ms;
+            totals.asks += file_timing.asks;
+        }
+    }
+    if timing {
+        eprintln!(
+            "timing: total files={} kernel_load_ms={:.2} parse_ms={:.2} analysis_ms={:.2} kernel_ms={:.2} asks={}",
+            files.len(), kernel_load_ms, totals.parse_ms, totals.analysis_ms, totals.kernel_ms, totals.asks
+        );
     }
     if total_printed == 0 {
         ExitCode::SUCCESS

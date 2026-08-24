@@ -412,7 +412,11 @@ fn int_theory_call(
     match function {
         "isqrt" => {
             let [only] = arguments else { return None };
-            int_transfer_call(TransferQuestionOp::IntIsqrt, int_transferable_operand(only)?, empty, grade, kernel)
+            let operand = int_transferable_operand(only)?;
+            if let Some(answer) = int_transfer_call(TransferQuestionOp::IntIsqrt, operand.clone(), empty, grade, kernel) {
+                return Some(answer);
+            }
+            isqrt_as_sqrt_floor_composition(&operand, grade, kernel)
         }
         "factorial" => {
             let [only] = arguments else { return None };
@@ -467,6 +471,54 @@ fn int_theory_call(
         }
         _ => None,
     }
+}
+
+/// `math.isqrt(n)` over a NON-SINGLETON `RefinedSet` (a seeded
+/// parameter range, or a bounded set another transfer already
+/// produced) — the FALLBACK `int_theory_call`'s own `isqrt` row takes
+/// once `int.isqrt` (`boundary/python.lean`) has already declined on
+/// it. `int.isqrt` matches `exactNatOf` on its one operand only — it
+/// carries no general-window arm the way `int.floorDiv` does
+/// (`shift_as_int_composition`'s own doc names the identical gap for
+/// `int.mul`), so a bounded, non-singleton `n` always reads back
+/// `.unknown` from `int.isqrt` and would decline outright with no
+/// further attempt.
+///
+/// pow.4 states `math.isqrt(n)` IS "the floor of the exact square
+/// root" — the same composition CPython's own implementation performs
+/// — so this asks `binary64.sqrt` (`sqrt_call_over_set`'s own kernel
+/// row, which DOES carry a general-window decider) over `operand`,
+/// then floors that Float-sorted enclosure through `binary64.floor`
+/// (`floor_call_over_set`'s own row) back to Integer sort. Both rows
+/// already exist and are already exercised by `math.sqrt`/`math.floor`
+/// over a declared range elsewhere in this file; this composes them
+/// rather than adding a third kernel-transfer implementation.
+///
+/// Gated on `operand` PROVABLY EXCLUDING every negative value first
+/// (`kernel.scalar_subset(operand, [0, +inf))`, the same "prove, never
+/// guess" discipline `divisor_provably_excludes_zero`
+/// (`expressions.rs`) keeps for its own zero exclusion): `math.isqrt`
+/// raises `ValueError` on a negative n (`isqrt_call`'s own doc), and
+/// `math.sqrt` raises `ValueError` on one too (pow.3) — composing
+/// sqrt+floor over a window that ADMITS a negative would either
+/// silently answer a value the real call never produces (the negative
+/// arm raises) or hand `binary64.sqrt` an operand its own domain
+/// excludes. `int_transferable_operand`'s caller already only reaches
+/// this fallback with an Integer-sorted `operand`, which `int.isqrt`
+/// itself already requires — the composition adds no new sort
+/// admission, only a wider VALUE reading of the same sort.
+fn isqrt_as_sqrt_floor_composition(
+    operand: &RefinedSet,
+    grade: TrustLevel,
+    kernel: &Arc<RefinedTSKernel>,
+) -> Option<AbstractValue> {
+    let nonneg = make_refined_set(vec![at_least(0.0)]);
+    if !(kernel.scalar_subset)(operand, &nonneg) {
+        return None;
+    }
+    let operand_value = AbstractValue { kind_tag: Some(PrimitiveKind::Integer), ..known_set(operand.clone(), None, grade, SetKindTag::None) };
+    let root = sqrt_call_over_set(&operand_value, kernel)?;
+    floor_call_over_set(&root, kernel)
 }
 
 /// `math.ceil(x)` on a known single numeric value: the exact
@@ -1154,10 +1206,50 @@ fn approximated_family_result(function: &str, arguments: &[AbstractValue]) -> Op
     if function == "sqrt" && sqrt_argument_is_known_negative(arguments) {
         return None;
     }
+    if function == "hypot" {
+        if let Some(result) = hypot_exact_perfect_square(arguments) {
+            return Some(result);
+        }
+    }
     for argument in arguments {
         single_numeric_operand(argument)?;
     }
     Some(float_sorted_unknown())
+}
+
+/// `math.hypot(*coordinates)` on KNOWN operands whose Euclidean norm is
+/// an EXACT PERFECT SQUARE: the exact Float result, not sort-only — the
+/// same IEEE-754-correctly-rounded reasoning `sqrt_exact_perfect_square`
+/// states for `math.sqrt`, applied to pow.8's own formula
+/// (`python-pins.md`: `math.hypot(*coordinates)` is `sqrt(sum(x**2 for x
+/// in coordinates))`, the Euclidean norm over ANY number of
+/// coordinates). `3, 4` is the textbook case: `sum(x**2) = 9 + 16 = 25`,
+/// `sqrt(25) = 5.0` exactly, no rounding error to introduce. Every
+/// coordinate must be a known single numeric value
+/// (`single_numeric_operand`) — a Set-shaped or unread argument declines
+/// here and falls through to `approximated_family_result`'s own
+/// sort-only row. The sum of squares must itself be a NONNEGATIVE
+/// PERFECT SQUARE that lands inside the f64-exact 2^53 window, mirroring
+/// `sqrt_exact_perfect_square`'s own three-part check (finite whole
+/// operand, an integral root, and the root squaring back to the exact
+/// operand — ruling out an f64 rounding coincidence).
+fn hypot_exact_perfect_square(arguments: &[AbstractValue]) -> Option<AbstractValue> {
+    let mut sum_of_squares = 0.0;
+    for argument in arguments {
+        let (value, _) = single_numeric_operand(argument)?;
+        if !value.is_finite() {
+            return None;
+        }
+        sum_of_squares += value * value;
+    }
+    if sum_of_squares.abs() >= 2f64.powi(53) {
+        return None;
+    }
+    let root = sum_of_squares.sqrt();
+    if root.fract() != 0.0 || root * root != sum_of_squares {
+        return None;
+    }
+    Some(float_result(root))
 }
 
 /// `math.pi` / `math.e` / `math.tau` / `math.inf` / `math.nan` —
@@ -1606,9 +1698,30 @@ mod tests {
         );
     }
 
+    /// `math.hypot(3, 4)` is the textbook 3-4-5 right triangle: `sqrt(3**2
+    /// + 4**2) == sqrt(25) == 5.0` exactly, no rounding error to
+    /// introduce — `hypot_exact_perfect_square`'s own row, answered
+    /// directly without a kernel round trip (`math_call`, not
+    /// `math_call_result`). c-reads-and-values.py's own `math_hypot`
+    /// fixture row (`int(math.hypot(3, 4))`) is this shape.
     #[test]
-    fn test_hypot_known_arguments_answer_sort_only() {
+    fn test_hypot_of_a_known_perfect_square_answers_the_exact_value() {
         let Some(result) = math_call("hypot", &[float_operand(3.0), float_operand(4.0)]) else { return };
+        assert_eq!(result.kind, Kind::Values);
+        assert_eq!(result.kind_tag, Some(PrimitiveKind::Float));
+        assert_eq!(result.values, vec![5.0]);
+    }
+
+    /// `math.hypot(1, 1)` — `sqrt(1**2 + 1**2) == sqrt(2)`, irrational:
+    /// no perfect-square shortcut applies, so this still answers the
+    /// SORT-ONLY set `hypot_exact_perfect_square`'s own doc names as the
+    /// fallback (`approximated_family_result`'s `float_sorted_unknown()`),
+    /// the row `test_hypot_known_arguments_answer_sort_only` used to pin
+    /// on the perfect-square pair before this wave gave that pair its own
+    /// exact row.
+    #[test]
+    fn test_hypot_of_a_non_perfect_square_still_answers_sort_only() {
+        let Some(result) = math_call("hypot", &[float_operand(1.0), float_operand(1.0)]) else { return };
         assert_eq!(result.kind, Kind::Set);
     }
 

@@ -32,10 +32,24 @@
 use std::cell::Cell;
 use std::panic::catch_unwind;
 use std::panic::AssertUnwindSafe;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::sync::Once;
 
 thread_local! {
     static SUPPRESS_PANIC_PRINT: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Time spent inside kernel asks and the number of asks, summed
+/// process-wide since start. `refinedpy-check --timing` reads deltas
+/// around each file to split analysis time into in-kernel and
+/// out-of-kernel portions.
+static KERNEL_ASK_NANOS: AtomicU64 = AtomicU64::new(0);
+static KERNEL_ASK_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// (nanoseconds inside kernel asks, ask count) accumulated so far.
+pub fn kernel_ask_totals() -> (u64, u64) {
+    (KERNEL_ASK_NANOS.load(Ordering::Relaxed), KERNEL_ASK_COUNT.load(Ordering::Relaxed))
 }
 
 static INSTALL_HOOK: Once = Once::new();
@@ -81,7 +95,11 @@ where
     install_hook_once();
     SUPPRESS_PANIC_PRINT.with(|flag| flag.set(true));
     let _guard = SuppressGuard;
-    catch_unwind(AssertUnwindSafe(f))
+    let started = std::time::Instant::now();
+    let result = catch_unwind(AssertUnwindSafe(f));
+    KERNEL_ASK_NANOS.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    KERNEL_ASK_COUNT.fetch_add(1, Ordering::Relaxed);
+    result
 }
 
 /// Installs every kernel-ask seam the crates BELOW the kernel dependency
