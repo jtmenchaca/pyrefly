@@ -1516,10 +1516,16 @@ mod tests {
 
     #[test]
     fn an_alias_name_not_in_the_table_states_nothing_even_as_one_side_of_a_none_union() {
-        // `int | None`: `int` is not a compiled alias in this test's
-        // table, so the inner read misses and the whole union declines
-        // — the same "alias lookup miss" reason a bare `int` would.
-        let union = none_union(name_expr("int"));
+        // `NotAnAlias | None`: `NotAnAlias` is not a compiled alias in
+        // this test's table, AND not one of the bare sorts
+        // (`int`/`float`/`str`/`bool`) the union arm's own base-sort
+        // fallback reads (`declared_refinement`'s `Expr::BinOp` arm doc:
+        // inside a `X | None` union, an unresolved `X` falls back to
+        // `base_sort_return_refinement` before declining) — so both the
+        // alias lookup AND the base-sort fallback miss, and the whole
+        // union states nothing, the same "alias lookup miss" reason a
+        // bare `NotAnAlias` would give outside a union too.
+        let union = none_union(name_expr("NotAnAlias"));
         let aliases = HashMap::new();
         let imports = no_imports();
         let environment = no_locals();

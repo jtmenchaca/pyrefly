@@ -61,17 +61,28 @@
 //! `list[X]`/`Sequence[X]` parameter), and `<elt>` must read the loop
 //! target and numeric literals only, combined with `+`, `-`, and `*`.
 //!
-//! Statement two, optional and the same in both forms, carries the
-//! division `<total> / len(<seq>)` in either of two positions:
+//! Statement two, optional and the same in both forms, carries a
+//! division of `<total>` by `len(<seq>)` in either of two positions, in
+//! either of two operators — `/` (true division, always Float) or `//`
+//! (floor division, Integer when the total is Integer-sorted, Float
+//! otherwise — expressions.rst, binary arithmetic):
 //!
-//! - an assignment — `<mean> = <total> / len(<seq>)`, the division at
-//!   the top level, naming the quotient;
+//! - an assignment — `<mean> = <total> / len(<seq>)` or `<total> //
+//!   len(<seq>)`, the division at the top level, naming the quotient;
 //! - a return — `return <expr containing the division>`, where the
 //!   division may sit nested at any depth, as the fixture's
 //!   `return math.sqrt(total / len(samples))` does
 //!   (`audio_level.py:25`). Exactly one occurrence, so a single
 //!   published answer can never be ambiguous about which node it
 //!   belongs to.
+//!
+//! A THIRD spelling of statement one exists alongside the loop and the
+//! generator: `<total> = sum(<name>)`, a bare name argument with no
+//! per-element transform (`recognize_sum_over_name`). It lowers to the
+//! identical `loopAccum` program with the per-trip effect fixed to the
+//! element slot itself, and it is the one form whose total sort is
+//! known outright — the sequence's own element sort, with no per-trip
+//! expression to widen it.
 //!
 //! Everything else declines to the paths that already existed,
 //! unchanged — including `sum([...])` over a list comprehension, which
@@ -136,13 +147,27 @@ pub struct RecognizedAccumulation {
     /// answer inherits — a spec-read element set never yields a proved
     /// total.
     pub grade: TrustLevel,
-    /// The total's language-level sort, when the SEED states it: a
+    /// The total's language-level sort, when it is known exactly: a
     /// float seed (`total = 0.0`) makes every later `total += _` a
     /// float — float absorbs each numeric add — so Float is exact. An
-    /// int seed or the seedless generator-sum spelling states nothing:
-    /// the elements' sort could go either way and no correct
-    /// per-element sort survives the repetition-window read.
+    /// int seed or the seedless generator-sum spelling states nothing
+    /// (`None`): the elements' sort could go either way and no correct
+    /// per-element sort survives the repetition-window read. The bare
+    /// `sum(<name>)` spelling (`recognize_sum_over_name`) is the one
+    /// path that states Integer: with no per-element expression to
+    /// widen the sort, the total's sort is exactly the sequence's own
+    /// element sort, read off `<name>`'s own `kind_tag`
+    /// (`sum_call_over_star`'s own reading of the same field).
     pub total_kind_tag: Option<PrimitiveKind>,
+    /// Which division operator folded, when one did — `None` until
+    /// `fold_division`/`fold_located_division` runs. Read by
+    /// `walk_accumulation` to pick the quotient's own sort: `Div` is
+    /// always Float (Python's `/` "division of integers yields a
+    /// float", expressions.rst); `FloorDiv` is Integer exactly when
+    /// both the total and the count are Integer-sorted, Float
+    /// otherwise (Python's `//` on any Float operand yields Float,
+    /// same clause).
+    pub quotient_op: Option<DivisionOp>,
     /// Names proved to equal `len(<sequence_name>)` by a plain
     /// assignment sitting between the accumulation and the division —
     /// `count = len(samples)`, then `total / count` — keyed by the
@@ -331,6 +356,112 @@ pub fn recognize_generator_sum_in_return(
     recognize_generator_sum_call(value, "$return".to_owned(), environment)
 }
 
+/// Recognizes `<total> = sum(<name>)` — `sum` called directly on a plain
+/// name bound to the element-set star shape, with no generator and no
+/// per-element transform. This is the shape `sum([s * s for s in
+/// samples])`'s own doc calls "already materialized eagerly elsewhere":
+/// unlike that list-display argument, a BARE name argument names no
+/// concrete items to walk, so the eager path can only fall back to plain
+/// interval arithmetic over the sequence's element hull — the same
+/// weak-division problem `accumulation_program`'s own module doc states
+/// for the generator spelling. Sharing the identical `loopAccum` lowering
+/// with the generator forms is what ties the total to the count here
+/// too.
+///
+/// There is no per-element expression to lower: `sum(xs)` reads each
+/// element unchanged, so the per-trip effect is always exactly
+/// `slot(ELEMENT_SLOT)` — there is no source AST node for a transform,
+/// so this does not go through `accumulation_program`'s own
+/// `lower_added_expression` call, which requires one.
+///
+/// The total's sort is known here in a way neither other recognized form
+/// states: `sum(xs)` performs no per-element transform, so the total's
+/// sort is exactly the sequence's own element sort, read off `<name>`'s
+/// own `kind_tag` — the same field `builtin_models.rs`'s
+/// `sum_call_over_star` reads for its own (non-relational) sign-envelope
+/// row on this identical star-shaped-iterable case.
+///
+/// `None` — declining to the eager path — under the exact same
+/// conditions `recognize_generator_sum` declines under, plus: the
+/// argument is not a single bare name (a list/set display, a generator,
+/// or any other expression is a different shape read elsewhere); or that
+/// name's own value states no element sort (`kind_tag` is `None` or
+/// anything but `Integer`/`Float`) — the total's sort must be known
+/// exactly, the same requirement `sum_call_over_star` states for its own
+/// row.
+pub fn recognize_sum_over_name(
+    assign: &StmtAssign,
+    environment: &Environment,
+) -> Option<RecognizedAccumulation> {
+    let [Expr::Name(total)] = assign.targets.as_slice() else {
+        return None;
+    };
+    let Expr::Call(call) = assign.value.as_ref() else {
+        return None;
+    };
+    let Expr::Name(callee) = call.func.as_ref() else {
+        return None;
+    };
+    // a local binding named `sum` is not the builtin, the same
+    // shadow-on-rebind rule every other builtin recognition applies
+    if callee.id.as_str() != "sum" || environment.read(callee.id.as_str()).is_some() {
+        return None;
+    }
+    if !call.arguments.keywords.is_empty() {
+        return None;
+    }
+    let sequence = match call.arguments.args.as_ref() {
+        [Expr::Name(sequence)] => sequence,
+        // `sum(xs, start)` — only a start of exactly 0 is the relation's
+        // own base; anything else is a different total
+        [Expr::Name(sequence), start] if is_zero_literal(start) => sequence,
+        _ => return None,
+    };
+    let total_name = total.id.as_str().to_owned();
+    let sequence_name = sequence.id.as_str();
+    let loop_variable = "$elt";
+    if total_name == sequence_name || total_name == loop_variable || sequence_name == loop_variable {
+        return None;
+    }
+    let sequence_value = environment.read(sequence_name)?;
+    let total_kind_tag = match sequence_value.kind_tag {
+        Some(PrimitiveKind::Integer) => Some(PrimitiveKind::Integer),
+        Some(PrimitiveKind::Float) => Some(PrimitiveKind::Float),
+        _ => return None,
+    };
+    let (element_set, count_set) = element_and_count_sets(sequence_value)?;
+    Some(RecognizedAccumulation {
+        total_name,
+        sequence_name: sequence_name.to_owned(),
+        entry_states: vec![
+            number_state(make_refined_set(vec![one_of(&[0.0])])),
+            number_state(element_set),
+            number_state(count_set.clone()),
+            KnownStateWire {
+                top: true,
+                set: make_refined_set(vec![]),
+                undef: false,
+                null: false,
+                nan: false,
+                thrown: false,
+            },
+        ],
+        statements: vec![IrStatement {
+            kind: IrStatementKind::LoopAccum,
+            target: TOTAL_SLOT,
+            accum_src: ELEMENT_SLOT,
+            accum_len: COUNT_SLOT,
+            effect: slot(ELEMENT_SLOT),
+            ..Default::default()
+        }],
+        grade: trust_level_of(sequence_value),
+        total_kind_tag,
+        quotient_op: None,
+        length_aliases: std::collections::HashMap::new(),
+        count_set,
+    })
+}
+
 /// The program both recognized forms build: the four entry states and
 /// the one `loopAccum` statement. Everything here comes from knowledge
 /// the walk already holds — the sequence's own element set and count
@@ -386,6 +517,7 @@ fn accumulation_program(
         }],
         grade: trust_level_of(sequence_value),
         total_kind_tag,
+        quotient_op: None,
         length_aliases: std::collections::HashMap::new(),
         count_set,
     })
@@ -398,26 +530,39 @@ fn accumulation_program(
 /// denominator one statement earlier, where a separate question would
 /// see only two unrelated enclosures.
 ///
-/// Recognizes `<total> / len(<sequence>)` for exactly the accumulator
-/// and sequence this accumulation named — OR a sequence a comprehension
-/// built 1:1 over it with no filter (`AbstractValue::same_length_as`,
-/// `is_len_of`'s own doc) — or a bare name the caller already recorded
-/// in `recognized.length_aliases` as equal to `len(<sequence>)` by a
-/// plain `count = len(samples)` assignment (`is_length_alias_assignment`,
-/// `record_length_alias`). `false` — leaving the program as the
-/// accumulation alone — for any other shape: a different, unlinked name
-/// on either side, a length taken of some other sequence, an operator
-/// that is not true division.
+/// Recognizes `<total> / len(<sequence>)` OR `<total> // len(<sequence>)`
+/// for exactly the accumulator and sequence this accumulation named — OR
+/// a sequence a comprehension built 1:1 over it with no filter
+/// (`AbstractValue::same_length_as`, `is_len_of`'s own doc) — or a bare
+/// name the caller already recorded in `recognized.length_aliases` as
+/// equal to `len(<sequence>)` by a plain `count = len(samples)`
+/// assignment (`is_length_alias_assignment`, `record_length_alias`).
+/// `false` — leaving the program as the accumulation alone — for any
+/// other shape: a different, unlinked name on either side, a length
+/// taken of some other sequence, an operator that is neither true nor
+/// floor division.
 pub fn fold_division(
     recognized: &mut RecognizedAccumulation,
     expression: &Expr,
     environment: &Environment,
 ) -> bool {
-    if !is_relational_division(expression, recognized, environment) {
+    let Some(op) = relational_division_op(expression, recognized, environment) else {
         return false;
-    }
-    recognized.statements.push(division_statement());
+    };
+    recognized.statements.push(division_statement(op));
+    recognized.quotient_op = Some(op);
     true
+}
+
+/// Which of Python's two division operators a folded division carries —
+/// `/` (true division, always Float) or `//` (floor division, Integer
+/// when both operands are Integer-sorted, Float otherwise) —
+/// `division_statement` reads this to choose the kernel effect, and
+/// `walk_accumulation` reads it to choose the quotient's own sort.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DivisionOp {
+    Div,
+    FloorDiv,
 }
 
 /// The division assignment both folding routes push: the total slot
@@ -425,28 +570,49 @@ pub fn fold_division(
 /// rides its own slot because both names survive these two statements
 /// in Python, so both exit states are read back and the total is never
 /// left holding a value it never had.
-fn division_statement() -> IrStatement {
+///
+/// `//` wraps the same `Div` effect in the kernel's existing `Floor`
+/// unary (`binary64.floor`): Python's floor division "is always rounded
+/// towards minus infinity" (expressions.rst, binary arithmetic), and for
+/// this module's own domain — `total` a sum of same-signed elements,
+/// `count = len(sequence) >= 0` — `total` and `count` never straddle a
+/// sign the way a general `//` would need to worry about, so plain
+/// `floor(total / count)` is exact; no separate floor-division kernel op
+/// is needed.
+fn division_statement(op: DivisionOp) -> IrStatement {
+    let divide = LoopEffect {
+        kind: LoopEffectKind::Binary,
+        op: LoopEffectOp::Div,
+        a: Some(Box::new(slot(TOTAL_SLOT))),
+        b: Some(Box::new(slot(COUNT_SLOT))),
+        ..Default::default()
+    };
+    let effect = match op {
+        DivisionOp::Div => divide,
+        DivisionOp::FloorDiv => LoopEffect {
+            kind: LoopEffectKind::Unary,
+            op: LoopEffectOp::Floor,
+            a: Some(Box::new(divide)),
+            ..Default::default()
+        },
+    };
     IrStatement {
         kind: IrStatementKind::Assign,
         target: QUOTIENT_SLOT,
-        effect: LoopEffect {
-            kind: LoopEffectKind::Binary,
-            op: LoopEffectOp::Div,
-            a: Some(Box::new(slot(TOTAL_SLOT))),
-            b: Some(Box::new(slot(COUNT_SLOT))),
-            ..Default::default()
-        },
+        effect,
         ..Default::default()
     }
 }
 
 /// Folds the division into the program without re-matching the node —
 /// the caller already located it with `division_range_in`, which
-/// matched the same shape `fold_division` checks. Used by the return
-/// form, where the division sits nested inside the returned expression
-/// rather than being that expression.
-pub fn fold_located_division(recognized: &mut RecognizedAccumulation) {
-    recognized.statements.push(division_statement());
+/// matched the same shape `fold_division` checks and returns the
+/// operator it matched alongside the range. Used by the return form,
+/// where the division sits nested inside the returned expression rather
+/// than being that expression.
+pub fn fold_located_division(recognized: &mut RecognizedAccumulation, op: DivisionOp) {
+    recognized.statements.push(division_statement(op));
+    recognized.quotient_op = Some(op);
 }
 
 /// Whether a statement is exactly `<name> = len(<sequence>)` for THIS
@@ -542,11 +708,12 @@ pub fn reassigns_alias_or_sequence(stmt: &Stmt, alias: &str, sequence_name: &str
     }
 }
 
-/// The range of the ONE `<total> / len(<sequence>)` division inside
-/// `expression`, at any depth — the shape a `return` wraps in the
-/// fixture (`return math.sqrt(total / len(samples))`,
-/// `audio_level.py:25`), where the division is a call argument rather
-/// than the returned expression itself.
+/// The range and operator of the ONE `<total> / len(<sequence>)` or
+/// `<total> // len(<sequence>)` division inside `expression`, at any
+/// depth — the shape a `return` wraps in the fixture (`return
+/// math.sqrt(total / len(samples))`, `audio_level.py:25`), where the
+/// division is a call argument rather than the returned expression
+/// itself.
 ///
 /// `None` unless the count is EXACTLY one. Zero means there is nothing
 /// to fold. Two or more means the caller would have to say which
@@ -557,8 +724,8 @@ pub fn division_range_in(
     expression: &Expr,
     recognized: &RecognizedAccumulation,
     environment: &Environment,
-) -> Option<TextRange> {
-    let mut found: Option<TextRange> = None;
+) -> Option<(TextRange, DivisionOp)> {
+    let mut found: Option<(TextRange, DivisionOp)> = None;
     let mut count = 0;
     find_divisions(expression, recognized, environment, &mut found, &mut count);
     match count {
@@ -567,10 +734,11 @@ pub fn division_range_in(
     }
 }
 
-/// Walks every subexpression, recording each `<total> / len(<seq>)` it
-/// meets. Counts past one so the caller can tell "exactly one" from
-/// "more than one"; the walk never stops early, because that
-/// distinction is the whole point.
+/// Walks every subexpression, recording each `<total> / len(<seq>)` or
+/// `<total> // len(<seq>)` it meets, alongside which operator it was.
+/// Counts past one so the caller can tell "exactly one" from "more than
+/// one"; the walk never stops early, because that distinction is the
+/// whole point.
 ///
 /// The recursion mirrors `check.rs`'s own `collect_walrus_names`,
 /// including its scope rule: a `lambda`'s body is a separate scope
@@ -580,11 +748,11 @@ fn find_divisions(
     expression: &Expr,
     recognized: &RecognizedAccumulation,
     environment: &Environment,
-    found: &mut Option<TextRange>,
+    found: &mut Option<(TextRange, DivisionOp)>,
     count: &mut usize,
 ) {
-    if is_relational_division(expression, recognized, environment) {
-        *found = Some(expression.range());
+    if let Some(op) = relational_division_op(expression, recognized, environment) {
+        *found = Some((expression.range(), op));
         *count += 1;
         // the operands are a name and a `len` call: neither can hold a
         // second occurrence, so the walk stops here
@@ -678,27 +846,35 @@ fn find_divisions(
     }
 }
 
-/// Whether an expression is exactly `<total> / len(<sequence>)` for the
-/// accumulator and sequence this accumulation named — or `len` of a
-/// DIFFERENT name whose value the environment holds with
+/// The division operator an expression carries, when the expression is
+/// exactly `<total> / len(<sequence>)` or `<total> // len(<sequence>)`
+/// for the accumulator and sequence this accumulation named — or `len`
+/// of a DIFFERENT name whose value the environment holds with
 /// `same_length_as` proved equal to the accumulation's own sequence, or
 /// a bare name proved by a plain assignment to equal `len(<sequence>)`
-/// (`is_len_of`'s own doc, both links).
-fn is_relational_division(
+/// (`is_len_of`'s own doc, both links). `None` for any other operator,
+/// including every operator besides `/` and `//`.
+fn relational_division_op(
     expression: &Expr,
     recognized: &RecognizedAccumulation,
     environment: &Environment,
-) -> bool {
+) -> Option<DivisionOp> {
     let Expr::BinOp(binop) = expression else {
-        return false;
+        return None;
     };
-    if !matches!(binop.op, Operator::Div) {
-        return false;
-    }
+    let op = match binop.op {
+        Operator::Div => DivisionOp::Div,
+        Operator::FloorDiv => DivisionOp::FloorDiv,
+        _ => return None,
+    };
     let Expr::Name(numerator) = binop.left.as_ref() else {
-        return false;
+        return None;
     };
-    numerator.id.as_str() == recognized.total_name && is_len_of(binop.right.as_ref(), recognized, environment)
+    if numerator.id.as_str() == recognized.total_name && is_len_of(binop.right.as_ref(), recognized, environment) {
+        Some(op)
+    } else {
+        None
+    }
 }
 
 /// What the kernel answered: the accumulated total, and the quotient
@@ -742,6 +918,31 @@ pub struct AccumulationAnswer {
 /// leaves `quotient` as `None` while the total still stands: the two
 /// claims are independent, and dropping the good one with the bad would
 /// state less than the kernel proved.
+/// The sort a folded division's quotient wears, once it binds. Two
+/// division operators fold here, and they sort differently
+/// (expressions.rst, binary arithmetic): `/` "division of integers
+/// yields a float" unconditionally, so `Div` is always Float. `//`
+/// keeps the OPERANDS' own sort — the count (`len(...)`) is always
+/// Integer-sorted (`walk_accumulation`'s own `count` field), so
+/// `FloorDiv` is Integer exactly when the total is ALSO Integer-sorted,
+/// and Float the moment either side is Float or the total's sort is
+/// unknown (`total_kind_tag` of `None` states no claim, never an
+/// assumed Integer). This is the sort the sqrt/floor call rows
+/// downstream require before they ask the kernel. Pure function of the
+/// recognized program's own fields, called only after a division
+/// folded (`recognized.quotient_op.is_some()`); on the `None` case
+/// (defensive — every caller already gates on `statements.len() > 1`,
+/// which only a fold reaches) it answers Float, matching the operator's
+/// own historical default.
+fn quotient_kind_tag(recognized: &RecognizedAccumulation) -> Option<PrimitiveKind> {
+    match recognized.quotient_op {
+        Some(DivisionOp::FloorDiv) if recognized.total_kind_tag == Some(PrimitiveKind::Integer) => {
+            Some(PrimitiveKind::Integer)
+        }
+        _ => Some(PrimitiveKind::Float),
+    }
+}
+
 pub fn walk_accumulation(recognized: &RecognizedAccumulation) -> Option<AccumulationAnswer> {
     let asked = ask_walk_relational(&recognized.entry_states, &recognized.statements, &[]);
     // Debug instrument (REFINEDPY_DEBUG_RELATIONAL): the raw exit
@@ -763,14 +964,9 @@ pub fn walk_accumulation(recognized: &RecognizedAccumulation) -> Option<Accumula
     let quotient = match recognized.statements.len() {
         // no division rode along, so the quotient slot was never written
         1 => None,
-        // the folded division is Python's `/`, which yields a float for
-        // every numeric operand pair (expressions.rst, binary arithmetic:
-        // "division of integers yields a float"), so the quotient is
-        // Float-sorted unconditionally — the sort the sqrt/floor call
-        // rows downstream require before they ask the kernel
         _ => states
             .get(QUOTIENT_SLOT as usize)
-            .and_then(|state| bindable_state(state, recognized.grade, Some(PrimitiveKind::Float))),
+            .and_then(|state| bindable_state(state, recognized.grade, quotient_kind_tag(recognized))),
     };
     // The count is not a kernel answer — it is the sequence's own
     // repetition window, already read at recognition time
@@ -1169,6 +1365,7 @@ mod tests {
             statements: Vec::new(),
             grade: TrustProved,
             total_kind_tag: None,
+            quotient_op: None,
             length_aliases: std::collections::HashMap::new(),
             count_set: make_refined_set(vec![]),
         };
@@ -1196,6 +1393,7 @@ mod tests {
             statements: Vec::new(),
             grade: TrustProved,
             total_kind_tag: None,
+            quotient_op: None,
             length_aliases: std::collections::HashMap::new(),
             count_set: make_refined_set(vec![]),
         };
@@ -1335,6 +1533,7 @@ mod tests {
             statements: Vec::new(),
             grade: TrustProved,
             total_kind_tag: None,
+            quotient_op: None,
             length_aliases: std::collections::HashMap::new(),
             count_set: make_refined_set(vec![]),
         };
@@ -1373,6 +1572,7 @@ mod tests {
             statements: Vec::new(),
             grade: TrustProved,
             total_kind_tag: None,
+            quotient_op: None,
             length_aliases: std::collections::HashMap::new(),
             count_set: make_refined_set(vec![]),
         };
@@ -1550,6 +1750,114 @@ mod tests {
         );
     }
 
+    // An environment holding `xs` as an unknown-length sequence of
+    // Integer-sorted elements in [0, 9] — the star shape `seed_parameters`
+    // builds for a `list[int]` parameter (`B2.use.sink`'s own `xs:
+    // list[int]`, elements narrowed to [0, 150] by the fixture's own
+    // guard; [0, 9] here is an arbitrary bounded window, since
+    // `recognize_sum_over_name` itself never reads the element bounds,
+    // only the element SORT).
+    fn environment_with_integer_xs() -> Environment {
+        let element = make_refined_set(vec![at_least(0.0), at_most(9.0)]);
+        let mut environment =
+            Environment::new(std::collections::HashSet::from(["total".to_owned(), "xs".to_owned()]));
+        environment.bind(
+            "xs",
+            AbstractValue {
+                kind_tag: Some(PrimitiveKind::Integer),
+                ..known_set(
+                    make_refined_set(vec![refined_sets::refinement_forms::star(element)]),
+                    None,
+                    TrustProved,
+                    SetKindTag::None,
+                )
+            },
+        );
+        environment
+    }
+
+    #[test]
+    fn sum_over_a_plain_name_recognizes_and_lowers_to_loop_accum() {
+        let assign = parsed_assignment("total = sum(xs)\n");
+        let recognized = recognize_sum_over_name(&assign, &environment_with_integer_xs())
+            .expect("sum(xs) over an Integer-sorted star sequence recognizes");
+        assert_eq!(recognized.total_name, "total");
+        assert_eq!(recognized.sequence_name, "xs");
+        assert_eq!(
+            recognized.total_kind_tag,
+            Some(PrimitiveKind::Integer),
+            "sum(xs) performs no per-element transform, so the total's sort is xs's own element sort"
+        );
+        let [accumulation] = recognized.statements.as_slice() else {
+            panic!("want exactly the accumulation, got {}", recognized.statements.len());
+        };
+        let got = stmt_wire(accumulation);
+        // no per-element transform: the per-trip effect is the bare
+        // element slot, unlike the generator forms' own transformed body
+        let want = r#"{"loopAccum":{"total":0,"src":1,"len":2,"body":{"var":1}}}"#;
+        assert_eq!(got, want, "stmt_wire(sum over a plain name) = {got:?}, want {want:?}");
+    }
+
+    #[test]
+    fn sum_over_a_plain_name_with_an_explicit_zero_start_is_recognized() {
+        let assign = parsed_assignment("total = sum(xs, 0)\n");
+        assert!(
+            recognize_sum_over_name(&assign, &environment_with_integer_xs()).is_some(),
+            "an explicit start of 0 is sum's own default and stays recognized"
+        );
+    }
+
+    #[test]
+    fn sum_over_a_plain_name_with_a_nonzero_start_is_declined() {
+        let assign = parsed_assignment("total = sum(xs, 5)\n");
+        assert!(
+            recognize_sum_over_name(&assign, &environment_with_integer_xs()).is_none(),
+            "a nonzero start shifts the total off the relation's zero base"
+        );
+    }
+
+    #[test]
+    fn sum_over_a_generator_is_left_to_recognize_generator_sum() {
+        // the ARGUMENT must be a bare name; a generator argument is the
+        // other recognizer's own shape and must not double-match here
+        let assign = parsed_assignment("total = sum(s * s for s in xs)\n");
+        assert!(
+            recognize_sum_over_name(&assign, &environment_with_integer_xs()).is_none(),
+            "a generator argument is recognize_generator_sum's shape, not this one's"
+        );
+    }
+
+    #[test]
+    fn sum_over_a_list_display_is_left_to_the_eager_path() {
+        let assign = parsed_assignment("total = sum([1, 2, 3])\n");
+        assert!(
+            recognize_sum_over_name(&assign, &environment_with_integer_xs()).is_none(),
+            "a list display argument is not a bare name and is already materialized eagerly"
+        );
+    }
+
+    #[test]
+    fn sum_over_a_name_with_no_known_element_sort_is_declined() {
+        // xs is bound, but with no kind_tag at all — the shape
+        // `environment_with_samples`'s own `samples` binding takes
+        let assign = parsed_assignment("total = sum(samples)\n");
+        assert!(
+            recognize_sum_over_name(&assign, &environment_with_samples()).is_none(),
+            "the total's sort must be known exactly; an unset kind_tag states neither Integer nor Float"
+        );
+    }
+
+    #[test]
+    fn a_locally_bound_sum_is_not_the_builtin_over_a_plain_name() {
+        let assign = parsed_assignment("total = sum(xs)\n");
+        let mut environment = environment_with_integer_xs();
+        environment.bind("sum", known_set(make_refined_set(vec![]), None, TrustProved, SetKindTag::None));
+        assert!(
+            recognize_sum_over_name(&assign, &environment).is_none(),
+            "a shadowed `sum` name is not the builtin this reader models"
+        );
+    }
+
     // A recognized accumulation over `total` and `samples`, with no
     // program built — enough for the division readers, which only ever
     // consult the two names.
@@ -1561,6 +1869,7 @@ mod tests {
             statements: Vec::new(),
             grade: TrustProved,
             total_kind_tag: None,
+            quotient_op: None,
             length_aliases: std::collections::HashMap::new(),
             count_set: make_refined_set(vec![]),
         }
@@ -1586,7 +1895,7 @@ mod tests {
     fn the_division_is_found_nested_inside_a_call_argument() {
         // the fixture's own return (audio_level.py:25)
         let returned = returned_expression("math.sqrt(total / len(samples))");
-        let range = division_range_in(&returned, &recognized_over_samples(), &environment_with_samples())
+        let (range, op) = division_range_in(&returned, &recognized_over_samples(), &environment_with_samples())
             .expect("the nested division is found");
         // the located node is the inner division, strictly inside the
         // call that wraps it
@@ -1598,18 +1907,20 @@ mod tests {
             range.end() < returned.range().end(),
             "want the inner division's range, not the whole call's: {range:?}"
         );
+        assert_eq!(op, DivisionOp::Div, "the source spelling is `/`, not `//`");
     }
 
     #[test]
     fn a_bare_division_in_return_position_is_found() {
         let returned = returned_expression("total / len(samples)");
-        let range = division_range_in(&returned, &recognized_over_samples(), &environment_with_samples())
+        let (range, op) = division_range_in(&returned, &recognized_over_samples(), &environment_with_samples())
             .expect("a top-level division is found");
         assert_eq!(
             range,
             returned.range(),
             "the whole returned expression IS the division"
         );
+        assert_eq!(op, DivisionOp::Div, "the source spelling is `/`, not `//`");
     }
 
     #[test]
@@ -1654,13 +1965,84 @@ mod tests {
     #[test]
     fn the_located_division_folds_the_same_statement_the_assignment_form_does() {
         let mut recognized = recognized_over_samples();
-        fold_located_division(&mut recognized);
+        fold_located_division(&mut recognized, DivisionOp::Div);
         let [division] = recognized.statements.as_slice() else {
             panic!("want exactly the division statement, got {}", recognized.statements.len());
         };
         let got = stmt_wire(division);
         let want = r#"{"assign":{"target":3,"e":{"op":"binary64.div","A":{"var":0},"B":{"var":2}}}}"#;
         assert_eq!(got, want, "stmt_wire(located division) = {got:?}, want {want:?}");
+        assert_eq!(
+            recognized.quotient_op,
+            Some(DivisionOp::Div),
+            "fold_located_division must record which operator folded"
+        );
+    }
+
+    #[test]
+    fn the_located_floor_division_wraps_the_div_effect_in_floor() {
+        let mut recognized = recognized_over_samples();
+        fold_located_division(&mut recognized, DivisionOp::FloorDiv);
+        let [division] = recognized.statements.as_slice() else {
+            panic!("want exactly the division statement, got {}", recognized.statements.len());
+        };
+        let got = stmt_wire(division);
+        let want =
+            r#"{"assign":{"target":3,"e":{"op":"binary64.floor","A":{"op":"binary64.div","A":{"var":0},"B":{"var":2}}}}}"#;
+        assert_eq!(got, want, "stmt_wire(located floor division) = {got:?}, want {want:?}");
+    }
+
+    // PIN: Python's `//` on two int operands yields an int
+    // (expressions.rst, binary arithmetic) — `total // len(xs)` with
+    // `total` an int-sorted sum (`recognize_sum_over_name` over
+    // `list[int]`) must publish an Integer-sorted quotient, matching the
+    // `int(...)` sink the fixture assigns it to (`B2.use.sink`,
+    // `m = total // len(xs)`).
+    #[test]
+    fn int_sum_floor_divided_by_len_is_integer_sorted() {
+        let mut recognized = recognized_over_samples();
+        recognized.total_kind_tag = Some(PrimitiveKind::Integer);
+        recognized.quotient_op = Some(DivisionOp::FloorDiv);
+        assert_eq!(
+            quotient_kind_tag(&recognized),
+            Some(PrimitiveKind::Integer),
+            "int // int must publish an Integer quotient"
+        );
+    }
+
+    // PIN: Python's `/` yields a float unconditionally, and `//` over
+    // ANY float operand also yields a float — same clause. Both must
+    // keep publishing Float, exactly as the hardcoded rule did before
+    // FloorDiv folded at all (`B2`'s own `audio_level.py`-style
+    // `total / len(samples)` mean/sqrt rows).
+    #[test]
+    fn float_sum_divided_by_len_stays_float_sorted() {
+        let mut float_true_div = recognized_over_samples();
+        float_true_div.total_kind_tag = Some(PrimitiveKind::Float);
+        float_true_div.quotient_op = Some(DivisionOp::Div);
+        assert_eq!(
+            quotient_kind_tag(&float_true_div),
+            Some(PrimitiveKind::Float),
+            "true division must stay Float regardless of the total's own sort"
+        );
+
+        let mut float_floor_div = recognized_over_samples();
+        float_floor_div.total_kind_tag = Some(PrimitiveKind::Float);
+        float_floor_div.quotient_op = Some(DivisionOp::FloorDiv);
+        assert_eq!(
+            quotient_kind_tag(&float_floor_div),
+            Some(PrimitiveKind::Float),
+            "float // int must stay Float — the total is not Integer-sorted"
+        );
+
+        let mut unknown_total = recognized_over_samples();
+        unknown_total.total_kind_tag = None;
+        unknown_total.quotient_op = Some(DivisionOp::FloorDiv);
+        assert_eq!(
+            quotient_kind_tag(&unknown_total),
+            Some(PrimitiveKind::Float),
+            "an unknown total sort must not be assumed Integer"
+        );
     }
 
     #[test]

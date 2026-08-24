@@ -80,6 +80,7 @@ use refined_kernel::narrow_questions::NarrowCmpOp;
 use refined_kernel::narrow_questions::NarrowTreeKind;
 use refined_sets::codepoint_sets::strings;
 use refined_sets::refinement_forms::at_least;
+use refined_sets::refinement_forms::at_most;
 use refined_sets::refinement_forms::integer;
 use refined_sets::refinement_forms::make_refined_set;
 use refined_sets::refinement_forms::one_of;
@@ -115,7 +116,171 @@ pub fn assume(
     // binding, not run before it exists.
     narrow(condition, &mut environment, kernel, truth);
     narrow_set_kind_names(condition, &mut environment, kernel, truth);
+    narrow_path_comparisons(condition, &mut environment, truth);
     environment
+}
+
+/// The ACCESS-PATH channel's own entry point (`env.rs`'s own
+/// `TrackedPlace`/`bind_path`/`read_path` doc): for every numeric
+/// comparison `condition` folds through `and` (chained comparisons and
+/// `and`-conjunctions only — an `or`'s own operand alone could have made
+/// the whole thing true, so it states nothing about any single operand,
+/// the same rule the VALUES channel's `narrow_bool_op` already follows),
+/// whose tested side is an ATTRIBUTE CHAIN rather than a bare name
+/// (`a.n`, `env::tracked_place_of`'s own doc), tighten a WINDOW bound at
+/// that path. Run after the VALUES and SET channels, for the identical
+/// reason `narrow_set_kind_names` runs after the VALUES channel: nothing
+/// in this wave SEEDS a path fact from an `isinstance` test the way a
+/// bare name can, so there is no ordering dependency the other direction,
+/// but keeping the SAME position after the two name-keyed channels keeps
+/// the three channels' relative order stable and easy to reason about.
+fn narrow_path_comparisons(condition: &Expr, environment: &mut Environment, truth: bool) {
+    match condition {
+        Expr::BoolOp(bool_op) if bool_op.op == BoolOp::And && truth => {
+            for value in &bool_op.values {
+                narrow_path_comparisons(value, environment, truth);
+            }
+        }
+        Expr::Compare(compare) if truth => {
+            let mut left = compare.left.as_ref();
+            for (op, right) in compare.ops.iter().zip(compare.comparators.iter()) {
+                narrow_one_path_comparison(left, *op, right, environment);
+                left = right;
+            }
+        }
+        // `not`, `or`, a single-pair falsity read, a call, anything else:
+        // no shape this channel narrows — the honest "narrows nothing"
+        // default every leaf in this file keeps. Falsity is not read at
+        // all here (unlike the VALUES channel's single-pair `is`/`is not
+        // None` exception): a comparison's negation over an unenumerated
+        // WINDOW fact has no single bound this channel can tighten to,
+        // the same reason `narrow_name_length_against_literal`'s own
+        // falsity path folds through `negate_numeric_cmp_op` instead of
+        // being read leaf-by-leaf — the path channel keeps that
+        // tightening scoped to the truth arm only, matching the mission's
+        // narrower ask.
+        _ => {}
+    }
+}
+
+/// One comparison pair (`left op right`) as an ACCESS-PATH narrowing leaf:
+/// a numeric literal on one side, an attribute chain on the other
+/// (`env::tracked_place_of`), tightens that chain's own WINDOW bound —
+/// the identical `{lo, hi}` tightening `narrow_name_length_against_literal`
+/// already gives a length window, applied here to a path's own numeric
+/// fact instead of a `len(...)` call's result. `is`/`is not`, `in`/`not
+/// in`, and a non-numeric operator narrow nothing this leaf reads (the
+/// VALUES/SET channels' own leaves already cover those over a BARE name;
+/// a path is scoped to the numeric-comparison construct the mission
+/// names). Two changing paths (`a.n < b.m`), or a side that is neither a
+/// path nor a literal, narrow nothing — the honest default.
+fn narrow_one_path_comparison(left: &Expr, op: CmpOp, right: &Expr, environment: &mut Environment) {
+    let Some(numeric_op) = numeric_cmp_op(op) else {
+        return;
+    };
+    let (place, on_place, literal) = if let (Some(place), Some(literal)) =
+        (crate::env::tracked_place_of(left), literal_number(right))
+    {
+        (place, true, literal)
+    } else if let (Some(literal), Some(place)) =
+        (literal_number(left), crate::env::tracked_place_of(right))
+    {
+        (place, false, literal)
+    } else {
+        return;
+    };
+    // a bare name is already the VALUES/SET channels' own business —
+    // this leaf is scoped to a GENUINE multi-segment path, the shape
+    // those two channels cannot bind at all (`bindings` is keyed on one
+    // name)
+    if place.path.is_empty() {
+        return;
+    }
+    let effective_op = if on_place { numeric_op } else { mirror_cmp_op(numeric_op) };
+    narrow_path_window(&place, effective_op, literal, environment);
+}
+
+/// Tightens the WINDOW bound recorded for `place` by `place op literal`
+/// holding — the path-keyed twin of `narrow_name_length_against_literal`'s
+/// own `{lo, hi}` tightening, reused here rather than duplicated: a path
+/// fact is read back (or seeded fresh, the unbounded integer ray — every
+/// `Age`-annotated instance field this construct's own rows use is an
+/// int, and this wave states no path fact for a non-integer field) then
+/// tightened the identical way that function tightens a length window,
+/// through the SAME `{lo, hi}` triple. `!=` tightens nothing (the same
+/// "no shape for a single excluded point" decline that function's own
+/// `NotEq` arm gives); a tightened-to-empty window is left UNBOUND rather
+/// than rebound (an infeasible path fact is the walk's own dead-branch
+/// business, never a narrowing claim this leaf makes).
+fn narrow_path_window(place: &crate::env::TrackedPlace, op: NumericCmpOp, literal: f64, environment: &mut Environment) {
+    let current = environment.read_path(place).cloned().unwrap_or_else(|| AbstractValue {
+        kind_tag: Some(PrimitiveKind::Integer),
+        ..known_set(unbounded_integers(), None, TrustSpec, SetKindTag::None)
+    });
+    if current.kind != Kind::Set {
+        return;
+    }
+    let Some(repeated_or_window) = numeric_window_of(&current.set) else {
+        return;
+    };
+    let (mut lo, mut hi) = repeated_or_window;
+    // integer-only bounds (this channel seeds nothing but the unbounded
+    // integer ray — `narrow_path_window`'s own doc), the same `± 1`
+    // strict-inequality reading `narrow_name_length_against_literal`
+    // already takes for a length window.
+    match op {
+        NumericCmpOp::GtE => lo = lo.max(literal),
+        NumericCmpOp::Gt => lo = lo.max(literal + 1.0),
+        NumericCmpOp::LtE => hi = Some(hi.map_or(literal, |current_hi| current_hi.min(literal))),
+        NumericCmpOp::Lt => hi = Some(hi.map_or(literal - 1.0, |current_hi| current_hi.min(literal - 1.0))),
+        NumericCmpOp::Eq => {
+            lo = lo.max(literal);
+            hi = Some(hi.map_or(literal, |current_hi| current_hi.min(literal)));
+        }
+        NumericCmpOp::NotEq => return,
+    }
+    if let Some(h) = hi {
+        if h < lo {
+            // the window is now provably empty — leave the path fact
+            // unchanged rather than rebind to an empty claim; the walk's
+            // own dead-branch handling is what skips an unreachable arm,
+            // not a narrowed-to-empty path fact here
+            return;
+        }
+    }
+    let mut forms = vec![integer()];
+    forms.push(at_least(lo));
+    if let Some(h) = hi {
+        forms.push(at_most(h));
+    }
+    environment.bind_path(
+        place,
+        AbstractValue {
+            kind_tag: Some(PrimitiveKind::Integer),
+            ..known_set(make_refined_set(forms), None, TrustSpec, SetKindTag::None)
+        },
+    );
+}
+
+/// A `RefinedSet`'s own `{lo, hi}` numeric window, read from its
+/// `AtLeast`/`AtMost`/`Integer` forms — the SAME shape
+/// `narrow_name_length_against_literal` reads off a length window,
+/// applied here to a path's own numeric fact. `None` for any set shape
+/// other than exactly these three forms (a `oneOf`, a string ground) —
+/// this wave's path channel only ever builds this one shape itself, so a
+/// set built any other way is not one it can tighten.
+fn numeric_window_of(set: &RefinedSet) -> Option<(f64, Option<f64>)> {
+    let mut lo: Option<f64> = None;
+    let mut hi: Option<f64> = None;
+    for form in &set.forms {
+        match form.form {
+            Form::AtLeast => lo = Some(form.a),
+            Form::AtMost => hi = Some(form.a),
+            Form::Integer => {}
+            _ => return None,
+        }
+    }
+    Some((lo.unwrap_or(f64::NEG_INFINITY), hi))
 }
 
 /// A match arm's GUARD (`case x if <condition>:`), read as a narrowing
@@ -299,11 +464,11 @@ fn collect_names(condition: &Expr, out: &mut Vec<String>) {
             }
         }
         Expr::Compare(compare) => {
-            if let Some(name) = name_of(&compare.left) {
+            if let Some(name) = name_of(&compare.left).or_else(|| affine_shifted_name_of(&compare.left)) {
                 add(name, out);
             }
             for comparator in &compare.comparators {
-                if let Some(name) = name_of(comparator) {
+                if let Some(name) = name_of(comparator).or_else(|| affine_shifted_name_of(comparator)) {
                     add(name, out);
                 }
             }
@@ -431,9 +596,145 @@ fn narrow_bool_op(
     // `or` under falsity narrows each operand by its own negation
     // (De Morgan); `and` under truth narrows each by its own truth.
     let per_operand_truth = bool_op.op == BoolOp::And;
+    // `x.isascii() and x.isupper()` (or `x.isascii() and x.islower()`),
+    // co-occurring anywhere in this SAME conjunction's own operand list —
+    // read together, never from either call alone (`narrow_ascii_case_
+    // conjunction`'s own doc names why `isupper()`/`islower()` alone
+    // cannot bound to ASCII). Asked under `per_operand_truth`, the truth
+    // EACH operand is individually proven at (`And`-under-outer-true:
+    // each operand proven true; `Or`-under-outer-false: each operand
+    // proven FALSE, which this leaf's own `if !truth` guard correctly
+    // declines — "not ascii"/"not uppercase" states no positive window).
+    narrow_ascii_case_conjunction(&bool_op.values, environment, per_operand_truth);
     for value in &bool_op.values {
         narrow(value, environment, kernel, per_operand_truth);
     }
+}
+
+/// `x.isascii() and x.isupper()` / `x.isascii() and x.islower()`, found
+/// TOGETHER anywhere among `operands` (an `and` chain's own flat operand
+/// list — `len(x) == 2 and x.isascii() and x.isupper()` is one
+/// three-value `BoolOp`, F2.fixed's own shape), narrows `x`'s codepoint
+/// ALPHABET to exactly the ASCII cased-letter window: `[0x41, 0x5A]` for
+/// `isupper()`, `[0x61, 0x7A]` for `islower()`.
+///
+/// Neither call alone states this bound: `str.isascii()` alone only
+/// proves every code point sits in `[0x00, 0x7F]` (stdtypes.rst,
+/// `str.isascii()` — "ASCII characters have code points in the range
+/// U+0000-U+007F"), and `str.isupper()`/`str.islower()` alone are pinned
+/// only against the full Unicode "cased character" categories
+/// (stdtypes.rst's own `[4]` footnote), which include cased letters far
+/// outside ASCII (e.g. 'É', 'ß') — bounding either call by itself to
+/// `[0x41,0x5A]`/`[0x61,0x7A]` would overclaim. Restricted to ASCII BY
+/// `isascii()` in the same conjunction, though, the codepoints
+/// `isupper()`/`islower()` can additionally hold narrow to EXACTLY the
+/// ASCII cased letters: within `[0x00, 0x7F]`, the only cased code
+/// points at all are `A`-`Z` (`0x41`-`0x5A`) and `a`-`z` (`0x61`-`0x7A`)
+/// — every other ASCII code point (control characters, digits,
+/// punctuation, space) is uncased, so "every cased character is
+/// uppercase, and there is at least one" restricted to that alphabet
+/// collapses to "every code point is in `[0x41, 0x5A]`."
+///
+/// Reads and rebuilds through `as_repetition`/`repeat_of`, the same
+/// element-preserving pattern `narrow_name_length_against_literal` uses
+/// for the LENGTH half of this same guard — this leaf tightens the
+/// ELEMENT instead, so the two compose regardless of which operand the
+/// source lists first (each leaf reads whatever the OTHER already
+/// narrowed, since both run against the same shared `environment`).
+/// Only the TRUE arm narrows: "not ASCII" or "not uppercase" states no
+/// single alphabet this window can name (the excluded codepoints are
+/// scattered, not a window), matching `narrow_regex_module_call`'s own
+/// "no complement" default for a state this grammar cannot express.
+/// Every other shape (no `isascii()` call, no `isupper()`/`islower()`
+/// call, receivers naming different places, a non-Set binding) narrows
+/// nothing — the honest default every leaf in this file keeps.
+fn narrow_ascii_case_conjunction(operands: &[Expr], environment: &mut Environment, truth: bool) {
+    if !truth {
+        return;
+    }
+    let Some(name) = operands.iter().find_map(is_isascii_call_name) else {
+        return;
+    };
+    let Some((case_name, ascii_case)) = operands.iter().find_map(is_ascii_case_call) else {
+        return;
+    };
+    if case_name != name {
+        return;
+    }
+    let Some(current) = environment.read(name).cloned() else {
+        return;
+    };
+    if current.kind != Kind::Set {
+        return;
+    }
+    let Some(repeated) = refined_sets::repetition_window_forms::as_repetition(&current.set) else {
+        return;
+    };
+    let (lo, hi) = ascii_case.codepoint_window();
+    let element = make_refined_set(vec![integer(), at_least(lo), at_most(hi)]);
+    let grade = trust_level_of(&current);
+    let narrowed_set = make_refined_set(vec![refined_sets::refinement_forms::repeat_of(element, repeated.lo, repeated.hi)]);
+    environment.bind(
+        name,
+        AbstractValue {
+            kind_tag: current.kind_tag,
+            ..known_set(narrowed_set, None, grade, current.set_kind_tag)
+        },
+    );
+}
+
+/// `A`-`Z` or `a`-`z` — the two ASCII cased-letter windows
+/// `narrow_ascii_case_conjunction` narrows to, told apart by which call
+/// (`isupper`/`islower`) named them.
+#[derive(Clone, Copy)]
+enum AsciiCase {
+    Upper,
+    Lower,
+}
+
+impl AsciiCase {
+    fn codepoint_window(self) -> (f64, f64) {
+        match self {
+            AsciiCase::Upper => (0x41 as f64, 0x5A as f64),
+            AsciiCase::Lower => (0x61 as f64, 0x7A as f64),
+        }
+    }
+}
+
+/// Whether `expression` is `<bare name>.isascii()` — zero arguments, no
+/// keywords, the receiver a bare tracked name. The tested place's own
+/// name, or `None` for any other shape.
+fn is_isascii_call_name(expression: &Expr) -> Option<&str> {
+    is_bare_string_predicate_call(expression, "isascii")
+}
+
+/// Whether `expression` is `<bare name>.isupper()` / `<bare name>.
+/// islower()` — the tested place's own name paired with which case the
+/// call names, or `None` for any other shape.
+fn is_ascii_case_call(expression: &Expr) -> Option<(&str, AsciiCase)> {
+    if let Some(name) = is_bare_string_predicate_call(expression, "isupper") {
+        return Some((name, AsciiCase::Upper));
+    }
+    if let Some(name) = is_bare_string_predicate_call(expression, "islower") {
+        return Some((name, AsciiCase::Lower));
+    }
+    None
+}
+
+/// `<bare name>.<method>()` with zero arguments and no keywords — the
+/// shape every `str` no-argument predicate call in this file reads,
+/// shared by `isascii`/`isupper`/`islower` rather than duplicated three
+/// times.
+fn is_bare_string_predicate_call<'a>(expression: &'a Expr, method: &str) -> Option<&'a str> {
+    let Expr::Call(call) = expression else { return None };
+    let Expr::Attribute(attribute) = call.func.as_ref() else { return None };
+    if attribute.attr.as_str() != method {
+        return None;
+    }
+    if !call.arguments.args.is_empty() || !call.arguments.keywords.is_empty() {
+        return None;
+    }
+    name_of(&attribute.value)
 }
 
 /// `ExprCompare` narrowing: chained comparisons lower to the
@@ -1666,6 +1967,21 @@ fn comparison_leaf_tree_of(left: &Expr, op: CmpOp, right: &Expr, place: &str) ->
     let Some(numeric_op) = numeric_cmp_op(op) else {
         return other_tree();
     };
+    // `<place> ± k1 <op> k2` (`n - 1 >= 0`, B1.keep.join's own ternary
+    // guard) — the tested side names no bare `place`, but an AFFINE SHIFT
+    // of it (`affine_place_of`'s own doc). Read BEFORE the bare-name arms
+    // below (which would otherwise silently fall through to `other_tree()`
+    // for this shape, exactly the gap that left the ternary's own arms
+    // unnarrowed): folding the shift's own literal into the comparison's
+    // literal by the inverse operation turns "n - 1 >= 0" into "n >= 1",
+    // a claim `place` itself, letting this leaf build the SAME `Cmp`/`Eq`
+    // tree the bare-name arms below build. Checked on EITHER side (`n - 1
+    // >= 0` or `0 <= n - 1`), mirroring `mirror_cmp_op`'s own two-sided
+    // reading for a bare name.
+    if let Some((on_place, literal)) = affine_comparison_literal(left, right, place) {
+        let effective_op = if on_place { numeric_op } else { mirror_cmp_op(numeric_op) };
+        return numeric_comparison_tree(effective_op, literal);
+    }
     let (on_place, literal) = if name_of(left) == Some(place) {
         (true, literal_number(right))
     } else if name_of(right) == Some(place) {
@@ -1677,6 +1993,16 @@ fn comparison_leaf_tree_of(left: &Expr, op: CmpOp, right: &Expr, place: &str) ->
         return other_tree();
     };
     let effective_op = if on_place { numeric_op } else { mirror_cmp_op(numeric_op) };
+    numeric_comparison_tree(effective_op, literal)
+}
+
+/// The `NarrowTree` a numeric comparison's own effective operator and
+/// literal build — `Eq`/`NotEq` fold to the kernel's own `Eq` leaf (never
+/// `Cmp`, which carries only the four order operators), every other
+/// operator folds to `Cmp`. Shared by `comparison_leaf_tree_of`'s bare-name
+/// arm and its affine-shift arm so the two build the identical tree shape
+/// once the effective operator and literal are known.
+fn numeric_comparison_tree(effective_op: NumericCmpOp, literal: f64) -> NarrowTree {
     match effective_op {
         NumericCmpOp::Eq => NarrowTree { kind: NarrowTreeKind::Eq, k: literal, ..other_tree() },
         NumericCmpOp::NotEq => not_tree(NarrowTree { kind: NarrowTreeKind::Eq, k: literal, ..other_tree() }),
@@ -1685,6 +2011,69 @@ fn comparison_leaf_tree_of(left: &Expr, op: CmpOp, right: &Expr, place: &str) ->
             cmp_tree(kernel_op, literal)
         }
     }
+}
+
+/// Whether `expression` is `<place> + k` or `<place> - k` — a literal
+/// AFFINE SHIFT of the tested place (`n - 1`, `n + 1`), for a literal `k`
+/// this file already reads (`literal_number`). The shift amount `k`, or
+/// `None` for any other shape (a bare name, a shift of a DIFFERENT name,
+/// two changing names, a non-literal offset).
+fn affine_shift_of_place(expression: &Expr, place: &str) -> Option<f64> {
+    let Expr::BinOp(binop) = expression else {
+        return None;
+    };
+    if name_of(&binop.left) != Some(place) {
+        return None;
+    }
+    let offset = literal_number(&binop.right)?;
+    match binop.op {
+        ruff_python_ast::Operator::Add => Some(offset),
+        ruff_python_ast::Operator::Sub => Some(-offset),
+        _ => None,
+    }
+}
+
+/// The BASE NAME inside an affine shift (`n - 1` names `n`), for whichever
+/// name sits there — `collect_names`'s own place collector needs this
+/// (unlike `affine_shift_of_place`, which is only asked once `place` is
+/// already known) to discover that a comparison like `n - 1 >= 0` is
+/// relevant to `n` at all, before the SET channel's per-name loop can ask
+/// `condition_tree_of` to build a tree relative to it. `None` for any
+/// other shape (a bare name — read separately by `name_of` — a
+/// non-literal offset, an operator other than `+`/`-`).
+fn affine_shifted_name_of(expression: &Expr) -> Option<&str> {
+    let Expr::BinOp(binop) = expression else {
+        return None;
+    };
+    if !matches!(binop.op, ruff_python_ast::Operator::Add | ruff_python_ast::Operator::Sub) {
+        return None;
+    }
+    literal_number(&binop.right)?;
+    name_of(&binop.left)
+}
+
+/// One comparison pair's own AFFINE-SHIFT reading: `<place> ± k1 <op> k2`
+/// (`n - 1 >= 0`) or the mirrored `k2 <op> <place> ± k1` (`0 <= n - 1`) —
+/// `place` sits inside an affine shift on one side, a plain literal on the
+/// other. Answers `(on_place, effective_literal)`: `on_place` tells the
+/// caller which side `place`'s own shift sits on (so it can still mirror
+/// the comparison operator the same way the bare-name arm does), and
+/// `effective_literal` is the comparison's own literal with the shift's
+/// offset folded in — "n - 1 >= 0" is exactly "n >= 0 + 1", so the shift
+/// (`-1`) is subtracted back out: `effective_literal = other_literal -
+/// shift`. `None` when neither side is an affine shift of `place`, or the
+/// OTHER side is not a plain literal (a shift compared to a second
+/// changing expression states no single-literal claim this leaf can fold).
+fn affine_comparison_literal(left: &Expr, right: &Expr, place: &str) -> Option<(bool, f64)> {
+    if let Some(shift) = affine_shift_of_place(left, place) {
+        let other = literal_number(right)?;
+        return Some((true, other - shift));
+    }
+    if let Some(shift) = affine_shift_of_place(right, place) {
+        let other = literal_number(left)?;
+        return Some((false, other - shift));
+    }
+    None
 }
 
 /// A plain string literal's code points, one f64 per point — the word
@@ -2198,6 +2587,112 @@ mod tests {
         );
     }
 
+    /// `n - 1 >= 0` (B1.keep.join's own ternary guard, `n - 1 if n - 1 >=
+    /// 0 else 0`) narrows `n` ITSELF, not `n - 1` (which is not a place
+    /// this file's environment binds at all) — the affine-shift reading
+    /// `comparison_leaf_tree_of` folds before falling through to
+    /// `other_tree()`. `n - 1 >= 0` is exactly `n >= 1`, so this asks the
+    /// SAME question `test_set_kind_greater_than_or_equal_intersects`
+    /// asks with a literal `1` in place of `0`.
+    #[test]
+    fn test_set_kind_affine_shift_left_narrows_the_base_place() {
+        let environment = environment_with_set("n", unbounded_integers(), PrimitiveKind::Integer);
+        let Some(narrowed) = assumed("n - 1 >= 0", environment, true) else {
+            return;
+        };
+        let n = narrowed.read("n").expect("n still bound");
+        let Some(kernel) = loaded_kernel() else { return };
+        let expected = make_refined_set(vec![integer(), at_least(1.0)]);
+        assert!(
+            (kernel.scalar_subset)(&n.set, &expected) && (kernel.scalar_subset)(&expected, &n.set),
+            "n.set = {:?}, want the same set as {:?}",
+            n.set,
+            expected
+        );
+    }
+
+    /// The mirrored spelling, `0 <= n - 1` — the affine shift sits on the
+    /// RIGHT of the comparison, so the effective operator mirrors too
+    /// (the same `mirror_cmp_op` reading the bare-name arm already takes
+    /// for a literal-on-the-left comparison), landing the identical `n >=
+    /// 1` claim as the left-shifted spelling above.
+    #[test]
+    fn test_set_kind_affine_shift_right_narrows_the_base_place_with_mirrored_operator() {
+        let environment = environment_with_set("n", unbounded_integers(), PrimitiveKind::Integer);
+        let Some(narrowed) = assumed("0 <= n - 1", environment, true) else {
+            return;
+        };
+        let n = narrowed.read("n").expect("n still bound");
+        let Some(kernel) = loaded_kernel() else { return };
+        let expected = make_refined_set(vec![integer(), at_least(1.0)]);
+        assert!(
+            (kernel.scalar_subset)(&n.set, &expected) && (kernel.scalar_subset)(&expected, &n.set),
+            "n.set = {:?}, want the same set as {:?}",
+            n.set,
+            expected
+        );
+    }
+
+    // ── the ACCESS-PATH channel ──────────────────────────────────────
+
+    /// A15.guard.eq/A15.guard.ne's own shape: `0 <= a.n <= 150` narrows
+    /// the PATH `a.n`, not the bare name `a` (which this environment
+    /// never even binds a Values/Set fact for — `a` is a class-instance
+    /// receiver, not a number). `env::tracked_place_of`'s own chain
+    /// reading finds `a.n`, and `narrow_path_window` tightens the SAME
+    /// `{lo, hi}` window shape a length comparison already tightens,
+    /// seeded fresh from the unbounded integer ray on first touch.
+    #[test]
+    fn test_path_chained_comparison_narrows_the_attribute_chain() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let mut locally_bound = HashSet::new();
+        locally_bound.insert("a".to_owned());
+        let environment = Environment::new(locally_bound);
+        let parsed = parse_expression("0 <= a.n <= 150").expect("test source must parse");
+        let narrowed = assume(&parsed.into_expr(), environment, &kernel, true);
+        let place = crate::env::TrackedPlace::bare("a").extend("n");
+        let a_n = narrowed.read_path(&place).expect("a.n's own path fact is bound");
+        assert_eq!(a_n.kind, Kind::Set);
+        let expected = make_refined_set(vec![integer(), at_least(0.0), refined_sets::refinement_forms::at_most(150.0)]);
+        assert!(
+            (kernel.scalar_subset)(&a_n.set, &expected) && (kernel.scalar_subset)(&expected, &a_n.set),
+            "a.n's set = {:?}, want the same set as {:?}",
+            a_n.set,
+            expected
+        );
+    }
+
+    /// A write to the base name forgets every path fact rooted at it
+    /// (`env::Environment::forget`'s own doc) — the one forget resolver
+    /// this channel relies on to never leave a stale `a.n` fact standing
+    /// once `a` itself is reassigned to a DIFFERENT instance.
+    #[test]
+    fn test_forgetting_the_base_name_drops_its_own_path_facts() {
+        let mut environment = Environment::new(HashSet::new());
+        let place = crate::env::TrackedPlace::bare("a").extend("n");
+        environment.bind_path(&place, known_values(vec![40.0], PrimitiveKind::Integer, TrustProved));
+        assert!(environment.read_path(&place).is_some());
+        environment.forget("a");
+        assert!(environment.read_path(&place).is_none(), "a write to the base must drop its path facts");
+    }
+
+    /// A write to a PREFIX of a deeper path forgets every path
+    /// continuing it, but leaves an unrelated sibling untouched
+    /// (`TrackedPlace::extends`'s own doc) — `a.n` write drops `a.n.x`,
+    /// never `a.m`.
+    #[test]
+    fn test_forgetting_a_path_prefix_drops_continuations_but_not_siblings() {
+        let mut environment = Environment::new(HashSet::new());
+        let a_n = crate::env::TrackedPlace::bare("a").extend("n");
+        let a_n_x = a_n.extend("x");
+        let a_m = crate::env::TrackedPlace::bare("a").extend("m");
+        environment.bind_path(&a_n_x, known_values(vec![1.0], PrimitiveKind::Integer, TrustProved));
+        environment.bind_path(&a_m, known_values(vec![2.0], PrimitiveKind::Integer, TrustProved));
+        environment.forget_path_base(&a_n);
+        assert!(environment.read_path(&a_n_x).is_none(), "a.n.x continues the written prefix a.n");
+        assert!(environment.read_path(&a_m).is_some(), "a.m is an unrelated sibling of a.n");
+    }
+
     /// `0 <= x <= 120` — b-body-expressions.py's `len_in_guard` shape
     /// (~b:649) once `x` already carries the unbounded integer ray:
     /// the chained comparison's `And` tree intersects BOTH bounds in
@@ -2685,5 +3180,119 @@ mod tests {
         };
         let value = narrowed.read("sample").expect("sample still bound");
         assert_eq!(value.kind, Kind::Null, "the wrapper must rebind to the exact null_value on the is-None-true fork");
+    }
+
+    // ── ASCII case-conjunction alphabet narrowing ─────────────────────
+
+    /// A bare `str` parameter's own seed: `Kind::Set` over the whole
+    /// string ground (`codepoint_sets::strings()`), untagged
+    /// (`kind_tag: None` — `check.rs::seed_parameters`'s own choice for
+    /// a sequence-shaped declared set, `states_sequence` true), matching
+    /// what `x: str` actually seeds to.
+    fn environment_with_bare_string(name: &str) -> Environment {
+        let mut locally_bound = HashSet::new();
+        locally_bound.insert(name.to_owned());
+        let mut environment = Environment::new(locally_bound);
+        environment.bind(name, known_set(strings(), None, TrustProved, SetKindTag::None));
+        environment
+    }
+
+    /// F2.fixed's own `str_len_fixed_inside` shape: `len(x) == 2 and
+    /// x.isascii() and x.isupper()` narrows `x` to exactly the `Code`
+    /// alias's own set — two ASCII upper-case letters.
+    #[test]
+    fn test_isascii_and_isupper_conjunction_narrows_to_the_ascii_upper_alphabet() {
+        let environment = environment_with_bare_string("x");
+        let Some(narrowed) = assumed("len(x) == 2 and x.isascii() and x.isupper()", environment, true) else {
+            return;
+        };
+        let x = narrowed.read("x").expect("x still bound");
+        assert_eq!(x.kind, Kind::Set);
+        let Some(kernel) = loaded_kernel() else { return };
+        let code = make_refined_set(vec![refined_sets::refinement_forms::repeat_of(
+            make_refined_set(vec![integer(), at_least(0x41 as f64), at_most(0x5A as f64)]),
+            2,
+            Some(2),
+        )]);
+        assert!(
+            (kernel.scalar_subset)(&x.set, &code) && (kernel.scalar_subset)(&code, &x.set),
+            "x.set = {:?}, want the same set as {:?}",
+            x.set,
+            code
+        );
+    }
+
+    /// The lower-case twin: `x.isascii() and x.islower()` narrows to
+    /// `[0x61, 0x7A]` instead of `[0x41, 0x5A]`.
+    #[test]
+    fn test_isascii_and_islower_conjunction_narrows_to_the_ascii_lower_alphabet() {
+        let environment = environment_with_bare_string("x");
+        let Some(narrowed) = assumed("len(x) == 2 and x.isascii() and x.islower()", environment, true) else {
+            return;
+        };
+        let x = narrowed.read("x").expect("x still bound");
+        let Some(kernel) = loaded_kernel() else { return };
+        let lower = make_refined_set(vec![refined_sets::refinement_forms::repeat_of(
+            make_refined_set(vec![integer(), at_least(0x61 as f64), at_most(0x7A as f64)]),
+            2,
+            Some(2),
+        )]);
+        assert!(
+            (kernel.scalar_subset)(&x.set, &lower) && (kernel.scalar_subset)(&lower, &x.set),
+            "x.set = {:?}, want the same set as {:?}",
+            x.set,
+            lower
+        );
+    }
+
+    /// `x.isupper()` ALONE (no `x.isascii()` in the same conjunction)
+    /// narrows nothing — the module doc's own reason: `isupper()` alone
+    /// is pinned only against the full Unicode cased-character
+    /// categories, which reach far outside ASCII, so bounding it to
+    /// `[0x41, 0x5A]` without the `isascii()` co-occurrence would
+    /// overclaim.
+    #[test]
+    fn test_isupper_alone_narrows_nothing() {
+        let environment = environment_with_bare_string("x");
+        let Some(narrowed) = assumed("x.isupper()", environment, true) else {
+            return;
+        };
+        let x = narrowed.read("x").expect("x still bound");
+        assert_eq!(x.set, strings(), "isupper() alone must not narrow the alphabet");
+    }
+
+    /// `x.isascii()` ALONE (no `isupper()`/`islower()` in the same
+    /// conjunction) narrows nothing through this leaf — `isascii()`
+    /// alone states a `[0x00, 0x7F]` bound, a different (wider) claim
+    /// this leaf does not build, matching the "only the conjunction"
+    /// scope this leaf's own doc states.
+    #[test]
+    fn test_isascii_alone_narrows_nothing_through_this_leaf() {
+        let environment = environment_with_bare_string("x");
+        let Some(narrowed) = assumed("x.isascii()", environment, true) else {
+            return;
+        };
+        let x = narrowed.read("x").expect("x still bound");
+        assert_eq!(x.set, strings(), "isascii() alone narrows nothing through the case-conjunction leaf");
+    }
+
+    /// `x.isascii() and y.isupper()` — the two calls on DIFFERENT
+    /// receivers — narrows neither: the conjunction must name the SAME
+    /// place from both calls.
+    #[test]
+    fn test_isascii_and_isupper_on_different_names_narrows_neither() {
+        let mut locally_bound = HashSet::new();
+        locally_bound.insert("x".to_owned());
+        locally_bound.insert("y".to_owned());
+        let mut environment = Environment::new(locally_bound);
+        environment.bind("x", known_set(strings(), None, TrustProved, SetKindTag::None));
+        environment.bind("y", known_set(strings(), None, TrustProved, SetKindTag::None));
+        let Some(narrowed) = assumed("x.isascii() and y.isupper()", environment, true) else {
+            return;
+        };
+        let x = narrowed.read("x").expect("x still bound");
+        let y = narrowed.read("y").expect("y still bound");
+        assert_eq!(x.set, strings(), "x's own alphabet must stay unnarrowed");
+        assert_eq!(y.set, strings(), "y's own alphabet must stay unnarrowed");
     }
 }

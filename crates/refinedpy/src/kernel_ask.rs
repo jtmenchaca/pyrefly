@@ -103,12 +103,14 @@ where
 }
 
 /// Installs every kernel-ask seam the crates BELOW the kernel dependency
-/// expose — today the one slot: `refined_domain`'s join-time
-/// no-scalar-reread gate, which cannot name the kernel's types itself
-/// (it sits under `refined_kernel` in the dependency graph) and so
-/// receives its ask as an injected closure routed through this module's
-/// own catch discipline. Both binaries call this once right after the
-/// kernel loads; installing twice is a no-op (the slot is a OnceLock).
+/// expose — today three slots on `refined_domain`: the join-time
+/// no-scalar-reread gate, the string-ground absorption's seq-subset
+/// ask, and the scalar-union join's bounds ask. None of the three can
+/// name the kernel's types itself (`refined_domain` sits under
+/// `refined_kernel` in the dependency graph), so each receives its ask
+/// as an injected closure routed through this module's own catch
+/// discipline. Both binaries call this once right after the kernel
+/// loads; installing twice is a no-op (each slot is a OnceLock).
 pub fn install_kernel_seams(kernel: &std::sync::Arc<refined_kernel::kernel_interface::RefinedTSKernel>) {
     {
         let kernel = kernel.clone();
@@ -120,6 +122,17 @@ pub fn install_kernel_seams(kernel: &std::sync::Arc<refined_kernel::kernel_inter
         let kernel = kernel.clone();
         refined_domain::kernel_seam::install_seq_subset_ask(move |a, b| {
             ask_kernel(|| (kernel.seq_subset)(a, b)).ok()
+        });
+    }
+    {
+        let kernel = kernel.clone();
+        refined_domain::kernel_seam::install_bounds_ask(move |set| {
+            ask_kernel(|| (kernel.bounds)(set)).ok().map(|answer| {
+                refined_domain::kernel_seam::BoundsAnswer {
+                    empty: answer.empty,
+                    hull: answer.hull,
+                }
+            })
         });
     }
 }

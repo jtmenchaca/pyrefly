@@ -89,11 +89,13 @@
 //! already dispatches numeric arithmetic through. Modeling it belongs
 //! beside that dispatcher, not in this method-result function.
 
-use refined_domain::abstract_value::{known_set, known_values, AbstractValue, Kind, PrimitiveKind, SetKindTag};
-use refined_domain::known_constructors::known_list;
+use refined_domain::abstract_value::{known_set, known_values, AbstractValue, Kind, ObjectKey, PrimitiveKind, SetKindTag};
+use refined_domain::known_constructors::{known_list, known_object};
 use refined_domain::trust_grades::{trust_level_of, TrustProved};
 use refined_sets::codepoint_sets::strings;
-use refined_sets::refinement_forms::{at_least, integer, make_refined_set};
+use refined_sets::refinement_forms::{at_least, at_most, integer, make_refined_set, repeat_of, Form, RefinedSet};
+use refined_sets::regex_compiler::format_grammar;
+use refined_sets::repetition_window_forms::as_repetition;
 
 /// The state for a known string literal: an exact value, one f64 code
 /// point per `char`, sorted `PrimitiveKind::String`. `len()` on the
@@ -247,6 +249,17 @@ pub fn string_method_result(
             }
             Some(string_literal_value(&parts.join(&receiver_text)))
         }
+        // "Return an encoded version of the string as a bytes object...
+        // encoding defaults to 'utf-8'." (library/stdtypes.html,
+        // str.encode). The zero-argument, default-encoding form only.
+        // This domain has no per-byte UTF-8 encoding table to walk, so
+        // the answer is the opaque "some bytes value" state
+        // (`crate::bytes_models::encoded_bytes_value`'s own doc) rather
+        // than the exact byte sequence — sufficient for every corpus row
+        // that only ever routes an `.encode()` result onward through
+        // `base64.b64encode`, which reads no content off its argument
+        // either (`bytes_models::b64encode_call`'s own doc).
+        "encode" if arguments.is_empty() => Some(crate::bytes_models::encoded_bytes_value()),
         _ => None,
     }
 }
@@ -291,6 +304,33 @@ pub fn string_method_result(
 /// sort-only-adjacent Set answers, so a WORN receiver's own weaker
 /// claim never gets restated as `TrustSpec`-strength here.
 pub fn string_method_sort_only_result(method: &str, receiver: &AbstractValue, arguments: &[AbstractValue]) -> Option<AbstractValue> {
+    // "Return an encoded version of the string as a bytes object"
+    // (str.encode, `string_method_result`'s own exact-receiver row
+    // states the identical citation) — the opaque bytes answer needs no
+    // receiver CONTENT, only that the receiver is string-sorted, so it
+    // is answered here directly rather than folded into the `Σ*`-only
+    // shaped-row match below (encode's own result is bytes-sorted, not
+    // string-sorted, so it must not share that match's one grade-wrapped
+    // `strings()` answer).
+    if method == "encode" && arguments.is_empty() {
+        return Some(crate::bytes_models::encoded_bytes_value());
+    }
+    // `upper`/`lower` over a receiver already narrowed to an ASCII
+    // cased-letter WINDOW (`narrowing.rs`'s `narrow_ascii_case_
+    // conjunction`, the `len(x) == 2 and x.isascii() and x.islower()`
+    // shape F2.fixed/F2.dead/F2.select all guard with) answer the
+    // MAPPED window, not the unbounded `Σ*` fallback below: `str.upper`/
+    // `str.lower`'s own contract (stdtypes.html) maps every code point,
+    // and inside the two ASCII cased-letter windows that mapping is the
+    // exact, length-preserving, bijective shift `casefold`'s own doc
+    // already cites (ASCII has no multi-character or non-1:1 case
+    // mapping at all) — so a guard that narrowed `x` to two ASCII
+    // lowercase letters lets `x.upper()` answer two ASCII UPPERCASE
+    // letters exactly, matching `Code`'s own declared set, rather than
+    // discarding the narrowing and falling back to `Σ*`.
+    if let (Some(result), true) = (ascii_case_mapped_shaped_result(method, receiver), arguments.is_empty()) {
+        return Some(result);
+    }
     let is_shaped_row = match method {
         "upper" | "lower" | "strip" | "lstrip" | "rstrip" => arguments.is_empty(),
         "casefold" => arguments.is_empty(),
@@ -303,6 +343,81 @@ pub fn string_method_sort_only_result(method: &str, receiver: &AbstractValue, ar
     }
     let grade = trust_level_of(receiver);
     Some(known_set(strings(), None, grade, SetKindTag::None))
+}
+
+/// `x.upper()`/`x.lower()` over a receiver `narrowing.rs`'s
+/// `narrow_ascii_case_conjunction` already narrowed to a REPETITION of
+/// exactly one ASCII cased-letter window (`[0x41, 0x5A]` for
+/// `isupper()`, `[0x61, 0x7A]` for `islower()`) at some fixed length —
+/// `x.upper()` maps the window to `[0x41, 0x5A]`, `x.lower()` maps it
+/// to `[0x61, 0x7A]`, and the length stays exactly what it already was
+/// (`str.upper`/`str.lower` never change a string's length: mapping is
+/// one Unicode code point to one Unicode code point,
+/// library/stdtypes.html — inside ASCII this is additionally BIJECTIVE,
+/// so mapping the whole window is exact, not an over-approximation).
+///
+/// Declines (returns `None`) for every other shape: a receiver that is
+/// not a repetition at all (`as_repetition` reads back only the shapes
+/// `repetition`/`narrow_ascii_case_conjunction` build), a repetition
+/// whose element is not EXACTLY one of the two ASCII cased-letter
+/// windows (any wider or narrower element — this row states no image
+/// for it, matching `casefold`'s own "ASCII cased letters only" scope
+/// one level up: outside these two exact windows, ASCII still has
+/// uncased code points this function does not attempt to fix
+/// pointwise). The caller's own `Σ*` fallback (`string_method_sort_
+/// only_result`'s tail) covers every declined case honestly.
+fn ascii_case_mapped_shaped_result(method: &str, receiver: &AbstractValue) -> Option<AbstractValue> {
+    if !matches!(method, "upper" | "lower") {
+        return None;
+    }
+    if receiver.kind != Kind::Set {
+        return None;
+    }
+    let repeated = as_repetition(&receiver.set)?;
+    let element_window = ascii_case_window_bounds(&repeated.element)?;
+    let ascii_upper = (0x41 as f64, 0x5A as f64);
+    let ascii_lower = (0x61 as f64, 0x7A as f64);
+    // the element must already be exactly one of the two ASCII
+    // cased-letter windows — any other element (a wider alphabet, a
+    // single code point, a non-cased window) states no image this row
+    // answers exactly, and falls through to the caller's own `Σ*`
+    // fallback instead.
+    if element_window != ascii_upper && element_window != ascii_lower {
+        return None;
+    }
+    let mapped = if method == "upper" { ascii_upper } else { ascii_lower };
+    let mapped_element = make_refined_set(vec![integer(), at_least(mapped.0), at_most(mapped.1)]);
+    let mapped_set = make_refined_set(vec![repeat_of(mapped_element, repeated.lo, repeated.hi)]);
+    let grade = trust_level_of(receiver);
+    Some(known_set(mapped_set, None, grade, SetKindTag::None))
+}
+
+/// The `(lo, hi)` bounds of `element` if it is EXACTLY the one-tuple
+/// set `{integer(), at_least(lo), at_most(hi)}` — the shape
+/// `narrow_ascii_case_conjunction` builds for its own ASCII
+/// cased-letter window (`narrowing.rs`). Any other form composition
+/// (extra forms, missing bounds, a non-Integer element) answers `None`
+/// — this reader states no window for a shape it was not built to
+/// read, matching `as_repetition`'s own "only the shapes I know" scope.
+fn ascii_case_window_bounds(element: &RefinedSet) -> Option<(f64, f64)> {
+    if element.forms.len() != 3 {
+        return None;
+    }
+    let mut has_integer = false;
+    let mut lo: Option<f64> = None;
+    let mut hi: Option<f64> = None;
+    for form in &element.forms {
+        match form.form {
+            Form::Integer => has_integer = true,
+            Form::AtLeast => lo = Some(form.a),
+            Form::AtMost => hi = Some(form.a),
+            _ => return None,
+        }
+    }
+    if !has_integer {
+        return None;
+    }
+    Some((lo?, hi?))
 }
 
 /// The SORT-ONLY answer `str.find`/`str.index` state over a receiver
@@ -377,6 +492,222 @@ fn boolean_value(value: bool) -> AbstractValue {
     known_values(vec![if value { 1.0 } else { 0.0 }], PrimitiveKind::Boolean, TrustProved)
 }
 
+/// The word a Match-object value built by `match_object_value` carries
+/// on `kind_word` — distinct from `evaluate_attribute_call`'s existing
+/// bare `"a match object"` opaque tag (`re.match`/`re.search`'s own
+/// contentless answer), since THIS value additionally carries readable
+/// group grammars a caller's `.group(n)` needs to find. `expressions.rs`
+/// reads this word to route a `.group(...)` call through
+/// `matched_group_grammar` below rather than the opaque-value default.
+pub const MATCH_WITH_GROUPS_WORD: &str = "a match object with readable groups";
+
+/// The top-level PARENTHESIZED groups of a regex pattern, each group's
+/// own inner text (no enclosing parens), in left-to-right opening order
+/// — `re.fullmatch(pattern, s)`'s own capture-group numbering
+/// (library/re.html, "Group 0 is the entire match... groups are
+/// numbered from 1 in the order their opening parentheses appear").
+/// Recognizes only the shapes the corpus's own patterns and
+/// `format_grammar`'s own supported subset both need: plain capturing
+/// groups `(...)`, with `\(`/`\)` escapes and NESTED parens read as
+/// plain text ONE LEVEL DEEP (a nested group inside a captured group is
+/// not itself extracted as a separate numbered group — this reader
+/// finds no corpus row needing that). A non-capturing group `(?:...)`
+/// is recognized and its own parens are consumed but it contributes NO
+/// numbered group — `re.rst`'s own "the contents of a group ... `(?:...)`
+/// ... cannot be retrieved". An unmatched paren, or a `(?...)` extension
+/// other than `(?:`, makes the WHOLE read decline (`None`) — this is
+/// not a general regex parser, only enough to find each `(...)`'s own
+/// span in the corpus's own literal patterns.
+fn capture_group_spans(pattern: &str) -> Option<Vec<String>> {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut groups = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => {
+                i += 2; // an escaped character is never a group boundary
+            }
+            '(' => {
+                let is_non_capturing = chars.get(i + 1) == Some(&'?') && chars.get(i + 2) == Some(&':');
+                if chars.get(i + 1) == Some(&'?') && !is_non_capturing {
+                    return None; // an unsupported (?...) extension
+                }
+                let body_start = if is_non_capturing { i + 3 } else { i + 1 };
+                let mut depth = 1;
+                let mut j = body_start;
+                while j < chars.len() && depth > 0 {
+                    match chars[j] {
+                        '\\' => j += 1,
+                        '(' => depth += 1,
+                        ')' => depth -= 1,
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                if depth != 0 {
+                    return None; // an unmatched opening paren
+                }
+                let body_end = j - 1;
+                if !is_non_capturing {
+                    groups.push(chars[body_start..body_end].iter().collect());
+                }
+                i = j;
+            }
+            _ => i += 1,
+        }
+    }
+    Some(groups)
+}
+
+/// The Match-object value `re.fullmatch(pattern, subject)` /
+/// `re.finditer(pattern, subject)`'s own yielded match answer —
+/// library/re.html: `fullmatch(pattern, string)` "If the whole string
+/// matches this regular expression, return a corresponding match
+/// object"; `finditer(pattern, string)` "Return an iterator yielding
+/// match objects." A `Kind::Object` (`MATCH_WITH_GROUPS_WORD`-tagged)
+/// whose keys are `"0"` (the whole match, ALWAYS present — "group()"
+/// with no argument or `group(0)` "The entire match") through `"N"`
+/// (each capturing group, in `capture_group_spans`'s own left-to-right
+/// numbering), every key's value the group's OWN compiled grammar,
+/// UNANCHORED (`format_grammar(text, "")` with no `^`/`$` inserted —
+/// library/re.html, "group()... Returns one or more subgroups of the
+/// match" is the group's OWN matched substring, which carries no
+/// anchor semantics of its own; `fullmatch`'s whole-pattern anchoring
+/// only pins the OUTER match, not what a captured GROUP's own text
+/// looks like). `anchor_whole_match` anchors group `"0"` ONLY, matching
+/// each caller's own semantics (`fullmatch`: both ends; `finditer`: an
+/// unanchored single iteration's match, so `false` — a global match is
+/// itself an arbitrary substring, `narrow_regex_module_call`'s own
+/// `search`-neither-anchor row states the identical unanchored-both-
+/// ends default `format_grammar` itself pads with `C*`). `None` on a
+/// pattern `capture_group_spans` cannot read, or a compiled grammar
+/// `format_grammar` refuses for group 0 or any numbered group — the
+/// WHOLE match value declines rather than answer a partial object
+/// missing some groups.
+pub fn match_object_value(pattern: &str, anchor_whole_match: bool) -> Option<AbstractValue> {
+    let mut whole = pattern.to_owned();
+    if anchor_whole_match {
+        if !whole.starts_with('^') {
+            whole.insert(0, '^');
+        }
+        if !(whole.ends_with('$') && !whole.ends_with("\\$")) {
+            whole.push('$');
+        }
+    }
+    let whole_grammar = format_grammar(&whole, "");
+    if !whole_grammar.ok {
+        return None;
+    }
+    let groups = capture_group_spans(pattern)?;
+    let mut keys = vec![ObjectKey {
+        name: "0".to_owned(),
+        numeric: true,
+        value: AbstractValue {
+            kind_tag: Some(PrimitiveKind::String),
+            ..known_set(whole_grammar.set, None, TrustProved, SetKindTag::None)
+        },
+    }];
+    for (index, group_text) in groups.iter().enumerate() {
+        let compiled = format_grammar(group_text, "");
+        if !compiled.ok {
+            return None;
+        }
+        keys.push(ObjectKey {
+            name: (index + 1).to_string(),
+            numeric: true,
+            value: AbstractValue {
+                kind_tag: Some(PrimitiveKind::String),
+                ..known_set(compiled.set, None, TrustProved, SetKindTag::None)
+            },
+        });
+    }
+    let mut instance = known_object(keys, None, true, TrustProved, false);
+    instance.kind_word = Some(MATCH_WITH_GROUPS_WORD);
+    Some(instance)
+}
+
+/// `match.group(n)` (one-argument, known-Integer form) over a
+/// `match_object_value`-built receiver — library/re.html#re.Match.group:
+/// "If a single argument is used, result is a single string." Group `0`
+/// (or the no-argument default, `group()`'s own zero-arg row — not this
+/// function, which only ever reads the one-argument numeric form) is
+/// the whole match; group `N` (`N >= 1`) is that numbered capturing
+/// group's own compiled grammar, `match_object_value`'s own key
+/// layout. A group number this match's own value carries no key for
+/// (out of range for the pattern's own group count) declines — CPython
+/// raises `IndexError: no such group` for it, a fact this row does not
+/// itself speak the raise for (no exception channel in this file);
+/// a non-Match receiver, or a non-Integer/unknown argument, declines
+/// the same way.
+pub fn matched_group_grammar(receiver: &AbstractValue, arguments: &[AbstractValue]) -> Option<AbstractValue> {
+    if receiver.kind != Kind::Object || receiver.kind_word != Some(MATCH_WITH_GROUPS_WORD) {
+        return None;
+    }
+    let [group_number] = arguments else { return None };
+    if group_number.kind != Kind::Values || group_number.kind_tag != Some(PrimitiveKind::Integer) || group_number.values.len() != 1 {
+        return None;
+    }
+    let name = format!("{}", group_number.values[0] as i64);
+    receiver.keys.iter().find(|key| key.numeric && key.name == name).map(|key| key.value.clone())
+}
+
+/// One codepoint drawn from the given ASCII characters — mirrors
+/// `expressions.rs::one_char_of`/`json_grammar.rs::one_char_of`, kept as
+/// a private copy per this crate's file-scope convention
+/// (`json_grammar.rs`'s own doc on its own copy) rather than widening
+/// either function's visibility for one caller outside its file.
+fn one_char_of(chars: &str) -> RefinedSet {
+    let points: Vec<f64> = chars.chars().map(|c| c as u32 as f64).collect();
+    make_refined_set(vec![refined_sets::refinement_forms::one_of(&points)])
+}
+
+/// `f"{x:.{precision}f}"` — the fixed-precision decimal grammar
+/// format_spec's own `'f'` presentation type states (library/string.rst,
+/// "Format examples" table, type `'f'`: "Fixed-point notation. For a
+/// given precision p, formats the number as a decimal number with
+/// exactly p digits following the decimal point"). This is a SOUND
+/// OVER-APPROXIMATION over every finite float, not a value-exact window
+/// (the same posture `json_grammar.rs::integer_window_grammar` takes for
+/// its own digit-count bound): an optional leading `-` sign (CPython
+/// never emits a leading `+` here — `format_spec.rst`'s own `sign`
+/// option defaults to `-`-only, and this row does not model an explicit
+/// `+`/` ` sign flag), one-or-more integer-part digits (unbounded above,
+/// since the fixed argument's own magnitude is not read here), a literal
+/// `.`, then EXACTLY `precision` fractional digits — never fewer, never
+/// more, the clause's own "exactly p digits" reading. Every digit drawn
+/// from the plain `0-9` alphabet (`one_char_of`, mirroring
+/// `json_grammar.rs`'s copy) — no grouping separator, since this row
+/// does not model the `,`/`_` grouping option.
+pub fn fixed_precision_decimal_grammar(precision: u32) -> RefinedSet {
+    let sign = repeat_of(one_char_of("-"), 0, Some(1));
+    let integer_part = repeat_of(one_char_of("0123456789"), 1, None);
+    let point = refined_sets::codepoint_sets::string_tuple(".");
+    let fractional_part = repeat_of(one_char_of("0123456789"), precision as i64, Some(precision as i64));
+    let signed_integer =
+        refined_sets::refinement_forms::concatenation(make_refined_set(vec![sign]), make_refined_set(vec![integer_part]));
+    let with_point = refined_sets::refinement_forms::concatenation(make_refined_set(vec![signed_integer]), point);
+    make_refined_set(vec![refined_sets::refinement_forms::concatenation(
+        make_refined_set(vec![with_point]),
+        make_refined_set(vec![fractional_part]),
+    )])
+}
+
+/// The `precision` a format spec states, when the spec is EXACTLY the
+/// plain `.{precision}f` spelling (no fill/align/sign/`#`/`0`/width/
+/// grouping option, `type` exactly `f`) — the fixed-point counterpart of
+/// `expressions.rs::zero_padded_decimal_width`'s own `0{width}d` reader,
+/// same single-literal-element, no-nested-interpolation restriction.
+pub fn fixed_precision_decimal_width(format_spec: &ruff_python_ast::InterpolatedStringFormatSpec) -> Option<u32> {
+    let [ruff_python_ast::InterpolatedStringElement::Literal(literal)] = &*format_spec.elements else {
+        return None;
+    };
+    let digits = literal.value.strip_prefix('.')?.strip_suffix('f')?;
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -398,6 +729,37 @@ mod tests {
         let value = string_literal_value("héllo");
         assert_eq!(value.values.len(), 5);
         assert_ne!(value.values.len(), "héllo".len());
+    }
+
+    /// `fixed_precision_decimal_grammar(2)` composes as ONE top-level
+    /// `Concatenation` form (`concatenation`'s own construction — the
+    /// same "one Concatenation, nested" shape `codepoint_sets::string_tuple`
+    /// builds), and different precisions build DIFFERENT grammars — the
+    /// `precision` parameter must actually reach the fractional-digit
+    /// repeat bound, not be silently ignored.
+    #[test]
+    fn test_fixed_precision_decimal_grammar_varies_with_precision() {
+        let two_digits = fixed_precision_decimal_grammar(2);
+        assert_eq!(two_digits.forms.len(), 1);
+        assert!(matches!(two_digits.forms[0].form, Form::Concatenation));
+        let three_digits = fixed_precision_decimal_grammar(3);
+        assert_ne!(two_digits, three_digits, "a different precision must build a different grammar");
+    }
+
+    /// `.2f` parses as precision `2`; `02d` (a DIFFERENT reader's own
+    /// spelling, `zero_padded_decimal_width`'s row) and a fill/align
+    /// spec (`^10`) are not this reader's grammar at all.
+    #[test]
+    fn test_fixed_precision_decimal_width_reads_the_plain_dot_f_spelling() {
+        let source = "f\"{x:.2f}\"";
+        let parsed = ruff_python_parser::parse_expression(source).expect("test source must parse");
+        let ruff_python_ast::Expr::FString(fstring) = parsed.into_expr() else { panic!("expected an FString") };
+        let single = fstring.as_single_part_fstring().expect("single-part f-string");
+        let [ruff_python_ast::InterpolatedStringElement::Interpolation(interpolation)] = &*single.elements else {
+            panic!("expected one interpolation")
+        };
+        let format_spec = interpolation.format_spec.as_ref().expect("format spec present");
+        assert_eq!(fixed_precision_decimal_width(format_spec), Some(2));
     }
 
     #[test]
@@ -574,6 +936,57 @@ mod tests {
         assert_eq!(exact_string_text(&result), None, "the answer states no exact content");
     }
 
+    /// F2.fixed/F2.dead/F2.select's own shape: `len(x) == 2 and
+    /// x.isascii() and x.islower()` narrows `x` to a length-2 repetition
+    /// of the ASCII lowercase window (`narrowing.rs`'s
+    /// `narrow_ascii_case_conjunction`, `[0x61, 0x7A]`) — `x.upper()`
+    /// over THAT receiver must answer the mapped ASCII UPPERCASE window
+    /// at the SAME length, not the unbounded `Σ*` fallback: the mapped
+    /// answer is exactly `Code`'s own declared set
+    /// (`(>= 65 && <= 90 && integer) × exactly 2`), so this is the
+    /// difference between a determined pass and the RTS7001 mismatch
+    /// those three rows previously answered.
+    fn ascii_lowercase_pair_receiver() -> AbstractValue {
+        let element = make_refined_set(vec![integer(), at_least(0x61 as f64), at_most(0x7A as f64)]);
+        let set = make_refined_set(vec![repeat_of(element, 2, Some(2))]);
+        known_set(set, None, TrustProved, SetKindTag::None)
+    }
+
+    #[test]
+    fn test_upper_over_a_narrowed_ascii_lowercase_pair_answers_the_mapped_uppercase_window() {
+        let receiver = ascii_lowercase_pair_receiver();
+        let result = string_method_sort_only_result("upper", &receiver, &[]).expect("upper must decide the mapped window");
+        let expected_element = make_refined_set(vec![integer(), at_least(0x41 as f64), at_most(0x5A as f64)]);
+        let expected = make_refined_set(vec![repeat_of(expected_element, 2, Some(2))]);
+        assert_eq!(result.set, expected, "x.upper() must map the ASCII window, keeping the length-2 bound");
+    }
+
+    /// The lower-case twin: an ASCII UPPERCASE pair's `.lower()` maps to
+    /// the lowercase window, same length-2 bound preserved.
+    #[test]
+    fn test_lower_over_a_narrowed_ascii_uppercase_pair_answers_the_mapped_lowercase_window() {
+        let element = make_refined_set(vec![integer(), at_least(0x41 as f64), at_most(0x5A as f64)]);
+        let set = make_refined_set(vec![repeat_of(element, 2, Some(2))]);
+        let receiver = known_set(set, None, TrustProved, SetKindTag::None);
+        let result = string_method_sort_only_result("lower", &receiver, &[]).expect("lower must decide the mapped window");
+        let expected_element = make_refined_set(vec![integer(), at_least(0x61 as f64), at_most(0x7A as f64)]);
+        let expected = make_refined_set(vec![repeat_of(expected_element, 2, Some(2))]);
+        assert_eq!(result.set, expected, "x.lower() must map the ASCII window, keeping the length-2 bound");
+    }
+
+    /// A receiver narrowed to a window OTHER than the two ASCII
+    /// cased-letter windows (e.g. digits) states no mapped image — this
+    /// row declines to the caller's own `Σ*` fallback rather than
+    /// guessing a case mapping for uncased code points.
+    #[test]
+    fn test_upper_over_a_non_cased_window_falls_back_to_any_string() {
+        let element = make_refined_set(vec![integer(), at_least(0x30 as f64), at_most(0x39 as f64)]);
+        let set = make_refined_set(vec![repeat_of(element, 2, Some(2))]);
+        let receiver = known_set(set, None, TrustProved, SetKindTag::None);
+        let result = string_method_sort_only_result("upper", &receiver, &[]).expect("upper must still decide the Σ* fallback");
+        assert_eq!(result.set, strings(), "a non-cased window's own .upper() falls back to Σ*, not a guessed mapping");
+    }
+
     /// `s.replace("a", "b")`/`s.strip()`/`s.zfill(4)` over an unbounded
     /// receiver all answer the same Σ* sort-only claim — `A3.xfer.
     /// replace`/`A3.xfer.trim`/`A3.xfer.pad`'s own rows.
@@ -649,5 +1062,95 @@ mod tests {
         let receiver = string_literal_value("ab");
         let sep = string_literal_value("");
         assert_eq!(string_method_result("split", &receiver, &[sep]), None);
+    }
+
+    #[test]
+    fn test_encode_on_an_exact_receiver_answers_the_opaque_bytes_state() {
+        let receiver = string_literal_value("ab");
+        let got = string_method_result("encode", &receiver, &[]).expect("encode must decide");
+        assert_eq!(got.kind, Kind::Object);
+        assert_eq!(got.kind_word, Some(crate::bytes_models::ENCODED_BYTES_WORD));
+    }
+
+    #[test]
+    fn test_encode_sort_only_on_an_unread_receiver_answers_the_opaque_bytes_state() {
+        let receiver = known_set(strings(), None, TrustProved, SetKindTag::None);
+        let got = string_method_sort_only_result("encode", &receiver, &[]).expect("encode must decide sort-only");
+        assert_eq!(got.kind, Kind::Object);
+        assert_eq!(got.kind_word, Some(crate::bytes_models::ENCODED_BYTES_WORD));
+    }
+
+    #[test]
+    fn test_encode_with_an_argument_declines() {
+        let receiver = string_literal_value("ab");
+        let encoding = string_literal_value("utf-8");
+        assert_eq!(string_method_result("encode", &receiver, &[encoding]), None);
+    }
+
+    #[test]
+    fn capture_group_spans_reads_two_plain_groups_in_order() {
+        let got = capture_group_spans(r"(\d+)-(\d+)").expect("two plain groups parse");
+        assert_eq!(got, vec![r"\d+".to_owned(), r"\d+".to_owned()]);
+    }
+
+    #[test]
+    fn capture_group_spans_skips_a_non_capturing_group() {
+        let got = capture_group_spans(r"(?:\d+)-([a-z]+)").expect("one capturing group parses");
+        assert_eq!(got, vec!["[a-z]+".to_owned()]);
+    }
+
+    #[test]
+    fn capture_group_spans_answers_empty_for_a_group_free_pattern() {
+        let got = capture_group_spans(r"\d+").expect("a group-free pattern parses");
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn capture_group_spans_declines_on_an_unmatched_paren() {
+        assert!(capture_group_spans(r"(\d+").is_none());
+    }
+
+    #[test]
+    fn match_object_value_for_fullmatch_carries_group_0_and_every_numbered_group() {
+        let got = match_object_value(r"(\d+)-(\d+)", true).expect("(\\d+)-(\\d+) compiles");
+        assert_eq!(got.kind, Kind::Object);
+        assert_eq!(got.kind_word, Some(MATCH_WITH_GROUPS_WORD));
+        assert_eq!(got.keys.len(), 3);
+        assert!(got.keys.iter().any(|k| k.name == "0"));
+        assert!(got.keys.iter().any(|k| k.name == "1"));
+        assert!(got.keys.iter().any(|k| k.name == "2"));
+    }
+
+    #[test]
+    fn match_object_value_for_finditer_group_0_is_the_unanchored_whole_pattern() {
+        // A3.xfer.matchall's own shape: re.finditer(r"\d+", s), reading
+        // m.group(0) — no capturing groups at all, only group 0.
+        let got = match_object_value(r"\d+", false).expect(r"\d+ compiles");
+        assert_eq!(got.keys.len(), 1);
+        assert_eq!(got.keys[0].name, "0");
+    }
+
+    #[test]
+    fn matched_group_grammar_reads_the_numbered_group_by_known_integer_argument() {
+        let receiver = match_object_value(r"(\d+)-(\d+)", true).expect("compiles");
+        let group_one = known_values(vec![1.0], PrimitiveKind::Integer, TrustProved);
+        let got = matched_group_grammar(&receiver, &[group_one]).expect("group(1) must decide");
+        assert_eq!(got.kind, Kind::Set);
+        assert_eq!(got.kind_tag, Some(PrimitiveKind::String));
+    }
+
+    #[test]
+    fn matched_group_grammar_out_of_range_declines() {
+        let receiver = match_object_value(r"\d+", false).expect("compiles");
+        let group_five = known_values(vec![5.0], PrimitiveKind::Integer, TrustProved);
+        let got = matched_group_grammar(&receiver, &[group_five]);
+        assert!(got.is_none(), "group(5) on a pattern with no such group should decline: {got:?}");
+    }
+
+    #[test]
+    fn matched_group_grammar_on_a_non_match_receiver_declines() {
+        let receiver = string_literal_value("not a match");
+        let group_zero = known_values(vec![0.0], PrimitiveKind::Integer, TrustProved);
+        assert!(matched_group_grammar(&receiver, &[group_zero]).is_none());
     }
 }

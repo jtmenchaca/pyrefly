@@ -161,6 +161,31 @@ pub fn call_result_with_enclosing(
     if depth >= CALL_DEPTH_CAP {
         return return_sort_fallback(def);
     }
+    // RECURSION WITH A MEASURE (A10.xfer.recursion.py's own `fact`/
+    // `fact_inside`): a SELF-recursive def (`fact` calls `fact` in its
+    // own body) called with a WINDOW argument (`n ∈ [0, 5]`, never a
+    // single concrete value) cannot resolve through the ordinary
+    // interpreter below at all — `n <= 1` stays undecided the whole way
+    // down, so BOTH arms stay live at every depth, the recursive call's
+    // own argument (`n - 1`) stays a window too at every step, and the
+    // depth cap is reached with `n` STILL unresolved, falling back to
+    // `return_sort_fallback`'s bare, unbounded sort (never `[1, 120]`).
+    // Tried BEFORE the kernel-summary route below (which the module doc's
+    // own `kernel_summary_result` — "the lowering reaches no callee
+    // today — a call declines the body" — already declines for any
+    // self-recursive def, so trying this first costs nothing the kernel
+    // route would have answered instead): a small bounded window ENUMERATES
+    // to its own concrete members (`enumerated_recursive_call`), and each
+    // concrete call recurses through this SAME function, one call per
+    // member, joined — the sound answer a purely symbolic unroll can never
+    // reach, since it is EXACTLY what CPython itself computes, one call
+    // per admitted `n`. A call whose arguments do not match this shape
+    // (no self-recursion, no lone bounded-window integer argument, a
+    // window too large to enumerate) answers `None` here and falls
+    // through to every route below unchanged.
+    if let Some(answer) = enumerated_recursive_call(def, arguments, table, kernel, depth, enclosing) {
+        return Some(answer);
+    }
     // THE KERNEL SUMMARY ROUTE, tried ahead of the concrete
     // interpretation below. The body is lowered and compiled ONCE per
     // `def` (`summary_registry`), and this call sends only its own
@@ -372,6 +397,193 @@ pub fn call_result_with_enclosing(
     };
     let joined = answers.fold(first, |acc, next| join_known(acc, next));
     Some(joined)
+}
+
+// --- RECURSION WITH A MEASURE, UNROLLED BY ENUMERATION --------------
+//
+// `fact(n)` for `n` a WINDOW (never a single value) cannot be answered
+// by walking the body once: `n <= 1` never decides, so every level of
+// the depth-capped interpreter stays symbolic and the whole call
+// bottoms out at `return_sort_fallback`'s bare sort. The one sound
+// route left is the one CPython itself takes: run the call once per
+// admitted `n`, concretely, and join every answer. This is enumeration
+// at the CALL SITE, never a change to `interpret_body`'s own statement
+// walk or to `CALL_DEPTH_CAP` — a concrete `fact(5)` still recurses
+// through the ordinary depth-capped path, five levels deep, each level
+// now holding a single concrete `n` the body's own `n <= 1` test DOES
+// decide.
+
+/// The largest window this file enumerates concretely — chosen to match
+/// `expressions.rs`'s own `MULTI_VALUE_CROSS_PRODUCT_CAP` (16), the one
+/// existing "how many members is too many to enumerate" convention in
+/// this crate, rather than a fresh number invented for this route alone.
+const RECURSIVE_ENUMERATION_CAP: usize = 16;
+
+/// `enumerated_recursive_call`'s own gate: `def` is SELF-recursive (its
+/// body calls its own name somewhere, direct — not through a cycle of
+/// OTHER same-module defs, which this reader does not chase) AND
+/// `arguments` carries EXACTLY ONE argument, currently `Kind::Set` over
+/// an Integer-tagged window with a provable `[lo, hi]` (`window_of`) of
+/// width `<= RECURSIVE_ENUMERATION_CAP` members. Scoped to exactly one
+/// argument — a multi-parameter recursive def (an accumulator-style
+/// `fact(n, acc)`) is out of this reader's own reach, matching the
+/// fixture's own shape (`fact(n: int) -> int`) rather than a guessed
+/// wider contract. Returns the enumerable argument's own `[lo, hi]`
+/// window; `None` for every other shape (not self-recursive, zero or
+/// two-plus arguments, the sole argument not a bounded integer window,
+/// or a window wider than the cap) falls through to every other route
+/// unchanged.
+fn enumerable_recursive_argument(def: &StmtFunctionDef, arguments: &[AbstractValue]) -> Option<(f64, f64)> {
+    if !calls_own_name(&def.body, def.name.id.as_str()) {
+        return None;
+    }
+    let [only_argument] = arguments else {
+        return None;
+    };
+    if only_argument.kind != Kind::Set {
+        return None;
+    }
+    if !only_argument.set.forms.iter().any(|form| form.form == Form::Integer) {
+        return None;
+    }
+    let (lo, hi) = window_of(&only_argument.set)?;
+    if hi < lo {
+        return None;
+    }
+    // the width comparison stays in floats: a huge window cast to
+    // usize saturates and the +1 overflows — comparing before any
+    // cast declines the wide window instead
+    let width = (hi - lo).round();
+    if width < 0.0 || width + 1.0 > RECURSIVE_ENUMERATION_CAP as f64 {
+        return None;
+    }
+    Some((lo, hi))
+}
+
+/// `set`'s own `[lo, hi]` window when it carries exactly one `AtLeast`
+/// lower form and one `AtMost` upper form (an `Integer`/`MultipleOf` form
+/// alongside them states the sort and never widens the window) — the
+/// same shape `check.rs`'s own `aug_assign_window` reads, restated here
+/// since this file owns no dependency on `check.rs`'s private readers.
+fn window_of(set: &RefinedSet) -> Option<(f64, f64)> {
+    let mut lo: Option<f64> = None;
+    let mut hi: Option<f64> = None;
+    for form in &set.forms {
+        match form.form {
+            Form::AtLeast => lo = Some(form.a),
+            Form::AtMost => hi = Some(form.a),
+            Form::Integer | Form::MultipleOf => {}
+            _ => return None,
+        }
+    }
+    Some((lo?, hi?))
+}
+
+/// Whether `body` calls a bare name `own_name` anywhere — the same
+/// restricted statement/expression reach `free_names_read`'s own
+/// collectors give (`Assign`/`AnnAssign`/`AugAssign`/`If`/`Return`/
+/// `Expr`, one level of `if`/elif/else nesting), since a call outside
+/// that reach is a shape `interpret_body` cannot walk at all and the
+/// enumeration route below would decline through the ordinary
+/// interpreter on its own first concrete call anyway.
+fn calls_own_name(body: &[Stmt], own_name: &str) -> bool {
+    body.iter().any(|stmt| statement_calls_own_name(stmt, own_name))
+}
+
+fn statement_calls_own_name(stmt: &Stmt, own_name: &str) -> bool {
+    match stmt {
+        Stmt::Assign(assign) => expr_calls_own_name(assign.value.as_ref(), own_name),
+        Stmt::AnnAssign(assign) => assign.value.as_deref().is_some_and(|value| expr_calls_own_name(value, own_name)),
+        Stmt::AugAssign(assign) => expr_calls_own_name(assign.value.as_ref(), own_name),
+        Stmt::Expr(expr_stmt) => expr_calls_own_name(expr_stmt.value.as_ref(), own_name),
+        Stmt::Return(ret) => ret.value.as_deref().is_some_and(|value| expr_calls_own_name(value, own_name)),
+        Stmt::If(if_stmt) => {
+            calls_own_name(&if_stmt.body, own_name)
+                || if_stmt.elif_else_clauses.iter().any(|clause| calls_own_name(&clause.body, own_name))
+        }
+        _ => false,
+    }
+}
+
+/// A shallow expression walk over the same shapes `collect_names_in_expr`
+/// reaches, asking only whether a `Call` node's own callee names
+/// `own_name` — never resolving whether that name is truly a recursive
+/// self-call (a local rebinding of the same spelling would still count,
+/// the same over-approximation `free_names_read`'s own doc calls always
+/// SAFE: a false-positive "is recursive" answer only sends a call through
+/// this route's own extra window check, which itself declines harmlessly
+/// on a shape it cannot enumerate).
+fn expr_calls_own_name(expr: &Expr, own_name: &str) -> bool {
+    match expr {
+        Expr::Call(call) => {
+            let callee_matches = matches!(call.func.as_ref(), Expr::Name(name) if name.id.as_str() == own_name);
+            callee_matches
+                || expr_calls_own_name(call.func.as_ref(), own_name)
+                || call.arguments.args.iter().any(|arg| expr_calls_own_name(arg, own_name))
+                || call.arguments.keywords.iter().any(|keyword| expr_calls_own_name(&keyword.value, own_name))
+        }
+        Expr::UnaryOp(unary) => expr_calls_own_name(unary.operand.as_ref(), own_name),
+        Expr::BinOp(binop) => expr_calls_own_name(binop.left.as_ref(), own_name) || expr_calls_own_name(binop.right.as_ref(), own_name),
+        Expr::BoolOp(boolop) => boolop.values.iter().any(|value| expr_calls_own_name(value, own_name)),
+        Expr::Compare(compare) => {
+            expr_calls_own_name(compare.left.as_ref(), own_name) || compare.comparators.iter().any(|comparator| expr_calls_own_name(comparator, own_name))
+        }
+        Expr::If(ternary) => {
+            expr_calls_own_name(ternary.test.as_ref(), own_name)
+                || expr_calls_own_name(ternary.body.as_ref(), own_name)
+                || expr_calls_own_name(ternary.orelse.as_ref(), own_name)
+        }
+        Expr::Attribute(attribute) => expr_calls_own_name(attribute.value.as_ref(), own_name),
+        Expr::Subscript(subscript) => {
+            expr_calls_own_name(subscript.value.as_ref(), own_name) || expr_calls_own_name(subscript.slice.as_ref(), own_name)
+        }
+        _ => false,
+    }
+}
+
+/// `enumerable_recursive_argument`'s own answer, folded into one call per
+/// admitted `n` in `[lo, hi]`: each member replaces the sole argument
+/// with its own exact `Kind::Values` singleton, calls `call_result_with_
+/// enclosing` at the SAME `depth` (this is a call-SITE transform, not an
+/// extra level of interpretation — the enumerated call's own body still
+/// recurses through the ordinary depth-capped path from here), and every
+/// answer joins through `join_known`, the same fold `call_result_with_
+/// enclosing`'s own multi-return join already uses. `None` when the
+/// gate itself declines, OR when even ONE enumerated member's own call
+/// declines (an honest "this whole claim is unproven" rather than
+/// joining a partial answer that quietly drops a member CPython could
+/// actually reach).
+fn enumerated_recursive_call(
+    def: &StmtFunctionDef,
+    arguments: &[AbstractValue],
+    table: Option<&Arc<FunctionTable>>,
+    kernel: &Arc<RefinedTSKernel>,
+    depth: u32,
+    enclosing: Option<&Environment>,
+) -> Option<AbstractValue> {
+    let (lo, hi) = enumerable_recursive_argument(def, arguments)?;
+    // `enumerable_recursive_argument` gates on the window carrying
+    // `Form::Integer` — the only sort this reader admits — so every
+    // enumerated member is Integer-sorted, whether or not the window's
+    // own `kind_tag` happens to carry that tag explicitly (a `Kind::Set`
+    // value's `kind_tag` is sometimes `Some(PrimitiveKind::Integer)`
+    // (a declared-refinement-seeded parameter) and sometimes `None`
+    // (`known_set`'s own bare construction) — the GATE already proved
+    // the sort either way, so the fallback below is never a guess.
+    let sort = arguments[0].kind_tag.unwrap_or(PrimitiveKind::Integer);
+    let member_count = (hi - lo).round() as usize + 1;
+    let mut answers: Vec<AbstractValue> = Vec::with_capacity(member_count);
+    let mut member = lo;
+    while member <= hi {
+        let member_value = known_values(vec![member], sort, TrustProved);
+        let member_arguments = vec![member_value];
+        let answer = call_result_with_enclosing(def, &member_arguments, table, kernel, depth, enclosing)?;
+        answers.push(answer);
+        member += 1.0;
+    }
+    let mut answers = answers.into_iter();
+    let first = answers.next()?;
+    Some(answers.fold(first, |acc, next| join_known(acc, next)))
 }
 
 // --- THE KERNEL SUMMARY ROUTE ---------------------------------------
@@ -1399,11 +1611,25 @@ pub(crate) fn free_variable_snapshot(
 }
 
 /// Every name `def` binds itself: its parameters of all four flavors,
-/// then every name its body binds. This is the set that decides which of
-/// the body's reads are FREE — the complement of it, over the body's own
-/// reads, is what `seed_free_variables` copies from the caller and what
-/// `needs_enclosing_scope` tests for existence. Both read it here so the
-/// gate and the machinery it guards share one definition.
+/// then every name its body binds — EXCEPT a name the body declares
+/// `nonlocal` (`collect_nonlocal_names`, the same reach `call_effects`'s
+/// own local exclusion already gives its OWN copy of this set — folded
+/// in here so the ordinary VALUE-ONLY route shares it too). CPython's own
+/// rule is that a `nonlocal`-declared name is NEVER local to this body
+/// (executionmodel.rst, "the nonlocal statement causes the listed
+/// identifiers to refer to previously bound variables in the nearest
+/// enclosing scope"), so `collect_bound_names`' own "any assignment
+/// target is a local" default must be corrected for exactly this set —
+/// otherwise a `nonlocal n; n += 1` body (`A10.xfer.closure`'s own
+/// `counter`/`next_value`) reads `n` as an ordinary local `AugAssign`
+/// would never seed from `enclosing`, and the read of `n`'s CURRENT
+/// value before the `+= 1` finds nothing bound at all.
+///
+/// This is the set that decides which of the body's reads are FREE — the
+/// complement of it, over the body's own reads, is what `seed_free_
+/// variables` copies from the caller and what `needs_enclosing_scope`
+/// tests for existence. Both read it here so the gate and the machinery
+/// it guards share one definition.
 fn locally_bound_names(def: &StmtFunctionDef) -> std::collections::HashSet<String> {
     let mut bound = std::collections::HashSet::new();
     for parameter in def
@@ -1422,6 +1648,11 @@ fn locally_bound_names(def: &StmtFunctionDef) -> std::collections::HashSet<Strin
         bound.insert(kwarg.name.id.as_str().to_owned());
     }
     collect_bound_names(&def.body, &mut bound);
+    let mut nonlocal_names = std::collections::HashSet::new();
+    collect_nonlocal_names(&def.body, &mut nonlocal_names);
+    for nonlocal_name in &nonlocal_names {
+        bound.remove(nonlocal_name);
+    }
     bound
 }
 
@@ -1509,15 +1740,28 @@ fn collect_names_in_body(body: &[Stmt], locally_bound: &std::collections::HashSe
 /// `seed_free_variables`, and `write_subscript_target`'s own
 /// `environment.read(name)` would find nothing, declining the whole call
 /// (this is the captured-receiver-mutation half of the CALLEE-EFFECTS
-/// CHANNEL, `call_effects`'s own doc). A bare `Expr::Name` target is NOT
-/// walked here — that shape is a LOCAL bind (`collect_bound_names`'s own
-/// job), never a free read of the pre-existing value. The subscript's own
-/// KEY expression (`"age"`) is also walked, on the chance it is itself a
-/// free name (`outlaw[key] = 200` where `key` is a captured local) —
-/// walked through the ordinary `collect_names_in_expr`, since a key
-/// expression is always a READ, never a target.
+/// CHANNEL, `call_effects`'s own doc). A bare `Expr::Name` target still
+/// bound in `locally_bound` is NOT walked here — that shape is an
+/// ORDINARY local bind (`collect_bound_names`'s own job), never a free
+/// read of the pre-existing value. A bare `Expr::Name` target NOT in
+/// `locally_bound` is the `nonlocal` shape (`locally_bound_names` already
+/// removed it): `nonlocal n; n += 1` reads `n`'s pre-existing value from
+/// the enclosing scope before the write composes a new one, the exact
+/// same "read before write" story the subscript/attribute arms already
+/// tell for a captured receiver — so it is walked as a free-read
+/// candidate too, the one exception to the "bare Name target is a bind"
+/// default. The subscript's own KEY expression (`"age"`) is also walked,
+/// on the chance it is itself a free name (`outlaw[key] = 200` where
+/// `key` is a captured local) — walked through the ordinary `collect_
+/// names_in_expr`, since a key expression is always a READ, never a
+/// target.
 fn collect_write_target_base_name(target: &Expr, locally_bound: &std::collections::HashSet<String>, names: &mut Vec<String>) {
     match target {
+        Expr::Name(name) => {
+            if !locally_bound.contains(name.id.as_str()) {
+                names.push(name.id.as_str().to_owned());
+            }
+        }
         Expr::Subscript(subscript) => {
             collect_names_in_expr(subscript.value.as_ref(), locally_bound, names);
             collect_names_in_expr(subscript.slice.as_ref(), locally_bound, names);
@@ -2682,6 +2926,51 @@ mod tests {
         known_values(vec![value], PrimitiveKind::Integer, TrustProved)
     }
 
+    /// A bounded Integer window `[lo, hi]`, `Kind::Set` — the shape a
+    /// narrowed parameter carries at a call site (`fact_inside`'s own `if
+    /// 0 <= n <= 5:` guard), never a single concrete value.
+    fn known_integer_window(lo: f64, hi: f64) -> AbstractValue {
+        use refined_sets::refinement_forms::at_most;
+        known_set(make_refined_set(vec![at_least(lo), at_most(hi), integer()]), None, TrustProved, SetKindTag::None)
+    }
+
+    /// A10.xfer.recursion.py's own `fact`: a self-recursive `def` with a
+    /// decreasing measure (`n - 1`, strictly below `n`, bounded below by
+    /// the `n <= 1` base case), called with a WINDOW argument `n ∈ [0, 5]`
+    /// rather than a single value. Pins `enumerated_recursive_call`: the
+    /// symbolic path alone (the ordinary depth-capped interpreter, `n <=
+    /// 1` never deciding) cannot resolve this at all, so the call-site
+    /// enumeration must run once per admitted `n` (0 through 5) and join —
+    /// factorial of `[0, 5]` is `{1, 1, 2, 6, 24, 120}`, DEDUPLICATED by
+    /// `join_known`'s own Integer-tagged `Kind::Values` merge (`fact(0)`
+    /// and `fact(1)` both answer the exact value 1) to `{1, 2, 6, 24,
+    /// 120}`.
+    #[test]
+    fn a_self_recursive_call_over_a_bounded_window_unrolls_by_enumeration() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parse_module(concat!(
+            "def fact(n: int) -> int:\n",
+            "    if n <= 1:\n",
+            "        return 1\n",
+            "    return n * fact(n - 1)\n",
+        ))
+        .expect("fixture source parses")
+        .into_syntax();
+        let table = Arc::new(crate::function_table::function_table(&module));
+        let fact = table.def("fact").expect("fact is a top-level def").clone();
+        let window = known_integer_window(0.0, 5.0);
+        let result = call_result(&fact, &[window], Some(&table), &kernel, 0)
+            .expect("a self-recursive call over a small bounded window must enumerate, never decline");
+        let mut values = result.values.clone();
+        values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(
+            result.kind,
+            Kind::Values,
+            "factorial of [0, 5] is the small exact, deduplicated set {{1, 2, 6, 24, 120}}: {result:?}"
+        );
+        assert_eq!(values, vec![1.0, 2.0, 6.0, 24.0, 120.0]);
+    }
+
     #[test]
     fn straight_line_body_answers_the_returned_expression() {
         let Some(kernel) = loaded_kernel() else { return };
@@ -2715,6 +3004,46 @@ mod tests {
         // carries a real key; `expressions.rs`'s own retained-callable
         // tests pin the full call-and-answer round trip through
         // `evaluate_call`.
+    }
+
+    /// `A10.xfer.closure.py`'s own `counter`/`closure_inside` shape: a
+    /// factory `def` binds a LOCAL (`n = 0`), returns a NESTED `def`
+    /// declared `nonlocal n; n += 1; return n`, and a SEPARATE top-level
+    /// `def` calls the factory then calls the returned closure. Pins
+    /// `locally_bound_names`' own `nonlocal`-name exclusion (folded from
+    /// `call_effects`'s own local copy into the shared free-name
+    /// question `free_variable_snapshot`/`needs_enclosing_scope` both
+    /// read) together with `collect_write_target_base_name`'s new bare-
+    /// Name-target read: without either half, `n += 1` reads `n` as an
+    /// ordinary local, finds nothing seeded, and the whole call declines
+    /// — the gap this fix closes. With both, the closure's snapshot
+    /// carries `n: {0}`, the aug-assign folds it to `{1}`, and the outer
+    /// call's return value is the exact set `{1}`, never a decline.
+    #[test]
+    fn a_retained_closures_nonlocal_aug_assign_reads_its_own_captured_snapshot() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parse_module(concat!(
+            "def counter():\n",
+            "    n = 0\n",
+            "    def next_value():\n",
+            "        nonlocal n\n",
+            "        n += 1\n",
+            "        return n\n",
+            "    return next_value\n",
+            "\n",
+            "def closure_inside():\n",
+            "    next_value = counter()\n",
+            "    return next_value()\n",
+        ))
+        .expect("fixture source parses")
+        .into_syntax();
+        let table = Arc::new(crate::function_table::function_table(&module));
+        let closure_inside = table.def("closure_inside").expect("closure_inside is a top-level def").clone();
+        let result = call_result(&closure_inside, &[], Some(&table), &kernel, 0)
+            .expect("the closure's nonlocal aug-assign must read its own captured n, never decline");
+        assert_eq!(result.kind, Kind::Values, "the first call of a fresh counter answers the exact value {{1}}: {result:?}");
+        assert_eq!(result.values, vec![1.0]);
+        assert_eq!(result.kind_tag, Some(PrimitiveKind::Integer));
     }
 
     #[test]

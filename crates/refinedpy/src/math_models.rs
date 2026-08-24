@@ -15,13 +15,16 @@
 //! `kernel_backed_unary_family_call`/`kernel_backed_atan2_call` —
 //! python-pins.md's explog.1–6 and trig.1–13 rows, each posed to the
 //! SAME `boundary/javascript.lean` transfer arm the JS adapter asks,
-//! answering a certified window rather than a bare sort), PLUS the
-//! sort-only approximated family that remains (`cbrt`, `hypot`, and
-//! `sqrt` on a non-perfect-square operand — pow.6/pow.8/pow.4's own
-//! pins rows name why each stays local), which answers
-//! `float_sorted_unknown()` — a Float-tagged all-numbers SET, never a
-//! specific value — once every argument is known, so assignability's
-//! sort-fire law can still refuse an int-sorted sink.
+//! answering a certified window rather than a bare sort), PLUS `cbrt`
+//! and `sqrt` on a known numeric SET operand (`cbrt_call_over_set`,
+//! `sqrt_call_over_set` — the kernel's own `Cbrt`/`Sqrt` transfers over
+//! a bounded window), PLUS the sort-only approximated family that
+//! remains (`cbrt`/`hypot` on a known SINGLE value, and `sqrt` on a
+//! non-perfect-square SINGLE value — pow.6/pow.8/pow.4's own pins rows
+//! name why each stays local), which answers `float_sorted_unknown()`
+//! — a Float-tagged all-numbers SET, never a specific value — once
+//! every argument is known, so assignability's sort-fire law can still
+//! refuse an int-sorted sink.
 //! `math` is CPython's thin libm wrapper (library/math.html,
 //! implementation detail note: "the current implementation... will
 //! raise ValueError for invalid operations... and OverflowError for
@@ -603,6 +606,45 @@ fn copysign_call(magnitude: f64, sign_source: f64) -> Option<AbstractValue> {
     Some(float_result(magnitude.copysign(sign_source)))
 }
 
+/// `math.copysign(x, y)` on a KNOWN magnitude `x` but an UNRESOLVED sign
+/// source `y` (a seeded range, a bare `float` parameter's own unbounded
+/// set, or any operand `single_numeric_operand` cannot read as one
+/// value): library/math.rst's clause states the result is "a float with
+/// the magnitude (absolute value) of x but the sign of y" — the
+/// magnitude is FIXED (`x` is known), so the only freedom left is the
+/// TWO possible outcomes IEEE 754's copysign can produce, `{-|x|, +|x|}`
+/// (`f64::copysign`'s own two-branch definition — the sign bit of `y`
+/// is copied onto `|x|` verbatim, and a sign bit has exactly two
+/// states). `y`'s own set is checked against the kernel's
+/// `scalar_subset` first, the same "prove, never guess" discipline
+/// `isqrt_as_sqrt_floor_composition` keeps for its own sign exclusion:
+/// a `y` provably `>= 0.0` answers the single positive branch `{+|x|}`
+/// outright (`copysign(x, +0.0)` is `+|x|` too — signed-zero's positive
+/// case, the same clause's own "on platforms that support signed
+/// zeros" note), a `y` provably `<= 0.0` (`< 0.0` union the zero point,
+/// so `-0.0` — the clause's OWN named example, `copysign(1.0, -0.0) ==
+/// -1.0` — reads as this branch) answers `{-|x|}`, and a `y` that
+/// straddles (or a kernel refusal to decide) answers both signed
+/// branches — sound over the full sign uncertainty either way.
+fn copysign_call_over_unresolved_sign(
+    magnitude: f64,
+    sign_source: &AbstractValue,
+    kernel: &Arc<RefinedTSKernel>,
+) -> Option<AbstractValue> {
+    let sign_operand = float_transferable_operand(sign_source)?;
+    let positive_magnitude = magnitude.abs();
+    let nonneg = make_refined_set(vec![at_least(0.0)]);
+    if matches!(crate::kernel_ask::ask_kernel(|| (kernel.scalar_subset)(&sign_operand, &nonneg)), Ok(true)) {
+        return Some(float_result(positive_magnitude));
+    }
+    let nonpos = make_refined_set(vec![at_most(0.0)]);
+    if matches!(crate::kernel_ask::ask_kernel(|| (kernel.scalar_subset)(&sign_operand, &nonpos)), Ok(true)) {
+        return Some(float_result(-positive_magnitude));
+    }
+    let grade = derived_trust_level(TrustSpec, std::slice::from_ref(sign_source));
+    Some(known_values(vec![-positive_magnitude, positive_magnitude], PrimitiveKind::Float, grade))
+}
+
 /// Which exception `math.floor`/`ceil`/`trunc` provably raises for a
 /// KNOWN NON-FINITE argument, or `None` when the call returns a value
 /// normally. The value dispatch and the raise dispatch read the SAME
@@ -724,6 +766,57 @@ fn sqrt_call_over_set(value: &AbstractValue, kernel: &Arc<RefinedTSKernel>) -> O
     let asked = crate::kernel_ask::ask_kernel(|| {
         (kernel.transfer)(&TransferQuestion {
             op: TransferQuestionOp::Sqrt,
+            a: value.set.clone(),
+            b: make_refined_set(vec![]),
+            c: 0.0,
+            base: nan_operand.clone(),
+            exp: nan_operand,
+        })
+    })
+    .ok()?;
+    let grade = derived_trust_level(TrustSpec, std::slice::from_ref(value));
+    match asked.kind {
+        TransferAnswerKind::Values => Some(known_values(asked.values, PrimitiveKind::Float, grade)),
+        TransferAnswerKind::Set => Some(AbstractValue {
+            kind_tag: Some(PrimitiveKind::Float),
+            ..known_set(asked.set, None, grade, SetKindTag::None)
+        }),
+        TransferAnswerKind::NaN | TransferAnswerKind::Unknown => None,
+    }
+}
+
+/// `math.cbrt(x)` on a KNOWN NUMERIC SET (a seeded range, or a bounded
+/// set another transfer already produced): the kernel's own `Cbrt`
+/// transfer (wire `"js.cbrt"`, `TransferQuestionOp::Cbrt`, already
+/// posed as a UNARY operand — `transfer_op_is_unary`) answers the
+/// cube-rooted enclosure directly, the exact mirror of
+/// `sqrt_call_over_set` above — same `TransferQuestion` construction,
+/// same `catch_unwind` refusal discipline, same `TransferAnswerKind`
+/// match. library/math.rst's own clause: "Return the cube root of x" —
+/// unlike `sqrt`, `cbrt` is total over every real (the cube root of a
+/// negative is itself negative), so no negative-operand exclusion is
+/// needed here the way `sqrt_argument_is_known_negative` gates the
+/// single-value `sqrt` row. Float sort ALWAYS (the same blanket rule
+/// `sqrt_call_over_set` cites), regardless of the operand set's own
+/// sort. A non-numeric-sorted set, or a kernel refusal on this set
+/// shape, declines to `None`.
+fn cbrt_call_over_set(value: &AbstractValue, kernel: &Arc<RefinedTSKernel>) -> Option<AbstractValue> {
+    if value.kind != Kind::Set {
+        return None;
+    }
+    if !matches!(
+        value.kind_tag,
+        Some(PrimitiveKind::Integer)
+            | Some(PrimitiveKind::Float)
+            | Some(PrimitiveKind::Boolean)
+            | Some(PrimitiveKind::Number)
+    ) {
+        return None;
+    }
+    let nan_operand = PowOperandWire { kind: PowOperandKind::NaN, set: make_refined_set(vec![]) };
+    let asked = crate::kernel_ask::ask_kernel(|| {
+        (kernel.transfer)(&TransferQuestion {
+            op: TransferQuestionOp::Cbrt,
             a: value.set.clone(),
             b: make_refined_set(vec![]),
             c: 0.0,
@@ -1134,14 +1227,14 @@ fn kernel_backed_atan2_call(
 /// name-keyed transfer table... every wire op name is a flat string
 /// key"). `atan2` (trig.10) is excluded — its own
 /// `kernel_backed_atan2_call` above poses the two-operand question
-/// directly. `hypot` (pow.8) and `cbrt` (pow.6) are excluded: `hypot`'s
-/// own pins row states plainly "no wire arm registered for the N-ary
-/// form" (Python's variadic `math.hypot(*coordinates)` has no kernel
-/// election, only JS's landed two-argument `js.hypot`), and `cbrt` is
-/// outside this wave's named remainder (its own pins row, pow.6, calls
-/// `js.cbrt` "the adjacent election but... not directly reusable" —
-/// a separate ledger line from the explog+trig block this function
-/// answers).
+/// directly. `hypot` (pow.8) is excluded: its own pins row states
+/// plainly "no wire arm registered for the N-ary form" (Python's
+/// variadic `math.hypot(*coordinates)` has no kernel election, only
+/// JS's landed two-argument `js.hypot`). `cbrt` (pow.6) is excluded from
+/// THIS table for the same reason `sqrt` is — its known-SET operand is
+/// posed directly by its own dedicated row (`cbrt_call_over_set`),
+/// mirroring `sqrt_call_over_set`, not folded into this shared-shape
+/// dispatch table.
 fn kernel_backed_unary_family_op(function: &str) -> Option<TransferQuestionOp> {
     match function {
         "exp" => Some(TransferQuestionOp::Exp),
@@ -1166,10 +1259,14 @@ fn kernel_backed_unary_family_op(function: &str) -> Option<TransferQuestionOp> {
     }
 }
 
-/// The approximated float family still riding sort-only precision:
-/// `sqrt` on a non-perfect-square operand, `cbrt`, `hypot` —
-/// `float_sorted_unknown()` (a Float-tagged, all-numbers SET) once
-/// every argument is known, never a specific value. None of these
+/// The approximated float family still riding sort-only precision on a
+/// KNOWN SINGLE-VALUE operand: `sqrt` on a non-perfect-square operand,
+/// `cbrt` (a Set-shaped `cbrt` operand is `cbrt_call_over_set`'s own
+/// row, tried first — this function is `math_call_result`'s `"cbrt"`
+/// fallback only), `hypot` (a Set-shaped `hypot` operand still declines
+/// outright — no kernel row exists for it, `kernel_backed_unary_family_op`'s
+/// own doc) — `float_sorted_unknown()` (a Float-tagged, all-numbers SET)
+/// once every argument is known, never a specific value. None of these
 /// carries a pinned exact-value clause (library/math.html's module
 /// intro: "the current implementation... Behavior in exceptional
 /// cases follows Annex F... will raise ValueError for invalid
@@ -1324,10 +1421,10 @@ pub fn random_call_result(function: &str, arguments: &[AbstractValue]) -> Option
 /// raises `OverflowError`/`ValueError` for ±inf/NaN, which is
 /// `rounding_argument_raises`' row) — `isqrt`, `fabs`, `copysign`, and `sqrt` on
 /// a known non-negative PERFECT-SQUARE operand (`sqrt_exact_perfect_square`'s
-/// own doc — IEEE 754 correct rounding, not an approximation). `floor`
-/// and `sqrt` additionally answer a bounded numeric SET operand through
-/// the kernel's own `Floor`/`Sqrt` transfers (`floor_call_over_set`,
-/// `sqrt_call_over_set`).
+/// own doc — IEEE 754 correct rounding, not an approximation). `floor`,
+/// `sqrt`, and `cbrt` additionally answer a bounded numeric SET operand
+/// through the kernel's own `Floor`/`Sqrt`/`Cbrt` transfers
+/// (`floor_call_over_set`, `sqrt_call_over_set`, `cbrt_call_over_set`).
 ///
 /// Modeled EXACTLY through the `int` theory (`int_theory_call`'s own
 /// doc, each row's pins clause named there): `factorial`, `gcd`, `lcm`,
@@ -1412,10 +1509,20 @@ pub fn math_call_result(
             let (value, _) = single_numeric_operand(arguments.first()?)?;
             fabs_call(value)
         }
+        // both arguments known answers the exact IEEE 754 recombination
+        // (`copysign_call`'s own doc); a known magnitude with an
+        // UNRESOLVED sign source still answers the two-signed-branch
+        // set, or the single branch the sign source's own window
+        // provably fixes (`copysign_call_over_unresolved_sign`'s own
+        // doc) — an unresolved MAGNITUDE has no row here, since neither
+        // function reads one.
         "copysign" => {
             let (magnitude, _) = single_numeric_operand(arguments.first()?)?;
-            let (sign_source, _) = single_numeric_operand(arguments.get(1)?)?;
-            copysign_call(magnitude, sign_source)
+            let sign_source = arguments.get(1)?;
+            match single_numeric_operand(sign_source) {
+                Some((value, _)) => copysign_call(magnitude, value),
+                None => copysign_call_over_unresolved_sign(magnitude, sign_source, kernel),
+            }
         }
         // `sqrt` on an exact perfect square answers the exact Float
         // result (IEEE 754 correct rounding — see
@@ -1431,6 +1538,18 @@ pub fn math_call_result(
                     sqrt_exact_perfect_square(value).or_else(|| approximated_family_result(function, arguments))
                 }
                 None => sqrt_call_over_set(only, kernel).or_else(|| approximated_family_result(function, arguments)),
+            }
+        }
+        // a KNOWN SET operand asks the kernel's own `Cbrt` transfer
+        // directly (`cbrt_call_over_set`'s own doc); a known single
+        // value still falls through to the sort-only row below — no
+        // exact-perfect-cube shortcut is modeled here, the same posture
+        // `sqrt`'s single-value row keeps for a non-perfect-square
+        "cbrt" => {
+            let [only] = arguments else { return None };
+            match single_numeric_operand(only) {
+                Some(_) => approximated_family_result(function, arguments),
+                None => cbrt_call_over_set(only, kernel).or_else(|| approximated_family_result(function, arguments)),
             }
         }
         // trig.10 — the one two-argument member of the kernel-backed
@@ -1626,6 +1745,41 @@ mod tests {
         assert_eq!(result.kind_tag, Some(PrimitiveKind::Float));
     }
 
+    /// `math.copysign(1, x)` with a KNOWN magnitude but a fully
+    /// UNRESOLVED sign source `x` (`copysign_call_over_unresolved_sign`'s
+    /// own doc): the answer is the two-signed-branch set `{-1.0, 1.0}` —
+    /// both magnitude-preserving outcomes IEEE 754's copysign can
+    /// produce when the sign bit is unknown, A2.xfer.sign's own row.
+    #[test]
+    fn test_copysign_of_a_known_magnitude_over_an_unresolved_sign_answers_both_branches() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let unresolved_sign = float_sorted_unknown();
+        let result = math_call_result("copysign", &[int_operand(1.0), unresolved_sign], &kernel)
+            .expect("copysign(1, x) over an unresolved sign should answer");
+        assert_eq!(result.kind, Kind::Values);
+        assert_eq!(result.kind_tag, Some(PrimitiveKind::Float));
+        let mut values = result.values.clone();
+        values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(values, vec![-1.0, 1.0]);
+    }
+
+    /// `math.copysign(1, x)` where `x` is provably NONNEGATIVE
+    /// (`x` narrowed to `x >= 0.0` by an upstream guard): the sign
+    /// source's own window excludes every negative sign bit, so the
+    /// answer narrows to the single positive branch, not both.
+    #[test]
+    fn test_copysign_of_a_known_magnitude_over_a_provably_nonnegative_sign_answers_one_branch() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let nonnegative_sign = AbstractValue {
+            kind_tag: Some(PrimitiveKind::Float),
+            ..known_set(make_refined_set(vec![at_least(0.0)]), None, TrustSpec, SetKindTag::None)
+        };
+        let result = math_call_result("copysign", &[int_operand(1.0), nonnegative_sign], &kernel)
+            .expect("copysign(1, x) over a provably nonnegative sign should answer");
+        assert_eq!(result.values, vec![1.0]);
+        assert_eq!(result.kind_tag, Some(PrimitiveKind::Float));
+    }
+
     /// `math.sqrt` on a KNOWN PERFECT SQUARE answers the exact Float
     /// value — IEEE 754 correct rounding pins `sqrt(40000.0) == 200.0`
     /// exactly, not merely approximately.
@@ -1763,6 +1917,27 @@ mod tests {
         assert_eq!(log10.kind_tag, Some(PrimitiveKind::Float));
         assert!((kernel.member)(&log10.set, &[3.0]), "log10(1000) = 3 exactly, must be inside the window");
         assert!(!(kernel.member)(&log10.set, &[4.0]), "4 is outside log10(1000)'s true window");
+    }
+
+    /// `math.cbrt(x)` over a KNOWN INTERVAL operand `[0.0, 1.0]`
+    /// (`cbrt_call_over_set`'s own doc): cbrt is monotone increasing, and
+    /// the cube root of `[0, 1]` is `[0, 1]` again (cbrt(0) = 0,
+    /// cbrt(1) = 1), so the answer's window must enclose both endpoints
+    /// and exclude a value clearly outside them.
+    #[test]
+    fn test_cbrt_over_a_known_interval_answers_a_window_containing_zero_to_one() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let interval = AbstractValue {
+            kind_tag: Some(PrimitiveKind::Float),
+            ..known_set(make_refined_set(vec![at_least(0.0), at_most(1.0)]), None, TrustSpec, SetKindTag::None)
+        };
+        let result =
+            math_call_result("cbrt", std::slice::from_ref(&interval), &kernel).expect("cbrt([0,1]) should answer");
+        assert_eq!(result.kind, Kind::Set);
+        assert_eq!(result.kind_tag, Some(PrimitiveKind::Float));
+        assert!((kernel.member)(&result.set, &[0.0]), "cbrt(0) = 0 must be inside the window");
+        assert!((kernel.member)(&result.set, &[1.0]), "cbrt(1) = 1 must be inside the window");
+        assert!(!(kernel.member)(&result.set, &[2.0]), "cbrt([0,1]) stays within [0,1] — 2 must be outside");
     }
 
     /// `math.floor(random.random() * 121)` — the kernel's own `Mult`

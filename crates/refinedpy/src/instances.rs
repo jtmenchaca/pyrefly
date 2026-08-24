@@ -205,9 +205,8 @@ pub fn typed_dict_table(
             let Expr::Name(target_name) = assign.target.as_ref() else {
                 continue;
             };
-            let Some(declared) =
-                declared_refinement(assign.annotation.as_ref(), aliases, imports, &empty_environment)
-            else {
+            let annotation = unwrap_required_marker(assign.annotation.as_ref());
+            let Some(declared) = declared_refinement(annotation, aliases, imports, &empty_environment) else {
                 continue;
             };
             members.push((target_name.id.as_str().to_owned(), declared));
@@ -215,6 +214,45 @@ pub fn typed_dict_table(
         out.insert(def.name.id.as_str().to_owned(), members);
     }
     out
+}
+
+/// `Required[X]` / `NotRequired[X]` (typing.rst, "Required" /
+/// "NotRequired" — TypedDict's own per-key presence override on a
+/// `total=False` / `total=True` class) peeled down to `X` — the bare
+/// annotation `declared_refinement` already knows how to read. Recognized
+/// by bare name only, the same no-import-identity convention
+/// `declared_refinement`'s own `Optional`/`Literal` arms already take
+/// (`SurfaceImports` carries no `typing.Required`/`typing.NotRequired`
+/// identity to gate on).
+///
+/// A member's PRESENCE is not itself a fact this table tracks either way
+/// — `class_parameter_object` (check.rs) seeds a `Kind::Object` key for
+/// every member THIS table records, so a member `declared_refinement`
+/// cannot read stays entirely OFF the seeded value's own `keys`,
+/// indistinguishable there from a genuinely absent key, and a later
+/// `r["a"]` read on it wrongly proves `KeyError` — the exact defect
+/// `Required[Age]` (a Record's own `total=False` class marking one key
+/// ALWAYS present) surfaced: `Required`'s wrapper, left unpeeled, made
+/// `declared_refinement` decline the whole member (a `Subscript` head it
+/// does not otherwise recognize), so the member never reached `keys` at
+/// all. Peeling to the wrapped annotation is what the MEMBERS LAW
+/// (`assignability.rs`) then judges the member's value AGAINST — the
+/// same set the annotation would state with no `Required`/`NotRequired`
+/// wrapper at all, since neither marker narrows or widens the KEY'S OWN
+/// value set, only whether the key must appear.
+fn unwrap_required_marker(annotation: &Expr) -> &Expr {
+    let Expr::Subscript(subscript) = annotation else {
+        return annotation;
+    };
+    let is_presence_marker = matches!(
+        subscript.value.as_ref(),
+        Expr::Name(head) if head.id.as_str() == "Required" || head.id.as_str() == "NotRequired"
+    );
+    if is_presence_marker {
+        subscript.slice.as_ref()
+    } else {
+        annotation
+    }
 }
 
 /// Depth-first build of one class into `out`, building its single
@@ -346,7 +384,21 @@ fn class_model_of(
         let Expr::Name(target_name) = assign.target.as_ref() else {
             continue;
         };
-        let declared = declared_refinement(assign.annotation.as_ref(), aliases, imports, &empty_environment)
+        // `Required[X]`/`NotRequired[X]` (typing.rst) is valid syntax
+        // only inside a TypedDict body — `class_table` builds a
+        // `ClassModel` for EVERY module-level class, TypedDict-based
+        // ones included (`typed_dict_table`'s own separate reading is
+        // the return-position/explicit-TypedDict-annotation path;
+        // `seed_parameters` (check.rs) reads a bare `r: Record`
+        // PARAMETER through `context.classes` FIRST, so THIS loop is
+        // what actually seeds a TypedDict-typed parameter's own
+        // per-field table) — so this same peel
+        // (`unwrap_required_marker`'s own doc) applies here too,
+        // unconditionally: an ordinary (non-TypedDict) class field never
+        // spells the wrapper at all, so the peel is a no-op for every
+        // other class shape.
+        let annotation = unwrap_required_marker(assign.annotation.as_ref());
+        let declared = declared_refinement(annotation, aliases, imports, &empty_environment)
             // A bare-Name annotation `declared_refinement` reads as
             // nothing this table's own alias/inline-form grammar
             // covers (`Resident.address: Address` — `Address` is a
@@ -2125,6 +2177,35 @@ mod tests {
         assert!(person.fields[1].declared.is_none(), "bare str states no refinement");
     }
 
+    /// A12.xfer.typeops's own real seeding path: `class_table` — not
+    /// `typed_dict_table` — is what `check.rs::seed_parameters` reads for
+    /// a bare `r: Record` PARAMETER (`context.classes` is checked before
+    /// any TypedDict-specific fallback), so a `Required[Age]` member must
+    /// read its own refinement HERE too, not only through
+    /// `typed_dict_table`'s separate return-position table. Before
+    /// `unwrap_required_marker` reached this loop, `Required`'s wrapper
+    /// made `declared_refinement` decline the field entirely, so `a`
+    /// never reached `class_parameter_object`'s seeded `keys`, and a
+    /// later `r["a"]` read wrongly proved `KeyError`.
+    #[test]
+    fn class_table_reads_a_typed_dicts_required_wrapped_field() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "from typing import Annotated, Required, TypedDict\n",
+            "from pydantic import Field\n",
+            "type Age = Annotated[int, Field(ge=0, le=120)]\n",
+            "class Record(TypedDict, total=False):\n",
+            "    a: Required[Age]\n",
+        ));
+        let aliases = crate::surface::compile_aliases(&module);
+        let imports = crate::surface::surface_imports(&module);
+        let table = class_table(&module, &aliases, &imports, &kernel);
+        let record = table.get("Record").expect("Record class recorded");
+        assert_eq!(record.fields.len(), 1);
+        assert_eq!(record.fields[0].name, "a");
+        assert!(record.fields[0].declared.is_some(), "Required[Age] must still read Age's own refinement");
+    }
+
     // --- typed_dict_table: per-member refinements ---
 
     #[test]
@@ -2143,6 +2224,52 @@ mod tests {
         let members = table.get("PersonDict").expect("PersonDict recorded");
         assert_eq!(members.len(), 1, "only age reads a refinement; bare str states none");
         assert_eq!(members[0].0, "age");
+        assert_eq!(members[0].1.spelling, "Age");
+    }
+
+    /// A12.xfer.typeops's own shape: `Required[Age]` on a `total=False`
+    /// class must record the SAME member `age: Age` (unwrapped) would —
+    /// `Required`/`NotRequired` state only presence, never a different
+    /// key set. Before `unwrap_required_marker`, `declared_refinement`
+    /// declined the whole `Subscript` (an unrecognized head), so the
+    /// member never reached this table at all, leaving the seeded
+    /// parameter's own `keys` without `"a"` and a later `r["a"]` read
+    /// wrongly proving `KeyError`.
+    #[test]
+    fn typed_dict_table_reads_a_required_wrapped_members_own_refinement() {
+        let module = parsed(concat!(
+            "from typing import Annotated, Required, TypedDict\n",
+            "from pydantic import Field\n",
+            "type Age = Annotated[int, Field(ge=0, le=120)]\n",
+            "class Record(TypedDict, total=False):\n",
+            "    a: Required[Age]\n",
+        ));
+        let aliases = crate::surface::compile_aliases(&module);
+        let imports = crate::surface::surface_imports(&module);
+        let table = typed_dict_table(&module, &aliases, &imports);
+        let members = table.get("Record").expect("Record recorded");
+        assert_eq!(members.len(), 1, "Required[Age] must still read Age's own refinement");
+        assert_eq!(members[0].0, "a");
+        assert_eq!(members[0].1.spelling, "Age", "Required peels to the wrapped annotation's own spelling");
+    }
+
+    /// The `NotRequired[X]` twin, on an otherwise `total=True` class —
+    /// same peel, same member table shape.
+    #[test]
+    fn typed_dict_table_reads_a_not_required_wrapped_members_own_refinement() {
+        let module = parsed(concat!(
+            "from typing import Annotated, NotRequired, TypedDict\n",
+            "from pydantic import Field\n",
+            "type Age = Annotated[int, Field(ge=0, le=120)]\n",
+            "class Record(TypedDict):\n",
+            "    a: NotRequired[Age]\n",
+        ));
+        let aliases = crate::surface::compile_aliases(&module);
+        let imports = crate::surface::surface_imports(&module);
+        let table = typed_dict_table(&module, &aliases, &imports);
+        let members = table.get("Record").expect("Record recorded");
+        assert_eq!(members.len(), 1, "NotRequired[Age] must still read Age's own refinement");
+        assert_eq!(members[0].0, "a");
         assert_eq!(members[0].1.spelling, "Age");
     }
 

@@ -1048,7 +1048,9 @@ fn evaluate_fstring(fstring: &ruff_python_ast::ExprFString, environment: &Enviro
                 }
                 if let Some(format_spec) = &interpolation.format_spec {
                     let value = evaluate_expression(&interpolation.expression, environment, kernel);
-                    let Some(part) = zero_padded_decimal_spelling(format_spec, &value) else {
+                    let part = zero_padded_decimal_spelling(format_spec, &value)
+                        .or_else(|| fixed_precision_decimal_spelling(format_spec, &value));
+                    let Some(part) = part else {
                         return unknown();
                     };
                     has_exact = false;
@@ -1124,7 +1126,10 @@ fn evaluate_fstring(fstring: &ruff_python_ast::ExprFString, environment: &Enviro
     while let Some(part) = parts.pop() {
         folded = make_refined_set(vec![refined_sets::refinement_forms::concatenation(part, folded)]);
     }
-    known_set(folded, None, grade, SetKindTag::None)
+    AbstractValue {
+        kind_tag: Some(PrimitiveKind::String),
+        ..known_set(folded, None, grade, SetKindTag::None)
+    }
 }
 
 /// `f"{year:04d}"` — an interpolation carrying a ZERO-PADDED DECIMAL
@@ -1164,6 +1169,32 @@ fn zero_padded_decimal_spelling(
         return None;
     }
     Some(make_refined_set(vec![repeat_of(one_char_of("0123456789"), width as i64, Some(width as i64))]))
+}
+
+/// `f"{x:.2f}"` — an interpolation carrying a FIXED-PRECISION format
+/// spec (`format_spec.rst`'s `'f'` presentation type: "formats the
+/// number as a decimal number with exactly p digits following the
+/// decimal point"), read only when `format_spec` is EXACTLY the plain
+/// `.{precision}f` spelling (`string_models::fixed_precision_decimal_width`'s
+/// own doc — no fill/align/sign/`#`/`0`/width/grouping option) and
+/// `value` is NUMERIC-sorted (Integer or Float — `single_numeric_value`'s
+/// own sort read, widened to accept a Set-shaped numeric operand too,
+/// never only a known single value: the grammar built
+/// (`string_models::fixed_precision_decimal_grammar`) is value-
+/// independent, sound over every finite float regardless of `value`'s
+/// own bound). A non-numeric-sorted `value` declines — CPython's `'f'`
+/// type raises `TypeError` on one, and this file has no exception
+/// channel to speak that raise through, matching every other row's
+/// "known operands only" discipline.
+fn fixed_precision_decimal_spelling(
+    format_spec: &ruff_python_ast::InterpolatedStringFormatSpec,
+    value: &AbstractValue,
+) -> Option<RefinedSet> {
+    let precision = string_models::fixed_precision_decimal_width(format_spec)?;
+    if !matches!(value.kind_tag, Some(PrimitiveKind::Integer) | Some(PrimitiveKind::Float) | Some(PrimitiveKind::Boolean)) {
+        return None;
+    }
+    Some(string_models::fixed_precision_decimal_grammar(precision))
 }
 
 /// The `width` a format spec states, when the spec is EXACTLY the plain
@@ -4835,8 +4866,9 @@ fn json_dumps_value(value: &AbstractValue) -> Option<String> {
 /// `environment.datetime_imports()`, not by this literal list, so they
 /// are named here too even though no arm below tests
 /// `module_name.id.as_str() == "datetime"` directly.
-const MODELED_MODULE_NAMES: &[&str] =
-    &["math", "random", "re", "json", "importlib", "types", "weakref", "asyncio", "array", "subprocess", "datetime"];
+const MODELED_MODULE_NAMES: &[&str] = &[
+    "math", "random", "re", "json", "importlib", "types", "weakref", "asyncio", "array", "subprocess", "datetime", "os", "time", "unicodedata", "base64",
+];
 
 /// The leftmost `Name` under an attribute-chain receiver (`a.b.c` → `a`;
 /// `a` itself → `a`) — `None` when the receiver is not built from a
@@ -5004,6 +5036,41 @@ fn evaluate_attribute_call(
                 }
                 return unknown();
             }
+            // `re.fullmatch(pattern, s)` / `re.finditer(pattern, s)` READ
+            // AS A VALUE (as opposed to `narrowing.rs`'s own truthy-
+            // condition-only reading of the identical calls) —
+            // library/re.html: `fullmatch(pattern, string)`, "If the
+            // whole string matches... return a corresponding match
+            // object"; `finditer(pattern, string)`, "Return an iterator
+            // yielding match objects." Modeled ONLY for a known
+            // exact-string pattern argument (`string_models::
+            // match_object_value`'s own doc — the same literal-pattern
+            // gate `narrow_regex_module_call` already applies for its
+            // own truthy-condition reading). `fullmatch` anchors both
+            // ends of the WHOLE-match group (`0`); `finditer` anchors
+            // neither (`narrow_regex_module_call`'s own `search` row
+            // states the identical unanchored-both-ends default) — the
+            // single MATCH this call answers stands in for "some element
+            // of the iterator," the value a `for m in
+            // re.finditer(...)` loop's OWN iterable-element read needs.
+            // `loops.rs::iterable_values`'s `Expr::Call` arm has no
+            // recognizer for `re.finditer` today, so a `for` loop over
+            // this call still declines upstream of ever reaching this
+            // dispatch — this row serves a NON-loop value use
+            // (`m = re.fullmatch(...); m.group(1)`) end to end, and
+            // stands ready for the loop element path once that other
+            // file's own recognizer is added.
+            if matches!(attribute.attr.as_str(), "fullmatch" | "finditer") {
+                if let [pattern, _subject] = arguments {
+                    if let Some(pattern_text) = exact_string_values(pattern).and_then(code_points_to_string) {
+                        let anchor_whole_match = attribute.attr.as_str() == "fullmatch";
+                        if let Some(value) = string_models::match_object_value(&pattern_text, anchor_whole_match) {
+                            return value;
+                        }
+                    }
+                }
+                return unknown();
+            }
         }
         // `json.loads(s)` — library/json.rst, `function:: loads(s, ...)`:
         // "deserialize s... to a Python object using this conversion
@@ -5022,6 +5089,9 @@ fn evaluate_attribute_call(
         if module_name.id.as_str() == "json" && environment.read("json").is_none() {
             if attribute.attr.as_str() == "loads" {
                 if let [text] = arguments {
+                    if let Some(carried) = json_grammar::round_trip_carried_value(text) {
+                        return carried.clone();
+                    }
                     if let Some(text) = exact_string_values(text).and_then(code_points_to_string) {
                         if let Some(value) = json_scalar_literal_value(text.trim()) {
                             return value;
@@ -5056,6 +5126,9 @@ fn evaluate_attribute_call(
                     }
                     if let Some(grammar) = json_grammar::dumps_grammar(value, &mut json_dumps_value) {
                         return grammar;
+                    }
+                    if let Some(carrier) = json_grammar::dumps_round_trip_carrier_value(value) {
+                        return carrier;
                     }
                 }
                 return unknown();
@@ -5143,6 +5216,36 @@ fn evaluate_attribute_call(
         if module_name.id.as_str() == "asyncio" && environment.read("asyncio").is_none() {
             if attribute.attr.as_str() == "gather" {
                 return collection_models::list_literal_value(arguments);
+            }
+        }
+        // `time.time()` / `os.open(path, flags)` / `os.close(fd)` /
+        // `unicodedata.normalize(form, s)` — `builtin_models::
+        // stdlib_call_result`'s own doc states each row's citation.
+        if module_name.id.as_str() == "time" && environment.read("time").is_none() {
+            if let Some(value) = builtin_models::stdlib_call_result("time", attribute.attr.as_str(), arguments) {
+                return value;
+            }
+        }
+        if module_name.id.as_str() == "os" && environment.read("os").is_none() {
+            if let Some(value) = builtin_models::stdlib_call_result("os", attribute.attr.as_str(), arguments) {
+                return value;
+            }
+        }
+        if module_name.id.as_str() == "unicodedata" && environment.read("unicodedata").is_none() {
+            if let Some(value) = builtin_models::stdlib_call_result("unicodedata", attribute.attr.as_str(), arguments) {
+                return value;
+            }
+        }
+        if module_name.id.as_str() == "dict" && environment.read("dict").is_none() {
+            if let Some(value) = builtin_models::stdlib_call_result("dict", attribute.attr.as_str(), arguments) {
+                return value;
+            }
+        }
+        // `base64.b64encode(s)` — `bytes_models::base64_call_result`'s
+        // own doc (library/base64.rst).
+        if module_name.id.as_str() == "base64" && environment.read("base64").is_none() {
+            if let Some(value) = bytes_models::base64_call_result(attribute.attr.as_str(), arguments) {
+                return value;
             }
         }
     }
@@ -5366,6 +5469,33 @@ fn evaluate_attribute_call(
         return unknown();
     }
     if receiver.kind == Kind::Object {
+        // `match.group(n)` — library/re.html#re.Match.group, the
+        // ONE-ARGUMENT numeric form — on a `string_models::
+        // match_object_value`-built receiver (`MATCH_WITH_GROUPS_WORD`-
+        // tagged, the `re.fullmatch`/`re.finditer` value-producing arm
+        // above). `string_models::matched_group_grammar`'s own doc
+        // states the exact group-number reading; any other receiver
+        // (the bare `opaque_value("a match object")` `re.match`/
+        // `re.search` still answer) or argument shape declines to
+        // `unknown()`, unchanged from today.
+        if attribute.attr.as_str() == "group" {
+            if let Some(value) = string_models::matched_group_grammar(&receiver, arguments) {
+                return value;
+            }
+        }
+        // `<bytes-like>.decode()` — library/stdtypes.html#bytes.decode,
+        // the zero-argument default-encoding form — on a
+        // `bytes_models::base64_call_result`-built receiver
+        // (`BASE64_ENCODED_WORD`-tagged). `bytes_models::
+        // bytes_decode_call`'s own doc states the exact reading; any
+        // other bytes-like receiver (a plain `Kind::List` bytes value,
+        // or an `.encode()` result's own `ENCODED_BYTES_WORD` tag)
+        // declines here, matching that function's own scope.
+        if attribute.attr.as_str() == "decode" {
+            if let Some(value) = bytes_models::bytes_decode_call(&receiver, arguments) {
+                return value;
+            }
+        }
         if attribute.attr.as_str() == "get" {
             // dict.get(key, default=None, /) — a missing default argument
             // is None (stdtypes.rst, dict's `method:: get`), matching
@@ -5649,6 +5779,17 @@ fn evaluate_attribute_read(
     environment: &Environment,
     kernel: &Arc<RefinedTSKernel>,
 ) -> AbstractValue {
+    // An access path this walk already narrowed (`a.n`'s own comparison,
+    // say) answers from that path binding directly — the same fact a bare
+    // tracked name would answer from `environment.read`, one level deeper.
+    // `tracked_place_of` declines any receiver chain that is not a plain
+    // Name/Attribute walk down to a base name (a call, a subscript), so
+    // this never fires for a shape it cannot state a path for.
+    if let Some(place) = crate::env::tracked_place_of(&Expr::Attribute(attribute.clone())) {
+        if let Some(narrowed) = environment.read_path(&place) {
+            return narrowed.clone();
+        }
+    }
     // `__class__` is a universal attribute (datamodel.rst: "instance.__class__
     // is the object's class") — EVERY value has one, the host's own type
     // object, never a program-tracked value; answered opaque regardless
@@ -5714,6 +5855,31 @@ fn evaluate_attribute_read(
                     SetKindTag::None,
                 )
             };
+        }
+    }
+    // `sys.float_info.max` — a TWO-LEVEL attribute chain (`sys.float_info`
+    // read, then `.max` off that), unlike `sys.maxsize`'s one-level read
+    // above: the outer `attribute.value` here is itself
+    // `Expr::Attribute(sys.float_info)`, not `Expr::Name("sys")`, so the
+    // chain must be peeled one level before the same module-name check
+    // applies. library/sys.rst's `data:: float_info` table, `float_info.max`
+    // row: "The maximum representable positive finite float," mapped to
+    // the C `DBL_MAX` macro. `f64::MAX` IS `DBL_MAX` on every IEEE 754
+    // binary64 platform (the same "one nearest representable value" IEEE
+    // 754 identity `math_constant_value`'s own doc cites for `math.pi`) —
+    // the exact CPython value, not a sort-only approximation, the same
+    // posture `math.pi`/`math.e` take for their own platform-independent
+    // constants.
+    if attribute.attr.as_str() == "max" {
+        if let Expr::Attribute(inner) = attribute.value.as_ref() {
+            if let Expr::Name(module_name) = inner.value.as_ref() {
+                if module_name.id.as_str() == "sys"
+                    && environment.read("sys").is_none()
+                    && inner.attr.as_str() == "float_info"
+                {
+                    return known_values(vec![f64::MAX], PrimitiveKind::Float, TrustProved);
+                }
+            }
         }
     }
     // `super().<name>` READ, no call — functions.rst's `super()` entry:
@@ -9807,6 +9973,22 @@ mod tests {
         assert_eq!(value.kind_tag, Some(PrimitiveKind::Float));
     }
 
+    /// `sys.float_info.max` is a TWO-LEVEL attribute chain, not a call —
+    /// the exact `f64::MAX` value (library/sys.rst's `float_info.max`
+    /// row: "The maximum representable positive finite float," `DBL_MAX`
+    /// — the same platform-independent IEEE 754 identity `math.pi`'s own
+    /// test above relies on).
+    #[test]
+    fn test_sys_float_info_max_attribute_read() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let parsed = parse_expression("sys.float_info.max").expect("test source must parse");
+        let environment = empty_environment();
+        let value = evaluate_expression(&parsed.into_expr(), &environment, &kernel);
+        assert_eq!(value.kind, Kind::Values);
+        assert_eq!(value.values, vec![f64::MAX]);
+        assert_eq!(value.kind_tag, Some(PrimitiveKind::Float));
+    }
+
     /// One module's `from math import ...` table, seeded onto a fresh
     /// environment the SAME WAY `check.rs::module_bindings_with_math_
     /// imports` seeds `context.module_bindings` for a real walk — the
@@ -11840,6 +12022,96 @@ mod tests {
         assert_eq!(value.kind, Kind::Unknown);
     }
 
+    /// `re.fullmatch(r"(\d+)-(\d+)", s)` read as a VALUE — the whole
+    /// call answers a Match-object carrying group 0 and both numbered
+    /// groups; `.group(1)` on it reads the first group's own grammar.
+    #[test]
+    fn test_re_fullmatch_value_then_group_reads_the_numbered_groups_grammar() {
+        let Some(value) = eval("re.fullmatch(r\"(\\d+)-(\\d+)\", s).group(1)") else { return };
+        assert_eq!(value.kind, Kind::Set);
+        assert_eq!(value.kind_tag, Some(PrimitiveKind::String));
+    }
+
+    /// `re.fullmatch(r"[A-Z]{2}", s).group(0)` — the whole-match group,
+    /// group 0, is always present even with no capturing groups.
+    #[test]
+    fn test_re_fullmatch_group_zero_is_always_present() {
+        let Some(value) = eval("re.fullmatch(r\"[A-Z]{2}\", s).group(0)") else { return };
+        assert_eq!(value.kind, Kind::Set);
+        assert_eq!(value.kind_tag, Some(PrimitiveKind::String));
+    }
+
+    /// `re.finditer(r"\d+", s)` read as a value directly (not through a
+    /// `for` loop, which `loops.rs` does not yet route to this arm) —
+    /// `.group(0)` on the single match value this call answers reads
+    /// the unanchored `\d+` grammar.
+    #[test]
+    fn test_re_finditer_value_then_group_zero_reads_the_unanchored_grammar() {
+        let Some(value) = eval("re.finditer(r\"\\d+\", s).group(0)") else { return };
+        assert_eq!(value.kind, Kind::Set);
+        assert_eq!(value.kind_tag, Some(PrimitiveKind::String));
+    }
+
+    /// `re.fullmatch` with a metacharacter-free but non-literal pattern
+    /// (an unbound name) declines — the same honest refusal
+    /// `test_re_search_with_a_metacharacter_pattern_declines` shows for
+    /// `re.search`.
+    #[test]
+    fn test_re_fullmatch_with_a_non_literal_pattern_declines() {
+        let Some(value) = eval("re.fullmatch(pattern, s)") else { return };
+        assert_eq!(value.kind, Kind::Unknown);
+    }
+
+    // --- os / time / unicodedata / base64 families ---
+
+    /// `os.open(path, os.O_RDONLY)` answers the nonnegative Integer
+    /// ground — a fresh file descriptor carries no further identity
+    /// claim (A15.xfer.handle's own row).
+    #[test]
+    fn test_os_open_answers_a_nonnegative_integer_ground() {
+        let Some(value) = eval("os.open(path, 0)") else { return };
+        assert_eq!(value.kind, Kind::Set);
+        assert_eq!(value.kind_tag, Some(PrimitiveKind::Integer));
+    }
+
+    /// `os.close(fd)` always answers `None`.
+    #[test]
+    fn test_os_close_answers_none() {
+        let Some(value) = eval("os.close(fd)") else { return };
+        assert_eq!(value.kind, Kind::Null);
+    }
+
+    /// `time.time()` answers the nonnegative Float ground.
+    #[test]
+    fn test_time_time_answers_a_nonnegative_float_ground() {
+        let Some(value) = eval("time.time()") else { return };
+        assert_eq!(value.kind, Kind::Set);
+        assert_eq!(value.kind_tag, Some(PrimitiveKind::Float));
+    }
+
+    /// `unicodedata.normalize("NFC", s)` answers the whole-strings
+    /// ground — A3.xfer.normalize's own claim.
+    #[test]
+    fn test_unicodedata_normalize_answers_the_whole_strings_ground() {
+        let Some(value) = eval("unicodedata.normalize(\"NFC\", s)") else { return };
+        assert_eq!(value.kind, Kind::Set);
+        assert_eq!(value.kind_tag, Some(PrimitiveKind::String));
+    }
+
+    /// `base64.b64encode("ab".encode()).decode()` — A3.xfer.base64's own
+    /// row end to end: `.encode()` answers an opaque bytes value,
+    /// `base64.b64encode` tags it, `.decode()` reads the base64-alphabet
+    /// string grammar off that tag. An exact-string literal receiver
+    /// (rather than an unbound name) so `.encode()` reaches the exact-
+    /// receiver row (`string_models::string_method_result`) under this
+    /// test's own empty environment, which cannot bind a free name.
+    #[test]
+    fn test_base64_b64encode_then_decode_answers_the_base64_alphabet_grammar() {
+        let Some(value) = eval("base64.b64encode(\"ab\".encode()).decode()") else { return };
+        assert_eq!(value.kind, Kind::Set);
+        assert_eq!(value.kind_tag, Some(PrimitiveKind::String));
+    }
+
     // --- j-stdlib-surfaces.py: json family ---
 
     #[test]
@@ -13162,9 +13434,34 @@ mod tests {
         assert_eq!(result.kind, Kind::Unknown);
     }
 
-    /// A format spec that is not the recognized `0{width}d` spelling
-    /// (here, `.2f`) declines the whole f-string, same as before this
-    /// wave's own format-spec gate ever recognized any spec at all.
+    /// `f"{value:.2f}"` — the fixed-precision decimal grammar
+    /// (`fixed_precision_decimal_spelling`'s own doc,
+    /// `string_models::fixed_precision_decimal_grammar`): a Float-sorted
+    /// `value` with a plain `.2f` spec answers a String-sorted Set, not a
+    /// decline — the digit-run/point/digit-run shape, disjoint from a
+    /// two-uppercase-letter grammar like `Code`'s own `/^[A-Z]{2}$/`
+    /// (A2.xfer.tostring's own row).
+    #[test]
+    fn test_fixed_precision_format_spec_answers_the_decimal_grammar() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let value = AbstractValue {
+            kind_tag: Some(PrimitiveKind::Float),
+            ..known_set(make_refined_set(vec![at_least(0.0)]), None, TrustSpec, SetKindTag::None)
+        };
+        let source = "f\"{value:.2f}\"";
+        let parsed = parse_expression(source).expect("test source must parse");
+        let Expr::FString(fstring) = parsed.into_expr() else { panic!("expected an FString") };
+        let mut environment = empty_environment();
+        environment.bind("value", value);
+        let result = evaluate_fstring(&fstring, &environment, &kernel);
+        assert_eq!(result.kind, Kind::Set);
+        assert_eq!(result.kind_tag, Some(PrimitiveKind::String));
+    }
+
+    /// A format spec that is not the recognized `0{width}d` or `.{p}f`
+    /// spelling (here, a fill/align character, `:^10`) declines the
+    /// whole f-string — neither reader's single-literal-element check
+    /// admits it.
     #[test]
     fn test_unrecognized_format_spec_declines() {
         let Some(kernel) = loaded_kernel() else { return };
@@ -13172,7 +13469,7 @@ mod tests {
             kind_tag: Some(PrimitiveKind::Float),
             ..known_set(make_refined_set(vec![at_least(0.0)]), None, TrustSpec, SetKindTag::None)
         };
-        let source = "f\"{value:.2f}\"";
+        let source = "f\"{value:^10}\"";
         let parsed = parse_expression(source).expect("test source must parse");
         let Expr::FString(fstring) = parsed.into_expr() else { panic!("expected an FString") };
         let mut environment = empty_environment();

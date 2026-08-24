@@ -1049,6 +1049,7 @@ pub fn mutated_receiver(method: &str, receiver: &AbstractValue, arguments: &[Abs
     match receiver.kind {
         Kind::List => list_mutated_receiver(method, receiver, arguments),
         Kind::Object => dict_mutated_receiver(method, receiver, arguments),
+        Kind::Set => set_mutated_receiver(method, receiver, arguments),
         _ => None,
     }
 }
@@ -1176,6 +1177,154 @@ fn list_mutated_receiver(method: &str, receiver: &AbstractValue, arguments: &[Ab
             Some((list_literal_value(&items), null_value()))
         }
         _ => None,
+    }
+}
+
+/// `set.append(x)`/`set.extend(iterable)` on a REPETITION-SHAPED receiver
+/// (`Kind::Set` whose own set is the bare star/window `as_repetition`
+/// reads back — `star_element_read`'s own doc, the shape
+/// `check.rs::seed_parameters` seeds for a `list[X]`/`set[X]`/
+/// `Sequence[X]` parameter with no concrete items). There is no
+/// receiver-side count to index into (unlike `list_mutated_receiver`'s
+/// `Kind::List`, which has exact items to push/remove), so a mutation
+/// widens the window's OWN {lo, hi} bounds instead of pushing an item:
+///
+/// - `append(x)`: the element set joins with `x`'s own set (the same
+///   lattice join `join_repetition_sets` — lattice_operations.rs — takes
+///   when two repetition sets union), and the count grows by exactly
+///   one: `lo + 1`, `hi + 1` when `hi` is finite, or unbounded when it
+///   already was (one more element never turns an unbounded window
+///   bounded).
+/// - `extend(iterable)`: the element set joins with the iterable's own
+///   element set (a `Kind::List` argument's items, each folded in by
+///   `join_known`, or a `Kind::Set` repetition argument's own element),
+///   and the iterable's own COUNT WINDOW adds onto `[lo, hi]`: `lo` sums
+///   (the iterable contributes at least its own minimum), `hi` sums when
+///   both sides are finite, else unbounded.
+///
+/// Every other method name declines (`None`) — this receiver shape has
+/// no concrete slot to `pop`/`insert`/`sort` against, and `add`/
+/// `discard`/`remove`/`clear` have no way to test or drop one member of
+/// a window that states no items, only a shape.
+fn set_mutated_receiver(method: &str, receiver: &AbstractValue, arguments: &[AbstractValue]) -> Option<(AbstractValue, AbstractValue)> {
+    if receiver.set_kind_tag != SetKindTag::None {
+        return None;
+    }
+    let window = as_repetition(&receiver.set)?;
+    let grade = trust_level_of(receiver);
+    match method {
+        "append" => {
+            let [element] = arguments else { return None };
+            let element_set = joined_element_set(window.element.clone(), element, grade)?;
+            let hi = window.hi.map(|h| h + 1);
+            Some((
+                repetition_receiver(receiver, element_set, window.lo + 1, hi, grade),
+                null_value(),
+            ))
+        }
+        "extend" => {
+            let [iterable] = arguments else { return None };
+            let (iterable_element, iterable_lo, iterable_hi) = count_window_of(iterable)?;
+            // An iterable PROVABLY EMPTY (hi == Some(0), so lo == 0 too)
+            // contributes no element claim at all — joining against it
+            // would falsely widen the receiver's own element set with
+            // whatever placeholder an empty argument reads as.
+            let element_set = if iterable_hi == Some(0) {
+                window.element.clone()
+            } else {
+                joined_element_set(window.element.clone(), &iterable_element, grade)?
+            };
+            let lo = window.lo + iterable_lo;
+            let hi = match (window.hi, iterable_hi) {
+                (Some(a), Some(b)) => Some(a + b),
+                _ => None,
+            };
+            Some((
+                repetition_receiver(receiver, element_set, lo, hi, grade),
+                null_value(),
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// The receiver's own element set joined with one new element's set —
+/// the same lattice join `join_repetition_sets` (lattice_operations.rs)
+/// takes when two repetition windows union, applied here to one element
+/// at a time via `known_set`/`join_known`/`set_of_known` rather than
+/// hand-rolled union arithmetic. `None` the moment the join keeps no
+/// tuple-layer set (`set_of_known`'s own refusal — an object/list
+/// element, say), matching every other decline in this file.
+fn joined_element_set(
+    element: refined_sets::refinement_forms::RefinedSet,
+    new_element: &AbstractValue,
+    grade: TrustLevel,
+) -> Option<refined_sets::refinement_forms::RefinedSet> {
+    let element_value = known_set(element, None, grade, SetKindTag::None);
+    let joined = join_known(element_value, new_element.clone());
+    set_of_known(&joined)
+}
+
+/// An iterable argument's own (element set, lo, hi) count window —
+/// `extend`'s own "add the iterable's count window" needs the SAME
+/// shape `len_result` already reads for a receiver, applied here to an
+/// ARGUMENT instead: a `Kind::List` argument's element set is every item
+/// joined together (`join_object_star_with_list`'s own fold,
+/// lattice_operations.rs) with an EXACT count `[len, len]`; a `Kind::Set`
+/// repetition argument reads back its own `{element, lo, hi}` directly
+/// via `as_repetition`. Every other argument shape declines.
+fn count_window_of(iterable: &AbstractValue) -> Option<(AbstractValue, i64, Option<i64>)> {
+    match iterable.kind {
+        Kind::List => {
+            let count = iterable.items.len() as i64;
+            // An EMPTY list contributes no element claim and no count —
+            // the same vacuous-star reading `join_object_star_with_list`
+            // takes for a zero-length array (lattice_operations.rs):
+            // there is no item to fold in, so the receiver's own element
+            // set is untouched rather than joined against a fabricated
+            // placeholder.
+            let Some((first, rest)) = iterable.items.split_first() else {
+                return Some((unknown(), 0, Some(0)));
+            };
+            let mut element = first.clone();
+            for item in rest {
+                element = join_known(element, item.clone());
+            }
+            Some((element, count, Some(count)))
+        }
+        Kind::Set if iterable.set_kind_tag == SetKindTag::None => {
+            let window = as_repetition(&iterable.set)?;
+            let grade = trust_level_of(iterable);
+            let element_value = AbstractValue {
+                kind_tag: iterable.kind_tag,
+                ..known_set(window.element, None, grade, SetKindTag::None)
+            };
+            Some((element_value, window.lo, window.hi))
+        }
+        _ => None,
+    }
+}
+
+/// The mutated receiver `append`/`extend` both build: the same
+/// repetition shape (`refined_sets::repetition_window_forms::
+/// repetition`), the receiver's own `kind_tag` carried across
+/// (`star_element_read`'s own convention — a numeric-tagged window stays
+/// numeric-tagged after a widening mutation), at the joined grade.
+fn repetition_receiver(
+    receiver: &AbstractValue,
+    element_set: refined_sets::refinement_forms::RefinedSet,
+    lo: i64,
+    hi: Option<i64>,
+    grade: TrustLevel,
+) -> AbstractValue {
+    AbstractValue {
+        kind_tag: receiver.kind_tag,
+        ..known_set(
+            refined_sets::repetition_window_forms::repetition(element_set, lo, hi),
+            None,
+            grade,
+            SetKindTag::None,
+        )
     }
 }
 
@@ -2116,6 +2265,88 @@ mod tests {
         let other = list_literal_value(&[integer(1.0), integer(2.0)]);
         let (new_receiver, _) = mutated_receiver("update", &set, &[other]).expect("update must decide");
         assert_eq!(new_receiver.items, vec![integer(1.0), integer(2.0)]);
+    }
+
+    // --- mutated_receiver: set (repetition-shaped Kind::Set receiver,
+    // the `list[int]`/`set[int]`/`Sequence[int]` parameter seed's own
+    // star shape — A10.seed.library / A15.xfer.inject) ---
+
+    /// A bounded integer window `[lo, hi]` — the whole-number element set
+    /// `star_of`'s own fixture uses, repeated through
+    /// `refined_sets::repetition_window_forms::repetition` rather than
+    /// `star`, so the window carries finite bounds a test can assert on.
+    fn bounded_ints(lo: i64, hi: Option<i64>) -> AbstractValue {
+        let whole_ints = refined_sets::refinement_forms::make_refined_set(vec![
+            refined_sets::refinement_forms::integer(),
+            refined_sets::refinement_forms::at_least(f64::NEG_INFINITY),
+        ]);
+        AbstractValue {
+            kind_tag: Some(PrimitiveKind::Integer),
+            ..known_set(
+                refined_sets::repetition_window_forms::repetition(whole_ints, lo, hi),
+                None,
+                TrustProved,
+                SetKindTag::None,
+            )
+        }
+    }
+
+    #[test]
+    fn mutated_receiver_set_append_widens_the_window_by_one() {
+        let set = bounded_ints(0, Some(3));
+        let (new_receiver, result) = mutated_receiver("append", &set, &[integer(9.0)]).expect("append must decide");
+        assert_eq!(new_receiver.kind, Kind::Set);
+        let window = as_repetition(&new_receiver.set).expect("append must keep the repetition shape");
+        assert_eq!(window.lo, 1);
+        assert_eq!(window.hi, Some(4));
+        assert_eq!(result.kind, Kind::Null);
+    }
+
+    #[test]
+    fn mutated_receiver_set_append_on_an_unbounded_window_stays_unbounded() {
+        let set = bounded_ints(0, None);
+        let (new_receiver, _) = mutated_receiver("append", &set, &[integer(9.0)]).expect("append must decide");
+        let window = as_repetition(&new_receiver.set).expect("append must keep the repetition shape");
+        assert_eq!(window.lo, 1);
+        assert_eq!(window.hi, None);
+    }
+
+    #[test]
+    fn mutated_receiver_set_extend_adds_the_iterables_own_count_window() {
+        let set = bounded_ints(0, Some(3));
+        let other = list_literal_value(&[integer(1.0), integer(2.0)]);
+        let (new_receiver, _) = mutated_receiver("extend", &set, &[other]).expect("extend must decide");
+        let window = as_repetition(&new_receiver.set).expect("extend must keep the repetition shape");
+        assert_eq!(window.lo, 2);
+        assert_eq!(window.hi, Some(5));
+    }
+
+    #[test]
+    fn mutated_receiver_set_extend_with_an_unbounded_iterable_stays_unbounded() {
+        let set = bounded_ints(0, Some(3));
+        let other = bounded_ints(0, None);
+        let (new_receiver, _) = mutated_receiver("extend", &set, &[other]).expect("extend must decide");
+        let window = as_repetition(&new_receiver.set).expect("extend must keep the repetition shape");
+        assert_eq!(window.lo, 0);
+        assert_eq!(window.hi, None);
+    }
+
+    #[test]
+    fn mutated_receiver_set_extend_with_an_empty_list_is_a_no_op_on_the_window() {
+        let set = bounded_ints(1, Some(3));
+        let empty = list_literal_value(&[]);
+        let (new_receiver, _) = mutated_receiver("extend", &set, &[empty]).expect("extend must decide");
+        let window = as_repetition(&new_receiver.set).expect("extend must keep the repetition shape");
+        assert_eq!(window.lo, 1);
+        assert_eq!(window.hi, Some(3));
+    }
+
+    #[test]
+    fn mutated_receiver_set_other_methods_decline() {
+        let set = bounded_ints(0, Some(3));
+        assert_eq!(mutated_receiver("pop", &set, &[]), None);
+        assert_eq!(mutated_receiver("clear", &set, &[]), None);
+        assert_eq!(mutated_receiver("add", &set, &[integer(1.0)]), None);
     }
 
     // --- mutated_receiver: dict ---

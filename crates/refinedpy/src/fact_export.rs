@@ -1244,13 +1244,48 @@ fn harness_shape(module: &ModModule) -> Option<HarnessShape> {
 }
 
 /// The stdin-JSON shape: some statement in the block is
-/// `print(json.dumps(<f>(json.load(sys.stdin))))`.
+/// `print(json.dumps(<f>(json.load(sys.stdin))))`, the `json.load(sys.stdin)`
+/// read either written inline as the call's sole argument, or bound one
+/// statement earlier by a plain assignment (`value = json.load(sys.stdin)`)
+/// and then referenced by that same name — `D5.count.helper.py`'s own
+/// anatomy (`level_gain_argv.py`'s already-recognized argv leg has the
+/// identical one-statement indirection; this is the stdin leg's twin,
+/// read through `argv_scalar_harness`'s exact intermediate-assignment
+/// pattern rather than a new one). Any other shape — a second statement of
+/// indirection, an assignment target that is not a bare name, an assigned
+/// value that is not exactly `json.load(sys.stdin)` — answers `None`.
 fn stdin_json_harness(body: &[Stmt]) -> Option<HarnessShape> {
-    for inner in body {
+    for (index, inner) in body.iter().enumerate() {
         let Stmt::Expr(expr_stmt) = inner else {
             continue;
         };
         if let Some(called) = harness_shape_call(expr_stmt.value.as_ref()) {
+            return Some(HarnessShape::StdinJson { called });
+        }
+        let Some((called, argument)) = harness_sole_argument_call(expr_stmt.value.as_ref()) else {
+            continue;
+        };
+        // The one intermediate assignment the brief allows, read exactly
+        // as `argv_scalar_harness` reads it for its own single argument:
+        // the statement directly before this one binds a bare name to
+        // `json.load(sys.stdin)`, and this call's sole argument is that
+        // same name.
+        let Expr::Name(referenced) = argument else {
+            continue;
+        };
+        let Some(Stmt::Assign(assign)) = index.checked_sub(1).and_then(|previous| body.get(previous)) else {
+            continue;
+        };
+        let [target] = assign.targets.as_slice() else {
+            continue;
+        };
+        let Expr::Name(bound) = target else {
+            continue;
+        };
+        if bound.id.as_str() != referenced.id.as_str() {
+            continue;
+        }
+        if is_stdin_json_load(assign.value.as_ref()) {
             return Some(HarnessShape::StdinJson { called });
         }
     }
@@ -2008,6 +2043,23 @@ mod tests {
     fn the_harness_reader_recognizes_the_json_stdio_shape() {
         let module = ruff_python_parser::parse_module(
             "import json\nimport sys\n\n\ndef f(x): return x\n\n\nif __name__ == \"__main__\":\n    print(json.dumps(f(json.load(sys.stdin))))\n",
+        )
+        .expect("test module parses")
+        .into_syntax();
+        let Some(HarnessShape::StdinJson { called }) = harness_shape(&module) else {
+            panic!("expected the stdin-JSON shape");
+        };
+        assert_eq!(called, "f");
+    }
+
+    /// The main-block reader recognizes the stdin-JSON shape spelled with
+    /// one intermediate assignment — `D5.count.helper.py`'s own anatomy:
+    /// `value = json.load(sys.stdin)` bound one statement before a call
+    /// whose sole argument is that bound name.
+    #[test]
+    fn the_harness_reader_recognizes_the_stdin_json_shape_via_intermediate_assignment() {
+        let module = ruff_python_parser::parse_module(
+            "import json\nimport sys\n\n\ndef f(x): return x\n\n\nif __name__ == \"__main__\":\n    value = json.load(sys.stdin)\n    print(json.dumps(f(value)))\n",
         )
         .expect("test module parses")
         .into_syntax();

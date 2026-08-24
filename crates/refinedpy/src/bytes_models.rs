@@ -84,9 +84,10 @@
 //! Fire-message voice matches `assignability.rs`'s `Verdict::Fire`:
 //! plain, states the value, states the rule/range that was crossed.
 
-use refined_domain::abstract_value::{known_values, AbstractValue, Kind, PrimitiveKind};
+use refined_domain::abstract_value::{known_set, known_values, opaque_value, AbstractValue, Kind, PrimitiveKind, SetKindTag};
 use refined_domain::known_constructors::known_list;
-use refined_domain::trust_grades::TrustProved;
+use refined_domain::trust_grades::{trust_level_of, TrustProved};
+use refined_sets::refinement_forms::{make_refined_set, one_of, repeat_of};
 
 /// What judging one bytes-like operation (a read or a write) against
 /// its runtime semantics concluded — the twin of `assignability.rs`'s
@@ -340,6 +341,105 @@ pub fn bytes_write_answer(receiver: &AbstractValue, value: &AbstractValue) -> Op
         Some(MEMORYVIEW_WORD) => memoryview_write_answer(value),
         _ => None,
     }
+}
+
+/// The word `base64.b64encode(...)`'s own result carries on `kind_word`
+/// — a `Kind::Object` (`opaque_value`'s own shape), the SAME "kind of
+/// thing known, contents not" posture `object_call`/`type_as_value`
+/// keep in `builtin_models.rs` for a value this file has no concrete
+/// bytes elements to enumerate. `.decode()` below reads this word to
+/// answer the base64-alphabet STRING grammar exactly, rather than the
+/// unbounded `Σ*` a generic bytes-decode would otherwise fall back to.
+pub const BASE64_ENCODED_WORD: &str = "a base64-encoded bytes value";
+
+/// The word a plain `str.encode()` result carries — a bytes value with
+/// NO further claim than "some bytes," distinct from
+/// `BASE64_ENCODED_WORD`'s own narrower alphabet claim so
+/// `bytes_decode_call` can tell the two apart (an `.encode()` result's
+/// OWN `.decode()` is not modeled — general UTF-8 decoding of arbitrary
+/// unread bytes can raise, `bytes_decode_call`'s own doc — only the
+/// base64-tagged shape answers a value there).
+pub const ENCODED_BYTES_WORD: &str = "an encoded bytes value";
+
+/// `str.encode()` — library/stdtypes.html#str.encode: "Return an
+/// encoded version of the string as a bytes object... `encoding`
+/// defaults to 'utf-8'." No per-byte encoding table is built; the
+/// answer is the opaque "some bytes value" state, `ENCODED_BYTES_WORD`-
+/// tagged. `string_models.rs`'s own `.encode()` rows (exact and
+/// sort-only receiver) both call this rather than build the tag
+/// locally, so the one tag has one definition.
+pub fn encoded_bytes_value() -> AbstractValue {
+    opaque_value(ENCODED_BYTES_WORD)
+}
+
+/// The base64 alphabet, unbounded repetition — `library/base64.rst`,
+/// `base64.b64encode`: "Encode the bytes-like object *s* using Base64
+/// and return the encoded bytes... the alphabet used... consists of the
+/// letters A-Z, a-z, digits 0-9, and the characters + and /... the
+/// encoded byte string is... padded with '=' so that its length is
+/// always a multiple of 4." Every output byte is drawn from
+/// `[A-Za-z0-9+/=]`, with no OTHER byte ever appearing (the pad
+/// character `=` only ever appears at the end, but this row states the
+/// sound over-approximation — any-position membership in the six-way
+/// alphabet — rather than a tighter trailing-pad-only grammar, matching
+/// the corpus's own claim, "result is [A-Za-z0-9+/=]*"). Modeled for
+/// ANY single argument this file/its caller has already resolved to a
+/// bytes-like receiver (a `Kind::List` this file's own literal shape
+/// builds, or an opaque bytes-sorted value from `.encode()`'s own
+/// sort-only row) — the alphabet claim holds regardless of the input
+/// bytes' own content, so the argument's shape is not otherwise
+/// inspected once the caller has confirmed it is bytes-like.
+fn b64encode_call(arguments: &[AbstractValue]) -> Option<AbstractValue> {
+    let [_only] = arguments else { return None };
+    // the claim holds for any bytes-like receiver; content is not
+    // otherwise inspected — the same "no operand-derived grade to
+    // thread" posture `object_call`/`type_as_value` keep in
+    // builtin_models.rs for their own opaque answers
+    Some(opaque_value(BASE64_ENCODED_WORD))
+}
+
+/// The dispatcher for a `base64.<function>(...)` module-qualified call
+/// — the `base64` twin of `builtin_models::stdlib_call_result`, kept
+/// here rather than there since this file already owns every other
+/// bytes-shaped answer this crate builds. `b64decode` is NOT modeled:
+/// the brief's own scope names `b64encode` only, and no corpus fixture
+/// calls `b64decode` (verified against `packages/tests/e2e`).
+pub fn base64_call_result(function: &str, arguments: &[AbstractValue]) -> Option<AbstractValue> {
+    match function {
+        "b64encode" => b64encode_call(arguments),
+        _ => None,
+    }
+}
+
+/// `bytesish.decode()` — library/stdtypes.html#bytes.decode: "Return a
+/// string decoded from the given bytes... `encoding` defaults to
+/// 'utf-8'." The zero-argument, default-encoding form only. Modeled for
+/// ONE receiver shape: a `base64.b64encode(...)`-tagged opaque value
+/// (`BASE64_ENCODED_WORD`, `b64encode_call`'s own doc) answers the
+/// EXACT base64-alphabet string grammar — `[A-Za-z0-9+/=]*` — since
+/// every byte `b64encode` ever produces is ASCII, and decoding an
+/// ASCII byte string is the identity mapping onto that same alphabet
+/// of `str` characters (no encoding error is possible over an
+/// ASCII-only byte string, `Doc/library/codecs.rst`'s own "ascii" is a
+/// strict subset of "utf-8"). Any OTHER bytes-like receiver (a known
+/// `Kind::List` of concrete byte values, or an untagged unknown bytes
+/// value) declines — a general UTF-8 decode of arbitrary bytes can
+/// raise `UnicodeDecodeError` on invalid sequences, which this row does
+/// not attempt to prove absent for the untagged case.
+pub fn bytes_decode_call(receiver: &AbstractValue, arguments: &[AbstractValue]) -> Option<AbstractValue> {
+    if !arguments.is_empty() {
+        return None;
+    }
+    if receiver.kind != Kind::Object || receiver.kind_word != Some(BASE64_ENCODED_WORD) {
+        return None;
+    }
+    let alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
+    let points: Vec<f64> = alphabet.chars().map(|c| c as u32 as f64).collect();
+    let grammar = make_refined_set(vec![repeat_of(make_refined_set(vec![one_of(&points)]), 0, None)]);
+    Some(AbstractValue {
+        kind_tag: Some(PrimitiveKind::String),
+        ..known_set(grammar, None, trust_level_of(receiver), SetKindTag::None)
+    })
 }
 
 #[cfg(test)]
@@ -626,5 +726,49 @@ mod tests {
 
     fn list_literal_value_for_test() -> AbstractValue {
         known_list(vec![integer(1.0), integer(2.0)], TrustProved)
+    }
+
+    #[test]
+    fn base64_call_result_b64encode_tags_the_result() {
+        let got = base64_call_result("b64encode", &[list_literal_value_for_test()]).expect("base64.b64encode(...) models");
+        assert_eq!(got.kind, Kind::Object);
+        assert_eq!(got.kind_word, Some(BASE64_ENCODED_WORD));
+    }
+
+    #[test]
+    fn base64_call_result_unmodeled_function_declines() {
+        let got = base64_call_result("b64decode", &[list_literal_value_for_test()]);
+        assert!(got.is_none(), "b64decode is out of this brief's scope: {got:?}");
+    }
+
+    #[test]
+    fn bytes_decode_on_a_b64encode_tagged_receiver_answers_the_base64_alphabet_grammar() {
+        let receiver = base64_call_result("b64encode", &[list_literal_value_for_test()]).expect("b64encode models");
+        let got = bytes_decode_call(&receiver, &[]).expect(".decode() on a b64encode result models");
+        assert_eq!(got.kind, Kind::Set);
+        assert_eq!(got.kind_tag, Some(PrimitiveKind::String));
+        let alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
+        let points: Vec<f64> = alphabet.chars().map(|c| c as u32 as f64).collect();
+        let want = make_refined_set(vec![repeat_of(make_refined_set(vec![one_of(&points)]), 0, None)]);
+        assert_eq!(got.set, want);
+    }
+
+    #[test]
+    fn bytes_decode_on_an_untagged_receiver_declines() {
+        let receiver = tagged(bytes_literal_value(&[10, 20]), BYTES_WORD);
+        let got = bytes_decode_call(&receiver, &[]);
+        assert!(got.is_none(), "a plain bytes receiver's .decode() is not modeled: {got:?}");
+    }
+
+    #[test]
+    fn bytes_decode_with_an_argument_declines() {
+        let receiver = base64_call_result("b64encode", &[list_literal_value_for_test()]).expect("b64encode models");
+        let got = bytes_decode_call(&receiver, &[string_value("utf-8")]);
+        assert!(got.is_none());
+    }
+
+    fn string_value(text: &str) -> AbstractValue {
+        let code_points: Vec<f64> = text.chars().map(|c| c as u32 as f64).collect();
+        known_values(code_points, PrimitiveKind::String, TrustProved)
     }
 }

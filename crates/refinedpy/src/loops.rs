@@ -73,9 +73,11 @@ use refined_domain::abstract_value::AbstractValue;
 use refined_domain::abstract_value::Kind;
 use refined_domain::abstract_value::PrimitiveKind;
 use refined_domain::abstract_value::SetKindTag;
+use refined_domain::kernel_seam::ask_bounds_public;
 use refined_domain::known_constructors::known_list;
 use refined_domain::lattice_operations::set_of_known;
 use refined_domain::lattice_operations::truthiness;
+use refined_domain::trust_grades::min_trust_level;
 use refined_domain::trust_grades::trust_level_of;
 use refined_domain::trust_grades::TrustProved;
 use refined_domain::trust_grades::TrustSpec;
@@ -95,7 +97,9 @@ use refined_sets::refinement_forms::make_refined_set;
 use refined_sets::refinement_forms::one_of;
 use refined_sets::refinement_forms::Form;
 use refined_sets::refinement_forms::RefinedSet;
+use refined_sets::refinement_forms::Refinement;
 use refined_sets::repetition_window_forms::as_repetition;
+use refined_sets::repetition_window_forms::repetition;
 use ruff_python_ast::CmpOp;
 use ruff_python_ast::Expr;
 use ruff_python_ast::ExprAttribute;
@@ -885,6 +889,177 @@ fn stable_by_containment(narrower: &RefinedSet, wider: &RefinedSet, kernel: &Arc
     matches!(seq_asked, Ok(true))
 }
 
+/// A closed scalar hull `[lo, hi]` read back off a kernel `Bounds`
+/// answer — `Some((lo, hi, is_integer))`, `lo`/`hi` each `None` when
+/// that side is unbounded. Reads exactly the two non-strict bound
+/// forms and the `Integer` mark the kernel's own `encodeEnclosure`
+/// always wires for a `Bounds` answer (`refined-lean/boundary/
+/// encode_sets.lean`) — `AtLeast`/`AtMost`, the same two
+/// `lattice_operations.rs`'s own private `integral_closed_window`
+/// reads. An unbounded edge crosses the wire AS an `AtLeast`/`AtMost`
+/// carrying `f64::NEG_INFINITY`/`f64::INFINITY` (`encodeEnclosure`
+/// wires both edges unconditionally, `encodeNumber .negInf/.posInf` —
+/// there is no "form omitted" wire shape), so an infinite edge here is
+/// read back as `None`, matching what "unbounded" means to this
+/// reader's own caller. `None` (the whole read declines) on a strict
+/// edge (`Above`/`Below` — a hull the kernel proved with a strict
+/// bound survives only through `Enclosure.weaken`'s callers, not
+/// through this one) or any other form: the caller declines to widen
+/// rather than guess at a bound the kernel did not state as a plain
+/// window.
+fn hull_window(hull: &RefinedSet) -> Option<(Option<f64>, Option<f64>, bool)> {
+    let mut lo: Option<f64> = None;
+    let mut hi: Option<f64> = None;
+    let mut is_integer = false;
+    for form in &hull.forms {
+        match form.form {
+            Form::AtLeast if form.a == f64::NEG_INFINITY => {}
+            Form::AtLeast => lo = Some(form.a),
+            Form::AtMost if form.a == f64::INFINITY => {}
+            Form::AtMost => hi = Some(form.a),
+            Form::Integer => is_integer = true,
+            _ => return None,
+        }
+    }
+    Some((lo, hi, is_integer))
+}
+
+/// Builds the widened scalar hull `W` for a Set pair whose containment
+/// check failed because the accumulation genuinely GROWS: `joined`'s
+/// hull (asked from the kernel via `ask_bounds_public` — the actual
+/// enclosure of whatever forms `joined`'s set wears, not merely its own
+/// syntactic spelling) is the pre-loop-join bound, `second`'s hull is
+/// one further body step past it. For each edge, the side that grew
+/// (second's hi above joined's hi; second's lo below joined's lo) is
+/// DROPPED entirely (no `at_most`/`at_least` on that edge — the true
+/// accumulated value could be reached after any number of further
+/// iterations, so no finite bound on the growing side is sound), and
+/// the side that stayed put keeps `joined`'s own bound. `integer()`
+/// survives only when BOTH hulls are integral — the same all-sides-
+/// agree rule `lattice_operations.rs`'s own run/hull collapses already
+/// use before keeping the integer mark. `None` when either side's
+/// `Bounds` ask refuses or reads empty, either hull is unreadable
+/// (`hull_window` refused), or the widened window would admit no
+/// members (`lo > hi` after widening, which cannot happen from a
+/// genuine growth but guards a malformed pair rather than building an
+/// impossible set).
+fn widened_scalar_hull(joined_set: &RefinedSet, second_set: &RefinedSet) -> Option<RefinedSet> {
+    let joined_bounds = ask_bounds_public(joined_set)?;
+    let second_bounds = ask_bounds_public(second_set)?;
+    if joined_bounds.empty || second_bounds.empty {
+        return None;
+    }
+    let (joined_lo, joined_hi, joined_integer) = hull_window(&joined_bounds.hull)?;
+    let (second_lo, second_hi, second_integer) = hull_window(&second_bounds.hull)?;
+    // the lower edge GREW when the second pass's own edge reads lower
+    // than the joined edge — including the second pass going unbounded
+    // outright (`second_lo` is `None`, `hull_window`'s own reading of
+    // an infinite edge) while `joined_lo` was still finite; either
+    // shape drops the edge from `W` entirely. `joined_lo` already
+    // `None` stays `None` (nothing to widen further).
+    let lo = match (joined_lo, second_lo) {
+        (Some(_), None) => None,
+        (Some(j), Some(s)) if s < j => None,
+        (j, _) => j,
+    };
+    let hi = match (joined_hi, second_hi) {
+        (Some(_), None) => None,
+        (Some(j), Some(s)) if s > j => None,
+        (j, _) => j,
+    };
+    if let (Some(lo), Some(hi)) = (lo, hi) {
+        if lo > hi {
+            return None;
+        }
+    }
+    let mut forms: Vec<Refinement> = Vec::new();
+    if let Some(lo) = lo {
+        forms.push(at_least(lo));
+    }
+    if let Some(hi) = hi {
+        forms.push(at_most(hi));
+    }
+    if joined_integer && second_integer {
+        forms.push(integer());
+    }
+    Some(make_refined_set(forms))
+}
+
+/// The widened candidate `W` for one name whose rejoin/containment
+/// stability check both failed — `stabilized_join`'s own last resort
+/// before havocing. Two shapes are tried: a plain scalar accumulator
+/// (both sides' sets read a `Bounds` hull, widened edge-by-edge by
+/// `widened_scalar_hull`) and a repetition-shaped accumulator (both
+/// sides read back as `as_repetition` — a bounded list/sequence build —
+/// widened the same way over the COUNT window, element = `joined`'s own
+/// element, per this function's own doc below). Neither shape read
+/// declines to the other; `None` when neither reads.
+///
+/// `W` is a CANDIDATE, not yet trusted: it is verified by rebinding
+/// `name` to `W` in a fresh fork of `joined` (the pair's shared,
+/// weaker-of-the-two grade, `SetKindTag::None` — the branch's own
+/// precondition on both sides) and running the body ONE further time
+/// from there. `W` is sound exactly when that run's own value for
+/// `name` is contained in `W` (`stable_by_containment`): `W` already
+/// contains the join (built by weakening `joined`'s own bound only on
+/// the growing edge) and, once ONE more body step from `W` also stays
+/// inside `W`, every later step does too by induction — a post-
+/// fixpoint, which is the loop's true invariant. `None` when the
+/// candidate cannot even be built, the verification run itself does
+/// not complete (a statement shape `run_body_once` cannot walk), or the
+/// verification containment check fails — `stabilized_join`'s caller
+/// falls back to havocing in every one of those cases, exactly as it
+/// did before this widening existed.
+#[allow(clippy::too_many_arguments)]
+fn widened_set_candidate(
+    joined_value: &AbstractValue,
+    second_value: &AbstractValue,
+    name: &str,
+    joined: &Environment,
+    body: &[Stmt],
+    target: &Expr,
+    element: &AbstractValue,
+    kernel: &Arc<RefinedTSKernel>,
+    judge_context: &mut JudgeContext,
+) -> Option<AbstractValue> {
+    let candidate_set = if let (Some(joined_repeated), Some(second_repeated)) =
+        (as_repetition(&joined_value.set), as_repetition(&second_value.set))
+    {
+        // a bounded-list accumulator: widen the COUNT window the same
+        // way a scalar hull widens, element = `joined`'s own element —
+        // the accumulation's element claim is already stable (only the
+        // COUNT grows across passes; a growing ELEMENT claim would
+        // already have failed `stable_by_containment` on the element's
+        // own scalar set, which this branch does not attempt to widen).
+        let lo = if second_repeated.lo < joined_repeated.lo { 0 } else { joined_repeated.lo };
+        let hi = match (joined_repeated.hi, second_repeated.hi) {
+            (Some(joined_hi), Some(second_hi)) if second_hi > joined_hi => None,
+            (joined_hi, _) => joined_hi,
+        };
+        Some(repetition(joined_repeated.element, lo, hi))
+    } else {
+        widened_scalar_hull(&joined_value.set, &second_value.set)
+    }?;
+
+    let grade = min_trust_level(trust_level_of(joined_value), trust_level_of(second_value));
+    let candidate_value = known_set(candidate_set.clone(), None, grade, SetKindTag::None);
+
+    let mut verification = joined.fork();
+    verification.bind(name, candidate_value.clone());
+    if !bind_for_target(target, element, &mut verification) {
+        return None;
+    }
+    run_body_once(body, &mut verification, kernel, judge_context)?;
+    let verified_value = verification.read(name)?;
+    if verified_value.kind != Kind::Set || verified_value.set_kind_tag != SetKindTag::None {
+        return None;
+    }
+    if !stable_by_containment(&verified_value.set, &candidate_set, kernel) {
+        return None;
+    }
+    Some(candidate_value)
+}
+
 /// The stability check every one-pass-plus-join abstract loop pass
 /// shares: a body that only REBINDS its written names (`last = s`) sees
 /// the same value on a second pass as the first, so joining the pre-loop
@@ -1004,13 +1179,35 @@ fn stabilized_join(
         // the structural rejoin has no fixpoint for a Set pair — ask the
         // kernel whether the second pass's set is genuinely covered by
         // `J`'s set before havocing what may be a real determination.
-        if !stable
-            && joined_value.kind == Kind::Set
+        let is_set_pair = joined_value.kind == Kind::Set
             && second_value.kind == Kind::Set
             && joined_value.set_kind_tag == SetKindTag::None
-            && second_value.set_kind_tag == SetKindTag::None
-        {
+            && second_value.set_kind_tag == SetKindTag::None;
+        if !stable && is_set_pair {
             stable = stable_by_containment(&second_value.set, &joined_value.set, kernel);
+        }
+        if !stable && is_set_pair {
+            // containment refused too — the accumulation GREW rather than
+            // merely rejoining. Before havocing, try the widened hull: a
+            // post-fixpoint candidate that keeps the stable side's bound
+            // and drops the growing side, verified by running the body a
+            // THIRD time from the joined environment with the name
+            // rebound to the candidate — see `widened_set_candidate`'s
+            // own doc for why this is sound.
+            if let Some(widened_value) = widened_set_candidate(
+                joined_value,
+                second_value,
+                &name,
+                &joined,
+                body,
+                target,
+                element,
+                kernel,
+                judge_context,
+            ) {
+                result.bind(&name, widened_value);
+                continue;
+            }
         }
         if !stable {
             result.bind(&name, unknown());
@@ -1423,7 +1620,8 @@ fn iterable_values(
         Expr::Tuple(tuple) => elements_as_values(&tuple.elts, environment, kernel),
         Expr::Call(call) => range_call_values(call)
             .or_else(|| dict_view_call_values(call, environment, kernel))
-            .or_else(|| generator_call_values(call, environment, kernel)),
+            .or_else(|| generator_call_values(call, environment, kernel))
+            .or_else(|| finditer_call_values(call, environment, kernel)),
         Expr::Dict(_) => {
             let receiver = evaluate_expression(iterable, environment, kernel);
             dict_keys_as_strings(&receiver)
@@ -1514,6 +1712,76 @@ fn dict_view_call_values(
         ),
         _ => None,
     }
+}
+
+/// `re.finditer(pattern, s)` — library/re.html, `finditer(pattern,
+/// string)`: "Return an iterator yielding match objects." Modeled ONLY
+/// for a known EXACT-STRING pattern argument (`string_models::
+/// match_object_value`'s own gate, the same one `expressions.rs`'s own
+/// value-position reading of this identical call already applies), and
+/// ONLY as ONE representative match element — `generator_call_values`'s
+/// own precedent above: a `for` loop's own body sees at most one bound
+/// value per pass regardless of how many times the pattern actually
+/// matches, so one representative element (the same unanchored match-
+/// object value `expressions.rs`'s own `re.finditer(...).group(0)`
+/// reading already answers for a non-loop use of this identical call) is
+/// what `for m in re.finditer(pattern, s): ... m.group(0)` needs — the
+/// loop body's own `m.group(0)` read then goes through the ALREADY-
+/// LANDED `.group` dispatch on that value, unchanged by this function.
+/// The receiver is recognized the same way `expressions.rs::
+/// evaluate_attribute_call` recognizes every OTHER modeled module call:
+/// the chain's root is the bare Name `re`, unshadowed by a local binding
+/// (`environment.read("re").is_none()`). `None` for every other shape —
+/// a non-`re` receiver, a shadowed `re`, an argument count other than
+/// two, or a pattern that is not a known exact string — falling through
+/// to `iterable_values`'s own existing decline for this call.
+fn finditer_call_values(
+    call: &ExprCall,
+    environment: &Environment,
+    kernel: &Arc<RefinedTSKernel>,
+) -> Option<Vec<AbstractValue>> {
+    let Expr::Attribute(attribute) = call.func.as_ref() else {
+        return None;
+    };
+    if attribute.attr.as_str() != "finditer" {
+        return None;
+    }
+    let Expr::Name(module_name) = attribute.value.as_ref() else {
+        return None;
+    };
+    if module_name.id.as_str() != "re" || environment.read("re").is_some() {
+        return None;
+    }
+    if !call.arguments.keywords.is_empty() {
+        return None;
+    }
+    let [pattern, _subject] = &*call.arguments.args else {
+        return None;
+    };
+    let pattern_value = evaluate_expression(pattern, environment, kernel);
+    let pattern_text = code_points_to_string(exact_string_values(&pattern_value)?)?;
+    let match_value = crate::string_models::match_object_value(&pattern_text, false)?;
+    Some(vec![match_value])
+}
+
+/// The code-point vector an AbstractValue carries, if it is a known
+/// exact string (`Kind::Values` tagged `PrimitiveKind::String`) —
+/// `expressions.rs::exact_string_values`'s own twin, reimplemented
+/// locally rather than imported (this file's own "no importing
+/// loops.rs" precedent, `generator_yields`'s own doc, applied to
+/// expressions.rs's private helper the same way).
+fn exact_string_values(value: &AbstractValue) -> Option<&[f64]> {
+    if value.kind != Kind::Values || value.kind_tag != Some(PrimitiveKind::String) {
+        return None;
+    }
+    Some(&value.values)
+}
+
+/// The `Vec<f64>` code points `string_models.rs` builds, converted back
+/// to a Rust `String` — `expressions.rs::code_points_to_string`'s own
+/// twin, reimplemented locally for the identical reason.
+fn code_points_to_string(code_points: &[f64]) -> Option<String> {
+    code_points.iter().map(|point| char::from_u32(*point as i64 as u32)).collect()
 }
 
 /// The dict name a `for` loop iterates DIRECTLY over its own entries —
@@ -2575,7 +2843,12 @@ mod tests {
             eprintln!("native kernel dylib absent — build it first");
             return None;
         }
-        Some(load_kernel(&path).expect("load_kernel"))
+        let kernel = load_kernel(&path).expect("load_kernel");
+        // The binary installs the domain crate's kernel seams at startup;
+        // tests exercising join/stabilization behavior need the same seams
+        // seated, or every seam ask answers None and the join falls back.
+        crate::kernel_ask::install_kernel_seams(&kernel);
+        Some(kernel)
     }
 
     /// Parses `source` as a module body and returns its single
@@ -2725,6 +2998,183 @@ mod tests {
         );
     }
 
+    /// `stabilized_join`'s widening, pinned at its own layer: a scalar
+    /// accumulator whose containment check fails because the second
+    /// pass's hull GREW past the first join's own hull — `total += x`
+    /// over `x` bound to `[0, 200] ∩ ℤ`, starting `environment` AND
+    /// `one_pass` at the SAME `total = [0, 200] ∩ ℤ` (so `joined` is
+    /// exactly that set, via `same_known`'s fast path — no dependence
+    /// on how `Environment::join`'s own Values/Set collapse would
+    /// otherwise read a `{0}`/`[0,200]` pair). Running `total += x`
+    /// once more from `[0, 200] ∩ ℤ` grows the hull to `[0, 400] ∩ ℤ`,
+    /// which `stable_by_containment` correctly refuses (400 is not
+    /// covered by `[0, 200]`) — this is the shape `stabilized_join`'s
+    /// widening exists for: the upper edge GREW, so `W` drops it
+    /// entirely and keeps the stable lower edge and the integer mark,
+    /// verified sound by one further body step staying inside `W`.
+    #[test]
+    fn stabilized_join_widens_a_growing_scalar_accumulator_to_the_ray() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let for_stmt = parsed_loop("for x in xs:\n    total += x\n");
+        let Stmt::For(for_stmt) = for_stmt else {
+            panic!("fixture is a for statement");
+        };
+        let bounded_total = AbstractValue {
+            kind_tag: Some(PrimitiveKind::Integer),
+            ..known_set(make_refined_set(vec![integer_form(), at_least(0.0), at_most(200.0)]), None, TrustProved, SetKindTag::None)
+        };
+        let locally_bound: HashSet<String> = HashSet::from(["total".to_owned(), "x".to_owned()]);
+        let mut environment = Environment::new(locally_bound.clone());
+        environment.bind("total", bounded_total.clone());
+        let mut one_pass = Environment::new(locally_bound);
+        one_pass.bind("total", bounded_total);
+        let declared = no_declared();
+        let mut judge_context = JudgeContext {
+            declared: &declared,
+            newly_declared: HashMap::new(),
+            already_fired: std::collections::HashSet::new(),
+            fires: Vec::new(),
+        };
+        let element = AbstractValue {
+            kind_tag: Some(PrimitiveKind::Integer),
+            ..known_set(make_refined_set(vec![integer_form(), at_least(0.0), at_most(200.0)]), None, TrustProved, SetKindTag::None)
+        };
+        let (result, widened) = stabilized_join(
+            &environment,
+            &one_pass,
+            &for_stmt.body,
+            for_stmt.target.as_ref(),
+            &element,
+            &kernel,
+            &mut judge_context,
+        )
+        .expect("the widened candidate's own verification pass completes");
+        assert_eq!(widened, Vec::<String>::new(), "the widened hull is trusted — the name is never havoced");
+        let total = result.read("total").expect("total stays bound");
+        assert_eq!(total.kind, Kind::Set, "the accumulator stays a determined Set, never unknown()");
+        let hull = ask_bounds_public(&total.set).expect("the widened hull is a plain scalar window");
+        assert!(!hull.empty);
+        let (lo, hi, is_integer) = hull_window(&hull.hull).expect("the widened set is a plain AtLeast/AtMost/Integer window");
+        assert_eq!(lo, Some(0.0), "the stable lower edge survives widening");
+        assert_eq!(hi, None, "the growing upper edge is dropped, not merely raised");
+        assert!(is_integer, "both hulls were integral, so the widened window stays integral");
+    }
+
+    /// `stabilized_join`'s widening over the OTHER shape it reads: a
+    /// repetition-shaped (bounded-list) accumulator whose COUNT window
+    /// grew rather than a scalar hull — `out.append(...)` inside an
+    /// `if`/`else`, mirroring `if_else_over_a_set_bound_loop_element_
+    /// joins_both_narrowed_arms`'s own fixture but calling
+    /// `stabilized_join` directly so the widened window's own shape can
+    /// be asserted precisely, not just "stays Kind::Set". `environment`
+    /// and `one_pass` both start `out` at the SAME repetition window
+    /// (`[0, 1]` copies of the element, `same_known`'s fast path again
+    /// keeping `joined` exactly that shape); one further `append` grows
+    /// the count to `[1, 2]`, which is not contained in `[0, 1]` — the
+    /// widening drops the grown upper edge, keeping `lo = 0` and
+    /// `hi = None` (an unbounded count, the star shape).
+    #[test]
+    fn stabilized_join_widens_a_growing_list_accumulator_count() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let for_stmt = parsed_loop("for x in xs:\n    if 0 <= x <= 149:\n        out.append(x + 1)\n    else:\n        out.append(0)\n");
+        let Stmt::For(for_stmt) = for_stmt else {
+            panic!("fixture is a for statement");
+        };
+        let element_set = make_refined_set(vec![integer_form(), at_least(0.0), at_most(200.0)]);
+        let out_window = AbstractValue {
+            kind_tag: Some(PrimitiveKind::Integer),
+            ..known_set(repetition(element_set.clone(), 0, Some(1)), None, TrustProved, SetKindTag::None)
+        };
+        let locally_bound: HashSet<String> = HashSet::from(["out".to_owned(), "x".to_owned()]);
+        let mut environment = Environment::new(locally_bound.clone());
+        environment.bind("out", out_window.clone());
+        let mut one_pass = Environment::new(locally_bound);
+        one_pass.bind("out", out_window);
+        let declared = no_declared();
+        let mut judge_context = JudgeContext {
+            declared: &declared,
+            newly_declared: HashMap::new(),
+            already_fired: std::collections::HashSet::new(),
+            fires: Vec::new(),
+        };
+        let element = AbstractValue {
+            kind_tag: Some(PrimitiveKind::Integer),
+            ..known_set(element_set, None, TrustProved, SetKindTag::None)
+        };
+        let (result, widened) = stabilized_join(
+            &environment,
+            &one_pass,
+            &for_stmt.body,
+            for_stmt.target.as_ref(),
+            &element,
+            &kernel,
+            &mut judge_context,
+        )
+        .expect("the widened candidate's own verification pass completes");
+        assert_eq!(widened, Vec::<String>::new(), "the widened count window is trusted — the name is never havoced");
+        let out = result.read("out").expect("out stays bound");
+        assert_eq!(out.kind, Kind::Set, "the accumulator stays a determined Set, never unknown()");
+        let window = as_repetition(&out.set).expect("the widened value stays a repetition window");
+        assert_eq!(window.lo, 0, "the stable lower edge of the count survives widening");
+        assert_eq!(window.hi, None, "the growing upper edge of the count is dropped — an unbounded count");
+    }
+
+    /// `stabilized_join`'s widening does NOT paper over a genuinely
+    /// unstable name: a body that unconditionally REBINDS `total` to a
+    /// fixed literal every pass (`total = 1000`, never reading `total`
+    /// or `x` at all) starts `environment`/`one_pass` at the SAME
+    /// `Kind::Set` window (so `joined` is that Set exactly, via
+    /// `same_known`'s fast path, same construction as the two widening
+    /// pins above), but the second pass's own literal assign rebinds
+    /// `total` to `Kind::Values [1000.0]` — a DIFFERENT Kind entirely,
+    /// oscillating between disjoint value kinds the way the module's
+    /// own doc names as the genuinely unstable shape. This pair never
+    /// reaches `widened_set_candidate` at all (`is_set_pair` requires
+    /// BOTH sides `Kind::Set`, which the second value no longer is) —
+    /// the plain rejoin/containment path this widening sits beside
+    /// still havocs it, exactly as before this widening existed.
+    #[test]
+    fn stabilized_join_still_havocs_a_genuinely_unstable_set_pair() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let for_stmt = parsed_loop("for x in xs:\n    total = 1000\n");
+        let Stmt::For(for_stmt) = for_stmt else {
+            panic!("fixture is a for statement");
+        };
+        let bounded_total = AbstractValue {
+            kind_tag: Some(PrimitiveKind::Integer),
+            ..known_set(make_refined_set(vec![integer_form(), at_least(0.0), at_most(10.0)]), None, TrustProved, SetKindTag::None)
+        };
+        let locally_bound: HashSet<String> = HashSet::from(["total".to_owned(), "x".to_owned()]);
+        let mut environment = Environment::new(locally_bound.clone());
+        environment.bind("total", bounded_total.clone());
+        let mut one_pass = Environment::new(locally_bound);
+        one_pass.bind("total", bounded_total);
+        let declared = no_declared();
+        let mut judge_context = JudgeContext {
+            declared: &declared,
+            newly_declared: HashMap::new(),
+            already_fired: std::collections::HashSet::new(),
+            fires: Vec::new(),
+        };
+        let element = known_number_sorted(0.0, PrimitiveKind::Integer);
+        let (result, widened) = stabilized_join(
+            &environment,
+            &one_pass,
+            &for_stmt.body,
+            for_stmt.target.as_ref(),
+            &element,
+            &kernel,
+            &mut judge_context,
+        )
+        .expect("both judged passes complete");
+        assert_eq!(widened, vec!["total".to_owned()], "a genuinely unstable pair is still named, never silently widened");
+        assert_eq!(
+            result.read("total").map(|v| v.kind),
+            Some(Kind::Unknown),
+            "the unstable name holds no claim past the loop, exactly as before this widening existed"
+        );
+    }
+
     // --- STEPWISE DIAGNOSTIC CHAIN for showcase.py's own `total = total +
     // amount` shape (invoice_total/refund_everything) — the two pins at
     // check.rs's own test module (`a_plain_rebind_accumulation_over_a_
@@ -2839,6 +3289,26 @@ mod tests {
             "the folded ray form still declines — the remaining defect is not the union's redundant \
             forms: {result:?}"
         );
+    }
+
+    /// A3.xfer.matchall.py's own `finditer_outside`: `for m in
+    /// re.finditer(r"\d+", s): return m.group(0)`. Pins `finditer_call_
+    /// values`: the loop binds `m` to ONE representative match-object
+    /// value (`string_models::match_object_value(r"\d+", false)`), and
+    /// the loop body's own `m.group(0)` read — through the ALREADY-
+    /// LANDED `.group` dispatch, unmodified by this unit — resolves to
+    /// the unanchored `\d+` grammar rather than declining the whole loop
+    /// (RTS7002, before this recognizer existed).
+    #[test]
+    fn for_over_re_finditer_binds_the_target_to_a_representative_match_value() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let stmt = parsed_loop("for m in re.finditer(r\"\\d+\", s):\n    matched = m.group(0)\n");
+        let mut environment = Environment::new(HashSet::from(["m".to_owned(), "matched".to_owned()]));
+        environment.bind("s", known_string("abc123"));
+        let result = run(&stmt, &environment, &kernel).expect("a literal-pattern finditer loop is concrete");
+        let matched = result.read("matched").expect("matched is bound after the loop runs");
+        assert_eq!(matched.kind, Kind::Set, "m.group(0) reads the \\d+ grammar as a String-sorted set: {matched:?}");
+        assert_eq!(matched.kind_tag, Some(PrimitiveKind::String));
     }
 
     #[test]
@@ -2959,9 +3429,14 @@ mod tests {
         environment.bind("xs", wide_list_parameter());
         environment.bind("out", collection_models::list_literal_value(&[]));
         let result = run(&stmt, &environment, &kernel).expect("the if/else over a Set-bound element now runs");
-        // `out` stays a known List value (never widened to unknown) —
-        // the join produced a real answer, not a decline-shaped stand-in.
-        assert_eq!(result.read("out").unwrap().kind, Kind::List);
+        // `out` never widens to unknown(): `stabilized_join`'s outer join
+        // compares the pre-loop `out` (0 items) against the one-pass `out`
+        // (1 item, already the if/else arms' own join) — a DIFFERENT-LENGTH
+        // List/List pair, which `join_lists_of_different_length`
+        // (lattice_operations.rs) answers as a repetition window over the
+        // joined element, `Kind::Set` — the join produced a real, weaker-
+        // true answer, not a decline-shaped stand-in.
+        assert_eq!(result.read("out").unwrap().kind, Kind::Set);
     }
 
     /// UNIT: `run_if_once`'s own EXISTING contract is unchanged for a

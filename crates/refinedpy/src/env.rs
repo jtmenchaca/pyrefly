@@ -10,6 +10,23 @@
 //! refinement inside a body only where that body never rebinds the
 //! alias's name — Python scoping makes a name local for the whole body
 //! if any statement in the body binds it.
+//!
+//! ACCESS-PATH BINDINGS: alongside the name-keyed `bindings` map, this
+//! environment separately tracks a fact about a PATH — a base binding
+//! plus a chain of attribute segments (`a.n`, `d.tzinfo`) — the same
+//! PLACE identity the Go adapter's `dataflowfacts.TrackedPlace` already
+//! spells (`refined-ts-go/internal/refinedts/dataflowfacts/access_paths.go`),
+//! mirrored here as `TrackedPlace` per the one-path-vocabulary rule: a
+//! comparison whose tested side is an attribute chain, not a bare name
+//! (`0 <= a.n <= 150`), has nowhere to record what it proves without
+//! this — `bindings` is keyed on a single name, and `a.n` names no
+//! binding at all. `bind_path`/`read_path` record and read a fact
+//! keyed on the whole chain; `forget_path_base` drops every path
+//! binding whose OWN base name, or any PREFIX of its path, was written
+//! — the one forget resolver every write channel routes through, so no
+//! write ever leaves a stale path fact behind (`Environment::forget`'s
+//! own doc states the identical rule for a bare name; this is its
+//! path-shaped twin).
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -232,8 +249,70 @@ impl RetainedCallable {
     }
 }
 
+/// A tracked place: a base binding name plus a chain of attribute
+/// segments — `a` alone, or `a.n`, or `a.n.x` for a deeper chain. Mirrors
+/// the Go adapter's `dataflowfacts.TrackedPlace` (`Binding` + `Path
+/// []string`) one-for-one, scoped down to the attribute-segment half
+/// this file needs today: Python's own subscript syntax (`d["k"]`) is a
+/// DIFFERENT construct (dict-presence narrowing, not an access-path
+/// fact), so this carries no index-segment spelling the Go type's own
+/// bracket convention gives its element slots.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct TrackedPlace {
+    pub binding: String,
+    pub path: Vec<String>,
+}
+
+impl TrackedPlace {
+    /// A bare binding, no path segments — `TrackedPlace::bare("a").path`
+    /// is empty, matching the Go type's own `Path: nil` for a plain name.
+    pub fn bare(binding: &str) -> TrackedPlace {
+        TrackedPlace { binding: binding.to_owned(), path: Vec::new() }
+    }
+
+    /// `self` extended by one more attribute segment — `a.extend("n")`
+    /// names `a.n`; `a.extend("n").extend("x")` names `a.n.x`.
+    pub fn extend(&self, segment: &str) -> TrackedPlace {
+        let mut path = self.path.clone();
+        path.push(segment.to_owned());
+        TrackedPlace { binding: self.binding.clone(), path }
+    }
+
+    /// Whether `self` is `prefix` itself, or a path that CONTINUES
+    /// `prefix` with one or more further segments — the containment test
+    /// `forget_path_base` uses: a write to `a.n` must also drop `a.n.x`
+    /// (continues) and `a.n` itself (equal), but never an unrelated
+    /// sibling path like `a.m`.
+    pub fn extends(&self, prefix: &TrackedPlace) -> bool {
+        self.binding == prefix.binding && self.path.len() >= prefix.path.len() && self.path[..prefix.path.len()] == prefix.path[..]
+    }
+}
+
+/// `a.n.x` reads as `TrackedPlace { binding: "a", path: ["n", "x"] }` —
+/// a bare `Expr::Name` alone, or a chain of `Expr::Attribute` reads over
+/// one, all the way down to that base name. Any other root (a call, a
+/// subscript, a literal) names no place at all: the checker cannot say
+/// the chain survives past a shape this reader does not recognize.
+pub fn tracked_place_of(expression: &ruff_python_ast::Expr) -> Option<TrackedPlace> {
+    match expression {
+        ruff_python_ast::Expr::Name(name) => Some(TrackedPlace::bare(name.id.as_str())),
+        ruff_python_ast::Expr::Attribute(attribute) => {
+            let base = tracked_place_of(attribute.value.as_ref())?;
+            Some(base.extend(attribute.attr.as_str()))
+        }
+        _ => None,
+    }
+}
+
 pub struct Environment {
     bindings: HashMap<String, AbstractValue>,
+    /// Facts recorded about an ACCESS PATH (`TrackedPlace`'s own doc) —
+    /// a comparison's own narrowing of `a.n`, kept separate from
+    /// `bindings` (which is keyed on a single name) since a path names
+    /// no single environment slot. `forget_path_base` is the one place
+    /// that removes an entry; every write channel routes through it, the
+    /// same discipline `forget` already keeps for a bare name.
+    path_bindings: HashMap<TrackedPlace, AbstractValue>,
     locally_bound: HashSet<String>,
     /// The module's own top-level `def`s, if this environment's walk
     /// has one to offer. Riding the table on the environment (rather
@@ -442,6 +521,7 @@ impl Environment {
     pub fn new(locally_bound: HashSet<String>) -> Environment {
         Environment {
             bindings: HashMap::new(),
+            path_bindings: HashMap::new(),
             locally_bound,
             functions: None,
             classes: None,
@@ -768,9 +848,37 @@ impl Environment {
     }
 
     /// Drop what was known about a name (an unmodeled write may have
-    /// changed it).
+    /// changed it). Also drops every access-path fact rooted at this
+    /// name (`forget_path_base`'s own doc) — a write to `a` invalidates
+    /// whatever this environment knew about `a.n` exactly as it
+    /// invalidates `a` itself.
     pub fn forget(&mut self, name: &str) {
         self.bindings.remove(name);
+        self.forget_path_base(&TrackedPlace::bare(name));
+    }
+
+    /// Record what an ACCESS PATH holds after a condition the walk
+    /// narrowed it by (`narrowing.rs`'s own SET/VALUES channels, once a
+    /// comparison's tested side is a path rather than a bare name).
+    pub fn bind_path(&mut self, place: &TrackedPlace, value: AbstractValue) {
+        self.path_bindings.insert(place.clone(), value);
+    }
+
+    /// What the access path holds here, if the walk bound it.
+    pub fn read_path(&self, place: &TrackedPlace) -> Option<&AbstractValue> {
+        self.path_bindings.get(place)
+    }
+
+    /// Drop every access-path fact this environment holds about `prefix`
+    /// itself, or about any path CONTINUING `prefix` (`TrackedPlace::
+    /// extends`'s own doc) — the one forget resolver: a write to `a`
+    /// (`prefix` is the bare place `a`) drops `a.n` and `a.n.x` alike; a
+    /// write to `a.n` (`prefix` is `a.n`) drops `a.n.x` too but leaves an
+    /// unrelated sibling path (`a.m`) standing. Every write channel that
+    /// can invalidate a path fact routes through this one function,
+    /// rather than each reimplementing the prefix test.
+    pub fn forget_path_base(&mut self, prefix: &TrackedPlace) {
+        self.path_bindings.retain(|place, _| !place.extends(prefix));
     }
 
     /// ALIASING: rebind every name currently holding a class instance
@@ -809,6 +917,7 @@ impl Environment {
     pub fn fork(&self) -> Environment {
         Environment {
             bindings: self.bindings.clone(),
+            path_bindings: self.path_bindings.clone(),
             locally_bound: self.locally_bound.clone(),
             functions: self.functions.clone(),
             classes: self.classes.clone(),
@@ -876,8 +985,21 @@ impl Environment {
                 );
             }
         }
+        // access-path facts join the same way: only a path BOTH arms
+        // still hold a fact about survives, through the identical
+        // lattice join `bindings` itself takes.
+        let mut path_bindings = HashMap::new();
+        for (place, value_a) in a.path_bindings {
+            if let Some(value_b) = b.path_bindings.get(&place) {
+                path_bindings.insert(
+                    place,
+                    refined_domain::lattice_operations::join_known(value_a, value_b.clone()),
+                );
+            }
+        }
         Environment {
             bindings,
+            path_bindings,
             locally_bound,
             functions,
             classes,
@@ -1043,5 +1165,136 @@ mod tests {
         assert_eq!(same_module_def_alias_name(&retained), None);
         let aliased = same_module_def_alias_value("identity");
         assert_eq!(retained_callable_key(&aliased), None);
+    }
+
+    // ── access-path bindings ────────────────────────────────────────
+
+    fn dummy_value() -> AbstractValue {
+        refined_domain::abstract_value::known_values(
+            vec![40.0],
+            refined_domain::abstract_value::PrimitiveKind::Integer,
+            refined_domain::trust_grades::TrustProved,
+        )
+    }
+
+    /// `a.n.x` reads through `tracked_place_of` the same way
+    /// `A15.guard.eq`/`A15.guard.ne`'s own `a.n` construct does, one
+    /// segment shallower — the recursive `Expr::Attribute` reading walks
+    /// down to the base `Expr::Name` and builds the path back up in
+    /// order.
+    #[test]
+    fn test_tracked_place_of_reads_a_multi_segment_attribute_chain() {
+        let parsed = ruff_python_parser::parse_expression("a.n.x").expect("test source must parse");
+        let place = tracked_place_of(&parsed.into_expr()).expect("a.n.x is a readable attribute chain");
+        assert_eq!(place.binding, "a");
+        assert_eq!(place.path, vec!["n".to_owned(), "x".to_owned()]);
+    }
+
+    /// A bare name reads as a `TrackedPlace` with an empty path — the
+    /// same "no segments" shape the Go type's own `Path: nil` gives a
+    /// plain identifier.
+    #[test]
+    fn test_tracked_place_of_a_bare_name_has_an_empty_path() {
+        let parsed = ruff_python_parser::parse_expression("a").expect("test source must parse");
+        let place = tracked_place_of(&parsed.into_expr()).expect("a bare name is a readable place");
+        assert_eq!(place.binding, "a");
+        assert!(place.path.is_empty());
+    }
+
+    /// A call, a subscript, or any other root names no place at all —
+    /// the checker cannot say the chain survives past a shape this
+    /// reader does not recognize.
+    #[test]
+    fn test_tracked_place_of_declines_a_non_attribute_root() {
+        let parsed = ruff_python_parser::parse_expression("f().n").expect("test source must parse");
+        assert!(tracked_place_of(&parsed.into_expr()).is_none());
+    }
+
+    /// `bind_path`/`read_path` round-trip a fact recorded at a path.
+    #[test]
+    fn test_bind_and_read_path_round_trips() {
+        let mut environment = Environment::new(HashSet::new());
+        let place = TrackedPlace::bare("a").extend("n");
+        environment.bind_path(&place, dummy_value());
+        assert!(environment.read_path(&place).is_some());
+    }
+
+    /// `TrackedPlace::extends` — the containment test `forget_path_base`
+    /// relies on: a path extends itself, extends a shorter prefix of the
+    /// same binding, and does NOT extend a sibling path or a different
+    /// binding's path entirely.
+    #[test]
+    fn test_tracked_place_extends_prefixes_of_the_same_binding_only() {
+        let a = TrackedPlace::bare("a");
+        let a_n = a.extend("n");
+        let a_n_x = a_n.extend("x");
+        let a_m = a.extend("m");
+        let b_n = TrackedPlace::bare("b").extend("n");
+        assert!(a_n.extends(&a_n), "a place extends itself");
+        assert!(a_n_x.extends(&a_n), "a.n.x continues the shorter prefix a.n");
+        assert!(!a_n.extends(&a_n_x), "a.n does not continue the LONGER path a.n.x");
+        assert!(!a_m.extends(&a_n), "a.m is a sibling of a.n, not a continuation");
+        assert!(!b_n.extends(&a_n), "a different binding's path never extends this one");
+    }
+
+    /// `Environment::forget` on the base name drops every path fact
+    /// rooted at it — `forget`'s own doc states the rule this pins.
+    #[test]
+    fn test_forget_drops_every_path_fact_rooted_at_the_base_name() {
+        let mut environment = Environment::new(HashSet::new());
+        let place = TrackedPlace::bare("a").extend("n");
+        environment.bind_path(&place, dummy_value());
+        environment.forget("a");
+        assert!(environment.read_path(&place).is_none());
+    }
+
+    /// `forget_path_base` on a deeper prefix drops a continuation but
+    /// leaves an unrelated sibling standing — the same distinction
+    /// `test_tracked_place_extends_prefixes_of_the_same_binding_only`
+    /// pins for `extends` itself, exercised here through the actual
+    /// forget call.
+    #[test]
+    fn test_forget_path_base_drops_continuations_not_siblings() {
+        let mut environment = Environment::new(HashSet::new());
+        let a_n = TrackedPlace::bare("a").extend("n");
+        let a_n_x = a_n.extend("x");
+        let a_m = TrackedPlace::bare("a").extend("m");
+        environment.bind_path(&a_n_x, dummy_value());
+        environment.bind_path(&a_m, dummy_value());
+        environment.forget_path_base(&a_n);
+        assert!(environment.read_path(&a_n_x).is_none(), "a.n.x continues the written prefix a.n");
+        assert!(environment.read_path(&a_m).is_some(), "a.m is unrelated to a.n");
+    }
+
+    /// `fork` shares no mutable state for path bindings (unlike the
+    /// retained-callable table) — a write through the forked
+    /// environment's OWN path map must not reach the original, matching
+    /// `bindings`' own by-value clone semantics.
+    #[test]
+    fn test_fork_clones_path_bindings_independently() {
+        let original = Environment::new(HashSet::new());
+        let mut forked = original.fork();
+        let place = TrackedPlace::bare("a").extend("n");
+        forked.bind_path(&place, dummy_value());
+        assert!(forked.read_path(&place).is_some());
+        assert!(original.read_path(&place).is_none(), "fork must not share the path map by reference");
+    }
+
+    /// `join` keeps a path fact only when BOTH arms still hold one for
+    /// the identical place — the same rule `bindings`' own join already
+    /// follows.
+    #[test]
+    fn test_join_keeps_a_path_fact_only_when_both_arms_hold_it() {
+        let parent = Environment::new(HashSet::new());
+        let mut arm_a = parent.fork();
+        let mut arm_b = parent.fork();
+        let shared = TrackedPlace::bare("a").extend("n");
+        let only_a = TrackedPlace::bare("a").extend("m");
+        arm_a.bind_path(&shared, dummy_value());
+        arm_b.bind_path(&shared, dummy_value());
+        arm_a.bind_path(&only_a, dummy_value());
+        let joined = Environment::join(arm_a, &arm_b);
+        assert!(joined.read_path(&shared).is_some(), "both arms held a fact about the shared place");
+        assert!(joined.read_path(&only_a).is_none(), "only one arm held a fact about this place");
     }
 }

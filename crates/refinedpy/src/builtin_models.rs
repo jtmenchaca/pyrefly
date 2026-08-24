@@ -20,11 +20,12 @@
 
 use std::sync::Arc;
 
-use refined_domain::abstract_value::{float_sorted_unknown, known_set, known_values, nan_value, opaque_value, AbstractValue, Kind, PrimitiveKind, SetKindTag};
+use refined_domain::abstract_value::{float_sorted_unknown, known_set, known_values, nan_value, null_value, opaque_value, AbstractValue, Kind, PrimitiveKind, SetKindTag};
 use refined_domain::known_constructors::known_list;
 use refined_domain::trust_grades::{derived_trust_level, TrustSpec};
 use refined_kernel::kernel_interface::RefinedTSKernel;
 use refined_kernel::transfer_questions::{PowOperandKind, PowOperandWire, TransferAnswerKind, TransferQuestion, TransferQuestionOp};
+use refined_sets::codepoint_sets::strings;
 use refined_sets::refinement_forms::{at_least, at_most, make_refined_set, one_of, Form, RefinedSet};
 use refined_sets::repetition_window_forms::as_repetition;
 
@@ -411,13 +412,98 @@ fn sorted_call(arguments: &[AbstractValue]) -> Option<AbstractValue> {
 /// argument copies through unchanged (`list`/`tuple`/`set` all share
 /// this domain's one `Kind::List` shape, per `collection_models.rs`'s
 /// own module doc — `list(some_set)` and `list(some_tuple)` both read
-/// through this same row).
+/// through this same row). A `dict.fromkeys(...)` ROUND-TRIP CARRIER
+/// argument (`dict_fromkeys_call`'s own doc, `A15.xfer.dedupe`'s
+/// `list(dict.fromkeys(xs))` shape) is unwrapped through `dict_fromkeys_
+/// keys_view` FIRST, before the `Kind::List` gate below (a carrier is
+/// `Kind::Object`, never `Kind::List`, so the two arms never both fire
+/// on the same argument).
 fn list_constructor_call(arguments: &[AbstractValue]) -> Option<AbstractValue> {
     let [iterable] = arguments else { return None };
+    if let Some(keys_view) = dict_fromkeys_keys_view(iterable) {
+        return Some(keys_view);
+    }
     if iterable.kind != Kind::List {
         return None;
     }
     Some(known_list(iterable.items.clone(), derived_trust_level(TrustSpec, arguments)))
+}
+
+/// The `kind_word` tagging a `dict.fromkeys(iterable, value=None)`
+/// ROUND-TRIP CARRIER value (`dict_fromkeys_call`'s own doc) — the same
+/// "`Kind::Object` plus a distinguishing word plus a payload in `inner`"
+/// idiom `json_grammar.rs::JSON_DUMPS_ROUND_TRIP_WORD` and
+/// `env.rs::retained_callable_value` both already use.
+const DICT_FROMKEYS_WORD: &str = "the keys view of a dict.fromkeys(...) call";
+
+/// `dict.fromkeys(iterable, value=None)` — library/stdtypes.rst's
+/// `classmethod:: fromkeys(iterable, value=None, /)`: "Create a new
+/// dictionary with keys from *iterable* and values set to *value*...
+/// *value* defaults to `None`." This domain's `dict` is `Kind::Object`
+/// with a CLOSED, string-named `keys` list (`collection_models.rs`'s
+/// own module doc) — it cannot represent a dict whose keys are an
+/// unbounded-count, windowed-VALUE set (`xs: list[int]`'s own element
+/// window, not a finite set of string names), so this row does not
+/// build a real `Kind::Object` dict at all. Modeled ONLY for the shape
+/// the corpus needs a value for — `iterable` a `Kind::Set` repetition
+/// window (`as_repetition`, the same shape `star_numeric_hull`/
+/// `min_max_over_star` already read for a `list[int]`-typed parameter)
+/// — and answers a ROUND-TRIP CARRIER (`Kind::Object`, `DICT_FROMKEYS_
+/// WORD`, the iterable's own repetition set carried in `inner`) rather
+/// than a real dict value: this file's own callers only ever consume a
+/// `fromkeys(...)` result through `list(...)`
+/// (`dict_fromkeys_keys_view`, `A15.xfer.dedupe`'s own row), never by
+/// reading a key/value pair directly, so carrying the iterable through
+/// unread is the exact answer for that one consumption path rather than
+/// building (and immediately discarding) machinery for dict reads this
+/// corpus never exercises. `value` (defaulting to `None`) is not
+/// modeled — the DEDUPED KEYS are the only fact `list(dict.fromkeys(xs))`
+/// ever needs; a caller that goes on to read a VALUE out of the result
+/// finds no dict shape here and declines honestly.
+fn dict_fromkeys_call(arguments: &[AbstractValue]) -> Option<AbstractValue> {
+    let iterable = match arguments {
+        [iterable] => iterable,
+        [iterable, _value] => iterable,
+        _ => return None,
+    };
+    if iterable.kind != Kind::Set || iterable.set_kind_tag != SetKindTag::None {
+        return None;
+    }
+    as_repetition(&iterable.set)?;
+    Some(AbstractValue {
+        inner: Some(Box::new(iterable.clone())),
+        ..opaque_value(DICT_FROMKEYS_WORD)
+    })
+}
+
+/// `list(dict.fromkeys(xs))`'s own value: the DISTINCT elements of
+/// `xs`, in insertion order (Python's `dict` preserves insertion order,
+/// library/stdtypes.rst's own "Mapping Types — dict" guarantee,
+/// `json_grammar.rs`'s identical citation for the same fact) — drawn
+/// from the SAME element window `xs` itself carries (dedup drops
+/// duplicates, never introduces a new element outside `xs`'s own
+/// alphabet), at a count anywhere from `0` (every element could
+/// collide down to one, or `xs` could already be empty) up to `xs`'s
+/// own upper length bound (dedup never GROWS a sequence). Rebuilds the
+/// SAME repetition shape `xs` itself carries (`as_repetition`/
+/// `repeat_of`, the identical window a plain `list[int]` parameter
+/// already flows through `loops.rs`'s own `for`-loop reader), with
+/// `lo` relaxed to `0` and `hi` unchanged — so `for x in
+/// list(dict.fromkeys(xs)): ...` binds `x` to exactly `xs`'s own
+/// element set through the SAME existing reader, no new loop machinery
+/// needed. `None` for any argument that is not a `dict_fromkeys_call`
+/// carrier (`dict_fromkeys_call`'s own doc on the one-consumer scope).
+fn dict_fromkeys_keys_view(argument: &AbstractValue) -> Option<AbstractValue> {
+    if argument.kind != Kind::Object || argument.kind_word != Some(DICT_FROMKEYS_WORD) {
+        return None;
+    }
+    let iterable = argument.inner.as_deref()?;
+    let repeated = as_repetition(&iterable.set)?;
+    let deduped_set = make_refined_set(vec![refined_sets::refinement_forms::repeat_of(repeated.element, 0, repeated.hi)]);
+    Some(AbstractValue {
+        kind_tag: iterable.kind_tag,
+        ..known_set(deduped_set, None, derived_trust_level(TrustSpec, &[iterable.clone()]), SetKindTag::None)
+    })
 }
 
 /// `set([iterable])` — library/stdtypes.rst's `class:: set([iterable])`
@@ -778,12 +864,28 @@ fn int_call(arguments: &[AbstractValue]) -> Option<AbstractValue> {
 /// `int` regardless of its argument's sort, the same rule `int_call`'s
 /// own `known_values(..., PrimitiveKind::Integer, ...)` return states.
 ///
-/// The answer must additionally be provably finite
-/// (`enclosure_is_provably_finite`): the same non-finite gate
-/// `int_call`'s single-value row keeps (`int(float('nan'))`/
-/// `int(float('inf'))` both RAISE `ValueError`/`OverflowError` in
-/// CPython, never returning a value), read here off a kernel-answered
-/// SET rather than one known value.
+/// A kernel-answered enclosure NOT provably finite
+/// (`enclosure_is_provably_finite` false — e.g. `binary64.trunc` over a
+/// bare unbounded `float` parameter's own `numbers()` seed,
+/// `float_sorted_unknown`'s own doc) does not decline outright: the
+/// same non-finite gate `int_call`'s single-value row keeps
+/// (`int(float('nan'))`/`int(float('inf'))` both RAISE `ValueError`/
+/// `OverflowError` in CPython, never returning a value) rules out ONLY
+/// the two non-finite INPUTS, not every finite input the enclosure also
+/// admits — those still truncate to SOME integer, so the WEAKER but
+/// still TRUE claim over the non-raising outcomes is the unbounded
+/// Integer sort (`int_image`'s own image — every row `int(...)`
+/// returns at all is an int, library/functions.html#int), not `None`.
+/// Answering `None` here left `n = int(x)` for a bare `float`
+/// parameter's own guard branches Unknown downstream — one undetermined
+/// branch that then poisons a whole function's derived return cases
+/// (D5's own `clamp_to_age` helpers, ISSUES.md's fact-export trace).
+/// `int_call`'s own single-VALUE row keeps declining outright on a
+/// non-finite operand (unchanged): that row reads ONE concrete number,
+/// which either raises or does not — there is no "other outcomes" to
+/// weaken to when the whole operand IS the non-finite value itself, the
+/// same distinction `domain_raise_served_half_value`'s own "straddling
+/// vs. entirely-raising" split keeps for a domain-limited math family.
 fn int_call_over_set(value: &AbstractValue, kernel: &Arc<RefinedTSKernel>) -> Option<AbstractValue> {
     if value.kind != Kind::Set {
         return None;
@@ -816,7 +918,11 @@ fn int_call_over_set(value: &AbstractValue, kernel: &Arc<RefinedTSKernel>) -> Op
         }
         TransferAnswerKind::Set => {
             if !enclosure_is_provably_finite(&asked.set) {
-                return None;
+                // the finite outcomes still all truncate to an int —
+                // `int_image`'s own unbounded Integer ray, the weaker
+                // TRUE claim over the non-raising half of this operand
+                // (this function's own doc above)
+                return int_image();
             }
             Some(AbstractValue {
                 kind_tag: Some(PrimitiveKind::Integer),
@@ -996,6 +1102,35 @@ fn float_call(arguments: &[AbstractValue]) -> Option<AbstractValue> {
         return Some(float_sorted_unknown());
     }
     None
+}
+
+/// `float(x)` on a KNOWN NUMERIC SET (a seeded range, or a bounded set
+/// another transfer already produced — e.g. `float(math.floor(x))`,
+/// `math.floor`'s own Integer-sorted enclosure over a declared parameter
+/// range, `math_models.rs`'s `floor_call_over_set`): `float_call`'s own
+/// row only reads a single known numeric value (`single_known_numeric`),
+/// so a Set-shaped argument declines there with no further attempt.
+/// Unlike `int_call_over_set`/`abs_call_over_set` (which pose a kernel
+/// `TransferQuestion` because their result VALUE differs from their
+/// input), `float(x)` on a numeric argument changes only the SORT, never
+/// the value (library/functions.html#float: "Return a floating-point
+/// number constructed from a number" — the same magnitude, Float-sorted)
+/// — so this re-tags the operand's own set in place, no kernel round
+/// trip needed. CPython never raises for a numeric argument (only the
+/// string-parse form can raise, `float_call`'s own doc), so every
+/// Integer/Float/Boolean/Number-sorted set answers here, unconditionally.
+fn float_call_over_set(value: &AbstractValue) -> Option<AbstractValue> {
+    if value.kind != Kind::Set {
+        return None;
+    }
+    if !matches!(
+        value.kind_tag,
+        Some(PrimitiveKind::Integer) | Some(PrimitiveKind::Float) | Some(PrimitiveKind::Boolean) | Some(PrimitiveKind::Number)
+    ) {
+        return None;
+    }
+    let grade = derived_trust_level(TrustSpec, std::slice::from_ref(value));
+    Some(AbstractValue { kind_tag: Some(PrimitiveKind::Float), ..known_set(value.set.clone(), None, grade, SetKindTag::None) })
 }
 
 /// `float(string)`'s exact parsed value, for the grammar
@@ -1232,6 +1367,52 @@ fn exception_single_string_message(instance: &AbstractValue) -> Option<AbstractV
     None
 }
 
+/// `hash(x)` — library/functions.html#hash: "Return the hash value of
+/// the object (if it has one). Hash values are integers... Numeric
+/// values that compare equal have the same hash value (even if they
+/// are of different types, as is the case for 1 and 1.0)." The doc
+/// states only that the result is a Python `int` and that EQUAL
+/// operands hash equally — it does NOT state `hash(n) == n` for every
+/// int `n` (CPython's real implementation reduces modulo
+/// `sys.hash_info.modulus`, a fact outside library/functions.html's own
+/// text), so this row answers the SORT the doc actually guarantees —
+/// the unbounded integer ground — rather than fabricate an identity
+/// claim the cited clause does not make. Modeled for any single
+/// argument this file can already read a value or a known Set for
+/// (`single_known_numeric`, or a numeric/string-sorted `Kind::Set`/
+/// `Kind::Values` argument): `hash` accepts any hashable object, and
+/// this row's own claim (unbounded `int`) holds regardless of which
+/// hashable shape the argument is, so the argument itself is not
+/// otherwise inspected.
+///
+/// The answer carries an EXPLICIT `AtLeast(-inf)` ray alongside
+/// `Integer`, the same two-form shape `narrowing.rs`'s own
+/// `unbounded_integers()` and this file's own `int_image()` both build
+/// for "the whole integer ground, no bound stated" — never `Integer`
+/// alone with zero ray forms. A bare `[Integer]` set is missing the
+/// ray form the kernel's scalar deciders key the 1-tuple scalar shape
+/// on, which let a one-sided guard's own narrowed window (`hash(x) >=
+/// 0`, only a lower ray tightened onto this set) reach
+/// `scalar_subset`/`assignability.rs`'s containment ask still missing
+/// the upper-boundedness a real `[0, 150]`-declared set requires — the
+/// A15.xfer.hash `hash_outside` soundness gap this two-form shape
+/// closes.
+fn hash_call(arguments: &[AbstractValue]) -> Option<AbstractValue> {
+    let [only] = arguments else { return None };
+    if only.kind == Kind::Unknown {
+        return None;
+    }
+    Some(AbstractValue {
+        kind_tag: Some(PrimitiveKind::Integer),
+        ..known_set(
+            make_refined_set(vec![refined_sets::refinement_forms::integer(), at_least(f64::NEG_INFINITY)]),
+            None,
+            TrustSpec,
+            SetKindTag::None,
+        )
+    })
+}
+
 /// `object()` — library/functions.html#object: "This is the ultimate
 /// base class of all other classes... When the constructor is called,
 /// it returns a new featureless object. The constructor does not accept
@@ -1320,6 +1501,11 @@ pub fn builtin_call_result(function: &str, arguments: &[AbstractValue]) -> Optio
         // (a different arity, out of scope).
         "type" if arguments.len() == 1 => Some(opaque_value("a type object")),
         "object" => object_call(arguments),
+        "hash" => hash_call(arguments),
+        // `from urllib.parse import quote` — see `urllib_quote_call`'s
+        // own doc for why this bare-name spelling is a builtin row here
+        // rather than routed through `stdlib_call_result`.
+        "quote" => urllib_quote_call(arguments),
         _ => None,
     }
 }
@@ -1329,9 +1515,13 @@ pub fn builtin_call_result(function: &str, arguments: &[AbstractValue]) -> Optio
 /// families that need it — `min`/`max`'s two-or-more-argument form when
 /// at least one argument is a `Kind::Set` (`min_max_call_over_sets`'s
 /// own doc, including the NaN-discharge citation), `abs`'s single
-/// Set-seeded operand (`abs_call_over_set`'s own doc), and `int`'s
+/// Set-seeded operand (`abs_call_over_set`'s own doc), `int`'s
 /// single Set-seeded operand (`int_call_over_set`'s own doc — e.g.
-/// `int(math.sqrt(x))` over a declared parameter range). Every other
+/// `int(math.sqrt(x))` over a declared parameter range), and `float`'s
+/// single Set-seeded operand (`float_call_over_set`'s own doc — e.g.
+/// `float(math.floor(x))`; this one row needs no kernel round trip of
+/// its own, only the `kernel` parameter's presence in this dispatcher's
+/// signature to sit beside its `int`/`abs` siblings). Every other
 /// builtin routes straight through the pure-Rust `builtin_call_result`
 /// above, tried FIRST so a known-scalar call never pays a kernel round
 /// trip it does not need.
@@ -1350,6 +1540,10 @@ pub fn builtin_call_result_with_kernel(
         "int" => {
             let [only] = arguments else { return None };
             int_call_over_set(only, kernel).or_else(|| int_image())
+        }
+        "float" => {
+            let [only] = arguments else { return None };
+            float_call_over_set(only)
         }
         _ => None,
     })
@@ -1375,6 +1569,153 @@ fn int_image() -> Option<AbstractValue> {
             SetKindTag::None,
         )
     })
+}
+
+/// An unbounded, NONNEGATIVE numeric ground — the shared answer shape
+/// `time_call_result`'s `time.time` row and `os_call_result`'s
+/// `os.open` row both state (a value known only to sit in `[0, +inf)`,
+/// tagged `sort`). Composed once here rather than duplicated at each
+/// call site. `PrimitiveKind::Integer` additionally carries the
+/// `integer()` refinement form in the SET itself, not just the
+/// `kind_tag` sort marker — without it, a caller's own guard (e.g.
+/// `0 <= fd <= 150`) narrows the range but the narrowed set stays
+/// bare `[0, 150]` with no integrality, which fails assignment against
+/// a declared alias requiring `integer` (A15.xfer.handle's own
+/// `os.open` row). `PrimitiveKind::Float` (`time.time`) never adds
+/// this form — a float ground is not integer-valued.
+fn nonnegative_ground(sort: PrimitiveKind) -> AbstractValue {
+    let mut forms = vec![at_least(0.0)];
+    if sort == PrimitiveKind::Integer {
+        forms.push(refined_sets::refinement_forms::integer());
+    }
+    AbstractValue {
+        kind_tag: Some(sort),
+        ..known_set(make_refined_set(forms), None, TrustSpec, SetKindTag::None)
+    }
+}
+
+/// `time.time()` — library/time.html#time.time: "Return the time in
+/// seconds since the epoch as a floating-point number... Note that even
+/// though the time is always returned as a floating-point number, not
+/// all systems provide time with a better precision than 1 second." The
+/// epoch itself is defined as 1970-01-01 00:00:00 (UTC) on every
+/// platform this doc covers, so the returned value is always
+/// NONNEGATIVE — this row states exactly that ground: `[0, +inf)`,
+/// Float-sorted, never a specific instant (the running clock is not a
+/// fact this domain reads). Zero-argument only, per the doc's own
+/// signature.
+fn time_call_result(function: &str, arguments: &[AbstractValue]) -> Option<AbstractValue> {
+    if function != "time" || !arguments.is_empty() {
+        return None;
+    }
+    Some(nonnegative_ground(PrimitiveKind::Float))
+}
+
+/// `os.open(path, flags)` / `os.close(fd)` — library/os.html:
+/// `os.open`: "Return a file descriptor... to be used by other
+/// low-level (i.e. os.read()) file operations." A file descriptor is
+/// always a NONNEGATIVE `int` (`os.rst`'s own examples index only ever
+/// nonnegative values, and CPython raises `OSError` rather than ever
+/// returning a negative fd) — this row states the ground `[0, +inf)`,
+/// Integer-sorted, never a specific descriptor number, matching
+/// A15.xfer.handle's own claim ("a file descriptor opened fresh...
+/// carries no identity claim"). `os.close`: "Close file descriptor
+/// *fd*... Availability: not Emscripten, not WASI." No return value —
+/// CPython's own `os.close` always returns `None`, so this row answers
+/// the domain's exact absent state (never Unknown) for ANY single
+/// argument, matching a Python function whose only documented effect is
+/// closing the descriptor.
+fn os_call_result(function: &str, arguments: &[AbstractValue]) -> Option<AbstractValue> {
+    match function {
+        "open" if arguments.len() == 2 => Some(nonnegative_ground(PrimitiveKind::Integer)),
+        "close" if arguments.len() == 1 => Some(null_value()),
+        _ => None,
+    }
+}
+
+/// `unicodedata.normalize(form, unistr)` — library/unicodedata.html:
+/// "Return the normal form *form* for the Unicode string *unistr*...
+/// Valid values for *form* are 'NFC', 'NFKC', 'NFD', and 'NFKD'." The
+/// doc states the return is itself a Python `str`, with no further
+/// bound on its content or length (a normalization form can both grow
+/// and shrink a string's code-point count relative to its input,
+/// library/unicodedata.html's own "Unicode Standard Annex #15"
+/// citation) — this row states exactly that sort, the whole-strings
+/// ground `Σ*`, matching A3.xfer.normalize's own claim ("result is
+/// Σ*"). Modeled for the two-argument form with a known exact-string
+/// `form` argument in the doc's own four valid spellings; any other
+/// `form` (unknown, or a string outside that set) declines rather than
+/// assume the call does not raise.
+fn unicodedata_call_result(function: &str, arguments: &[AbstractValue]) -> Option<AbstractValue> {
+    if function != "normalize" {
+        return None;
+    }
+    let [form, _unistr] = arguments else { return None };
+    if form.kind != Kind::Values || form.kind_tag != Some(PrimitiveKind::String) {
+        return None;
+    }
+    let form_text: String = form.values.iter().filter_map(|point| char::from_u32(*point as i64 as u32)).collect();
+    if !matches!(form_text.as_str(), "NFC" | "NFKC" | "NFD" | "NFKD") {
+        return None;
+    }
+    Some(AbstractValue {
+        kind_tag: Some(PrimitiveKind::String),
+        ..known_set(strings(), None, TrustSpec, SetKindTag::None)
+    })
+}
+
+/// `urllib.parse.quote(string)` — library/urllib.parse.html#urllib.parse.quote:
+/// "Replace special characters in *string* using the %xx escape...
+/// Letters, digits, and the characters '_.-~' are never quoted." The
+/// result is a Python `str` built only from that ASCII subset plus the
+/// literal `%` escape triples — narrower than the whole-strings ground,
+/// but this row states the SORT-ONLY answer (`Σ*`, String-sorted)
+/// rather than the tight percent-encoding grammar: the doc's own
+/// `safe='/'` default (a further always-unquoted character this row
+/// does not thread through) makes the exact alphabet argument-
+/// dependent, so `Σ*` is the sound claim actually made here, matching
+/// A3.xfer.url's own claim ("result is Σ* (percent-encoding
+/// grammar)"). One-argument form only (no `safe=`/`encoding=`/
+/// `errors=` keyword arguments modeled).
+///
+/// Reached through `builtin_call_result`'s own BARE-NAME dispatch, not
+/// `stdlib_call_result`'s module-qualified one: the corpus's own row
+/// (A3.xfer.url.py) writes `from urllib.parse import quote` then calls
+/// the bare name `quote(s)` — `urllib.parse` is not a Python-source
+/// module the cross-module resolver reads (`check.rs::
+/// bind_or_forget_imported_name`'s own doc), so the import binds
+/// nothing and `quote` reaches `evaluate_call`'s `Expr::Call(Expr::Name(...))`
+/// arm exactly like an ordinary builtin call.
+fn urllib_quote_call(arguments: &[AbstractValue]) -> Option<AbstractValue> {
+    let [_string] = arguments else { return None };
+    Some(AbstractValue {
+        kind_tag: Some(PrimitiveKind::String),
+        ..known_set(strings(), None, TrustSpec, SetKindTag::None)
+    })
+}
+
+/// The dispatcher for a MODULE-QUALIFIED stdlib call whose result is
+/// answered from this file — `time.<function>`, `os.<function>`,
+/// `unicodedata.<function>`, `dict.<function>` (a builtin TYPE's own
+/// classmethod, gated in `expressions.rs::evaluate_attribute_call` the
+/// same way a module name is: a bare `dict` receiver that reads unbound
+/// in `environment`, since `dict` is never locally rebound in the
+/// corpus's own rows). Callable name `module` (the attribute chain's
+/// own root, e.g. `"time"`) and `function` (the called attribute, e.g.
+/// `"time"`) are read separately so a caller can gate on the module
+/// name exactly the way its own `math`/`re`/`json` arms already do,
+/// before ever reaching this dispatcher. `None` means "not modeled
+/// here" — the caller's own decline, never a guessed value.
+/// `urllib.parse.quote` is NOT reached here — see `urllib_quote_call`'s
+/// own doc for why it is a bare-name builtin row instead.
+pub fn stdlib_call_result(module: &str, function: &str, arguments: &[AbstractValue]) -> Option<AbstractValue> {
+    match module {
+        "time" => time_call_result(function, arguments),
+        "os" => os_call_result(function, arguments),
+        "unicodedata" => unicodedata_call_result(function, arguments),
+        "dict" if function == "fromkeys" => dict_fromkeys_call(arguments),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -1465,6 +1806,24 @@ mod tests {
         assert_eq!(got.set, want, "abs([-2, 1]) should answer [0, 2]: got {:?}", got.set);
     }
 
+    /// `float(x)` over an Integer-sorted Set operand (`floor_call_over_set`'s
+    /// own image, `math.floor(x)` over a declared `[2.5, 3.5]` guard —
+    /// `float_call_over_set`'s own doc): re-tags the same set Float-sorted,
+    /// no kernel round trip and no value change — `float([2, 3])` answers
+    /// the identical `{2, 3}` window, only Float-sorted now.
+    #[test]
+    fn float_over_a_set_operand_re_sorts_without_a_kernel_round_trip() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let window = make_refined_set(vec![at_least(2.0), at_most(3.0)]);
+        let operand =
+            AbstractValue { kind_tag: Some(PrimitiveKind::Integer), ..known_set(window.clone(), None, TrustSpec, SetKindTag::None) };
+        let got = builtin_call_result_with_kernel("float", &[operand], &kernel)
+            .expect("float([2, 3]) over a Set operand models");
+        assert_eq!(got.kind, Kind::Set);
+        assert_eq!(got.kind_tag, Some(PrimitiveKind::Float));
+        assert_eq!(got.set, window, "float() must not change the operand's own set: got {:?}", got.set);
+    }
+
     #[test]
     fn int_truncates_toward_zero_on_positive_fraction() {
         let got = builtin_call_result("int", &[float(7.9)]).expect("int(7.9) models");
@@ -1530,6 +1889,29 @@ mod tests {
         let want = make_refined_set(vec![at_least(0.0), at_most(10.0), refined_sets::refinement_forms::integer()]);
         assert!((kernel.scalar_subset)(&got.set, &want), "result {:?} not ⊆ want {:?}", got.set, want);
         assert!((kernel.scalar_subset)(&want, &got.set), "want {:?} not ⊆ result {:?}", want, got.set);
+    }
+
+    /// `int(x)` over a BARE, UNBOUNDED `float` parameter's own seed
+    /// (`float_sorted_unknown()`'s own `numbers()` set, `[NEG_INFINITY,
+    /// +inf)`) must still answer the unbounded Integer sort rather than
+    /// decline outright: `binary64.trunc`'s own enclosure over an
+    /// entirely-unbounded window is never provably finite
+    /// (`enclosure_is_provably_finite` false by construction — the empty-
+    /// forms/unbounded-ray cases it itself declines), so before this fix
+    /// `int_call_over_set` returned `None` here, leaving `n = int(x)`
+    /// Unknown downstream (D5's own `clamp_to_age` helpers' fact-export
+    /// blocker). The weaker TRUE claim — every non-raising outcome of
+    /// `int(x)` is SOME int — is `int_image`'s own image, pinned here
+    /// directly.
+    #[test]
+    fn int_over_an_unbounded_float_operand_answers_the_unbounded_integer_image() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let operand = float_sorted_unknown();
+        let got = builtin_call_result_with_kernel("int", &[operand], &kernel).expect("int(x) over an unbounded float must still decide the image");
+        assert_eq!(got.kind, Kind::Set);
+        assert_eq!(got.kind_tag, Some(PrimitiveKind::Integer));
+        let want = make_refined_set(vec![refined_sets::refinement_forms::integer(), at_least(f64::NEG_INFINITY)]);
+        assert_eq!(got.set, want, "the answer is int_image's own unbounded Integer ray, not a decline");
     }
 
     #[test]
@@ -1695,6 +2077,49 @@ mod tests {
         assert_eq!(got.kind_tag, Some(PrimitiveKind::Float));
     }
 
+    /// `D5.edge.helper.py`'s own `sum(s * s for s in clamped)` shape: a
+    /// GENERATOR expression, which `expressions.rs`'s own `Expr::
+    /// Generator` arm already routes through `evaluate_list_or_set_comp`
+    /// — the SAME star-comprehension path a list/set comprehension takes
+    /// — so once `clamped`'s own element window reaches `sum(...)` as a
+    /// `Kind::Set` repetition (`s * s` squaring `s ∈ [-1, 1]` down to
+    /// `[0, 1]`, a fact `expressions.rs`'s own `*` transfer over Set
+    /// operands states, not this file's concern), `sum_call`'s existing
+    /// `.or_else(|| sum_call_over_star(arguments))` fallback (this
+    /// dispatcher's own wiring, unchanged) already answers it — pinned
+    /// here directly on a star-shaped Float window with no concrete
+    /// `Kind::List` items, the shape a generator's own star evaluation
+    /// produces. No new recognition needed in this file: `sum_call_over_
+    /// star`'s own `star_numeric_hull` gate already accepts any
+    /// repetition-window `Kind::Set` regardless of whether a generator,
+    /// a list comprehension, or a declared `list[X]` parameter produced
+    /// it — the three are indistinguishable once evaluated to this
+    /// shape.
+    #[test]
+    fn sum_over_a_star_shaped_nonnegative_float_window_answers_the_lower_bound_ray() {
+        let squared = AbstractValue {
+            kind_tag: Some(PrimitiveKind::Float),
+            ..known_set(
+                make_refined_set(vec![refined_sets::refinement_forms::repeat_of(
+                    make_refined_set(vec![at_least(0.0), at_most(1.0)]),
+                    0,
+                    None,
+                )]),
+                None,
+                TrustSpec,
+                SetKindTag::None,
+            )
+        };
+        let got = builtin_call_result("sum", &[squared]).expect("sum(star-shaped [0,1] window) must decide through sum_call_over_star");
+        assert_eq!(got.kind, Kind::Set);
+        assert_eq!(got.kind_tag, Some(PrimitiveKind::Float));
+        // every element is nonnegative, so the running total only ever
+        // moves up from the start value (0) — `sum_call_over_star`'s own
+        // nonnegative-branch doc
+        let want = make_refined_set(vec![at_least(0.0)]);
+        assert_eq!(got.set, want);
+    }
+
     #[test]
     fn sorted_over_known_list_ascending() {
         let list = known_list(vec![integer(3.0), integer(1.0), integer(2.0)], TrustSpec);
@@ -1744,6 +2169,91 @@ mod tests {
         let got = builtin_call_result("dict", &[pairs]).expect("dict([...]) models");
         assert_eq!(got.keys.len(), 1);
         assert_eq!(got.keys[0].value, integer(2.0));
+    }
+
+    /// `xs: list[int]`'s own seeded shape — a `Kind::Set` repetition
+    /// window (`check.rs::seed_parameters`'s own sequence-container
+    /// branch, `loops.rs`'s own `for`-loop reader) — bounded `[lo, hi]`
+    /// with element `[element_lo, element_hi]`. This test module's own
+    /// stand-in receiver for every `dict.fromkeys`/`list(...)` row below.
+    fn integer_repetition_window(element_lo: f64, element_hi: f64, lo: i64, hi: Option<i64>) -> AbstractValue {
+        let element = make_refined_set(vec![at_least(element_lo), at_most(element_hi), refined_sets::refinement_forms::integer()]);
+        AbstractValue {
+            kind_tag: Some(PrimitiveKind::Integer),
+            ..known_set(
+                make_refined_set(vec![refined_sets::refinement_forms::repeat_of(element, lo, hi)]),
+                None,
+                TrustSpec,
+                SetKindTag::None,
+            )
+        }
+    }
+
+    /// `A15.xfer.dedupe`'s own `dict.fromkeys(xs)` row: a `list[int]`
+    /// bounded `[0, 150]` answers a round-trip carrier value — `Kind::
+    /// Object`, `DICT_FROMKEYS_WORD`, `xs` itself carried in `inner` —
+    /// never a `Kind::List`/`Kind::Object` dict directly (this domain's
+    /// dict cannot represent windowed, non-string keys, `dict_fromkeys_
+    /// call`'s own doc).
+    #[test]
+    fn dict_fromkeys_over_a_windowed_list_answers_a_round_trip_carrier() {
+        let xs = integer_repetition_window(0.0, 150.0, 0, None);
+        let got = stdlib_call_result("dict", "fromkeys", &[xs.clone()]).expect("dict.fromkeys(xs) must decide");
+        assert_eq!(got.kind, Kind::Object);
+        assert_eq!(got.kind_word, Some(DICT_FROMKEYS_WORD));
+        assert_eq!(got.inner.as_deref(), Some(&xs));
+    }
+
+    /// `dict.fromkeys(xs, 0)` — the two-argument form, `value` explicit
+    /// rather than defaulted — still reads the SAME iterable `dict_
+    /// fromkeys_call`'s own doc states this row does not otherwise
+    /// inspect `value` for.
+    #[test]
+    fn dict_fromkeys_two_argument_form_still_reads_the_iterable() {
+        let xs = integer_repetition_window(0.0, 150.0, 0, None);
+        let got = stdlib_call_result("dict", "fromkeys", &[xs.clone(), integer(0.0)]).expect("dict.fromkeys(xs, 0) must decide");
+        assert_eq!(got.inner.as_deref(), Some(&xs));
+    }
+
+    /// A non-repetition-window argument (an exact `Kind::List`, this
+    /// domain's own EXACT-arity container — `dict.fromkeys`'s own row is
+    /// scoped to the unbounded-count windowed shape only) declines.
+    #[test]
+    fn dict_fromkeys_over_an_exact_list_declines() {
+        let xs = known_list(vec![integer(1.0), integer(2.0)], TrustSpec);
+        assert_eq!(stdlib_call_result("dict", "fromkeys", &[xs]), None);
+    }
+
+    /// `A15.xfer.dedupe`'s own full row: `list(dict.fromkeys(xs))` for
+    /// `xs: list[int]` bounded `[0, 150]` answers the SAME element window
+    /// at a RELAXED length bound (`lo: 0`, `hi` unchanged) — the
+    /// `for x in deduped:` loop that follows reads `x` through the
+    /// identical `as_repetition` path a plain `list[int]` parameter
+    /// already flows through (`loops.rs`), so `0 <= x <= 150` narrows it
+    /// the same way.
+    #[test]
+    fn list_of_dict_fromkeys_answers_the_deduped_element_window() {
+        let xs = integer_repetition_window(0.0, 150.0, 3, Some(10));
+        let carrier = stdlib_call_result("dict", "fromkeys", &[xs]).expect("dict.fromkeys(xs) must decide");
+        let got = builtin_call_result("list", &[carrier]).expect("list(dict.fromkeys(xs)) must decide");
+        assert_eq!(got.kind, Kind::Set);
+        assert_eq!(got.kind_tag, Some(PrimitiveKind::Integer));
+        let expected_element = make_refined_set(vec![at_least(0.0), at_most(150.0), refined_sets::refinement_forms::integer()]);
+        let expected = make_refined_set(vec![refined_sets::refinement_forms::repeat_of(expected_element, 0, Some(10))]);
+        assert_eq!(got.set, expected, "dedup relaxes lo to 0, keeps hi unchanged, keeps the same element window");
+    }
+
+    /// `list(...)` over an ORDINARY exact `Kind::List` argument still
+    /// takes the pre-existing row unchanged — the carrier check is
+    /// gated on `Kind::Object`/`DICT_FROMKEYS_WORD` and never fires for
+    /// this shape, so `list_constructor_call`'s own long-standing
+    /// behavior is undisturbed.
+    #[test]
+    fn list_of_an_ordinary_list_is_unaffected_by_the_carrier_check() {
+        let items = known_list(vec![integer(1.0), integer(2.0)], TrustSpec);
+        let got = builtin_call_result("list", &[items]).expect("list([...]) models");
+        assert_eq!(got.kind, Kind::List);
+        assert_eq!(got.items.len(), 2);
     }
 
     fn string_value(text: &str) -> AbstractValue {
@@ -1918,5 +2428,131 @@ mod tests {
         // accept any arguments."
         let got = builtin_call_result("object", &[integer(1.0)]);
         assert!(got.is_none(), "object(x) should decline: {got:?}");
+    }
+
+    #[test]
+    fn hash_of_a_bounded_int_answers_the_unbounded_integer_sort() {
+        // hash(x) for x: int is a Python int (library/functions.html#hash),
+        // but this row states no identity claim beyond the sort — a
+        // later band guard is what narrows it, exactly A15.xfer.hash's
+        // own fixture shape. The set carries an EXPLICIT AtLeast(-inf)
+        // ray alongside Integer — the same two-form "whole integer
+        // ground" shape `narrowing.rs::unbounded_integers()` and this
+        // file's own `int_image()` both build — never Integer alone
+        // with zero ray forms (A15.xfer.hash's own `hash_outside` row:
+        // a bare-Integer set with no ray form let a one-sided `>= 0`
+        // guard's own narrowed window silently pass a declared-bounded
+        // Age sink).
+        let bounded = integer_window(0.0, 150.0);
+        let got = builtin_call_result("hash", &[bounded]).expect("hash(x) models");
+        assert_eq!(got.kind, Kind::Set);
+        assert_eq!(got.kind_tag, Some(PrimitiveKind::Integer));
+        let want = make_refined_set(vec![refined_sets::refinement_forms::integer(), at_least(f64::NEG_INFINITY)]);
+        assert_eq!(got.set, want, "hash(x) must carry an explicit unbounded ray, not a bare Integer form: got {:?}", got.set);
+    }
+
+    #[test]
+    fn hash_wrong_arity_declines() {
+        let got = builtin_call_result("hash", &[]);
+        assert!(got.is_none());
+    }
+
+    /// A15.xfer.hash's own `hash_outside` soundness row, pinned directly
+    /// against the kernel: `hash(x)`'s own unbounded-both-ways ground,
+    /// narrowed by `h >= 0` alone (the ONE ray a one-sided guard can ever
+    /// tighten — `narrowing.rs::meet_set_answer`'s own intersection),
+    /// must NOT prove a subset of Age's declared `[0, 150] && integer`
+    /// window — an unbounded-above ray is never contained in a set
+    /// bounded above, so `assignability.rs`'s own `scalar_subset` ask
+    /// (the exact containment question `judge`'s `Kind::Set` arm poses at
+    /// the `return h` sink) must answer `false` here. Before this fix,
+    /// `hash_call`'s bare-`Integer` set (no ray form at all) reached this
+    /// same ask and was silently admitted — the reproducer this test
+    /// pins the refusal for.
+    #[test]
+    fn hash_narrowed_only_below_is_not_a_subset_of_a_bounded_declared_window() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let bare_int = integer_window(0.0, 150.0);
+        let hash_result = builtin_call_result("hash", &[bare_int]).expect("hash(x) models");
+        // `h >= 0` narrows only the lower ray — the SAME `meet_set_answer`
+        // intersection `narrowing.rs` performs for a one-sided guard,
+        // reproduced here directly on the set rather than through the
+        // full narrowing walk, since this file's own tests stay
+        // kernel-optional and narrowing-free.
+        let mut narrowed_forms = hash_result.set.forms.clone();
+        narrowed_forms.push(at_least(0.0));
+        let narrowed_set = make_refined_set(narrowed_forms);
+        let age_declared = make_refined_set(vec![at_least(0.0), at_most(150.0), refined_sets::refinement_forms::integer()]);
+        let is_subset = (kernel.scalar_subset)(&narrowed_set, &age_declared);
+        assert!(
+            !is_subset,
+            "hash(x) narrowed only below by `>= 0` must not be a subset of Age's bounded window: narrowed {:?}, declared {:?}",
+            narrowed_set, age_declared
+        );
+    }
+
+    #[test]
+    fn time_time_answers_a_nonnegative_float_ground() {
+        let got = stdlib_call_result("time", "time", &[]).expect("time.time() models");
+        assert_eq!(got.kind, Kind::Set);
+        assert_eq!(got.kind_tag, Some(PrimitiveKind::Float));
+        assert_eq!(got.set, make_refined_set(vec![at_least(0.0)]));
+    }
+
+    #[test]
+    fn time_time_with_an_argument_declines() {
+        let got = stdlib_call_result("time", "time", &[integer(1.0)]);
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn os_open_answers_a_nonnegative_integer_ground() {
+        let got = stdlib_call_result("os", "open", &[string_value("/tmp/x"), integer(0.0)]).expect("os.open(...) models");
+        assert_eq!(got.kind, Kind::Set);
+        assert_eq!(got.kind_tag, Some(PrimitiveKind::Integer));
+        assert_eq!(
+            got.set,
+            make_refined_set(vec![at_least(0.0), refined_sets::refinement_forms::integer()])
+        );
+    }
+
+    #[test]
+    fn os_close_answers_none() {
+        let got = stdlib_call_result("os", "close", &[integer(3.0)]).expect("os.close(fd) models");
+        assert_eq!(got.kind, Kind::Null);
+    }
+
+    #[test]
+    fn unicodedata_normalize_nfc_answers_the_whole_strings_ground() {
+        let form = string_value("NFC");
+        let subject = string_value("e\u{0301}");
+        let got = stdlib_call_result("unicodedata", "normalize", &[form, subject]).expect("unicodedata.normalize(...) models");
+        assert_eq!(got.kind, Kind::Set);
+        assert_eq!(got.kind_tag, Some(PrimitiveKind::String));
+    }
+
+    #[test]
+    fn unicodedata_normalize_with_an_unknown_form_declines() {
+        let form = string_value("bogus");
+        let subject = string_value("x");
+        let got = stdlib_call_result("unicodedata", "normalize", &[form, subject]);
+        assert!(got.is_none(), "an unrecognized normalization form should decline: {got:?}");
+    }
+
+    #[test]
+    fn urllib_parse_quote_answers_the_whole_strings_ground() {
+        // reached as a bare-name builtin (`from urllib.parse import
+        // quote` then `quote(s)`), not through stdlib_call_result — see
+        // urllib_quote_call's own doc.
+        let subject = string_value("a b");
+        let got = builtin_call_result("quote", &[subject]).expect("quote(...) models");
+        assert_eq!(got.kind, Kind::Set);
+        assert_eq!(got.kind_tag, Some(PrimitiveKind::String));
+    }
+
+    #[test]
+    fn unmodeled_stdlib_module_declines() {
+        let got = stdlib_call_result("sys", "exit", &[]);
+        assert!(got.is_none());
     }
 }

@@ -40,6 +40,7 @@
 //! discipline.
 
 use refined_domain::abstract_value::known_set;
+use refined_domain::abstract_value::opaque_value;
 use refined_domain::abstract_value::AbstractValue;
 use refined_domain::abstract_value::Kind;
 use refined_domain::abstract_value::PrimitiveKind;
@@ -280,4 +281,99 @@ pub fn dumps_grammar(
     let grammar = object_members_grammar(value, exact_reader, &mut graded_members)?;
     let grade = derived_trust_level(TrustProved, &graded_members);
     Some(known_set(grammar, None, grade, SetKindTag::None))
+}
+
+/// The `kind_word` tagging a `json.dumps(...)` ROUND-TRIP CARRIER value
+/// (`dumps_round_trip_carrier_value`'s own doc) — the same "`Kind::
+/// Object` plus a distinguishing word plus a payload field" idiom
+/// `env.rs::retained_callable_value` and `string_models.rs::
+/// MATCH_WITH_GROUPS_WORD`'s own match-object value already use, here
+/// with the payload carried in `inner` (a whole nested `AbstractValue`,
+/// not a string key) rather than `source`.
+pub const JSON_DUMPS_ROUND_TRIP_WORD: &str = "the serialized text of a json.dumps round-trip carrier";
+
+/// Whether `value`'s own shape is one `json.dumps` then `json.loads`
+/// PRESERVES EXACTLY — library/json.rst's own Python-to-JSON-to-Python
+/// conversion table, read end to end rather than one hop at a time:
+/// `None` -> `null` -> `None`; `bool` -> `true`/`false` -> `bool`
+/// (checked BEFORE Integer below — CPython's `bool` is an `int`
+/// subclass, `AGENT-BRIEF.md`, so a Boolean-tagged value must not fall
+/// through to the Integer arm and lose its own boolean sort); `int` ->
+/// a decimal integer token -> `int` (exact for EVERY `int`, unlike
+/// `integer_window_grammar`'s own digit-count OVER-approximation — that
+/// function states a sound but wider claim for a downstream pattern
+/// sink, while this round trip preserves the VALUE's own exact window,
+/// since `json.loads` re-parses the same decimal digits `json.dumps`
+/// wrote); `str` -> a quoted string -> `str` (this file's own `Debug`-
+/// escape convention, `json_dumps_value`'s doc); a `Kind::Object` whose
+/// OWN members are each one of these same round-trippable shapes
+/// (recursion, `B7.keep.join`'s own dict-of-int shape). Declines for
+/// every shape the round trip does NOT preserve exactly: `float`
+/// (`B7.use.sink`'s own `nan_through_json_refused` row — `json.dumps`
+/// emits the non-standard "NaN"/"Infinity" tokens for those values,
+/// library/json.rst's own `allow_nan` note, so a Float-sorted value
+/// cannot carry this claim soundly), a list, or any opaque/unknown
+/// value this file holds no fact about.
+fn round_trips_exactly(value: &AbstractValue) -> bool {
+    if value.kind == Kind::Null {
+        return true;
+    }
+    if value.kind == Kind::Values && value.kind_tag == Some(PrimitiveKind::Boolean) {
+        return true;
+    }
+    if value.kind == Kind::Values && value.kind_tag == Some(PrimitiveKind::Integer) {
+        return true;
+    }
+    if value.kind == Kind::Values && value.kind_tag == Some(PrimitiveKind::String) {
+        return true;
+    }
+    if value.kind == Kind::Set && value.kind_tag == Some(PrimitiveKind::Integer) {
+        return true;
+    }
+    if value.kind == Kind::Set && (value.kind_tag.is_none() || value.kind_tag == Some(PrimitiveKind::String)) && value.set_kind_tag == SetKindTag::None {
+        return true;
+    }
+    if value.kind == Kind::Object {
+        return value.keys.iter().all(|entry| round_trips_exactly(&entry.value));
+    }
+    false
+}
+
+/// `json.loads(json.dumps(v))`'s own value, for a `v` this file cannot
+/// serialize to EXACT text or a member-grammar (`json_dumps_value`'s
+/// exact reading, then `dumps_grammar`'s own member-grammar composition,
+/// both already tried and declined by the caller before this is reached)
+/// but whose SHAPE the round trip still preserves exactly
+/// (`round_trips_exactly`'s own scope). Built on `Kind::Object` plus
+/// `JSON_DUMPS_ROUND_TRIP_WORD` plus `v` ITSELF carried in `inner` —
+/// `round_trip_carried_value` reads it back unchanged. This is
+/// `json.dumps`'s own return value at the call site: the TEXT `dumps`
+/// answers is never read as a string by anything else (the corpus's own
+/// B7 rows only ever feed it straight into `json.loads`), so carrying
+/// the original value rather than composing (and later re-parsing) an
+/// actual grammar string is the exact, not approximated, answer for the
+/// composed round trip — the same value `v` itself already proved,
+/// unwidened.
+pub fn dumps_round_trip_carrier_value(value: &AbstractValue) -> Option<AbstractValue> {
+    if !round_trips_exactly(value) {
+        return None;
+    }
+    Some(AbstractValue {
+        inner: Some(Box::new(value.clone())),
+        ..opaque_value(JSON_DUMPS_ROUND_TRIP_WORD)
+    })
+}
+
+/// The original value `dumps_round_trip_carrier_value` carried, if
+/// `value` is a round-trip carrier value built that way (`kind_word` is
+/// the round-trip word AND `inner` is populated). `None` for an ordinary
+/// string, or any other value `json.loads`'s own caller might pass —
+/// the honest "not a carrier" answer that sends the caller back to its
+/// own exact-literal reading or the full `json_loads_value_space`
+/// fallback.
+pub fn round_trip_carried_value(value: &AbstractValue) -> Option<&AbstractValue> {
+    if value.kind != Kind::Object || value.kind_word != Some(JSON_DUMPS_ROUND_TRIP_WORD) {
+        return None;
+    }
+    value.inner.as_deref()
 }

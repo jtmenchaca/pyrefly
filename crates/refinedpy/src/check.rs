@@ -36,7 +36,7 @@ use refined_domain::trust_grades::{TrustProved, TrustSpec};
 use refined_kernel::kernel_interface::RefinedTSKernel;
 use refined_sets::refinement_forms::{make_refined_set, on_one_tuple_layer, one_of, repeat_of, requires_integer, RefinedSet};
 use ruff_python_ast::{
-    Alias, AtomicNodeIndex, CmpOp, ExceptHandler, ExceptHandlerExceptHandler, Expr, ExprAttribute, ExprSubscript,
+    AtomicNodeIndex, BoolOp, CmpOp, ExceptHandler, ExceptHandlerExceptHandler, Expr, ExprAttribute, ExprSubscript,
     ModModule, Parameters, Stmt, StmtAnnAssign, StmtAssign, StmtAugAssign, StmtClassDef, StmtFunctionDef,
     StmtIf, StmtMatch, StmtRaise, StmtReturn, StmtTry, StmtWith, WithItem,
 };
@@ -1046,6 +1046,7 @@ fn walk_body_with_self_binding(
                     .map(|recognized| (recognized, Some(for_stmt.target.as_ref()), None))
             }
             Stmt::Assign(assign) => relational_sum::recognize_generator_sum(assign, &environment)
+                .or_else(|| relational_sum::recognize_sum_over_name(assign, &environment))
                 .map(|recognized| (recognized, None, Some(assign.range()))),
             _ => None,
         };
@@ -3037,7 +3038,7 @@ fn walk_if(
         // reflects the relation — no separate "intersect after the
         // fact" step, and the kernel arithmetic itself is untouched.
         if let Some(test) = test {
-            relational_narrow_upper_bound(test, body, &mut arm_environment);
+            relational_narrow_upper_bounds(test, body, &mut arm_environment);
         }
         let mut arm_provably_unbound: HashSet<String> = HashSet::new();
         // FOREIGN EDGE: same walrus-in-test recognition as the
@@ -3097,6 +3098,48 @@ fn walk_if(
     };
 }
 
+/// THE RELATIONAL LEDGER's own fact collector: every `left < right` /
+/// `left <= right` two-Name comparison `test` states directly, gathered
+/// from two shapes — an `and`-conjunction of separate `Compare` nodes
+/// (`n > 150 and i < n`, `i >= 0 and 0 <= n <= 9 and i < n`), and a
+/// CHAINED comparison's own adjacent pairs (`lo <= x <= hi` states BOTH
+/// `lo <= x` AND `x <= hi` — CPython's own chaining rule, `tmp/cpython/
+/// Doc/reference/expressions.rst`'s "Comparisons can be chained
+/// arbitrarily": `a op1 b op2 c` means `a op1 b and b op2 c`). Recurses
+/// through NESTED `and`s (`(p and q) and r`) but never descends into an
+/// `or` — an `or`'s own two arms are not both live at once, so a fact
+/// true on one arm is not a fact of the whole test. A conjunct/pair whose
+/// two sides are not both bare Names, or whose op is not `Lt`/`LtE`,
+/// contributes no fact — the same "narrows nothing" default every other
+/// leaf here keeps for a shape it does not recognize.
+fn relational_ceiling_facts(test: &Expr) -> Vec<(String, CmpOp, String)> {
+    let mut facts = Vec::new();
+    collect_relational_ceiling_facts(test, &mut facts);
+    facts
+}
+
+fn collect_relational_ceiling_facts(test: &Expr, facts: &mut Vec<(String, CmpOp, String)>) {
+    match test {
+        Expr::BoolOp(bool_op) if bool_op.op == BoolOp::And => {
+            for value in &bool_op.values {
+                collect_relational_ceiling_facts(value, facts);
+            }
+        }
+        Expr::Compare(compare) => {
+            let mut left = compare.left.as_ref();
+            for (op, right) in compare.ops.iter().zip(compare.comparators.iter()) {
+                if matches!(op, CmpOp::Lt | CmpOp::LtE) {
+                    if let (Expr::Name(left_name), Expr::Name(right_name)) = (left, right) {
+                        facts.push((left_name.id.as_str().to_owned(), *op, right_name.id.as_str().to_owned()));
+                    }
+                }
+                left = right;
+            }
+        }
+        _ => {}
+    }
+}
+
 /// `i < n` / `i <= n` (`i`/`n` both bare Names, both currently bound
 /// `Kind::Set` over INTEGER-tagged windows) rebinds `i` — the SAME
 /// binding `walk_if`'s own arm-body walk sees, so a LATER aug-assign
@@ -3110,63 +3153,139 @@ fn walk_if(
 /// the `-1` step is unsound over a Float-tagged window, which this
 /// reader declines rather than narrow wrongly.
 ///
-/// The bound is proved once, at arm entry, over `n`'s CURRENT window —
-/// so it must not survive a LATER write to `n` anywhere in `body`
-/// (B1.keep.write.py's own `reassign_forgets_relation`: `if i < n: n =
-/// 0; return i` — the `i < n` relation the guard proved is STALE the
-/// moment `n` is reassigned, and `i` must NOT be judged against the
-/// relation's now-invalid bound). Gated on `locally_bound_names(body)`
-/// never naming `n` — the same whole-body, any-nesting-depth scan the
-/// walk's own scoping (`walk_body_with_self_binding`'s own doc) already
-/// uses to decide what a body binds, checked here BEFORE the arm body
-/// walks rather than invalidated statement-by-statement, the
-/// conservative direction: a body that writes `n` on some path never
-/// gets the narrowing at all, even on a path that does not.
+/// GENERALIZED beyond one bare `Compare` (B1.est.guard's own
+/// `conjunction_inside`, B1.keep.trans's `transitivity_holds`, B1.use.
+/// project's `projection_stays_inside`, B1.use.sink's `between_bounds_
+/// admitted`): `relational_ceiling_facts` collects every two-Name `<`/`<=`
+/// fact the test states, through an `and`-conjunction of separate
+/// comparisons AND a chained comparison's own adjacent pairs, and each is
+/// applied here in turn. Applied TWICE over the same fact list — the
+/// second pass is ONE transitivity step: `i < n and n <= m` first
+/// narrows `i` against `n`'s window as it stood at the START of the
+/// first pass (still `n`'s bare declared window), and separately narrows
+/// `n` against `m`; the second pass then re-narrows `i` against `n`'s
+/// NOW-TIGHTENED window, so `i`'s own final ceiling reflects `m`
+/// transitively without a general fixpoint loop. A third fact chained
+/// off a second transitive step is out of this pass's own reach — two
+/// passes is the one step the cluster asks for, never a fixpoint.
 ///
-/// Declines silently (`arm_environment` unchanged) for every other test
-/// shape (a chained comparison, a non-Name operand, an operand not
-/// currently `Kind::Set`, either window not Integer-tagged, an unbounded
-/// `n`, a body that reassigns `n`) — the honest "narrows nothing"
-/// default every other narrowing channel in this file already keeps.
-fn relational_narrow_upper_bound(test: &Expr, body: &[Stmt], arm_environment: &mut Environment) {
-    use refined_sets::refinement_forms::{at_most, Form};
-    let Expr::Compare(compare) = test else {
-        return;
-    };
-    let ([op], [right]) = (&*compare.ops, &*compare.comparators) else {
-        return;
-    };
-    if !matches!(op, CmpOp::Lt | CmpOp::LtE) {
-        return;
-    }
-    let Expr::Name(left_name) = compare.left.as_ref() else {
-        return;
-    };
-    let Expr::Name(right_name) = right else {
-        return;
-    };
-    if locally_bound_names(body).contains(right_name.id.as_str()) {
-        return;
-    }
-    let Some(current) = arm_environment.read(left_name.id.as_str()) else {
-        return;
-    };
-    if current.kind != Kind::Set || !current.set.forms.iter().any(|form| form.form == Form::Integer) {
+/// Each fact is proved once, at arm entry, over the right name's CURRENT
+/// window — so it must not survive a LATER write to that name anywhere
+/// in `body` (B1.keep.write.py's own `reassign_forgets_relation`: `if i
+/// < n: n = 0; return i` — the `i < n` relation the guard proved is
+/// STALE the moment `n` is reassigned, and `i` must NOT be judged
+/// against the relation's now-invalid bound). Gated on `locally_bound_
+/// names(body)` never naming the right name — the same whole-body,
+/// any-nesting-depth scan the walk's own scoping (`walk_body_with_self_
+/// binding`'s own doc) already uses to decide what a body binds, checked
+/// here BEFORE the arm body walks rather than invalidated statement-by-
+/// statement, the conservative direction: a body that writes the right
+/// name on some path never gets that one fact's narrowing at all, even
+/// on a path that does not.
+///
+/// A fact whose left name is not currently `Kind::Set` over an
+/// Integer-tagged window, whose right name is unbound or not Integer-
+/// tagged, or whose right window carries no provable ceiling
+/// (`aug_assign_ceiling`) contributes nothing — the honest "narrows
+/// nothing" default every other narrowing channel in this file already
+/// keeps, applied fact-by-fact rather than declining the whole test for
+/// one unreadable conjunct.
+fn relational_narrow_upper_bounds(test: &Expr, body: &[Stmt], arm_environment: &mut Environment) {
+    let facts = relational_ceiling_facts(test);
+    if facts.is_empty() {
         return;
     }
-    let Some(other) = arm_environment.read(right_name.id.as_str()) else {
-        return;
-    };
-    if other.kind != Kind::Set || !other.set.forms.iter().any(|form| form.form == Form::Integer) {
-        return;
+    let locally_bound = locally_bound_names(body);
+    for _ in 0..2 {
+        for (left_name, op, right_name) in &facts {
+            apply_relational_ceiling_fact(left_name, *op, right_name, &locally_bound, arm_environment);
+        }
     }
-    let Some(other_ceiling) = aug_assign_ceiling(other) else {
-        return;
-    };
-    let bound = if matches!(op, CmpOp::Lt) { other_ceiling - 1.0 } else { other_ceiling };
-    let mut narrowed = current.clone();
-    narrowed.set.forms.push(at_most(bound));
-    arm_environment.bind(left_name.id.as_str(), narrowed);
+}
+
+/// One fact's own narrowing step — `relational_narrow_upper_bounds`'s
+/// per-fact body, split out so the two-pass loop above stays a plain
+/// fact-list iteration rather than a hand-inlined nest.
+///
+/// `left_name op right_name` is symmetric information: it states BOTH an
+/// upper bound on `left_name` (`right_name`'s own ceiling) AND a lower
+/// bound on `right_name` (`left_name`'s own floor) — `lo <= x` narrows
+/// `x`'s ceiling to nothing new (a floor gives no ceiling), but ALSO
+/// narrows `x`'s FLOOR to `lo`'s own floor, exactly as `x <= hi` narrows
+/// `x`'s ceiling to `hi`'s. B1.use.sink's own `between_bounds_admitted`
+/// (`lo <= x <= hi`, `lo`/`hi` both `Age`) needs both halves at once: the
+/// ceiling half alone leaves `x` floorless, which a `Kind::Set` sink
+/// judge correctly refuses to admit into `Age`'s own `[0, 150]` window.
+/// Applying the ceiling narrowing to `left_name` and the floor narrowing
+/// to `right_name` from the SAME fact is the sound symmetric reading of
+/// one relational fact, not two independent claims.
+fn apply_relational_ceiling_fact(
+    left_name: &str,
+    op: CmpOp,
+    right_name: &str,
+    locally_bound: &HashSet<String>,
+    arm_environment: &mut Environment,
+) {
+    use refined_sets::refinement_forms::{at_least, at_most, Form};
+    fn integer_windowed(value: &AbstractValue) -> bool {
+        value.kind == Kind::Set && value.set.forms.iter().any(|form| form.form == Form::Integer)
+    }
+    // the ceiling half: narrow `left_name` by `right_name`'s own ceiling —
+    // read both sides, THEN bind, so the two immutable reads above never
+    // overlap the mutable bind below.
+    if !locally_bound.contains(right_name) {
+        let current = arm_environment.read(left_name).cloned();
+        let other = arm_environment.read(right_name).cloned();
+        if let (Some(current), Some(other)) = (current, other) {
+            if integer_windowed(&current) && integer_windowed(&other) {
+                if let Some(other_ceiling) = aug_assign_ceiling(&other) {
+                    let bound = if matches!(op, CmpOp::Lt) { other_ceiling - 1.0 } else { other_ceiling };
+                    let mut narrowed = current;
+                    narrowed.set.forms.push(at_most(bound));
+                    arm_environment.bind(left_name, narrowed);
+                }
+            }
+        }
+    }
+    // the floor half: narrow `right_name` by `left_name`'s own floor — the
+    // same fact's mirrored claim, see this function's own doc.
+    if !locally_bound.contains(left_name) {
+        let current = arm_environment.read(left_name).cloned();
+        let other = arm_environment.read(right_name).cloned();
+        if let (Some(current), Some(other)) = (current, other) {
+            if integer_windowed(&current) && integer_windowed(&other) {
+                if let Some(current_floor) = aug_assign_floor(&current) {
+                    let bound = if matches!(op, CmpOp::Lt) { current_floor + 1.0 } else { current_floor };
+                    let mut narrowed = other;
+                    narrowed.set.forms.push(at_least(bound));
+                    arm_environment.bind(right_name, narrowed);
+                }
+            }
+        }
+    }
+}
+
+/// The lowest value `value` could hold: the TIGHTEST `AtLeast`-form
+/// bound of a `Kind::Set` window, mirroring `aug_assign_ceiling`'s own
+/// `AtMost` read — a window can carry more than one `AtLeast` form for
+/// the same reason (a later narrowing pass pushes a tighter bound
+/// without removing the stale one), so this reads the MAXIMUM over
+/// every `AtLeast` form, never the first one found. `None` for a set
+/// with no `AtLeast` form (unbounded below) or any non-`Kind::Set`
+/// shape — the caller narrows nothing rather than guess a floor the
+/// value does not state.
+fn aug_assign_floor(value: &AbstractValue) -> Option<f64> {
+    use refined_sets::refinement_forms::Form;
+    match value.kind {
+        Kind::Set => value
+            .set
+            .forms
+            .iter()
+            .filter(|form| form.form == Form::AtLeast)
+            .map(|form| form.a)
+            .reduce(f64::max),
+        _ => None,
+    }
 }
 
 /// Whether `test` is an `is`/`is not` comparison against a bare `None`
@@ -3352,8 +3471,8 @@ fn walk_relational_sum(
         Some(Stmt::Return(ret)) => {
             if let Some(value) = ret.value.as_deref() {
                 if !rebinds_relational_name(value, &recognized) {
-                    if let Some(range) = relational_sum::division_range_in(value, &recognized, environment) {
-                        relational_sum::fold_located_division(&mut recognized);
+                    if let Some((range, op)) = relational_sum::division_range_in(value, &recognized, environment) {
+                        relational_sum::fold_located_division(&mut recognized, op);
                         published_division = Some(range);
                         consumed_statements += 1;
                     }
@@ -4938,17 +5057,28 @@ fn aug_assign_write_refutation(
 }
 
 /// The highest value `value` could hold: the maximum of an exact
-/// `Kind::Values` set, or the `AtMost`-form bound of a `Kind::Set` window
-/// (`aug_assign_window`'s own doc — the same `[lo, hi]` shape this file's
-/// `integer_window_minus_edge_literals` already reads `Form::AtMost` off
-/// of). `None` for anything else (`Kind::Unknown`, an unbounded set with
-/// no `AtMost` form, an empty exact set) — the caller falls back to the
-/// generic refutation wording then.
+/// `Kind::Values` set, or the TIGHTEST `AtMost`-form bound of a
+/// `Kind::Set` window (`aug_assign_window`'s own doc — the same `[lo,
+/// hi]` shape this file's `integer_window_minus_edge_literals` already
+/// reads `Form::AtMost` off of). A window can carry more than one
+/// `AtMost` form — a later narrowing pass pushes a tighter bound onto
+/// the SAME window without removing the earlier, now-stale one
+/// (`apply_relational_ceiling_fact`'s two-pass transitivity step) — so
+/// this reads the MINIMUM over every `AtMost` form, never the first
+/// one found. `None` for anything else (`Kind::Unknown`, an unbounded
+/// set with no `AtMost` form, an empty exact set) — the caller falls
+/// back to the generic refutation wording then.
 fn aug_assign_ceiling(value: &AbstractValue) -> Option<f64> {
     use refined_sets::refinement_forms::Form;
     match value.kind {
         Kind::Values => value.values.iter().copied().reduce(f64::max),
-        Kind::Set => value.set.forms.iter().find(|form| form.form == Form::AtMost).map(|form| form.a),
+        Kind::Set => value
+            .set
+            .forms
+            .iter()
+            .filter(|form| form.form == Form::AtMost)
+            .map(|form| form.a)
+            .reduce(f64::min),
         _ => None,
     }
 }
@@ -6319,6 +6449,9 @@ fn sink_value(
     if let Some(result) = callable_variable_call_result(expr, context, environment) {
         return Some(result);
     }
+    if let Some(result) = same_module_def_call_result_already_reported(expr, context, environment) {
+        return Some(result);
+    }
     // RUNG 2 — THE MANIFEST READER TEMPLATE
     // (`packages/cpp/findings/python-c-extension-boundary.md`): a call
     // recognized against a discovered manifest judges its own written
@@ -6593,6 +6726,59 @@ fn callable_variable_call_result(
         });
     }
     Some(known_set(declared.set.clone(), None, TrustSpec, SetKindTag::None))
+}
+
+/// A SAME-MODULE-DEF CALL whose own body already reports its own
+/// escaping return: `findings_for_module_at` walks EVERY module-level
+/// `def` on its own (this file's own doc, "each nested `def` gets its
+/// own fresh body walk"), so a `def two_hundred() -> Age: return 200`
+/// ALWAYS fires RTS7001 at its own `return 200`, independent of any
+/// caller. Reading `two_hundred`'s call result at ANOTHER sink
+/// (`f = two_hundred; over: Age = f()`, or a direct `over: Age =
+/// two_hundred()`) must not ALSO fire there — that would report the
+/// SAME defect twice ("one error per defect... at its own construct"),
+/// once at the `return` statement and once at every caller.
+///
+/// Recognizes `expr` as a call whose callee resolves to a same-module
+/// `def` — either directly by name, or through a same-module-def alias
+/// value (`f = two_hundred`, `env::same_module_def_alias_name`) — and,
+/// when that def states its own `-> Annotation` refinement, evaluates
+/// the call exactly as `evaluate_expression` would and asks whether the
+/// answer escapes it. An escaping answer substitutes the DECLARED SET
+/// for the raw value, the same refused-slot substitution `judge_and_
+/// bind_naming`'s own Fire arm already makes for a later read in the
+/// SAME body — so this sink sees an in-window value and stays silent,
+/// leaving the one true fire at the def's own `return`. A value that
+/// stays inside the declared window, or a def whose return states no
+/// refinement this table reads, or a callee this file cannot resolve to
+/// a same-module def at all, all fall through `None` — the caller tries
+/// every other channel and ultimately `evaluate_expression` unchanged.
+fn same_module_def_call_result_already_reported(
+    expr: &Expr,
+    context: &WalkContext,
+    environment: &Environment,
+) -> Option<AbstractValue> {
+    let Expr::Call(call) = expr else {
+        return None;
+    };
+    let Expr::Name(callee_name) = call.func.as_ref() else {
+        return None;
+    };
+    let functions = environment.functions().or(Some(&context.functions))?;
+    let def = match environment.read(callee_name.id.as_str()) {
+        Some(value) => {
+            let aliased_name = crate::env::same_module_def_alias_name(value)?;
+            functions.def(aliased_name)?
+        }
+        None => functions.def(callee_name.id.as_str())?,
+    };
+    let returns = def.returns.as_deref()?;
+    let declared = declared_refinement(returns, context.aliases, context.imports, environment)?;
+    let value = evaluate_expression(expr, environment, context.kernel);
+    match judge(&value, &declared, context.kernel) {
+        Verdict::Fire(_) => Some(known_set(declared.set.clone(), None, TrustSpec, SetKindTag::None)),
+        Verdict::Silent | Verdict::Undetermined(_) => Some(value),
+    }
 }
 
 /// STATEMENT-SIDE METHOD CALLS: `name.method(args)` where `name` reads
@@ -7979,16 +8165,23 @@ fn collect_bound_names_stmt(stmt: &Stmt, bound: &mut HashSet<String>, excluded: 
         Stmt::ClassDef(def) => {
             bound.insert(def.name.id.as_str().to_owned());
         }
-        Stmt::Import(import) => {
-            for alias in &import.names {
-                bound.insert(imported_local_name(alias));
-            }
-        }
-        Stmt::ImportFrom(import) => {
-            for alias in &import.names {
-                bound.insert(imported_local_name(alias));
-            }
-        }
+        // An import DECLARES a name; it never REBINDS one — the
+        // rebinding gate this collector feeds
+        // (`Environment::alias_is_visible`) exists to catch a body's OWN
+        // assignment/for/with/except target shadowing a module-level
+        // alias, never the import statement that IS how the alias
+        // itself becomes visible in the first place (C1.scope.py's own
+        // `from support.py.refined import Age` at module top level —
+        // the alias's own establishing import — must never read as
+        // shadowing `Age` at its own declaration site, the false
+        // positive this arm once produced). A local import shadowing an
+        // OUTER alias by the same spelling inside a nested body is a
+        // real Python fact this collector does not separately state
+        // today; no fixture in the corpus exercises that shape, and
+        // leaving it unstated is conservative (an unshadowed alias name
+        // still resolves the caller's normal way), never a false report
+        // the other direction.
+        Stmt::Import(_) | Stmt::ImportFrom(_) => {}
         Stmt::Global(global) => {
             for name in &global.names {
                 excluded.insert(name.id.as_str().to_owned());
@@ -8061,20 +8254,6 @@ fn collect_with_item_names(item: &WithItem, bound: &mut HashSet<String>) {
     collect_walrus_names(&item.context_expr, bound);
     if let Some(vars) = item.optional_vars.as_deref() {
         collect_target_names(vars, bound);
-    }
-}
-
-fn imported_local_name(alias: &Alias) -> String {
-    match alias.asname.as_ref() {
-        Some(asname) => asname.id.as_str().to_owned(),
-        None => {
-            // `import a.b.c` binds the top-level name `a` in the local
-            // scope; `import a.b.c as x` (the asname arm above) binds
-            // `x` instead. A plain `from` import's alias.name is
-            // already the single name being bound.
-            let full = alias.name.id.as_str();
-            full.split('.').next().unwrap_or(full).to_owned()
-        }
     }
 }
 
@@ -8387,6 +8566,66 @@ mod tests {
     fn offset_of(source: &str, needle: &str) -> TextSize {
         let byte_offset = source.find(needle).unwrap_or_else(|| panic!("{needle:?} not found in fixture"));
         TextSize::try_from(byte_offset).expect("fixture offsets fit in TextSize")
+    }
+
+    /// C1.scope.py's own shape: a module-level `AnnAssign` typed with an
+    /// alias IMPORTED at that same module's top level
+    /// (`from support.py.refined import Age`) must never read as the
+    /// alias being "rebound in this body" — the import is how `Age`
+    /// BECOMES visible, not a shadow of it. Before
+    /// `collect_bound_names_stmt`'s `Stmt::ImportFrom` arm stopped
+    /// feeding import names into the rebinding gate, every module-level
+    /// alias-typed binding fired this false RTS7002 at its own
+    /// declaration, since `walk_body`/`walk_body_with_self_binding`
+    /// walks the module's own top-level body through the identical
+    /// `locally_bound_names` computation every function body uses.
+    #[test]
+    fn a_module_level_import_of_its_own_alias_is_never_read_as_rebinding_it() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Age = Annotated[int, Field(ge=0, le=150)]\n",
+            "module_level_binding: Age = 0\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        assert!(
+            !findings.iter().any(|finding| finding.message.contains("is rebound in this body")),
+            "an alias's own establishing import must never read as rebinding it: {:?}",
+            findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// The identical shape through an actual CROSS-MODULE import
+    /// (`from support.py.refined import Age`, C1.scope.py's own literal
+    /// spelling) rather than a same-module `type` alias — the
+    /// `Stmt::ImportFrom` arm specifically, not just `Stmt::Import`.
+    /// The in-memory resolver map is `an_imported_value_read_through_a_
+    /// two_module_resolver_fires_at_a_return_sink`'s own pattern
+    /// (`cross_module.rs`'s own test convention).
+    #[test]
+    fn a_module_level_from_import_of_its_own_alias_is_never_read_as_rebinding_it() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let mut sources: HashMap<&str, &str> = HashMap::new();
+        sources.insert(
+            "support",
+            concat!(
+                "from typing import Annotated\n",
+                "from pydantic import Field\n",
+                "type Age = Annotated[int, Field(ge=0, le=150)]\n",
+            ),
+        );
+        let module = parsed(concat!(
+            "from support import Age\n",
+            "module_level_binding: Age = 0\n",
+        ));
+        let resolver: ModuleResolver = &|name: &str| sources.get(name).map(|source| parsed(source));
+        let findings = findings_for_module_with_resolver(&module, resolver, &kernel);
+        assert!(
+            !findings.iter().any(|finding| finding.message.contains("is rebound in this body")),
+            "an alias's own establishing FROM-import must never read as rebinding it: {:?}",
+            findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+        );
     }
 
     /// A module whose ONLY refinement vocabulary is a bare
@@ -10056,7 +10295,7 @@ mod tests {
 
     /// B1.keep.write.py's own `increment_weakens_to_le`: under `i < n`
     /// (both `Age`), `i += 1` gives `i ≤ n ≤ 150` — `i` stays inside
-    /// `Age`. Pins `relational_narrow_upper_bound`'s own intersection of
+    /// `Age`. Pins `relational_narrow_upper_bounds`'s own intersection of
     /// the guard's relation with `i`'s current window, consulted BEFORE
     /// the kernel-computed fold `judge_and_bind_aug_assign_write` still
     /// runs unchanged.
@@ -10085,7 +10324,7 @@ mod tests {
     /// n` guard, but `n` is reassigned to `0` inside the arm before `i`
     /// is read back — the relation the guard proved is stale, and `i`
     /// (declared `Wide`, `[0, 200]`) must NOT be judged against the
-    /// now-invalid `i < n` bound. Pins `relational_narrow_upper_bound`'s
+    /// now-invalid `i < n` bound. Pins `relational_narrow_upper_bounds`'s
     /// own `locally_bound_names(body)` gate: a body that reassigns the
     /// relation's own right-hand name never gets the narrowing at all.
     #[test]
@@ -10108,6 +10347,113 @@ mod tests {
             fires.len(),
             1,
             "the stale i < n relation must not silence i's own out-of-Age window: {:?}",
+            findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// B1.est.guard.py's own `conjunction_inside`: a CHAINED comparison
+    /// `lo <= x <= hi` states two facts at once — `relational_ceiling_
+    /// facts`'s own chained-comparison pairing must read the SECOND pair
+    /// (`x <= hi`) and narrow `x`'s ceiling to `hi`'s own [0, 150]
+    /// ceiling, keeping `x` inside `Age` on the return.
+    #[test]
+    fn a_chained_comparison_narrows_the_middle_names_ceiling_from_its_own_upper_pair() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Age = Annotated[int, Field(ge=0, le=150)]\n",
+            "type Wide = Annotated[int, Field(ge=0, le=200)]\n",
+            "def conjunction_inside(lo: Age, x: Wide, hi: Age) -> Age:\n",
+            "    if lo <= x <= hi:\n",
+            "        return x\n",
+            "    return 0\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        assert!(
+            findings.is_empty(),
+            "lo <= x <= hi must narrow x's ceiling to hi's own Age window: {:?}",
+            findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// B1.keep.trans.py's own `transitivity_holds`: `i < n and n <= m`
+    /// combines two two-Name facts from ONE `and`-conjunction — pins the
+    /// TWO-PASS transitivity step: the first pass narrows `i` against
+    /// `n`'s own bare `Wide` [0, 200] ceiling and separately narrows `n`
+    /// against `m`'s `Age` [0, 150] ceiling; the second pass then
+    /// re-narrows `i` against `n`'s now-tightened ceiling, so `i`'s own
+    /// final bound reflects `m` transitively and stays inside `Age`.
+    #[test]
+    fn an_and_conjunction_of_two_facts_narrows_transitively_in_one_step() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Age = Annotated[int, Field(ge=0, le=150)]\n",
+            "type Wide = Annotated[int, Field(ge=0, le=200)]\n",
+            "def transitivity_holds(i: Wide, n: Wide, m: Age) -> Age:\n",
+            "    if i < n and n <= m:\n",
+            "        return i\n",
+            "    return 0\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        assert!(
+            findings.is_empty(),
+            "i < n and n <= m must transitively bound i by m's own Age ceiling: {:?}",
+            findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// B1.use.project.py's own `projection_stays_inside`: the two-Name
+    /// fact `i < n` sits as the THIRD conjunct of a three-way `and`
+    /// (`i >= 0 and 0 <= n <= 9 and i < n`) — pins that `relational_
+    /// ceiling_facts` finds the fact wherever it sits among conjuncts of
+    /// mixed shapes (a single-name literal bound, a chained single-name
+    /// bound, then the two-Name fact), narrowing `i`'s ceiling to `n`'s
+    /// own (already SET-channel-narrowed) ceiling of 9.
+    #[test]
+    fn a_two_name_fact_is_found_among_mixed_conjuncts_in_an_and_chain() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Age = Annotated[int, Field(ge=0, le=150)]\n",
+            "def projection_stays_inside(i: int, n: int) -> Age:\n",
+            "    if i >= 0 and 0 <= n <= 9 and i < n:\n",
+            "        return i\n",
+            "    return 0\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        assert!(
+            findings.is_empty(),
+            "i < n with n's own ceiling narrowed to 9 must keep i inside Age: {:?}",
+            findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// B1.use.sink.py's own `between_bounds_admitted`: `lo <= x <= hi`
+    /// (`lo`, `hi` both `Age`) narrows `x`'s ceiling to `hi`'s own
+    /// [0, 150] window BEFORE the arm's own `a: Age = x` sink judges it —
+    /// pins that the chained-comparison ceiling narrowing applies ahead
+    /// of an ordinary declared-target assignment, not only a `return`.
+    #[test]
+    fn a_chained_comparisons_ceiling_narrowing_admits_a_later_declared_sink() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Age = Annotated[int, Field(ge=0, le=150)]\n",
+            "def between_bounds_admitted(lo: Age, x: int, hi: Age) -> Age:\n",
+            "    if lo <= x <= hi:\n",
+            "        a: Age = x\n",
+            "        return a\n",
+            "    return 0\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        assert!(
+            findings.is_empty(),
+            "lo <= x <= hi must narrow x's ceiling so a: Age = x is admitted: {:?}",
             findings.iter().map(|f| &f.message).collect::<Vec<_>>()
         );
     }
@@ -10148,7 +10494,7 @@ mod tests {
         let findings = findings_for_module(&module, &kernel);
         let fires: Vec<&Finding> = findings.iter().filter(|f| f.code == "RTS7001").collect();
         assert_eq!(fires.len(), 1, "{:?}", findings.iter().map(|f| &f.message).collect::<Vec<_>>());
-        assert!(fires[0].message.contains("'240'"), "{}", fires[0].message);
+        assert!(fires[0].message.contains("may write 240,"), "{}", fires[0].message);
     }
 
     #[test]
