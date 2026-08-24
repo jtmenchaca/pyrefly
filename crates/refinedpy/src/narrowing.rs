@@ -1265,9 +1265,18 @@ fn narrow_type_guard_call(call: &ruff_python_ast::ExprCall, environment: &mut En
 /// parameter — `check.rs::seed_parameters` states nothing for the bare
 /// `object` annotation, since no alias names it) is a SEPARATE case
 /// from an existing Values binding: `environment.read` answers `None`,
-/// not a Values state to filter. `isinstance(value, int)`/`float`
-/// PROVING true (`truth` and no prior binding) is itself the first
-/// fact this environment learns about `value` — it seeds a fresh
+/// not a Values state to filter. A name bound to `Kind::Unknown` — a
+/// read this file genuinely determined NOTHING about (a subscript into
+/// an unrecognized container shape, an unmodeled call's own result,
+/// `abstract_value::unknown`'s own doc: "no fact reads through it at
+/// all") — carries the identical absence of information, so it takes
+/// the SAME seeding path rather than the "existing binding" arm below:
+/// an `Unknown` value is not a state with members to filter, and
+/// treating it as one that "already agrees" or "wholly disagrees"
+/// with the test would be a claim this file never derived. Both cases
+/// converge here as `no_information`. `isinstance(value, int)`/`float`
+/// PROVING true (`truth` and no information) is itself the first fact
+/// this environment learns about `value` — it seeds a fresh
 /// `Kind::Set` binding holding the unbounded sort (the same set
 /// `summaries.rs::return_sort_fallback`/`expressions.rs`'s `int(...)`
 /// row build for a proved-but-unbounded `int`/`float`), grade
@@ -1276,10 +1285,11 @@ fn narrow_type_guard_call(call: &ruff_python_ast::ExprCall, environment: &mut En
 /// `isinstance(value, bool)` seeds `Kind::Values` instead: `bool`'s
 /// domain is the two exact values `{0, 1}` (`string_models.rs`'s
 /// `boolean_value` convention), not an unbounded ray, so it is not a
-/// Set-kind sort seed. Proving FALSE, or a name already bound to
-/// SOMETHING (however unreadable), never seeds here — a falsified test
-/// says nothing positive about which sort `value` DOES hold, and an
-/// existing binding is this function's other, unchanged, arm below.
+/// Set-kind sort seed. Proving FALSE, or a name already bound to a
+/// READABLE value (however far from the sort being tested), never
+/// seeds here — a falsified test says nothing positive about which
+/// sort `value` DOES hold, and an existing readable binding is this
+/// function's other, unchanged, arm below.
 fn narrow_isinstance_call(call: &ruff_python_ast::ExprCall, environment: &mut Environment, truth: bool) {
     let Expr::Name(func_name) = call.func.as_ref() else {
         return;
@@ -1297,7 +1307,11 @@ fn narrow_isinstance_call(call: &ruff_python_ast::ExprCall, environment: &mut En
         return;
     };
     let current = environment.read(name).cloned();
-    if current.is_none() {
+    let no_information = match &current {
+        None => true,
+        Some(value) => value.kind == Kind::Unknown,
+    };
+    if no_information {
         if truth {
             if let [tag] = tags.as_slice() {
                 if let Some(seeded) = sort_seed(*tag) {
@@ -1307,7 +1321,7 @@ fn narrow_isinstance_call(call: &ruff_python_ast::ExprCall, environment: &mut En
         }
         return;
     }
-    let current = current.expect("checked Some above");
+    let current = current.expect("no_information false means Some was read above");
     // A KindUnion binding (json.loads's own honest return space,
     // `expressions.rs::json_loads_value_space`) narrows arm-by-arm: each
     // arm already carries the `kind_tag` an ordinary Values/Set binding
@@ -2435,6 +2449,53 @@ mod tests {
     #[test]
     fn test_isinstance_int_seeds_a_fresh_integer_set_from_unbound() {
         let environment = Environment::new(HashSet::new());
+        let Some(narrowed) = assumed("isinstance(value, int)", environment, true) else {
+            return;
+        };
+        let value = narrowed.read("value").expect("isinstance seeded value");
+        assert_eq!(value.kind, Kind::Set);
+        assert_eq!(value.kind_tag, Some(PrimitiveKind::Integer));
+        assert_eq!(value.set, unbounded_integers());
+    }
+
+    /// `isinstance(value, int)` on a name the environment HAS bound —
+    /// but to `Kind::Unknown` (a subscript into an unrecognized
+    /// container shape, `expressions.rs::evaluate_subscript`'s own
+    /// `unknown()` fallback for `parsed["value"]` over a `json.loads`
+    /// `Kind::KindUnion` result — `collection_models::subscript_read`
+    /// carries no `Kind::KindUnion` arm) — takes the SAME seeding path
+    /// the unbound case above does, not the "existing binding" arm: an
+    /// `Unknown` value states no information for the isinstance test to
+    /// filter, disagree with, or agree with, so a guard re-establishing
+    /// the sort over it is the honest reading, mirroring the e2e fixture
+    /// A10.edge.json's own `json_inside` row (`value = parsed["value"]`
+    /// guarded by `isinstance(value, int) and 0 <= value <= 150` before
+    /// `return value`).
+    #[test]
+    fn test_isinstance_int_seeds_a_fresh_integer_set_from_an_unknown_binding() {
+        let mut locally_bound = HashSet::new();
+        locally_bound.insert("value".to_owned());
+        let mut environment = Environment::new(locally_bound);
+        environment.bind("value", refined_domain::abstract_value::unknown());
+        let Some(narrowed) = assumed("isinstance(value, int)", environment, true) else {
+            return;
+        };
+        let value = narrowed.read("value").expect("isinstance seeded value");
+        assert_eq!(value.kind, Kind::Set);
+        assert_eq!(value.kind_tag, Some(PrimitiveKind::Integer));
+        assert_eq!(value.set, unbounded_integers());
+    }
+
+    /// The same seeding applies to `Kind::Unknown` marked `opaque: true`
+    /// (`abstract_value::opaque`'s own "determined to be undeterminable"
+    /// shape, e.g. an external call's result) — both share `Kind::Unknown`,
+    /// so both carry zero information for this test to read.
+    #[test]
+    fn test_isinstance_int_seeds_a_fresh_integer_set_from_an_opaque_binding() {
+        let mut locally_bound = HashSet::new();
+        locally_bound.insert("value".to_owned());
+        let mut environment = Environment::new(locally_bound);
+        environment.bind("value", refined_domain::abstract_value::opaque());
         let Some(narrowed) = assumed("isinstance(value, int)", environment, true) else {
             return;
         };

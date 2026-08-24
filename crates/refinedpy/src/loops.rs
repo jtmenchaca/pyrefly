@@ -115,9 +115,9 @@ use crate::assignability::judge;
 use crate::assignability::Verdict;
 use crate::collection_models;
 use crate::env::Environment;
-use crate::expressions::binary_arithmetic_value;
 use crate::expressions::evaluate_expression;
 use crate::instances;
+use crate::narrowing::assume;
 use crate::summaries::iterable_element_sort;
 use crate::typereading::DeclaredRefinement;
 
@@ -464,6 +464,23 @@ fn repetition_window_element_pass(
     let receiver = evaluate_expression(for_stmt.iter.as_ref(), environment, kernel);
     if receiver.kind != Kind::Set || receiver.set_kind_tag != SetKindTag::None {
         return None;
+    }
+    // ITERATOR NON-TERMINATION: `for x in lst: lst.append(x)` — a list
+    // iterated DIRECTLY (`iterated_list_name`) whose own body provably
+    // appends to that SAME list on every reachable pass
+    // (`list_size_changing_mutation_range`) never reaches its own end
+    // (a list's iterator, unlike a dict's, carries no size-changed
+    // guard — `diagnostic_sentences::list_never_terminates_self_append`'s
+    // own citation) — checked here, before the one abstract pass runs,
+    // mirroring `for_loop_final_environment`'s own dict-iterator-
+    // invalidation check one level up: this fire is recorded and the
+    // whole loop still declines (`None`, below), the same "fires
+    // propagate unconditionally" convention this file already keeps.
+    if let Some(list_name) = iterated_list_name(for_stmt.iter.as_ref()) {
+        if let Some(range) = list_size_changing_mutation_range(&for_stmt.body, list_name) {
+            judge_context.fires.push((range, crate::diagnostic_sentences::list_never_terminates_self_append(list_name)));
+            return None;
+        }
     }
     let repeated = as_repetition(&receiver.set)?;
     // The element inherits the sequence's own numeric sort — the same
@@ -1593,6 +1610,70 @@ fn dict_size_changing_mutation_range(body: &[Stmt], dict_name: &str) -> Option<T
     None
 }
 
+/// The bare Name a `for` loop iterates DIRECTLY over — `for x in lst:`
+/// — when `lst` is itself the loop's own iterable expression, no
+/// `.keys()`/`.values()`/`.items()` view or other wrapping call
+/// involved. `Some(name)` only for this exact bare-Name shape (a
+/// computed expression, a literal display, or a view call has no
+/// single WRITABLE name a body statement could mutate through, so
+/// `list_size_changing_mutation_range` has nothing to match against);
+/// mirrors `iterated_dict_name`'s own scoping, one level simpler since
+/// a list carries no `.keys()`-style view methods to see through.
+fn iterated_list_name(iterable: &Expr) -> Option<&str> {
+    let Expr::Name(name) = iterable else {
+        return None;
+    };
+    Some(name.id.as_str())
+}
+
+/// Whether `expr` is `<list_name>.append(...)` — the one list mutation
+/// that unconditionally GROWS the receiver on every call (stdtypes.rst,
+/// "list.append(x): Add an item to the end of the list. Equivalent to
+/// a[len(a):] = [x]"), called on a bare Name equal to `list_name`.
+/// `insert`/`extend`/`+=` also grow a list, but are not read here: this
+/// function's own caller (`list_size_changing_mutation_range`) only
+/// needs the ONE shape the corpus states as non-terminating —
+/// `for x in lst: lst.append(x)`, a self-feeding append that runs the
+/// iterator's own internal index into elements the SAME pass just
+/// added (`tmp/cpython/Doc/library/stdtypes.rst`'s list iterator has
+/// no length snapshot the way a `range(len(...))` counter would) —
+/// extending the recognized method set to the wider non-terminating
+/// family is a follow-on, not a behavior this one row needs.
+fn is_list_growing_append_call(expr: &Expr, list_name: &str) -> bool {
+    let Expr::Call(call) = expr else {
+        return false;
+    };
+    let Expr::Attribute(attribute) = call.func.as_ref() else {
+        return false;
+    };
+    if attribute.attr.as_str() != "append" {
+        return false;
+    }
+    let Expr::Name(receiver) = attribute.value.as_ref() else {
+        return false;
+    };
+    receiver.id.as_str() == list_name
+}
+
+/// Scans `body`'s own TOP-LEVEL statements (the same straight-line
+/// scope `dict_size_changing_mutation_range` reads — a nested `.append`
+/// one level inside an `if`/`for`/`try` is not proved to run on EVERY
+/// reachable pass) for a statement that provably grows `list_name` on
+/// every pass: `list_name.append(...)` as an expression statement
+/// (`is_list_growing_append_call`). `Some(range)` names the FIRST such
+/// statement's own range; `None` when no top-level statement in this
+/// body provably appends to the iterated list.
+fn list_size_changing_mutation_range(body: &[Stmt], list_name: &str) -> Option<TextRange> {
+    for stmt in body {
+        if let Stmt::Expr(expr_stmt) = stmt {
+            if is_list_growing_append_call(expr_stmt.value.as_ref(), list_name) {
+                return Some(stmt.range());
+            }
+        }
+    }
+    None
+}
+
 /// `some_generator(args...)` — a bare-Name call to a SAME-MODULE `def`
 /// (sync or async: `async def stream(): ...` still parses as
 /// `StmtFunctionDef`, ruff carries `is_async` as a flag on the def, not
@@ -1921,8 +2002,20 @@ fn run_statement_once(
                 None => unknown(),
             };
             let operand = evaluate_expression(assign.value.as_ref(), environment, kernel);
-            let updated = binary_arithmetic_value(assign.op, &current, &operand);
-            if updated.kind != Kind::Values {
+            // an accumulator (`total += x`) folding a Set-shaped operand —
+            // a for-loop element bound off an ABSTRACT pass
+            // (`repetition_window_element_pass`, `windowed_range_element_
+            // pass`), never one concrete number — has no answer through
+            // the plain, kernel-less arithmetic path: `single_numeric_
+            // value` needs one known scalar on both sides. `binary_
+            // arithmetic_value_with_kernel` asks `transfer_over_sets`
+            // first for exactly that shape (at least one operand
+            // `Kind::Set`), falling through to the identical plain path
+            // for the two-known-values case this function already served
+            // — one arithmetic transfer, not two independently maintained
+            // copies.
+            let updated = crate::expressions::binary_arithmetic_value_with_kernel(assign.op, &current, &operand, kernel);
+            if !matches!(updated.kind, Kind::Values | Kind::Set) {
                 return None;
             }
             bind_checked(name.id.as_str(), updated, stmt.range(), environment, kernel, judge_context)?;
@@ -2123,13 +2216,35 @@ fn bind_checked(
 /// `if test: body [elif test: body ...] [else: body]` inside a loop —
 /// the taken arm is decided PER ITERATION by evaluating `test` against
 /// the CURRENT environment (`lattice_operations::truthiness`'s
-/// `(value, known)` pair): an unknown test on this iteration declines
-/// the WHOLE loop (the corpus's own framing: "an unknown test on ANY
-/// iteration declines the whole loop" — a body this module cannot
-/// decide even once is not a shape it can claim to run exactly). The
-/// taken arm's statements run in place; an untaken arm is not walked at
-/// all, matching CPython's own single-branch execution
-/// (compound_stmts.rst, "the `if` statement").
+/// `(value, known)` pair). Most of this module's callers step ONE
+/// concrete element (a display's own literal, a dict's own key) — a
+/// test over that element's own scalar value always reads a known
+/// `(taken, true)`/`(false, true)` pair, so the single-branch execution
+/// below (matching CPython's own `if` semantics, compound_stmts.rst)
+/// covers the whole concrete-iterate story exactly.
+///
+/// The loop's own ABSTRACT passes (`repetition_window_element_pass`,
+/// `windowed_range_element_pass`, `abstract_element_sort_pass`,
+/// `custom_iterator_element_pass` — every one whose own doc names
+/// itself "one JUDGED pass standing in for the whole run", never a
+/// concrete per-element walk) bind the loop target to a Set-shaped
+/// abstraction rather than one concrete value, so a test over that
+/// target (`0 <= x <= 149`) never resolves to one known boolean —
+/// `evaluate_expression`'s comparison reader has no single scalar to
+/// compare. `run_if_once_over_unknown_test` is this case's own
+/// fallback: EXACTLY the same "narrow each arm, walk it, join the
+/// survivors" contract `check.rs::walk_if` already uses for a
+/// module-level `if` whose test is not proved either way — sound here
+/// for the identical reason it is sound there, since an abstract
+/// pass's own fires already carry that pass's "some argument reaches
+/// here" caveat, never the concrete path's stronger "this really
+/// happened" one. Scoped to a plain `if: ... else: ...` (or a bare
+/// `if: ...` with no `elif`/`else`) whose every taken arm falls
+/// through (`BodyOutcome::Fell`) — an unknown test on any WIDER shape
+/// (an `elif` chain, a `break`/`continue`/`return` inside either arm)
+/// still declines the whole loop, the same honesty this function
+/// always kept: this module never approximates a step it cannot state
+/// exactly.
 fn run_if_once(
     if_stmt: &StmtIf,
     environment: &mut Environment,
@@ -2139,7 +2254,7 @@ fn run_if_once(
     let condition = evaluate_expression(if_stmt.test.as_ref(), environment, kernel);
     let (taken, known) = truthiness(&condition);
     if !known {
-        return None;
+        return run_if_once_over_unknown_test(if_stmt, environment, kernel, judge_context);
     }
     if taken {
         return run_body_once(&if_stmt.body, environment, kernel, judge_context).map(outcome_of_body);
@@ -2166,6 +2281,113 @@ fn run_if_once(
     // no arm's test held and there was no bare `else:` — the whole `if`
     // statement is a no-op this iteration
     Some(StatementOutcome::Next)
+}
+
+/// `run_if_once`'s own fallback for a test whose truth value this
+/// abstract pass cannot read off the CURRENT (Set-shaped) binding —
+/// mirrors `check.rs::walk_if`'s own narrow-each-arm-then-join
+/// contract, restricted to the one shape this module's abstract passes
+/// actually need: a bare `if: body` or `if: body else: body`, no
+/// `elif` clause. `narrowing::assume` tightens each arm's own fork by
+/// what the test being true (respectively false) says — the SAME
+/// narrowing `walk_if` runs before walking a module-level arm whose
+/// test is not itself proved — and each fork's body then runs through
+/// the ordinary concrete `run_body_once`.
+///
+/// Both arms must report `BodyOutcome::Fell` — a `break`/`continue`/
+/// `return` reachable on only ONE of the two hypothetical arms has no
+/// single per-iteration outcome this function can state (the real
+/// iterate takes exactly one arm, and this function does not know
+/// which), so that shape still declines the WHOLE loop, `None`,
+/// exactly as an unrecognized statement anywhere else in this module
+/// does. Two `Fell` arms join through `Environment::join` (the same
+/// per-name lattice join `walk_if`'s own `surviving` fold uses), and
+/// the joined environment becomes this statement's own outcome.
+///
+/// An absent `else` arm folds through the SAME machine as a bare
+/// `else: pass`: the untaken-when-false path is the test's own
+/// `assume(..., false)` narrowing of the CURRENT environment, run
+/// through no statements at all — matching CPython's own "no `else`
+/// clause" semantics (compound_stmts.rst, "the `if` statement") without
+/// a second `run_body_once([])` call.
+///
+/// Gated on the test naming AT LEAST ONE currently `Kind::Set`-bound
+/// name (`test_mentions_a_set_bound_name`) — the one signal that
+/// distinguishes "this test is unknown because it reads an ABSTRACT
+/// per-pass element" (join-worthy) from "this test is unknown because
+/// it calls something this module cannot evaluate at all" (`if f():`
+/// over a CONCRETE per-element iterate, `unknown_if_test_on_any_
+/// iteration_declines_the_whole_loop`'s own pin) — an opaque call
+/// mentions no bound name this reader recognizes, so it still declines
+/// exactly as before this fallback existed, rather than joining two
+/// arms neither `assume` narrowed at all.
+fn run_if_once_over_unknown_test(
+    if_stmt: &StmtIf,
+    environment: &mut Environment,
+    kernel: &Arc<RefinedTSKernel>,
+    judge_context: &mut JudgeContext,
+) -> Option<StatementOutcome> {
+    let (else_body, has_wider_chain): (&[Stmt], bool) = match if_stmt.elif_else_clauses.as_slice() {
+        [] => (&[], false),
+        [clause] if clause.test.is_none() => (clause.body.as_slice(), false),
+        _ => (&[], true),
+    };
+    if has_wider_chain {
+        return None;
+    }
+    let test = if_stmt.test.as_ref();
+    if !test_mentions_a_set_bound_name(test, environment) {
+        return None;
+    }
+
+    let mut true_arm = environment.fork();
+    true_arm = assume(test, true_arm, kernel, true);
+    let true_outcome = run_body_once(&if_stmt.body, &mut true_arm, kernel, judge_context)?;
+    if !matches!(true_outcome, BodyOutcome::Fell) {
+        return None;
+    }
+
+    let mut false_arm = environment.fork();
+    false_arm = assume(test, false_arm, kernel, false);
+    let false_outcome = run_body_once(else_body, &mut false_arm, kernel, judge_context)?;
+    if !matches!(false_outcome, BodyOutcome::Fell) {
+        return None;
+    }
+
+    *environment = Environment::join(true_arm, &false_arm);
+    Some(StatementOutcome::Next)
+}
+
+/// Whether `test` names at least one bare identifier CURRENTLY bound
+/// `Kind::Set` in `environment` — walked over the same leaf vocabulary
+/// `narrowing::condition_tree_of`/`collect_names` read (`not`, `and`/
+/// `or`, a `Compare`'s two sides, an `isinstance` call's first
+/// argument), wide enough to catch every name a real narrowing ask
+/// might reach, never wider. A test with no such name (every operand a
+/// literal, or an opaque call `narrowing::narrow`'s own `Call` arm does
+/// not recognize) answers `false` — this function's own caller reads
+/// that as "nothing here for `assume` to narrow," not as a shape to
+/// guess at.
+fn test_mentions_a_set_bound_name(test: &Expr, environment: &Environment) -> bool {
+    match test {
+        Expr::Name(name) => environment.read(name.id.as_str()).is_some_and(|value| value.kind == Kind::Set),
+        Expr::UnaryOp(unary) if unary.op == UnaryOp::Not => test_mentions_a_set_bound_name(&unary.operand, environment),
+        Expr::BoolOp(bool_op) => bool_op.values.iter().any(|value| test_mentions_a_set_bound_name(value, environment)),
+        Expr::Compare(compare) => {
+            test_mentions_a_set_bound_name(&compare.left, environment)
+                || compare.comparators.iter().any(|comparator| test_mentions_a_set_bound_name(comparator, environment))
+        }
+        Expr::Call(call) => {
+            let Expr::Name(func_name) = call.func.as_ref() else {
+                return false;
+            };
+            if func_name.id.as_str() != "isinstance" || call.arguments.args.len() != 2 {
+                return false;
+            }
+            test_mentions_a_set_bound_name(&call.arguments.args[0], environment)
+        }
+        _ => false,
+    }
 }
 
 /// Folds a nested `run_body_once` result (an `if` arm's own body, which
@@ -2703,6 +2925,95 @@ mod tests {
         // here is nothing
         assert!(result.read("x").is_none());
         assert_eq!(result.read("total").unwrap().values, vec![0.0]);
+    }
+
+    /// A `list[Wide]`-shaped parameter — the repetition-window seed
+    /// `check.rs::seed_parameters` builds for a bare `list[X]` annotation
+    /// (`AbstractValue { kind_tag: Some(sort), ..known_set(repeat_of(...))
+    /// }`, that function's own doc) — the SAME shape this test builds by
+    /// hand so `repetition_window_element_pass` sees exactly what a real
+    /// `xs: list[Wide]` parameter would.
+    fn wide_list_parameter() -> AbstractValue {
+        let element = make_refined_set(vec![integer_form(), at_least(0.0), at_most(200.0)]);
+        AbstractValue {
+            kind_tag: Some(PrimitiveKind::Integer),
+            ..known_set(make_refined_set(vec![refined_sets::refinement_forms::repeat_of(element, 0, None)]), None, TrustProved, SetKindTag::None)
+        }
+    }
+
+    /// UNIT: `run_if_once_over_unknown_test`'s own join path — `for x in
+    /// xs: if 0 <= x <= 149: out.append(x + 1) else: out.append(0)`
+    /// against `xs: list[Wide]` ([0, 200]). Before `run_if_once`'s own
+    /// Set-narrowing fallback, this whole loop declined with the coarse
+    /// "not yet walked" blocker, because `0 <= x <= 149` never resolves
+    /// to one known boolean against a Set-bound `x`. This pins the fixed
+    /// mechanism the wave's A10.seed.library/A15.xfer.dedupe/A15.xfer.inject
+    /// rows share: the loop now runs, joining both narrowed arms.
+    #[test]
+    fn if_else_over_a_set_bound_loop_element_joins_both_narrowed_arms() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let stmt = parsed_loop(
+            "for x in xs:\n    if 0 <= x <= 149:\n        out.append(x + 1)\n    else:\n        out.append(0)\n",
+        );
+        let mut environment = Environment::new(HashSet::from(["xs".to_owned(), "x".to_owned(), "out".to_owned()]));
+        environment.bind("xs", wide_list_parameter());
+        environment.bind("out", collection_models::list_literal_value(&[]));
+        let result = run(&stmt, &environment, &kernel).expect("the if/else over a Set-bound element now runs");
+        // `out` stays a known List value (never widened to unknown) —
+        // the join produced a real answer, not a decline-shaped stand-in.
+        assert_eq!(result.read("out").unwrap().kind, Kind::List);
+    }
+
+    /// UNIT: `run_if_once`'s own EXISTING contract is unchanged for a
+    /// test this file's narrowing channels do not recognize at all —
+    /// `if f():` over a CONCRETE per-element iterate never reaches the
+    /// new join fallback (no name in the test is Set-bound), so the
+    /// whole loop still declines exactly as before this wave's fix.
+    #[test]
+    fn unknown_if_test_on_a_concrete_iterate_still_declines_the_whole_loop() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let stmt = parsed_loop("for x in [1, 2]:\n    if f():\n        total = total + x\n");
+        let mut environment = Environment::new(HashSet::from(["total".to_owned(), "x".to_owned()]));
+        environment.bind("total", integer(0.0));
+        assert!(run(&stmt, &environment, &kernel).is_none(), "an opaque call still declines — nothing here for assume to narrow");
+    }
+
+    /// UNIT: the AugAssign kernel-aware fix — `total += x` where `x` is
+    /// the abstract pass's own Set-bound element (never one concrete
+    /// number). Before wiring `binary_arithmetic_value_with_kernel` in,
+    /// this AugAssign's `updated.kind != Kind::Values` guard declined
+    /// the whole loop the moment the operand was Set-shaped — the
+    /// mechanism E1.loop/E2.loop/B2.est.loop/B3.est.loop share.
+    #[test]
+    fn aug_assign_folds_a_set_shaped_operand_through_the_kernel_aware_transfer() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let stmt = parsed_loop("for x in xs:\n    total += x\n");
+        let mut environment = Environment::new(HashSet::from(["xs".to_owned(), "x".to_owned(), "total".to_owned()]));
+        environment.bind("xs", wide_list_parameter());
+        environment.bind("total", integer(0.0));
+        let result = run(&stmt, &environment, &kernel).expect("the Set-shaped accumulation now runs");
+        // total widens to a known Set/Values answer, never unknown()
+        assert_ne!(result.read("total").unwrap().kind, Kind::Unknown);
+    }
+
+    /// UNIT: `list_size_changing_mutation_range`'s own fire —
+    /// `for x in lst: lst.append(x)` on a `list[int]`-shaped (repetition-
+    /// window) parameter provably never terminates. Pins C5.rangefor's
+    /// own mechanism: the fire is recorded and the loop declines, rather
+    /// than silently running the abstract pass over a receiver the body
+    /// itself keeps growing.
+    #[test]
+    fn list_appended_to_inside_its_own_for_loop_fires_and_declines() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let stmt = parsed_loop("for x in lst:\n    lst.append(x)\n");
+        let mut environment = Environment::new(HashSet::from(["lst".to_owned(), "x".to_owned()]));
+        environment.bind("lst", wide_list_parameter());
+        let declared = no_declared();
+        let mut out = Vec::new();
+        let answer = loop_final_environment(&stmt, &environment, &kernel, &declared, &mut out);
+        assert!(answer.is_none(), "a self-feeding append never terminates — the loop must decline");
+        assert_eq!(out.len(), 1, "exactly one fire names the non-termination: {out:?}");
+        assert!(out[0].1.contains("never terminates"), "the fire names non-termination: {:?}", out[0].1);
     }
 
     #[test]

@@ -1106,13 +1106,13 @@ fn chr_call(arguments: &[AbstractValue]) -> Option<AbstractValue> {
 
 /// `str(object)` — library/stdtypes.rst's `class:: str(object='')`
 /// constructor row: "Return a string version of *object*." Modeled for
-/// three known argument shapes: an exact string (the identity
+/// four known argument shapes: an exact string (the identity
 /// conversion — `str(word)` answers `word` unchanged, per the same
 /// row's own "If *object* already is a string, it is returned
 /// unchanged" behavior), a known Integer (CPython's plain decimal
 /// spelling, no `.0` — the same integer-spelling rule
 /// `expressions.rs`'s f-string composition already establishes for an
-/// interpolated Integer), and a known EXCEPTION instance
+/// interpolated Integer), a known EXCEPTION instance
 /// (`expressions.rs`'s `exception_construction_value`, tagged
 /// `source == "exception"`, one `args` field holding the constructor's
 /// own positional arguments as a `Kind::List`) whose FIRST argument is
@@ -1124,7 +1124,13 @@ fn chr_call(arguments: &[AbstractValue]) -> Option<AbstractValue> {
 /// exactly that one string (CPython's own `BaseException.__str__`:
 /// zero args -> `''`, one arg -> `str(args[0])`, 2+ args -> the
 /// `repr()` of the whole tuple — only the one-string-argument row is
-/// modeled here). A known FLOAT argument is NOT modeled: the
+/// modeled here), and a NONNEGATIVE BOUNDED Integer window (a seeded
+/// parameter range, or a bounded set another transfer produced) —
+/// `int.__repr__`'s plain no-leading-zero decimal spelling widened
+/// from one value to the whole window, `json_grammar::
+/// integer_window_grammar`'s own composition (already built for
+/// `json.dumps`'s serialized-text grammar; reused here rather than
+/// duplicated). A known FLOAT argument is NOT modeled: the
 /// repr-shortest spelling `format_py_number` builds lives in the
 /// `refined_sets` crate, out of this file's own dependency edge for
 /// this wave, so `str(float)` declines rather than half-build that
@@ -1137,6 +1143,9 @@ fn str_call(arguments: &[AbstractValue]) -> Option<AbstractValue> {
     if only.kind == Kind::Object && only.source == "exception" {
         return exception_single_string_message(only);
     }
+    if only.kind == Kind::Set && only.kind_tag == Some(PrimitiveKind::Integer) {
+        return str_call_over_integer_window(only);
+    }
     let (value, sort) = single_known_numeric(only)?;
     if sort != PrimitiveKind::Integer {
         return None;
@@ -1144,6 +1153,63 @@ fn str_call(arguments: &[AbstractValue]) -> Option<AbstractValue> {
     let spelled = format!("{}", value as i64);
     let code_points: Vec<f64> = spelled.chars().map(|c| c as u32 as f64).collect();
     Some(known_values(code_points, PrimitiveKind::String, TrustSpec))
+}
+
+/// `str(n)` on a NONNEGATIVE BOUNDED Integer-sorted `Kind::Set` window
+/// `[lo, hi]` (a seeded parameter range, or a bounded set another
+/// transfer produced) — the exact digit-count run
+/// `json_grammar::integer_window_grammar` already composes for
+/// `json.dumps`'s serialized-text grammar, reused unchanged here for
+/// `str_call`'s own decimal-spelling row: both are the SAME `int.
+/// __repr__` plain decimal spelling (stdtypes.rst's `str(object)`
+/// row delegates to `__str__`, which for `int` is `__repr__`'s own
+/// no-leading-zero decimal text), just reached from a different
+/// caller. The bound is read off the set's own top-level
+/// `AtLeast`/`Above`/`AtMost`/`Below` forms syntactically — no kernel
+/// ask, the same private-copy convention `json_grammar::
+/// integer_set_bounds` already keeps against `expressions.rs`'s own
+/// identically-named helper (this file's own AGENT-BRIEF scope keeps
+/// it from reaching into either). A negative lower bound, or a bound
+/// this reader cannot close (an unbounded ray, a union, a pattern),
+/// declines — `integer_window_grammar`'s own `lo < 0` refusal
+/// propagates here as a decline rather than a fabricated fallback.
+fn str_call_over_integer_window(value: &AbstractValue) -> Option<AbstractValue> {
+    let (lo, hi) = integer_set_bounds(value)?;
+    let grammar = crate::json_grammar::integer_window_grammar(lo, hi)?;
+    let grade = derived_trust_level(TrustSpec, std::slice::from_ref(value));
+    Some(AbstractValue {
+        kind_tag: Some(PrimitiveKind::String),
+        ..known_set(grammar, None, grade, SetKindTag::None)
+    })
+}
+
+/// The closed integer bound `[lo, hi]` a value states, when the value is
+/// a bounded Integer-sorted `Kind::Set` — the same syntactic hull
+/// `json_grammar::integer_set_bounds`/`expressions.rs::
+/// integer_set_bounds` both already read, duplicated here rather than
+/// exported per this file's own file-ownership convention (see either
+/// of those two functions' own doc comments).
+fn integer_set_bounds(value: &AbstractValue) -> Option<(i64, i64)> {
+    if value.kind != Kind::Set || value.kind_tag != Some(PrimitiveKind::Integer) {
+        return None;
+    }
+    let mut lo: Option<f64> = None;
+    let mut hi: Option<f64> = None;
+    for form in &value.set.forms {
+        match form.form {
+            Form::AtLeast => lo = Some(lo.map_or(form.a, |current: f64| current.max(form.a))),
+            Form::Above => lo = Some(lo.map_or(form.a.floor() + 1.0, |current: f64| current.max(form.a.floor() + 1.0))),
+            Form::AtMost => hi = Some(hi.map_or(form.a, |current: f64| current.min(form.a))),
+            Form::Below => hi = Some(hi.map_or(form.a.ceil() - 1.0, |current: f64| current.min(form.a.ceil() - 1.0))),
+            Form::Integer => {}
+            _ => return None,
+        }
+    }
+    let (lo, hi) = (lo?, hi?);
+    if !lo.is_finite() || !hi.is_finite() {
+        return None;
+    }
+    Some((lo as i64, hi as i64))
 }
 
 /// The exact message `str()` of a known exception instance answers, for
@@ -1799,6 +1865,43 @@ mod tests {
         instance.source = "exception".to_owned();
         let got = builtin_call_result("str", &[instance]);
         assert!(got.is_none(), "a zero-argument exception's __str__ (empty string) is not modeled: {got:?}");
+    }
+
+    fn integer_window(lo: f64, hi: f64) -> AbstractValue {
+        AbstractValue {
+            kind_tag: Some(PrimitiveKind::Integer),
+            ..known_set(
+                make_refined_set(vec![at_least(lo), at_most(hi), refined_sets::refinement_forms::integer()]),
+                None,
+                TrustSpec,
+                SetKindTag::None,
+            )
+        }
+    }
+
+    #[test]
+    fn str_of_a_bounded_integer_window_answers_the_decimal_digit_grammar() {
+        // str(n) over n in [0, 255]: the decimal spelling runs 1 to 3
+        // digits ("0".."255"), every digit drawn from 0-9 —
+        // `integer_window_grammar`'s own composition, reused unchanged.
+        let got = builtin_call_result("str", &[integer_window(0.0, 255.0)]).expect("str(n) over [0, 255] models");
+        assert_eq!(got.kind, Kind::Set);
+        assert_eq!(got.kind_tag, Some(PrimitiveKind::String));
+        let digits: Vec<f64> = "0123456789".chars().map(|c| c as u32 as f64).collect();
+        let expected = make_refined_set(vec![refined_sets::refinement_forms::repeat_of(
+            make_refined_set(vec![one_of(&digits)]),
+            1,
+            Some(3),
+        )]);
+        assert_eq!(got.set, expected);
+    }
+
+    #[test]
+    fn str_of_a_negative_lower_bound_integer_window_declines() {
+        // `integer_window_grammar`'s own `lo < 0` refusal — no signed
+        // digit-run grammar is built here.
+        let got = builtin_call_result("str", &[integer_window(-5.0, 5.0)]);
+        assert!(got.is_none(), "str(n) over a window with a negative lower bound should decline: {got:?}");
     }
 
     #[test]

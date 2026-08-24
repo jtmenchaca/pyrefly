@@ -1387,6 +1387,7 @@ fn annotated_types_argument<'a>(call: &'a ruff_python_ast::ExprCall, imports: &S
 /// `typing` or `typing_extensions`), which local name means pydantic's
 /// `StrictInt`, and one set per recognized `annotated_types`
 /// constructor (`Ge`/`Gt`/`Le`/`Lt`/`MultipleOf`/`MinLen`/`MaxLen`).
+#[derive(Clone)]
 pub struct SurfaceImports {
     field_names: HashSet<String>,
     pydantic_modules: HashSet<String>,

@@ -838,6 +838,14 @@ fn walk_body_with_self_binding(
         collect_parameter_names(parameters, &mut locally_bound);
     }
     let mut environment = Environment::new(locally_bound);
+    // Declared BEFORE `seed_parameters` runs (rather than beside the
+    // straight-line statement loop below, where an AnnAssign-only table
+    // would suffice) so a PARAMETER's own declared refinement can be
+    // recorded into it too — `seed_parameters`'s own insert, mirroring
+    // `walk_ann_assign`'s identical insert for a body-local `x: Age =
+    // ...` target. A LATER `x += 1`/`x = 200` against either kind of
+    // declared target then judges against the same one table.
+    let mut aug_assign_refinements: HashMap<String, DeclaredRefinement> = HashMap::new();
     if returned_values_out.is_some() {
         environment.collect_returned_values();
     }
@@ -851,6 +859,7 @@ fn walk_body_with_self_binding(
     }
     environment.set_functions(Arc::new(merged(&local_function_table(body), &context.functions)));
     environment.set_classes(merged_classes_for_body(body, context));
+    environment.set_declared_aliases(Arc::new(context.aliases.clone()), Arc::new(context.imports.clone()));
     environment.set_datetime_imports(context.datetime_imports.clone());
     environment.set_locale_never_set(context.locale_never_set);
     if let Some(entry_directory) = context.entry_directory.clone() {
@@ -889,7 +898,7 @@ fn walk_body_with_self_binding(
         }
     }
     if let Some(parameters) = parameters {
-        seed_parameters(parameters, enclosing_def_name, context, &mut environment);
+        seed_parameters(parameters, enclosing_def_name, context, &mut environment, &mut aug_assign_refinements);
         // `*args`/`**kwargs`'s own names — a bare-Name forward of either
         // (`f(*args)`, `f(**kwargs)`) hands CPython exactly what THIS
         // body itself received, never an independently-grown collection
@@ -958,7 +967,6 @@ fn walk_body_with_self_binding(
         environment.set_callable_returns(Arc::new(module_callable_returns));
     }
     let mut blocked = false;
-    let mut aug_assign_refinements: HashMap<String, DeclaredRefinement> = HashMap::new();
     // PROVABLY-UNBOUND READS: every name this straight-line walk has seen
     // declared by a VALUELESS AnnAssign (`x: int`) with no assignment
     // observed since. `walk_statement`'s own `If`/`For`/`While`/`Match`/
@@ -1330,7 +1338,13 @@ fn is_generator_shaped(body: &[Stmt]) -> bool {
 /// all. Left unbound (ordinary Python, no seed) when no caller-joined
 /// value applies either — unannotated, uncalled, or a caller whose own
 /// argument does not fold.
-fn seed_parameters(parameters: &Parameters, enclosing_def_name: Option<&str>, context: &WalkContext, environment: &mut Environment) {
+fn seed_parameters(
+    parameters: &Parameters,
+    enclosing_def_name: Option<&str>,
+    context: &WalkContext,
+    environment: &mut Environment,
+    aug_assign_refinements: &mut HashMap<String, DeclaredRefinement>,
+) {
     // Position, when `Some`, is this parameter's own index among
     // POSITIONAL parameters only (`posonlyargs` then `args`, in the
     // exact order a plain positional call's own `call.arguments.args`
@@ -1377,6 +1391,39 @@ fn seed_parameters(parameters: &Parameters, enclosing_def_name: Option<&str>, co
                 continue;
             }
         }
+        // A `Callable[[...], R]`-ANNOTATED PARAMETER (`declared_refinement`
+        // states nothing for it — a `Callable[...]` subscript is not a set
+        // the parameter itself binds to) states a fact a LATER `f(...)`
+        // call site still needs: `R`'s own declared return refinement.
+        // Recorded into this environment's `callable_returns` table, keyed
+        // on the parameter's own name — the SAME table `walk_ann_assign`'s
+        // own CALLABLE-VARIABLE CALL CHANNEL grows for a body-local
+        // `x: Callable[[...], R] = ...`, read back by the identical
+        // `sink_value`/`evaluate_call` call-site channels with no new
+        // dispatch needed. Bound to a plain `FUNCTION_VALUE_WORD`-tagged
+        // opaque value (`same_module_def_gate_open`'s own `kind_word`
+        // check reads this as "a function value" everywhere that matters —
+        // truthy, `is`-comparable, never a scalar/collection value with a
+        // fire message of its own) rather than left unbound: a parameter
+        // must hold SOME value for `f is known`/`if f:` guards to read at
+        // all, and this file has no way to know WHICH function a caller
+        // actually passes, so the value carries no specific def identity
+        // (unlike `env::same_module_def_alias_value`, which names one).
+        if let Some(callable_declared) =
+            callable_return_refinement(annotation, context.aliases, context.imports, environment)
+        {
+            let mut callable_returns = environment
+                .callable_returns()
+                .map(|table| (**table).clone())
+                .unwrap_or_default();
+            callable_returns.insert(parameter.parameter.name.id.as_str().to_owned(), callable_declared);
+            environment.set_callable_returns(Arc::new(callable_returns));
+            environment.bind(
+                parameter.parameter.name.id.as_str(),
+                refined_domain::abstract_value::opaque_value(crate::env::FUNCTION_VALUE_WORD),
+            );
+            continue;
+        }
         // A bare `int`/`float`/`str` PARAMETER seeds its sort claim (the
         // whole-int ray etc. — typereading's own base-sort reader), so
         // `age: int` flowing into a refined sink refuses by containment
@@ -1390,6 +1437,21 @@ fn seed_parameters(parameters: &Parameters, enclosing_def_name: Option<&str>, co
         else {
             continue;
         };
+        // WRITE-SITE CHECK ELIGIBILITY: a parameter's own declared
+        // refinement is recorded into `aug_assign_refinements` — the SAME
+        // table `walk_ann_assign` inserts a body-local `x: Age = ...`
+        // target's own `declared` into (that function's own doc, right
+        // after its identical `declared_refinement` read succeeds, before
+        // any shape-specific branching) — so a LATER `x += 1`/`x = 200`
+        // against this PARAMETER judges against its declared set at the
+        // write, not only at whichever sink the value eventually flows
+        // to. Without this, `walk_name_aug_assign`'s own `aug_assign_
+        // refinements.get(name)` lookup finds nothing for a parameter (the
+        // table was, until this insert, populated by AnnAssign targets
+        // only), so `x += 1` on a declared-refinement parameter bound
+        // silently instead of being judged at the `+=` itself
+        // (E2.operator.py's own `compound_assign_outside_set`).
+        aug_assign_refinements.insert(parameter.parameter.name.id.as_str().to_owned(), declared.clone());
         // A `list[X]`/`set[X]`/`Sequence[X]` PARAMETER (`declared.element`
         // Some, `declared.set` unused/empty — typereading's own "one
         // active field" convention) seeds a SEQUENCE whose every position
@@ -2954,6 +3016,29 @@ fn walk_if(
         if let Some(test) = test {
             arm_environment = assume(test, arm_environment, context.kernel, true);
         }
+        // THE RELATIONAL LEDGER (B1.keep.write's own `increment_weakens_
+        // to_le`): `i < n` between two Set-kind names is a relation the
+        // SET channel's own `condition_tree_of` cannot express (its
+        // every leaf is scoped to ONE `place` against a LITERAL —
+        // `narrowing.rs`'s own module doc names "two changing names" as
+        // one of the shapes that lowers to `other_tree()`), so `assume`
+        // above narrows neither `i` nor `n` at all: `i`'s window going
+        // into this arm is still its bare declared `[0, 150]`, never
+        // intersected with `n`'s own current ceiling. `relational_
+        // narrow_upper_bound` reads that comparison directly off the
+        // test's own syntax and REBINDS the left name (`i`) to its
+        // current window intersected with the bound the comparison
+        // proves — the same "narrow the BINDING, not the declared
+        // refinement" law `narrowing.rs::meet_set_answer` already keeps
+        // for a single-name comparison, extended here to a comparison
+        // against ANOTHER name's current window. A LATER `i += 1` inside
+        // this arm then folds the kernel's own arithmetic over the
+        // TIGHTENED current binding, so `updated`'s own ceiling already
+        // reflects the relation — no separate "intersect after the
+        // fact" step, and the kernel arithmetic itself is untouched.
+        if let Some(test) = test {
+            relational_narrow_upper_bound(test, body, &mut arm_environment);
+        }
         let mut arm_provably_unbound: HashSet<String> = HashSet::new();
         // FOREIGN EDGE: same walrus-in-test recognition as the
         // provably-true short-circuit arm above, applied to this
@@ -3010,6 +3095,78 @@ fn walk_if(
             joined
         }
     };
+}
+
+/// `i < n` / `i <= n` (`i`/`n` both bare Names, both currently bound
+/// `Kind::Set` over INTEGER-tagged windows) rebinds `i` — the SAME
+/// binding `walk_if`'s own arm-body walk sees, so a LATER aug-assign
+/// inside this arm folds the kernel's arithmetic over the tightened
+/// window — to its current window INTERSECTED with an upper bound `n`'s
+/// own current ceiling proves: `i < n` proves `i ≤ n's ceiling − 1`
+/// (strict order between two integers — CPython `int` has no value
+/// between `k` and `k+1`, `tmp/cpython/Doc/library/stdtypes.rst`'s
+/// integer type states no fractional members); `i <= n` proves `i ≤ n`'s
+/// ceiling directly. Requires BOTH windows to carry `Form::Integer` —
+/// the `-1` step is unsound over a Float-tagged window, which this
+/// reader declines rather than narrow wrongly.
+///
+/// The bound is proved once, at arm entry, over `n`'s CURRENT window —
+/// so it must not survive a LATER write to `n` anywhere in `body`
+/// (B1.keep.write.py's own `reassign_forgets_relation`: `if i < n: n =
+/// 0; return i` — the `i < n` relation the guard proved is STALE the
+/// moment `n` is reassigned, and `i` must NOT be judged against the
+/// relation's now-invalid bound). Gated on `locally_bound_names(body)`
+/// never naming `n` — the same whole-body, any-nesting-depth scan the
+/// walk's own scoping (`walk_body_with_self_binding`'s own doc) already
+/// uses to decide what a body binds, checked here BEFORE the arm body
+/// walks rather than invalidated statement-by-statement, the
+/// conservative direction: a body that writes `n` on some path never
+/// gets the narrowing at all, even on a path that does not.
+///
+/// Declines silently (`arm_environment` unchanged) for every other test
+/// shape (a chained comparison, a non-Name operand, an operand not
+/// currently `Kind::Set`, either window not Integer-tagged, an unbounded
+/// `n`, a body that reassigns `n`) — the honest "narrows nothing"
+/// default every other narrowing channel in this file already keeps.
+fn relational_narrow_upper_bound(test: &Expr, body: &[Stmt], arm_environment: &mut Environment) {
+    use refined_sets::refinement_forms::{at_most, Form};
+    let Expr::Compare(compare) = test else {
+        return;
+    };
+    let ([op], [right]) = (&*compare.ops, &*compare.comparators) else {
+        return;
+    };
+    if !matches!(op, CmpOp::Lt | CmpOp::LtE) {
+        return;
+    }
+    let Expr::Name(left_name) = compare.left.as_ref() else {
+        return;
+    };
+    let Expr::Name(right_name) = right else {
+        return;
+    };
+    if locally_bound_names(body).contains(right_name.id.as_str()) {
+        return;
+    }
+    let Some(current) = arm_environment.read(left_name.id.as_str()) else {
+        return;
+    };
+    if current.kind != Kind::Set || !current.set.forms.iter().any(|form| form.form == Form::Integer) {
+        return;
+    }
+    let Some(other) = arm_environment.read(right_name.id.as_str()) else {
+        return;
+    };
+    if other.kind != Kind::Set || !other.set.forms.iter().any(|form| form.form == Form::Integer) {
+        return;
+    }
+    let Some(other_ceiling) = aug_assign_ceiling(other) else {
+        return;
+    };
+    let bound = if matches!(op, CmpOp::Lt) { other_ceiling - 1.0 } else { other_ceiling };
+    let mut narrowed = current.clone();
+    narrowed.set.forms.push(at_most(bound));
+    arm_environment.bind(left_name.id.as_str(), narrowed);
 }
 
 /// Whether `test` is an `is`/`is not` comparison against a bare `None`
@@ -3489,17 +3646,20 @@ fn walk_loop(
 ) -> bool {
     let mut judged_fires: Vec<(TextRange, String)> = Vec::new();
     let result = loop_final_environment(stmt, environment, context.kernel, aug_assign_refinements, &mut judged_fires);
-    // A fire recorded ALONGSIDE a decline is `loops.rs`'s one shape that
-    // proves the loop's FIRST iteration unconditionally raises (the
-    // iterator-invalidation check, `for_loop_final_environment`'s own
-    // doc: checked before any element runs, so this can only be non-empty
-    // when the raise is proved regardless of what the body does). That
-    // makes everything past this statement in the current body
-    // UNREACHABLE — the same "no fall-through path exists" fact
+    // A fire recorded ALONGSIDE a decline is `loops.rs`'s own family of
+    // checked-before-any-element-runs proofs that no statement after
+    // this loop is ever reached on a real execution — either the FIRST
+    // iteration unconditionally raises (the dict iterator-invalidation
+    // check, `for_loop_final_environment`'s own doc) or the loop itself
+    // provably never terminates (the list self-append check,
+    // `repetition_window_element_pass`'s own doc, `diagnostic_sentences::
+    // list_never_terminates_self_append`) — both read identically here:
+    // nothing past this statement in the current body is UNREACHABLE —
+    // the same "no fall-through path exists" fact
     // `arm_terminates_or_provably_raises` already states for a `return`/
     // `raise`-terminated arm, just proved by a different construct. This
     // is checked BEFORE the blocker record below so a proved-unreachable
-    // loop never reports a spurious "not yet walked" — the raise IS the
+    // loop never reports a spurious "not yet walked" — the fire IS the
     // full account of every real execution, not an unread remainder.
     let raise_terminates = result.is_none() && !judged_fires.is_empty();
     for (range, message) in judged_fires {
@@ -4620,11 +4780,18 @@ fn walk_aug_assign(
     }
 }
 
-/// `x op= v` on a plain name — the original bare-name aug-target law,
-/// unchanged: fold the target's current value with the evaluated RHS
-/// through `binary_arithmetic_value`, then judge against `x`'s own
-/// recorded declared refinement (`aug_assign_refinements`) through the
-/// shared refused-write law.
+/// `x op= v` on a plain name: fold the target's current value with the
+/// evaluated RHS through `binary_arithmetic_value_with_kernel` (the
+/// kernel-computed SET transfer, tried first, falling through to the
+/// plain arithmetic dispatcher for everything the SET path does not
+/// serve), then judge against `x`'s own recorded declared refinement
+/// (`aug_assign_refinements` — populated for a body-local `x: Age = ...`
+/// by `walk_ann_assign` AND for a declared-refinement PARAMETER by
+/// `seed_parameters`) through `judge_and_bind_aug_assign_write`'s own
+/// write-site law — the refused-write binding `judge_and_bind` gives
+/// every other sink, but with a Fire message naming the WRITE itself
+/// (the pre-write ceiling, the operator expression, the post-write
+/// ceiling) rather than only the escaped result.
 fn walk_name_aug_assign(
     assign: &StmtAugAssign,
     name: &str,
@@ -4664,9 +4831,197 @@ fn walk_name_aug_assign(
         // discarded.
         Some(declared) => {
             let declared = declared.clone();
-            judge_and_bind(name, updated, &declared, assign.range(), context, environment, out);
+            judge_and_bind_aug_assign_write(name, &current, updated, assign, &declared, context, environment, out);
         }
         None => environment.bind(name, updated),
+    }
+}
+
+/// The WRITE-SITE check for a bare-name aug-target (`x += 1`): judges
+/// `updated` — the kernel-computed fold `binary_arithmetic_value_with_
+/// kernel` already produced (E2.operator.py's own row exists to pin real
+/// arithmetic transfer defects the plain `binary_arithmetic_value`
+/// dispatcher does not reach; this function never re-derives that value,
+/// only judges and reports it) — against `declared`, exactly the verdict
+/// `judge_and_bind` itself would reach, but with a WRITE-SPECIFIC Fire
+/// message naming three things a reader needs at the WRITE, not just the
+/// escaped result: what the target may have HELD going in (`x may be
+/// 150`), the operator expression that wrote it (`x += 1`), and what that
+/// write may have PRODUCED, past the declared window (`may write 151,
+/// outside Age's [0, 150]`) — `aug_assign_write_refutation`'s own doc.
+/// Silent/Undetermined bind/forget exactly as `judge_and_bind_naming`
+/// does; only the Fire arm's message differs.
+fn judge_and_bind_aug_assign_write(
+    name: &str,
+    current: &AbstractValue,
+    updated: AbstractValue,
+    assign: &StmtAugAssign,
+    declared: &DeclaredRefinement,
+    context: &WalkContext,
+    environment: &mut Environment,
+    out: &mut Vec<Finding>,
+) {
+    match judge(&updated, declared, context.kernel) {
+        Verdict::Fire(judge_message) => {
+            let message =
+                aug_assign_write_refutation(name, current, &updated, assign, declared).unwrap_or(judge_message);
+            out.push(Finding {
+                range: assign.range(),
+                code: "RTS7001",
+                message,
+            });
+            // the same refused-slot binding `judge_and_bind_naming`'s own
+            // Fire arm leaves onward flow with: the declared set itself,
+            // tagged the identical numeric-ground way, so a later read of
+            // `name` in this same body is not judged twice for the one
+            // refused write.
+            let refused_slot = if on_one_tuple_layer(&declared.set) && !states_sequence(&declared.set) {
+                let sort = if requires_integer(&declared.set) {
+                    PrimitiveKind::Integer
+                } else {
+                    PrimitiveKind::Float
+                };
+                AbstractValue {
+                    kind_tag: Some(sort),
+                    ..known_set(declared.set.clone(), None, TrustSpec, SetKindTag::None)
+                }
+            } else {
+                known_set(declared.set.clone(), None, TrustSpec, SetKindTag::None)
+            };
+            environment.bind(name, refused_slot);
+        }
+        Verdict::Silent => {
+            environment.bind(name, updated);
+        }
+        Verdict::Undetermined(_) => {
+            // a bare-name aug-target is not itself a blocker candidate
+            // (`walk_name_aug_assign`'s own doc — blockers here are scoped
+            // to non-name targets), so the sentence is discarded, matching
+            // `judge_and_bind`'s call sites that ignore its `Option<String>`
+            // return.
+            environment.forget(name);
+        }
+    }
+}
+
+/// The write-site Fire message for `judge_and_bind_aug_assign_write`:
+/// "`x` may be `150`; `x += 1` may write `151`, outside `Age`'s `[0,
+/// 150]`" — the target's own pre-write ceiling, the operator expression
+/// as written, the post-write ceiling the kernel-computed fold reached,
+/// and the declared window it escapes. `None` when any of the three
+/// windows this composes (`current`'s, `updated`'s, `declared`'s) is not
+/// a plain `[lo, hi]` scalar window (`aug_assign_window`'s own doc), or
+/// the RHS is not a plain integer literal (`aug_assign_exact_operand_
+/// spelling`'s own doc) — the caller falls back to `judge`'s own
+/// already-computed Fire message then, a courtesy for a shape this
+/// composer does not spell exactly, never a guessed number.
+fn aug_assign_write_refutation(
+    name: &str,
+    current: &AbstractValue,
+    updated: &AbstractValue,
+    assign: &StmtAugAssign,
+    declared: &DeclaredRefinement,
+) -> Option<String> {
+    let current_ceiling = aug_assign_ceiling(current)?;
+    let updated_ceiling = aug_assign_ceiling(updated)?;
+    let (lo, hi) = aug_assign_window(&declared.set)?;
+    let operand_spelling = aug_assign_exact_operand_spelling(assign.value.as_ref())?;
+    Some(format!(
+        "{name} may be {}; {name} {}= {operand_spelling} may write {}, outside {}'s [{}, {}]",
+        format_aug_assign_number(current_ceiling),
+        aug_assign_op_spelling(assign.op),
+        format_aug_assign_number(updated_ceiling),
+        declared.spelling,
+        format_aug_assign_number(lo),
+        format_aug_assign_number(hi),
+    ))
+}
+
+/// The highest value `value` could hold: the maximum of an exact
+/// `Kind::Values` set, or the `AtMost`-form bound of a `Kind::Set` window
+/// (`aug_assign_window`'s own doc — the same `[lo, hi]` shape this file's
+/// `integer_window_minus_edge_literals` already reads `Form::AtMost` off
+/// of). `None` for anything else (`Kind::Unknown`, an unbounded set with
+/// no `AtMost` form, an empty exact set) — the caller falls back to the
+/// generic refutation wording then.
+fn aug_assign_ceiling(value: &AbstractValue) -> Option<f64> {
+    use refined_sets::refinement_forms::Form;
+    match value.kind {
+        Kind::Values => value.values.iter().copied().reduce(f64::max),
+        Kind::Set => value.set.forms.iter().find(|form| form.form == Form::AtMost).map(|form| form.a),
+        _ => None,
+    }
+}
+
+/// `set`'s own `[lo, hi]` window, when it carries EXACTLY one `AtLeast`
+/// lower form and one `AtMost` upper form (an `Integer`/`MultipleOf` form
+/// alongside them, if present, states the sort and never widens the
+/// window — the same forms `integer_window_minus_edge_literals` already
+/// reads past) — `Age`'s own shape (`Annotated[int, Field(ge=0,
+/// le=150)]` compiles to `[at_least(0), at_most(150), integer()]`,
+/// `surface.rs::ge_and_le_constructors_compile_the_same_set_field_kwargs_
+/// would`'s own pinned form order). `None` for any other shape (a
+/// one-sided ray, a union, a `Literal[...]` tuple set, …) — this reader
+/// states the common bounded-window case only, never a guess at a shape
+/// it cannot spell as `[lo, hi]`.
+fn aug_assign_window(set: &RefinedSet) -> Option<(f64, f64)> {
+    use refined_sets::refinement_forms::Form;
+    let mut lo: Option<f64> = None;
+    let mut hi: Option<f64> = None;
+    for form in &set.forms {
+        match form.form {
+            Form::AtLeast => lo = Some(form.a),
+            Form::AtMost => hi = Some(form.a),
+            Form::Integer | Form::MultipleOf => {}
+            _ => return None,
+        }
+    }
+    lo.zip(hi)
+}
+
+/// The RHS's own exact numeric spelling, when `value_expr` is a plain
+/// integer literal (`x += 1`'s own `1`) — the one operand shape this
+/// write-site message composes; every other RHS shape (a name, a call, a
+/// float literal) falls back to the caller's own generic wording rather
+/// than guessing a spelling this reader cannot state exactly.
+fn aug_assign_exact_operand_spelling(value_expr: &Expr) -> Option<String> {
+    let Expr::NumberLiteral(literal) = value_expr else {
+        return None;
+    };
+    match &literal.value {
+        ruff_python_ast::Number::Int(int) => int.as_i64().map(|value| value.to_string()),
+        _ => None,
+    }
+}
+
+/// `n` spelled as a plain integer when it is a whole number (`150`, never
+/// `150.0`) — every window this composer reads (`Age`'s own `[0, 150]`,
+/// an aug-assign's own before/after ceiling) is integer-ground in every
+/// row this message composes for, matching the marker sentence's own
+/// plain-integer spelling.
+fn format_aug_assign_number(n: f64) -> String {
+    if n.fract() == 0.0 { format!("{}", n as i64) } else { format!("{n}") }
+}
+
+/// `+=`/`-=`/… — the AugAssign operator's own token spelling
+/// (simple_stmts.rst's `augassign` production), reconstructed from
+/// `ruff_python_ast::Operator` since this file never carries the raw
+/// source text to slice the written token back out of.
+fn aug_assign_op_spelling(op: ruff_python_ast::Operator) -> &'static str {
+    match op {
+        ruff_python_ast::Operator::Add => "+",
+        ruff_python_ast::Operator::Sub => "-",
+        ruff_python_ast::Operator::Mult => "*",
+        ruff_python_ast::Operator::MatMult => "@",
+        ruff_python_ast::Operator::Div => "/",
+        ruff_python_ast::Operator::Mod => "%",
+        ruff_python_ast::Operator::Pow => "**",
+        ruff_python_ast::Operator::LShift => "<<",
+        ruff_python_ast::Operator::RShift => ">>",
+        ruff_python_ast::Operator::BitOr => "|",
+        ruff_python_ast::Operator::BitXor => "^",
+        ruff_python_ast::Operator::BitAnd => "&",
+        ruff_python_ast::Operator::FloorDiv => "//",
     }
 }
 
@@ -5062,6 +5417,41 @@ fn walk_ann_assign(
 /// target, all at the same value range. A target with no recorded
 /// refinement binds (or, for a destructuring target, forgets) exactly
 /// as before.
+/// `cast(Callable[[...], R], <expr>)` — `typing.cast`'s own docstring
+/// ("returns the value unchanged... signals that the return value has
+/// the designated type"), read for its FIRST argument's own type
+/// expression: `builtin_models::cast_call` only ever sees already-
+/// EVALUATED `AbstractValue`s (the identity function over its second
+/// argument), so it has no access to the syntactic `Callable[[...], R]`
+/// the first argument SPELLS — that annotation is read here instead,
+/// straight off the call's own AST, the same `typereading::callable_
+/// return_refinement` reader `seed_parameters`/`walk_ann_assign` already
+/// use for a `Callable`-shaped parameter/annotation. `None` for any
+/// other callee (not a bare `cast` call — no `SurfaceImports` identity
+/// for `cast` exists any more than one exists for `Callable` itself,
+/// the same no-import-identity convention `callable_return_refinement`'s
+/// own doc already takes), wrong arity, or a first argument that is not
+/// a `Callable[[...], R]` subscript.
+fn cast_to_callable_return(
+    value_expr: &Expr,
+    context: &WalkContext,
+    environment: &Environment,
+) -> Option<DeclaredRefinement> {
+    let Expr::Call(call) = value_expr else {
+        return None;
+    };
+    let Expr::Name(callee_name) = call.func.as_ref() else {
+        return None;
+    };
+    if callee_name.id.as_str() != "cast" {
+        return None;
+    }
+    let [typ, _val] = &*call.arguments.args else {
+        return None;
+    };
+    callable_return_refinement(typ, context.aliases, context.imports, environment)
+}
+
 fn walk_assign(
     assign: &StmtAssign,
     context: &WalkContext,
@@ -5070,6 +5460,25 @@ fn walk_assign(
     out: &mut Vec<Finding>,
 ) {
     bind_walrus_targets(assign.value.as_ref(), context, aug_assign_refinements, environment, out);
+    // CAST-TO-CALLABLE ASSIGNMENT: `g = cast(Callable[[...], R], f)` —
+    // tried BEFORE the ordinary `sink_value` read below (`cast_call`'s
+    // own doc: the cast is the identity function over its second
+    // argument, so `sink_value` still answers `g`'s own VALUE correctly
+    // either way; this only ADDS the return-refinement fact a later
+    // `g(...)` call site needs, the same channel a `Callable`-annotated
+    // target already grows). Scoped to a single bare-Name target — a
+    // chained `a = b = cast(...)` or a destructuring target is ordinary
+    // Python this channel does not special-case.
+    if let [Expr::Name(target_name)] = assign.targets.as_slice() {
+        if let Some(callable_declared) = cast_to_callable_return(assign.value.as_ref(), context, environment) {
+            let mut callable_returns = environment
+                .callable_returns()
+                .map(|table| (**table).clone())
+                .unwrap_or_default();
+            callable_returns.insert(target_name.id.as_str().to_owned(), callable_declared);
+            environment.set_callable_returns(Arc::new(callable_returns));
+        }
+    }
     let Some(value) = sink_value(assign.value.as_ref(), context, environment, aug_assign_refinements, out) else {
         // a provable raise already pushed its own RTS7001 — every
         // target this assignment would have bound holds nothing.
@@ -9454,6 +9863,255 @@ mod tests {
         );
     }
 
+    /// PEP 484's "Stub Files" convention, restated for an INLINE `def`
+    /// (typing.rst's own `...` placeholder example for a declaration
+    /// with no runtime implementation): `crossed_from_fact`'s body is a
+    /// single `...` — declaration-only, PEP 484's own words — so a
+    /// caller reading its return must seed from the DECLARED `-> Age`
+    /// annotation, not from a body `interpret_body` never genuinely
+    /// interprets. Before `summaries::is_stub_body`, a bare `...`
+    /// statement fell through `interpret_body`'s ordinary `Stmt::Expr`
+    /// arm (evaluated and discarded, like `pass`), landing on a
+    /// fabricated `null_value()` return that fired RTS7001 against the
+    /// declared `-> Age` sink — this pins the fix: the crossing local
+    /// (`x: Age` flowing through the stub, unchanged, into another
+    /// `-> Age` return) stays silent.
+    #[test]
+    fn a_stub_bodied_call_seeds_its_declared_return_instead_of_none() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Age = Annotated[int, Field(ge=0, le=150)]\n",
+            "def crossed_from_fact(x: Age) -> Age: ...\n",
+            "def fact_inside(x: Age) -> Age:\n",
+            "    return crossed_from_fact(x)\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        assert!(
+            findings.is_empty(),
+            "a stub callee must answer its declared -> Age return, not a fabricated None: {:?}",
+            findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// The stub convention applies with a leading docstring too
+    /// (`first_non_docstring_statement`'s own leading-docstring skip) —
+    /// `def crossed_from_fact(x: Age) -> Age:\n    """docs"""\n    ...\n`
+    /// is a stub exactly as much as one with no docstring.
+    #[test]
+    fn a_docstring_then_ellipsis_stub_body_still_seeds_its_declared_return() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Age = Annotated[int, Field(ge=0, le=150)]\n",
+            "def crossed_from_fact(x: Age) -> Age:\n",
+            "    \"\"\"a proved contract crossed as a fact.\"\"\"\n",
+            "    ...\n",
+            "def fact_inside(x: Age) -> Age:\n",
+            "    return crossed_from_fact(x)\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        assert!(
+            findings.is_empty(),
+            "a docstring-then-ellipsis stub must still seed its declared -> Age return: {:?}",
+            findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// A body that merely OPENS with a stray `...` expression, then goes
+    /// on to return something OUT of the declared set, is an ORDINARY
+    /// body — not a stub (`is_stub_body`'s own doc: the ellipsis must be
+    /// the body's own LAST statement) — and must still interpret
+    /// concretely and fire on its real out-of-set return, never read
+    /// through the stub's declared-return seed.
+    #[test]
+    fn a_leading_ellipsis_followed_by_a_real_statement_is_not_a_stub() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Age = Annotated[int, Field(ge=0, le=150)]\n",
+            "def not_a_stub() -> Age:\n",
+            "    ...\n",
+            "    return 200\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        let fires: Vec<&Finding> = findings.iter().filter(|f| f.code == "RTS7001").collect();
+        assert_eq!(
+            fires.len(),
+            1,
+            "a stray leading ellipsis must not mask the body's own out-of-set return: {:?}",
+            findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// A guard re-establishes a sort over an UNKNOWN value — the local's
+    /// own unknowable origin (a subscript into `json.loads`'s honest
+    /// return space, which this file's `collection_models::subscript_
+    /// read` does not read a `Kind::KindUnion` container through) must
+    /// not matter once `isinstance(value, int) and 0 <= value <= 150`
+    /// proves the whole window. Before `narrowing::narrow_isinstance_call`
+    /// treated a `Kind::Unknown` binding the same "no information yet"
+    /// way an entirely-unbound name is treated, `value`'s `Kind::Unknown`
+    /// binding passed through the isinstance test unchanged (the
+    /// function's own "existing binding" arm, which reads only
+    /// `Kind::Values`/`Kind::KindUnion`), so `return value` against `->
+    /// Age` fired RTS7002 ("not yet readable") rather than reading the
+    /// guard's own proof.
+    #[test]
+    fn an_isinstance_guard_narrows_an_unknown_valued_local_to_its_declared_return() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "import json\n",
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Age = Annotated[int, Field(ge=0, le=150)]\n",
+            "def json_inside() -> Age:\n",
+            "    record = {\"value\": 42}\n",
+            "    text = json.dumps(record)\n",
+            "    parsed = json.loads(text)\n",
+            "    value = parsed[\"value\"]\n",
+            "    if isinstance(value, int) and 0 <= value <= 150:\n",
+            "        return value\n",
+            "    return 0\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        assert!(
+            findings.is_empty(),
+            "the isinstance-and-comparison guard must prove value's window over its unknown origin: {:?}",
+            findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+        );
+    }
+
+    // --- E2.operator: the AugAssign write-site check, restored beside the kernel-computed fold ---
+
+    /// E2.operator.py's own `compound_assign_outside_set`: `x: Age`
+    /// (a PARAMETER, never an AnnAssign local) then `x += 1` — the
+    /// write-site check must fire AT the `+=` line, with the marker's
+    /// own sentence as a verbatim prefix ("x may be 150; x += 1 may
+    /// write 151, outside Age's [0, 150]"), not at the later `return x`
+    /// with `judge`'s generic "not assignable" wording. Pins
+    /// `seed_parameters`'s own `aug_assign_refinements` insert (a
+    /// parameter's declared refinement was, before this fix, invisible
+    /// to `walk_name_aug_assign`'s lookup, which only ever saw an
+    /// AnnAssign target's entry) AND `judge_and_bind_aug_assign_write`'s
+    /// own write-specific message.
+    #[test]
+    fn a_compound_assign_past_a_declared_parameters_ceiling_fires_at_the_write_with_the_marker_sentence() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Age = Annotated[int, Field(ge=0, le=150)]\n",
+            "def compound_assign_outside_set(x: Age) -> Age:\n",
+            "    x += 1\n",
+            "    return x\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        let fires: Vec<&Finding> = findings.iter().filter(|f| f.code == "RTS7001").collect();
+        assert_eq!(
+            fires.len(),
+            1,
+            "exactly one fire, at the aug-assign write: {:?}",
+            findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+        );
+        assert!(
+            fires[0].message.starts_with("x may be 150; x += 1 may write 151, outside Age's [0, 150]"),
+            "want the marker's own sentence as a verbatim prefix, got: {:?}",
+            fires[0].message
+        );
+    }
+
+    /// E2.operator.py's own silent sibling `compound_assign_in_set`: a
+    /// bounded guard (`x < 149`) before the compound write keeps the
+    /// result inside `Age` — pins that the write-site check's OWN Fire
+    /// composition never fires on a genuinely in-set write; the SET
+    /// channel's ordinary comparison-against-literal narrowing (`x <
+    /// 149`, unaffected by this unit) still applies before
+    /// `judge_and_bind_aug_assign_write` runs.
+    #[test]
+    fn a_compound_assign_kept_in_set_by_a_prior_guard_stays_silent() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Age = Annotated[int, Field(ge=0, le=150)]\n",
+            "def compound_assign_in_set(x: Age) -> Age:\n",
+            "    if x < 149:\n",
+            "        x += 1\n",
+            "        return x\n",
+            "    return 0\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        assert!(
+            findings.is_empty(),
+            "a guarded compound assign that stays inside Age must not fire: {:?}",
+            findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+        );
+    }
+
+    // --- B1.keep.write: the relational ledger, restored beside the kernel-computed fold ---
+
+    /// B1.keep.write.py's own `increment_weakens_to_le`: under `i < n`
+    /// (both `Age`), `i += 1` gives `i ≤ n ≤ 150` — `i` stays inside
+    /// `Age`. Pins `relational_narrow_upper_bound`'s own intersection of
+    /// the guard's relation with `i`'s current window, consulted BEFORE
+    /// the kernel-computed fold `judge_and_bind_aug_assign_write` still
+    /// runs unchanged.
+    #[test]
+    fn an_increment_under_a_strict_less_than_guard_weakens_to_le_and_stays_silent() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Age = Annotated[int, Field(ge=0, le=150)]\n",
+            "def increment_weakens_to_le(i: Age, n: Age) -> Age:\n",
+            "    if i < n:\n",
+            "        i += 1\n",
+            "        return i\n",
+            "    return 0\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        assert!(
+            findings.is_empty(),
+            "i < n weakening to i <= n after the increment must keep i inside Age: {:?}",
+            findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// B1.keep.write.py's own `reassign_forgets_relation`: the SAME `i <
+    /// n` guard, but `n` is reassigned to `0` inside the arm before `i`
+    /// is read back — the relation the guard proved is stale, and `i`
+    /// (declared `Wide`, `[0, 200]`) must NOT be judged against the
+    /// now-invalid `i < n` bound. Pins `relational_narrow_upper_bound`'s
+    /// own `locally_bound_names(body)` gate: a body that reassigns the
+    /// relation's own right-hand name never gets the narrowing at all.
+    #[test]
+    fn a_relation_is_forgotten_once_its_own_right_hand_name_is_reassigned() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Wide = Annotated[int, Field(ge=0, le=200)]\n",
+            "type Age = Annotated[int, Field(ge=0, le=150)]\n",
+            "def reassign_forgets_relation(i: Wide, n: Age) -> Age:\n",
+            "    if i < n:\n",
+            "        n = 0\n",
+            "        return i\n",
+            "    return 0\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        let fires: Vec<&Finding> = findings.iter().filter(|f| f.code == "RTS7001").collect();
+        assert_eq!(
+            fires.len(),
+            1,
+            "the stale i < n relation must not silence i's own out-of-Age window: {:?}",
+            findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn an_if_else_join_carries_an_out_of_set_arm_into_a_judged_row() {
         let Some(kernel) = loaded_kernel() else { return };
@@ -11692,6 +12350,177 @@ mod tests {
         assert!(
             findings.iter().all(|f| f.code != "RTS7001"),
             "Callable[[int], Age]'s own return is already Age-refined: {:?}",
+            findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+        );
+    }
+
+    // --- Callable-annotated PARAMETER / cast() seeding (A10.guard rows) ---
+
+    /// A10.guard.eq — a `Callable[[Age], Age]`-annotated PARAMETER (not
+    /// a `x: Callable[...] = ...` body-local, the shape the tests above
+    /// already cover) seeds `f`'s own callable-returns entry through
+    /// `seed_parameters`'s new arm; `f is known` needs no identity
+    /// narrowing at all — the declared Callable's own `R` (`Age`)
+    /// already states the whole fact `return f(x)` needs.
+    #[test]
+    fn a_callable_annotated_parameter_seeds_its_declared_return_after_an_identity_guard() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "from typing import Callable\n",
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Age = Annotated[int, Field(ge=0, le=150)]\n",
+            "def known(x: Age) -> Age:\n",
+            "    return x\n",
+            "def after_identity_inside(f: Callable[[Age], Age], x: Age) -> Age:\n",
+            "    if f is known:\n",
+            "        return f(x)\n",
+            "    return 0\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        assert!(
+            findings.is_empty(),
+            "a Callable-annotated parameter's own declared return must silence the guarded call: {:?}",
+            findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// A10.guard.ne — the inequality complement: `f is not known and f is
+    /// other` still calls through the SAME Callable-annotated `f`, so the
+    /// identical seeding applies with no narrowing on either identity leg.
+    #[test]
+    fn a_callable_annotated_parameter_seeds_its_declared_return_after_an_inequality_guard() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "from typing import Callable\n",
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Age = Annotated[int, Field(ge=0, le=150)]\n",
+            "def known(x: Age) -> Age:\n",
+            "    return x\n",
+            "def other(x: Age) -> Age:\n",
+            "    if 0 <= x <= 150:\n",
+            "        return x\n",
+            "    return 0\n",
+            "def after_inequality_inside(f: Callable[[Age], Age], x: Age) -> Age:\n",
+            "    if f is not known and f is other:\n",
+            "        return f(x)\n",
+            "    return 0\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        assert!(
+            findings.is_empty(),
+            "a Callable-annotated parameter's own declared return must silence the guarded call: {:?}",
+            findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// A10.guard.exit — `g = cast(Callable[[Age], Age], f)` records `g`'s
+    /// own callable-returns entry through `walk_assign`'s new cast
+    /// recognizer, reached below an early `not callable(f)` exit.
+    #[test]
+    fn a_cast_to_callable_seeds_its_declared_return_below_a_callable_exit_guard() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "from typing import Any, Callable, cast\n",
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Age = Annotated[int, Field(ge=0, le=150)]\n",
+            "def below_exit_inside(f: Any, x: Age) -> Age:\n",
+            "    if not callable(f):\n",
+            "        return 0\n",
+            "    g = cast(Callable[[Age], Age], f)\n",
+            "    if 0 <= x <= 150:\n",
+            "        return g(x)\n",
+            "    return 0\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        assert!(
+            findings.is_empty(),
+            "cast(Callable[[Age], Age], f)'s own declared return must silence the call through g: {:?}",
+            findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// A10.guard.sort — the same cast shape, guarded by `callable(f) and
+    /// 0 <= x <= 150` in one `if` test instead of an early exit.
+    #[test]
+    fn a_cast_to_callable_seeds_its_declared_return_after_a_callable_guard() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "from typing import Any, Callable, cast\n",
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Age = Annotated[int, Field(ge=0, le=150)]\n",
+            "def after_callable_guard_inside(f: Any, x: Age) -> Age:\n",
+            "    if callable(f) and 0 <= x <= 150:\n",
+            "        g = cast(Callable[[Age], Age], f)\n",
+            "        return g(x)\n",
+            "    return 0\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        assert!(
+            findings.is_empty(),
+            "cast(Callable[[Age], Age], f)'s own declared return must silence the call through g: {:?}",
+            findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// A10.guard.truthy — `f = identity` (a module `def`, not a
+    /// `Callable`-annotated parameter) binds `f` to a same-module-def
+    /// alias value (`env::same_module_def_alias_value`); `f(x)` resolves
+    /// through `evaluate_call`'s new alias-call arm to `identity`'s own
+    /// body, interpreted exactly as a direct `identity(x)` call would be
+    /// — a function value is always truthy, so `if f:` always takes the
+    /// call branch.
+    #[test]
+    fn a_name_bound_to_a_same_module_def_calls_through_to_that_defs_own_body() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Age = Annotated[int, Field(ge=0, le=150)]\n",
+            "def identity(x: Age) -> Age:\n",
+            "    return x\n",
+            "def truthy_always_inside(x: Age) -> Age:\n",
+            "    f = identity\n",
+            "    if f:\n",
+            "        if 0 <= x <= 150:\n",
+            "            return f(x)\n",
+            "    return 0\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        assert!(
+            findings.is_empty(),
+            "f = identity must call through to identity's own body: {:?}",
+            findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// A name bound to a same-module def still calls through when the
+    /// def's own body would fire against a DIFFERENT declared alias —
+    /// pins that the alias call genuinely reaches the real body (through
+    /// `call_result_with_enclosing`) rather than silently reading as an
+    /// unjudged `unknown()` that a containment law never gets to see.
+    #[test]
+    fn a_name_bound_to_a_same_module_def_still_fires_when_the_defs_body_would() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parsed(concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Age = Annotated[int, Field(ge=0, le=150)]\n",
+            "def two_hundred() -> Age:\n",
+            "    return 200\n",
+            "def rows() -> None:\n",
+            "    f = two_hundred\n",
+            "    over: Age = f()\n",
+        ));
+        let findings = findings_for_module(&module, &kernel);
+        let fires: Vec<&Finding> = findings.iter().filter(|f| f.code == "RTS7001").collect();
+        assert_eq!(
+            fires.len(),
+            1,
+            "a same-module-def alias call must still reach the real out-of-set body: {:?}",
             findings.iter().map(|f| &f.message).collect::<Vec<_>>()
         );
     }

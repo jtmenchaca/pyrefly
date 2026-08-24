@@ -5,8 +5,14 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! String VALUE states: a known string literal's abstract value, and
-//! the exactly-decidable `str` methods on an exact-string receiver.
+//! String VALUE states: a known string literal's abstract value, the
+//! exactly-decidable `str` methods on an exact-string receiver
+//! (`string_method_result`), and the SORT-ONLY answer the same methods
+//! state over a receiver that is String-sorted but not exact
+//! (`string_method_sort_only_result`/`string_method_int_sort_only_result`
+//! — the whole-strings-ground or whole-int-ray claim a method's own
+//! CPython contract still proves even when the receiver's own content
+//! is unread).
 //!
 //! ## How the domain carries a string
 //!
@@ -83,9 +89,11 @@
 //! already dispatches numeric arithmetic through. Modeling it belongs
 //! beside that dispatcher, not in this method-result function.
 
-use refined_domain::abstract_value::{known_values, AbstractValue, Kind, PrimitiveKind};
+use refined_domain::abstract_value::{known_set, known_values, AbstractValue, Kind, PrimitiveKind, SetKindTag};
 use refined_domain::known_constructors::known_list;
-use refined_domain::trust_grades::TrustProved;
+use refined_domain::trust_grades::{trust_level_of, TrustProved};
+use refined_sets::codepoint_sets::strings;
+use refined_sets::refinement_forms::{at_least, integer, make_refined_set};
 
 /// The state for a known string literal: an exact value, one f64 code
 /// point per `char`, sorted `PrimitiveKind::String`. `len()` on the
@@ -241,6 +249,82 @@ pub fn string_method_result(
         }
         _ => None,
     }
+}
+
+/// The SORT-ONLY answer a `str` method call states when the receiver is
+/// known to be STRING-SORTED but not an EXACT string (`string_method_
+/// result`'s own `exact_string_text` already declined) — the same
+/// "state the sort, never a guessed value" posture
+/// `math_models::approximated_family_result` keeps for a transcendental
+/// call over a known numeric window rather than one known number.
+/// Every row here answers `refined_sets::codepoint_sets::strings()`
+/// (`Σ*`, the whole-strings ground) tagged `PrimitiveKind::String` —
+/// sound regardless of what the receiver's own content actually is,
+/// since every one of these methods' own CPython contract (library/
+/// stdtypes.html) returns another Python `str`, and this file carries
+/// no NARROWER-than-Σ* claim (a length bound, a case-only image) for an
+/// unbounded receiver to state exactly.
+///
+/// Scoped to the methods a corpus row actually needs a value for over
+/// an unbounded receiver: `upper`/`lower`/`casefold`/`strip`/`lstrip`/
+/// `rstrip`/`replace`/`zfill` (`str.zfill` is not modeled at ALL in
+/// `string_method_result` — no exact row exists for it either — so its
+/// only citation is here: "Return a copy of the string left filled with
+/// ASCII '0' digits to make a string of length width," library/
+/// stdtypes.html, str.zfill). `find`/`index` are NOT here: their own
+/// result is `int`-sorted, not `str`-sorted, so `find`/`index`'s own
+/// sort-only answer is `string_method_int_sort_only_result` below, a
+/// separate row rather than a shared one — the two return different
+/// Python types and must not share one function's "always strings"
+/// answer. Every other method name answers `None`: `startswith`/
+/// `endswith` are `bool`-sorted, not `str`- or `int`-sorted, and this
+/// file states no sort-only claim for a boolean predicate over an
+/// unread receiver; `split` answers a LIST, a third sort again; `join`'s
+/// receiver is the SEPARATOR, not the thing being transformed, and no
+/// corpus row needs its own sort-only answer here — every one of these
+/// is this function's own "not modeled at this precision" decline, same
+/// honesty as `string_method_result`'s own catch-all.
+///
+/// `receiver`'s own trust grade carries onto the answer
+/// (`trust_grades::trust_level_of`) — the same grade-preservation
+/// `math_models::kernel_backed_unary_family_call` keeps for its own
+/// sort-only-adjacent Set answers, so a WORN receiver's own weaker
+/// claim never gets restated as `TrustSpec`-strength here.
+pub fn string_method_sort_only_result(method: &str, receiver: &AbstractValue, arguments: &[AbstractValue]) -> Option<AbstractValue> {
+    let is_shaped_row = match method {
+        "upper" | "lower" | "strip" | "lstrip" | "rstrip" => arguments.is_empty(),
+        "casefold" => arguments.is_empty(),
+        "replace" => arguments.len() == 2,
+        "zfill" => arguments.len() == 1,
+        _ => false,
+    };
+    if !is_shaped_row {
+        return None;
+    }
+    let grade = trust_level_of(receiver);
+    Some(known_set(strings(), None, grade, SetKindTag::None))
+}
+
+/// The SORT-ONLY answer `str.find`/`str.index` state over a receiver
+/// known to be STRING-SORTED but not exact: every real call answers an
+/// Integer, never wider than `[-1, +inf)` (`str.find`'s own contract,
+/// `string_method_result`'s own doc — "Return -1 if sub is not
+/// found"). `str.index` never actually returns `-1` (a miss raises
+/// instead), but `[-1, +inf)` still SOUNDLY bounds it — a superset of
+/// the true `[0, +inf)` answer costs this file nothing it needs to
+/// state exactly here, and keeping the two methods on one row (rather
+/// than a tighter, `index`-only `[0, +inf)` claim) matches `find`'s own
+/// exact row, which likewise never distinguishes the two beyond the
+/// miss case `expressions.rs::call_provable_raise` already reads
+/// separately.
+pub fn string_method_int_sort_only_result(method: &str, arguments: &[AbstractValue]) -> Option<AbstractValue> {
+    if !matches!(method, "find" | "index") || arguments.len() != 1 {
+        return None;
+    }
+    Some(AbstractValue {
+        kind_tag: Some(PrimitiveKind::Integer),
+        ..known_set(make_refined_set(vec![integer(), at_least(-1.0)]), None, TrustProved, SetKindTag::None)
+    })
 }
 
 /// The exact text an AbstractValue carries, if it is a `Kind::Values`
@@ -468,6 +552,62 @@ mod tests {
     fn test_non_string_receiver_declines() {
         let receiver = known_values(vec![1.0], PrimitiveKind::Number, TrustProved);
         assert_eq!(string_method_result("upper", &receiver, &[]), None);
+    }
+
+    /// The unbounded whole-strings ground — `s: str`'s own seed
+    /// (`typereading::base_sort_return_refinement`) — as this test
+    /// module's own Set-shaped receiver.
+    fn any_string_receiver() -> AbstractValue {
+        known_set(strings(), None, TrustProved, SetKindTag::None)
+    }
+
+    /// `s.upper()` over an unbounded receiver answers Σ* — `string_
+    /// method_result`'s own exact row already declined (no exact text to
+    /// read), so this is the sort-only fallback `A3.xfer.case`'s own row
+    /// needs: the method still names a real `str`-sorted claim rather
+    /// than declining the whole call.
+    #[test]
+    fn test_sort_only_upper_over_an_unbounded_receiver_answers_any_string() {
+        let receiver = any_string_receiver();
+        let result = string_method_sort_only_result("upper", &receiver, &[]).expect("upper must decide the sort");
+        assert_eq!(result.kind, Kind::Set);
+        assert_eq!(exact_string_text(&result), None, "the answer states no exact content");
+    }
+
+    /// `s.replace("a", "b")`/`s.strip()`/`s.zfill(4)` over an unbounded
+    /// receiver all answer the same Σ* sort-only claim — `A3.xfer.
+    /// replace`/`A3.xfer.trim`/`A3.xfer.pad`'s own rows.
+    #[test]
+    fn test_sort_only_replace_strip_zfill_all_answer_any_string() {
+        let receiver = any_string_receiver();
+        let replace = string_method_sort_only_result("replace", &receiver, &[string_literal_value("a"), string_literal_value("b")])
+            .expect("replace must decide the sort");
+        assert_eq!(replace.kind, Kind::Set);
+        let strip = string_method_sort_only_result("strip", &receiver, &[]).expect("strip must decide the sort");
+        assert_eq!(strip.kind, Kind::Set);
+        let zfill = string_method_sort_only_result("zfill", &receiver, &[known_values(vec![4.0], PrimitiveKind::Integer, TrustProved)])
+            .expect("zfill must decide the sort");
+        assert_eq!(zfill.kind, Kind::Set);
+    }
+
+    /// A method this file states no sort-only claim for (`split` answers
+    /// a LIST, not a string — a different sort this function does not
+    /// speak to) still declines, matching `string_method_result`'s own
+    /// "not modeled" honesty at this precision.
+    #[test]
+    fn test_sort_only_declines_a_method_with_no_string_sorted_claim() {
+        let receiver = any_string_receiver();
+        assert_eq!(string_method_sort_only_result("split", &receiver, &[string_literal_value(",")]), None);
+    }
+
+    /// `s.find("z")` over an unbounded receiver answers an Integer-sorted
+    /// `[-1, +inf)` claim — `A3.xfer.search`'s own row: `find` never
+    /// raises, so this sound bound is the whole real answer.
+    #[test]
+    fn test_sort_only_find_over_an_unbounded_receiver_answers_an_integer_ray() {
+        let result = string_method_int_sort_only_result("find", &[string_literal_value("z")]).expect("find must decide the sort");
+        assert_eq!(result.kind, Kind::Set);
+        assert_eq!(result.kind_tag, Some(PrimitiveKind::Integer));
     }
 
     /// replace with a non-exact-string argument declines rather than

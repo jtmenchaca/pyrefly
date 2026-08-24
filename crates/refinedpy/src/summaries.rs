@@ -67,7 +67,9 @@ use refined_sets::refinement_forms::at_least;
 use refined_sets::refinement_forms::fold_ray_forms;
 use refined_sets::refinement_forms::integer;
 use refined_sets::refinement_forms::make_refined_set;
+use refined_sets::refinement_forms::on_one_tuple_layer;
 use refined_sets::refinement_forms::one_of;
+use refined_sets::refinement_forms::requires_integer;
 use refined_sets::refinement_forms::Form;
 use refined_sets::refinement_forms::RefinedSet;
 use refined_sets::refinement_forms::Refinement;
@@ -83,6 +85,7 @@ use ruff_python_ast::StmtFunctionDef;
 use ruff_python_ast::StmtIf;
 use ruff_text_size::TextRange;
 
+use crate::assignability::states_sequence;
 use crate::collection_models::dict_with_item;
 use crate::collection_models::list_with_item;
 use crate::env::Environment;
@@ -100,6 +103,7 @@ use crate::narrowing;
 use crate::summary_lowering::lower_function_body;
 use crate::summary_lowering::LoweredBody;
 use crate::surface::surface_imports;
+use crate::typereading::declared_refinement;
 
 /// The deepest a call chain interprets before declining outright. A
 /// same-module call whose body calls itself (directly or through a
@@ -238,6 +242,19 @@ pub fn call_result_with_enclosing(
                 environment.set_classes(classes.clone());
             }
         }
+        // DECLARED ALIASES: the same inherit-when-unset rule `classes`
+        // just took, for the reason `declared_return_seed`'s own doc
+        // states — `fresh_body_environment` never populates this table
+        // on its own, so without inheriting it here, a call this file
+        // cannot interpret (a stub body, a genuine decline) would answer
+        // only the three bare `int`/`float`/`str` sorts even when the
+        // CALLER's own environment carries the full alias table
+        // `check.rs::walk_body_with_self_binding` seeded it with.
+        if environment.declared_aliases().is_none() {
+            if let Some((aliases, imports)) = enclosing.declared_aliases() {
+                environment.set_declared_aliases(aliases.clone(), imports.clone());
+            }
+        }
         // DATETIME IMPORTS: the same inherit-when-unset rule `classes`
         // just took, for the identical reason — a same-module def
         // interpreted here may itself construct/call a `datetime`
@@ -266,8 +283,27 @@ pub fn call_result_with_enclosing(
         }
     }
     let Some(()) = bind_parameters(def, arguments, kernel, &mut environment, enclosing) else {
-        return return_sort_fallback(def);
+        return declared_return_seed(def, &environment).or_else(|| return_sort_fallback(def));
     };
+
+    // A stub body (PEP 484's "Stub Files" convention, restated for an
+    // inline definition by typing.rst's own `...` placeholder example:
+    // a body that is exactly one `Expr::EllipsisLiteral` statement,
+    // optionally preceded by a leading docstring) is DECLARATION-ONLY —
+    // it states no runtime behavior for `interpret_body` to read.
+    // Recognized here, before the ordinary interpretation below, so a
+    // stub answers its own declared return annotation
+    // (`declared_return_seed`/`return_sort_fallback`) the same way any
+    // other body this interpreter cannot get off the ground already
+    // does (`raise NotImplementedError`'s own first-statement-declines
+    // path, further down) — never `interpret_body`'s ordinary
+    // `Stmt::Expr` arm, which would evaluate the bare `...` and discard
+    // it like `pass`, falling off the end into a fabricated
+    // `null_value()` return that carries no relation to what the
+    // annotation actually declares.
+    if is_stub_body(&def.body) {
+        return declared_return_seed(def, &environment).or_else(|| return_sort_fallback(def));
+    }
 
     let mut returns: Vec<AbstractValue> = Vec::new();
     let Some(falls_through) = interpret_body(&def.body, kernel, depth, &mut environment, &mut returns, None) else {
@@ -302,14 +338,14 @@ pub fn call_result_with_enclosing(
         // that is nothing but a docstring then a decline is exactly as
         // opaque as a body that declines immediately.
         let Some(first_statement) = first_non_docstring_statement(&def.body) else {
-            return return_sort_fallback(def);
+            return declared_return_seed(def, &environment).or_else(|| return_sort_fallback(def));
         };
         let mut probe_environment = fresh_body_environment(def, table, depth);
         if let Some(enclosing) = enclosing {
             seed_free_variables(def, enclosing, &mut probe_environment);
         }
         if bind_parameters(def, arguments, kernel, &mut probe_environment, enclosing).is_none() {
-            return return_sort_fallback(def);
+            return declared_return_seed(def, &environment).or_else(|| return_sort_fallback(def));
         }
         let mut probe_returns: Vec<AbstractValue> = Vec::new();
         let first_statement_declines = interpret_body(
@@ -322,7 +358,7 @@ pub fn call_result_with_enclosing(
         )
         .is_none();
         if first_statement_declines {
-            return return_sort_fallback(def);
+            return declared_return_seed(def, &environment).or_else(|| return_sort_fallback(def));
         }
         return None;
     };
@@ -332,7 +368,7 @@ pub fn call_result_with_enclosing(
 
     let mut answers = returns.into_iter();
     let Some(first) = answers.next() else {
-        return return_sort_fallback(def);
+        return declared_return_seed(def, &environment).or_else(|| return_sort_fallback(def));
     };
     let joined = answers.fold(first, |acc, next| join_known(acc, next));
     Some(joined)
@@ -1151,6 +1187,60 @@ pub fn return_sort_fallback(def: &StmtFunctionDef) -> Option<AbstractValue> {
     }
 }
 
+/// `return_sort_fallback`'s own answer, widened to a declared ALIAS
+/// return (`-> Age`, `Age = Annotated[int, Field(ge=0, le=150)]`) —
+/// every `call_result_with_enclosing` decline point calls this instead
+/// of `return_sort_fallback` directly, so a callee this checker cannot
+/// interpret still answers its own declared window, not just the three
+/// bare `int`/`float`/`str` sorts `return_sort_fallback` alone reads.
+///
+/// Tries `typereading::declared_refinement` first, through the alias
+/// table `environment` carries (`Environment::declared_aliases`,
+/// `check.rs::walk_body_with_self_binding`'s own seeding site) — the
+/// SAME table `check.rs::walk_function_def` already reads a def's own
+/// `-> Annotation` through, made reachable here too. `None` when this
+/// environment carries no alias table (a bare test environment, or a
+/// walk that never threaded one through), when the annotation resolves
+/// to a container/generator/temporal/TypedDict shape (this reading
+/// converts a SCALAR declared set only — the same scope
+/// `return_sort_fallback` already keeps), or when the annotation names
+/// nothing the alias table recognizes; every one of those falls back to
+/// `return_sort_fallback`'s own bare-sort reading unchanged.
+///
+/// The declared set carries its own numeric sort onto the seeded
+/// value's `kind_tag` under the exact gate `check.rs::seed_parameters`
+/// already applies to a scalar parameter (`on_one_tuple_layer` true,
+/// `states_sequence` false) — a string/sequence-shaped declared set is
+/// left untagged, matching that function's own convention. Graded
+/// TrustSpec: an annotation states the developer's claim, never an
+/// execution-proved fact, the same grading `return_sort_fallback`
+/// itself already carries for a bare `int`/`float`/`str` reading.
+pub fn declared_return_seed(def: &StmtFunctionDef, environment: &Environment) -> Option<AbstractValue> {
+    let annotation = def.returns.as_deref()?;
+    let (aliases, imports) = environment.declared_aliases()?;
+    let declared = declared_refinement(annotation, aliases, imports, environment)?;
+    if declared.set.forms.is_empty() {
+        // A container/generator/temporal/TypedDict declaration (typereading's
+        // own "one active field" convention — `set` sits empty when
+        // `element`/`positions`/`generator`/`temporal`/`members` carries the
+        // answer instead) is out of this reading's scope; the caller's own
+        // `return_sort_fallback` retry answers what it always answered for
+        // that def (nothing, for any of those shapes — `return_sort_
+        // fallback`'s own doc).
+        return None;
+    }
+    let seeded = if on_one_tuple_layer(&declared.set) && !states_sequence(&declared.set) {
+        let sort = if requires_integer(&declared.set) { PrimitiveKind::Integer } else { PrimitiveKind::Float };
+        AbstractValue {
+            kind_tag: Some(sort),
+            ..known_set(declared.set, None, TrustSpec, SetKindTag::None)
+        }
+    } else {
+        known_set(declared.set, None, TrustSpec, SetKindTag::None)
+    };
+    Some(seeded)
+}
+
 /// R-bar (`refinement_forms::numbers()`'s own unbounded ray) conjoined
 /// with the `int` form — the unbounded whole-number set: every integer,
 /// no ceiling/floor. The same shape `surface.rs::annotated_expression_set`
@@ -1248,6 +1338,27 @@ pub(crate) fn first_non_docstring_statement(body: &[Stmt]) -> Option<&Stmt> {
 /// docstring shape `first_non_docstring_statement` skips.
 fn is_bare_string_literal_statement(stmt: &Stmt) -> bool {
     matches!(stmt, Stmt::Expr(expr_stmt) if matches!(expr_stmt.value.as_ref(), Expr::StringLiteral(_)))
+}
+
+/// Whether `body` is a STUB body — PEP 484's "Stub Files" convention
+/// (typeshed's own written form for a declaration with no runtime
+/// implementation), read here for an INLINE `def` rather than a `.pyi`
+/// file: a body whose only non-docstring statement is a bare `...`
+/// (`Expr::EllipsisLiteral`), and nothing follows it. `first_non_
+/// docstring_statement`'s own leading-docstring skip applies first
+/// (`def f() -> Age:\n    """docs"""\n    ...\n` is a stub exactly as
+/// much as one with no docstring), so this checks the body's own FIRST
+/// REAL statement, then requires it be the body's LAST statement too —
+/// `def f() -> Age:\n    ...\n    return 200\n` is an ordinary body
+/// that merely opens with a stray `...` expression, not a stub, and
+/// still interprets through `interpret_body`'s ordinary `Stmt::Expr`
+/// arm unchanged.
+fn is_stub_body(body: &[Stmt]) -> bool {
+    let Some(first_statement) = first_non_docstring_statement(body) else {
+        return false;
+    };
+    let is_ellipsis = matches!(first_statement, Stmt::Expr(expr_stmt) if matches!(expr_stmt.value.as_ref(), Expr::EllipsisLiteral(_)));
+    is_ellipsis && std::ptr::eq(first_statement, body.last().expect("first_non_docstring_statement found a statement, so body is non-empty"))
 }
 
 /// Copies every name `enclosing` binds that `def`'s own body does NOT
@@ -2546,6 +2657,8 @@ mod tests {
     use refined_kernel::kernel_bridge::load_kernel;
     use ruff_python_parser::parse_module;
 
+    use crate::surface::compile_aliases;
+
     use super::*;
 
     fn loaded_kernel() -> Option<Arc<RefinedTSKernel>> {
@@ -2947,13 +3060,138 @@ mod tests {
 
     /// A return annotation that is not a bare `int`/`float`/`str` name
     /// (a compiled alias name, `Age`) still declines outright on a
-    /// genuinely-declining body — the fallback states nothing beyond the
-    /// three base sorts.
+    /// genuinely-declining body when the CALLER's environment carries no
+    /// alias table (a plain `call_result` test, exactly like every test
+    /// above this one) — `declared_return_seed` requires `Environment::
+    /// declared_aliases`, which `fresh_body_environment` never populates
+    /// on its own; only `check.rs::walk_body_with_self_binding` does
+    /// (the alias-aware path is exercised below, through an environment
+    /// that DOES carry the table).
     #[test]
     fn a_declined_while_loop_body_with_a_non_base_sort_annotation_still_declines() {
         let Some(kernel) = loaded_kernel() else { return };
         let def = parsed_def("def counted(n) -> Age:\n    while n > 0:\n        n -= 1\n    return n\n");
         assert!(call_result(&def, &[known_int(3.0)], None, &kernel, 0).is_none());
+    }
+
+    // --- declared_return_seed / is_stub_body: the stub-body decline path ---
+
+    /// A whole module's own compiled alias table, mirroring exactly what
+    /// `check.rs::walk_body_with_self_binding` threads onto an
+    /// `Environment` (`Environment::set_declared_aliases`) — built here
+    /// so `declared_return_seed`'s alias-aware reading can be exercised
+    /// directly, without going through the full `check.rs` walk.
+    fn environment_with_module_aliases(source: &str) -> Environment {
+        let module = parse_module(source).expect("fixture source parses").into_syntax();
+        let aliases = compile_aliases(&module);
+        let imports = surface_imports(&module);
+        let mut environment = Environment::new(std::collections::HashSet::new());
+        environment.set_declared_aliases(Arc::new(aliases), Arc::new(imports));
+        environment
+    }
+
+    /// A body whose only statement is a bare `...` is a stub
+    /// (PEP 484's "Stub Files" convention, restated for an inline `def`).
+    #[test]
+    fn is_stub_body_recognizes_a_bare_ellipsis_body() {
+        let def = parsed_def("def crossed_from_fact(x) -> None: ...\n");
+        assert!(is_stub_body(&def.body));
+    }
+
+    /// A leading docstring before the `...` is still a stub —
+    /// `first_non_docstring_statement`'s own skip applies first.
+    #[test]
+    fn is_stub_body_recognizes_a_docstring_then_ellipsis_body() {
+        let def = parsed_def("def crossed_from_fact(x) -> None:\n    \"\"\"docs\"\"\"\n    ...\n");
+        assert!(is_stub_body(&def.body));
+    }
+
+    /// A body that opens with `...` but goes on to a REAL statement is
+    /// NOT a stub — the ellipsis must be the body's own LAST statement.
+    #[test]
+    fn is_stub_body_refuses_an_ellipsis_followed_by_a_real_statement() {
+        let def = parsed_def("def not_a_stub() -> None:\n    ...\n    return None\n");
+        assert!(!is_stub_body(&def.body));
+    }
+
+    /// An ordinary body (no ellipsis at all) is not a stub.
+    #[test]
+    fn is_stub_body_refuses_an_ordinary_body() {
+        let def = parsed_def("def f(x):\n    return x\n");
+        assert!(!is_stub_body(&def.body));
+    }
+
+    /// `declared_return_seed` reads a same-module callee's `-> Age`
+    /// stub return through the alias table, the same scalar seed
+    /// `check.rs::seed_parameters` builds for an `Age`-typed parameter:
+    /// `Age`'s own set (`[0, 150]`, Integer-tagged), grade TrustSpec.
+    #[test]
+    fn declared_return_seed_reads_an_alias_typed_stub_return() {
+        let environment = environment_with_module_aliases(concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Age = Annotated[int, Field(ge=0, le=150)]\n",
+            "def crossed_from_fact(x: Age) -> Age: ...\n",
+        ));
+        let def = parsed_def("def crossed_from_fact(x: Age) -> Age: ...\n");
+        let seeded = declared_return_seed(&def, &environment).expect("Age resolves through the alias table");
+        assert_eq!(seeded.kind_tag, Some(PrimitiveKind::Integer));
+        assert_eq!(seeded.set, refined_sets::refinement_forms::make_refined_set(vec![
+            refined_sets::refinement_forms::at_least(0.0),
+            refined_sets::refinement_forms::at_most(150.0),
+            refined_sets::refinement_forms::integer(),
+        ]));
+    }
+
+    /// `declared_return_seed` answers `None` when the environment carries
+    /// no alias table at all — the caller's own `.or_else(|| return_sort_
+    /// fallback(def))` is what a bare-sort return still falls back to.
+    #[test]
+    fn declared_return_seed_declines_with_no_alias_table() {
+        let environment = Environment::new(std::collections::HashSet::new());
+        let def = parsed_def("def crossed_from_fact(x) -> Age: ...\n");
+        assert!(declared_return_seed(&def, &environment).is_none());
+    }
+
+    /// A caller's own contract crosses through a stub callee end to end:
+    /// `fact_inside` calls `crossed_from_fact`, whose body is a bare
+    /// `...` — `call_result_with_enclosing`'s own `is_stub_body` check
+    /// reads the declared `-> Age` return rather than interpreting the
+    /// stub body (which would otherwise fall through to a fabricated
+    /// `null_value()`). Threads the SAME alias table `check.rs`'s own
+    /// walk threads, through `enclosing`, exactly the way a real call
+    /// site's environment carries it (`call_result_with_enclosing`'s own
+    /// `enclosing.declared_aliases()`-reachable seam is `environment`
+    /// itself, built fresh per call — this test pins that the def's OWN
+    /// `Environment`, not `enclosing`'s, is what `declared_return_seed`
+    /// reads, matching `walk_body_with_self_binding`'s per-body seeding).
+    #[test]
+    fn a_stub_bodied_call_answers_its_declared_return_not_none() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = parse_module(concat!(
+            "from typing import Annotated\n",
+            "from pydantic import Field\n",
+            "type Age = Annotated[int, Field(ge=0, le=150)]\n",
+            "def crossed_from_fact(x: Age) -> Age: ...\n",
+        ))
+        .expect("fixture source parses")
+        .into_syntax();
+        let def = module
+            .body
+            .iter()
+            .find_map(|stmt| match stmt {
+                Stmt::FunctionDef(def) if def.name.id.as_str() == "crossed_from_fact" => Some(def.clone()),
+                _ => None,
+            })
+            .expect("the fixture's own def");
+        let aliases = compile_aliases(&module);
+        let imports = surface_imports(&module);
+        let mut caller_environment = Environment::new(std::collections::HashSet::new());
+        caller_environment.set_declared_aliases(Arc::new(aliases), Arc::new(imports));
+        let result = call_result_with_enclosing(&def, &[known_int(40.0)], None, &kernel, 0, Some(&caller_environment))
+            .expect("a stub callee must answer its declared return, not decline outright");
+        assert_ne!(result.kind, Kind::Null, "a stub body must never fabricate a None return");
+        assert_eq!(result.kind_tag, Some(PrimitiveKind::Integer));
     }
 
     /// A def with a keyword-only parameter the CALLER never covers (no

@@ -543,6 +543,24 @@ pub fn dict_changed_size_during_iteration(dict_name: &str) -> String {
     )
 }
 
+/// A `for` loop iterating a list directly (`for x in lst:`) whose own
+/// body provably APPENDS TO THAT SAME LIST on every reachable pass —
+/// `loops.rs::list_size_changing_mutation_range`'s own recognized
+/// `.append(...)` call. Unlike a dict (which raises `RuntimeError`
+/// outright, `dict_changed_size_during_iteration`'s own citation), a
+/// list's iterator carries no such guard (library/stdtypes.rst's list
+/// iterator has no length snapshot the way a `range(len(...))` counter
+/// would) — every pass finds a fresh element the SAME pass just
+/// appended, so the loop never reaches its own end. Names the iterated
+/// list so the reader does not have to re-derive which name the loop
+/// reads from the mutation alone.
+pub fn list_never_terminates_self_append(list_name: &str) -> String {
+    format!(
+        "this loop never terminates: list '{list_name}' is appended to inside its own for-loop body — \
+        the iterator keeps finding new elements appended ahead of it"
+    )
+}
+
 /// The generic `value_not_readable` sentence's own NAMED replacement, for
 /// the one shape that generic wording leaves anonymous: a flowing value
 /// that reached a sink undetermined because it was produced by a call

@@ -30,6 +30,7 @@ use refined_domain::abstract_value::SetKindTag;
 use refined_domain::known_constructors::known_object;
 use refined_domain::lattice_operations::join_known;
 use refined_domain::lattice_operations::truthiness;
+use refined_domain::trust_grades::trust_level_of;
 use refined_domain::trust_grades::TrustLevel;
 use refined_domain::trust_grades::TrustProved;
 use refined_domain::trust_grades::TrustSpec;
@@ -137,6 +138,22 @@ fn evaluate_expression_dispatch(
         // module attribute) reads through the ordinary Name arm instead.
         Expr::Name(name) if name.id.as_str() == "__name__" && environment.read("__name__").is_none() => {
             known_set(strings(), None, TrustSpec, SetKindTag::None)
+        }
+        // A bare reference to a SAME-MODULE `def` — `f = identity`,
+        // naming the function without calling it. `environment.read`
+        // answers `None` here (a module-level `def` is indexed in
+        // `environment.functions()`, never separately bound as a value
+        // of its own), so without this arm the read would fall to the
+        // catch-all `unknown()` below, discarding which function `f`
+        // actually names and losing the call-through this value's later
+        // `f(x)` needs (`env::same_module_def_alias_value`'s own doc).
+        // Checked only when the name is not itself locally bound (a
+        // local shadowing a def name reads its own binding instead, the
+        // same shadow-on-rebind rule every other module-level fact in
+        // this file keeps) and the module's function table actually
+        // names a def there.
+        Expr::Name(name) if environment.read(name.id.as_str()).is_none() && environment.functions().is_some_and(|table| table.def(name.id.as_str()).is_some()) => {
+            env::same_module_def_alias_value(name.id.as_str())
         }
         Expr::Name(name) => match environment.read(name.id.as_str()) {
             Some(value) => value.clone(),
@@ -3860,6 +3877,43 @@ fn evaluate_call(call: &ruff_python_ast::ExprCall, environment: &Environment, ke
             }
         }
     }
+    // A SAME-MODULE-DEF ALIAS CALL: `f = identity; f(x)` — `f` reads a
+    // value `env::same_module_def_alias_value` built (this file's own
+    // `Expr::Name` read arm, for a bare reference to a module-level
+    // `def`). Tried alongside the retained-callable arm above, for the
+    // identical reason: the value already NAMES its own callee (the
+    // def's own name, read back through `env::same_module_def_alias_
+    // name`), a stronger fact than the bare `f` spelling `table.def`
+    // would look up next — and `table.def("f")` would find nothing
+    // anyway unless the module happens to ALSO declare a `def f`. No
+    // retained-body table entry, no closure snapshot: the aliased def
+    // is a MODULE-LEVEL def, already fully resolvable by name through
+    // `environment.functions()`, so this calls `summaries::call_result_
+    // with_enclosing` directly on it, exactly the way the same-module-
+    // def dispatch just below calls a def reached by its own literal
+    // name.
+    if let Expr::Name(name) = call.func.as_ref() {
+        if let Some(value) = environment.read(name.id.as_str()) {
+            if let Some(aliased_name) = env::same_module_def_alias_name(value) {
+                if let Some(table) = environment.functions() {
+                    if let Some(def) = table.def(aliased_name) {
+                        let Some(positional) = positional_arguments_for_def(call, def, environment, kernel) else {
+                            return unknown();
+                        };
+                        let answer = summaries::call_result_with_enclosing(
+                            def,
+                            &positional,
+                            environment.functions(),
+                            kernel,
+                            environment.call_depth(),
+                            Some(environment),
+                        );
+                        return answer.unwrap_or_else(unknown);
+                    }
+                }
+            }
+        }
+    }
     if let Expr::Name(name) = call.func.as_ref() {
         if same_module_def_gate_open(environment, name.id.as_str()) {
             if let Some(table) = environment.functions() {
@@ -5266,6 +5320,29 @@ fn evaluate_attribute_call(
             Some(value) => value,
             None => unknown(),
         };
+    }
+    // A STRING-SORTED but NOT EXACT receiver (`s: str`, unrefined — a
+    // bare-`str` parameter seeds the whole-strings ground,
+    // `typereading::base_sort_return_refinement`'s own doc — or any
+    // other Set-shaped string value this file's readers already
+    // produced): `exact_string_values` above already declined, but a
+    // method whose own CPython contract always returns ANOTHER `str`
+    // (or, for `find`/`index`, an `int`) still states that SORT exactly,
+    // the same "answer the sort, not a guessed value" row `math_models`'s
+    // approximated family keeps for a numeric transcendental over a
+    // known window. `assignability::states_sequence`/`sequence_shaped`
+    // is the SAME string-vs-numeric-ground test that file's own sort
+    // laws already gate on — never a second recognizer for the same
+    // question.
+    if receiver.kind == Kind::Set
+        && (crate::assignability::states_sequence(&receiver.set) || crate::assignability::sequence_shaped(&receiver.set))
+    {
+        if let Some(value) = string_models::string_method_sort_only_result(attribute.attr.as_str(), &receiver, arguments) {
+            return value;
+        }
+        if let Some(value) = string_models::string_method_int_sort_only_result(attribute.attr.as_str(), arguments) {
+            return value;
+        }
     }
     // `dict[str, X]` PARAMETER'S own unbounded-key receiver
     // (`Kind::ObjectStar` — `check.rs::seed_parameters`'
@@ -7151,13 +7228,25 @@ fn union_transfer_answers(
 ///   corner sound is future work; this composition declines it rather
 ///   than guess.
 ///
-/// The exponent must be a KNOWN exact integer in `[1, 64]`
+/// The exponent is EITHER a known exact integer in `[1, 64]`
 /// (`exact_nonnegative_integer`'s own f64-exact gate, further narrowed
-/// to the `1..=64` window both Lean deciders share) — a set-shaped or
-/// out-of-window exponent gives neither decider a `PowArg.value` to
-/// match, so this declines outright rather than pose a question neither
-/// row can answer. `x ** 0` is its own pinned branch below (answered
-/// directly, no kernel round trip — see that branch's own doc for why).
+/// to the `1..=64` window both Lean deciders share — read as the
+/// one-element set `{k}`, the same singleton reading
+/// `transferable_numeric_operand` gives any known scalar), OR an
+/// Integer-sorted `Kind::Set` WINDOW (a seeded parameter range, or a
+/// bounded set another transfer produced) — read as its own set,
+/// mirroring exactly how `base_set` below is built off `left_set`/
+/// `left_sort`. Either shape rides the wire as `PowOperandWire::Set`;
+/// the kernel's own `transferIntegerPow` (`theories/pow/binary64.lean`)
+/// is the decider for a windowed exponent (an integer-marked bounded
+/// enclosure, nonnegative bounds) exactly as it already is for a
+/// windowed BASE — a negative or unbounded exponent window, or any
+/// shape the Lean decider does not read, comes back `Unknown`/`NaN`
+/// and this function declines the same way it already declines an
+/// unread base window. `x ** 0` is its own pinned branch below
+/// (answered directly, no kernel round trip — see that branch's own
+/// doc for why) and applies ONLY to the known-scalar exponent path,
+/// since a window can never be the single value `0`.
 /// A negative exponent is `binary_arithmetic_pair`'s own row when both
 /// operands are single values, and stays `unknown()` here for a SET
 /// base — outside this function's declared scope.
@@ -7174,32 +7263,47 @@ fn pow_over_sets(
     use refined_kernel::transfer_questions::TransferQuestion;
     use refined_kernel::transfer_questions::TransferQuestionOp;
 
-    let exponent = exact_nonnegative_integer(right)?;
-    // `x ** 0` is exactly `1` for EVERY `x` — expressions.rst's power
-    // operator row states no exception (unlike `0 ** negative`, which
-    // raises `ZeroDivisionError`, or a negative base under a fractional
-    // exponent, which goes complex): this is a closed pinned fact, not a
-    // window computation, so it answers directly rather than asking
-    // either Lean decider — neither `transferIntegerPow`
-    // (`A.int` only) nor `transferRealPow` (`1 ≤ k ≤ 64`, nonnegative
-    // base only) reads `k = 0` at all, and the shared classifier's own
-    // `k = 0` cell (`powCells`'s `e.may zero → addVal vs 1`) sits behind
-    // ECMA-shaped NaN/unpinned guards (`powNaN`'s own finite-negative-
-    // base branch) that do not hold for Python's own `**` — Python
-    // raises rather than answers NaN on the corner ECMA's classifier
-    // reads as NaN, so trusting that branch here would risk claiming a
-    // value on an input Python actually raises on. Answering `1`
-    // directly for `k = 0` sidesteps both: no base reading is needed at
-    // all for this one exponent value. Result sort matches the base's
-    // own sort exactly as the two-known-values `binary_arithmetic_pair`
-    // row already states for this same corner.
-    if exponent == 0.0 {
-        return Some(known_values(vec![1.0], left_sort, grade));
-    }
-    if exponent < 1.0 || exponent > 64.0 {
+    let exp_set = if let Some(exponent) = exact_nonnegative_integer(right) {
+        // `x ** 0` is exactly `1` for EVERY `x` — expressions.rst's power
+        // operator row states no exception (unlike `0 ** negative`, which
+        // raises `ZeroDivisionError`, or a negative base under a fractional
+        // exponent, which goes complex): this is a closed pinned fact, not a
+        // window computation, so it answers directly rather than asking
+        // either Lean decider — neither `transferIntegerPow`
+        // (`A.int` only) nor `transferRealPow` (`1 ≤ k ≤ 64`, nonnegative
+        // base only) reads `k = 0` at all, and the shared classifier's own
+        // `k = 0` cell (`powCells`'s `e.may zero → addVal vs 1`) sits behind
+        // ECMA-shaped NaN/unpinned guards (`powNaN`'s own finite-negative-
+        // base branch) that do not hold for Python's own `**` — Python
+        // raises rather than answers NaN on the corner ECMA's classifier
+        // reads as NaN, so trusting that branch here would risk claiming a
+        // value on an input Python actually raises on. Answering `1`
+        // directly for `k = 0` sidesteps both: no base reading is needed at
+        // all for this one exponent value. Result sort matches the base's
+        // own sort exactly as the two-known-values `binary_arithmetic_pair`
+        // row already states for this same corner.
+        if exponent == 0.0 {
+            return Some(known_values(vec![1.0], left_sort, grade));
+        }
+        if exponent < 1.0 || exponent > 64.0 {
+            return None;
+        }
+        make_refined_set(vec![one_of(&[exponent])])
+    } else if right.kind == Kind::Set && right.kind_tag == Some(PrimitiveKind::Integer) {
+        // A WINDOWED exponent — no exact scalar to read, so no `k = 0`/
+        // `[1, 64]` pinned corner applies; the kernel's own
+        // `transferIntegerPow` window arm decides the whole question
+        // (including refusing an out-of-range or negative window), the
+        // same "ask the shared theory" posture the base side already
+        // takes for a window it cannot read locally.
+        let mut forms = right.set.forms.clone();
+        if !requires_integer(&right.set) {
+            forms.push(integer());
+        }
+        make_refined_set(forms)
+    } else {
         return None;
-    }
-    let exp_set = make_refined_set(vec![one_of(&[exponent])]);
+    };
     let base_forms = if left_sort == PrimitiveKind::Integer {
         let mut forms = left_set.forms.clone();
         if !requires_integer(left_set) {
@@ -7519,6 +7623,10 @@ fn sequence_binop_value(op: Operator, left: &AbstractValue, right: &AbstractValu
             if let Some(result) = sequence_repetition(right, left) {
                 return result;
             }
+            if let Some(result) = string_repetition_sort_only(left, right).or_else(|| string_repetition_sort_only(right, left))
+            {
+                return result;
+            }
             unknown()
         }
         _ => unknown(),
@@ -7570,6 +7678,43 @@ fn sequence_repetition(sequence: &AbstractValue, count: &AbstractValue) -> Optio
         return Some(collection_models::list_literal_value(&repeated));
     }
     None
+}
+
+/// `sequence * count` where `sequence` is provably STRING-SORTED (an
+/// exact string, or a Set `assignability::states_sequence`/
+/// `sequence_shaped` reads as a sequence form) but `sequence_
+/// repetition`'s own exact row already declined — either `sequence`
+/// carries no exact code points to repeat, or `count` is not one known
+/// Integer value (a bare, unrefined `n: int` parameter, `Kind::Set`
+/// over the unbounded integer ray). Every real `str * int` call
+/// (stdtypes.rst, "Common Sequence Operations," note 2 — a negative `n`
+/// answers the empty string, never anything else) answers ANOTHER
+/// `str`, so `strings()` (`Σ*`) is sound here regardless of which side
+/// is unread: this is the same "answer the sort, not a guessed value"
+/// row `string_models::string_method_sort_only_result` keeps for a
+/// method call over an unbounded receiver, applied to the `*` operator
+/// instead of a method name. `count` must still be provably
+/// Integer-sorted (`Kind::Values`/`Kind::Set` tagged
+/// `PrimitiveKind::Integer`) — a Float or unread count is `str`'s own
+/// `TypeError`, not this row's to answer. `None` when `sequence` is not
+/// string-shaped at all (a list repetition, or a genuinely unknown
+/// operand) — the caller's own final `unknown()` decline, unchanged.
+fn string_repetition_sort_only(sequence: &AbstractValue, count: &AbstractValue) -> Option<AbstractValue> {
+    let sequence_is_string_shaped = exact_string_values(sequence).is_some()
+        || (sequence.kind == Kind::Set
+            && (crate::assignability::states_sequence(&sequence.set) || crate::assignability::sequence_shaped(&sequence.set)));
+    if !sequence_is_string_shaped {
+        return None;
+    }
+    let count_is_integer_sorted = match count.kind {
+        Kind::Values => count.kind_tag == Some(PrimitiveKind::Integer),
+        Kind::Set => count.kind_tag == Some(PrimitiveKind::Integer),
+        _ => false,
+    };
+    if !count_is_integer_sorted {
+        return None;
+    }
+    Some(known_set(strings(), None, trust_level_of(sequence), SetKindTag::None))
 }
 
 /// `left + right` where at least one side is a STRING-SHAPED SET rather
@@ -8495,6 +8640,61 @@ mod tests {
         assert_eq!(value.kind, Kind::Unknown);
     }
 
+    /// `s.upper()` where `s` is a bare, unrefined `str` parameter (seeded
+    /// as the whole-strings ground, `typereading::base_sort_return_
+    /// refinement`'s own doc — never `Kind::Values`) now answers the
+    /// SORT-ONLY Σ* claim (`string_models::string_method_sort_only_
+    /// result`) rather than `unknown()` — `evaluate_attribute_call`'s own
+    /// fallback past the exact-string block, A3.xfer.case's own row.
+    #[test]
+    fn test_upper_over_an_unbounded_str_parameter_answers_the_sort_only_claim() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let parsed = parse_expression("s.upper()").expect("test source must parse");
+        let expression = parsed.into_expr();
+        let mut environment = empty_environment();
+        environment.bind("s", known_set(strings(), None, TrustProved, SetKindTag::None));
+        let value = evaluate_expression(&expression, &environment, &kernel);
+        assert_eq!(value.kind, Kind::Set, "the sort-only fallback answers a Set, never unknown(): {value:?}");
+    }
+
+    /// `s * n` where BOTH `s: str` and `n: int` are bare, unrefined
+    /// parameters — `sequence_repetition`'s own exact row declines twice
+    /// over (no exact code points, no single known count), so
+    /// `string_repetition_sort_only` is what keeps this a real Σ*
+    /// answer rather than `unknown()` — A3.xfer.repeat's own row.
+    #[test]
+    fn test_string_times_unbounded_int_answers_the_sort_only_claim() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let parsed = parse_expression("s * n").expect("test source must parse");
+        let expression = parsed.into_expr();
+        let mut environment = empty_environment();
+        environment.bind("s", known_set(strings(), None, TrustProved, SetKindTag::None));
+        environment.bind(
+            "n",
+            AbstractValue {
+                kind_tag: Some(PrimitiveKind::Integer),
+                ..known_set(make_refined_set(vec![integer(), at_least(f64::NEG_INFINITY)]), None, TrustProved, SetKindTag::None)
+            },
+        );
+        let value = evaluate_expression(&expression, &environment, &kernel);
+        assert_eq!(value.kind, Kind::Set, "the sort-only fallback answers a Set, never unknown(): {value:?}");
+    }
+
+    /// A Float-sorted (never Integer) count still declines — `str * n`
+    /// where `n` provably is not an int is CPython's own `TypeError`,
+    /// not a row `string_repetition_sort_only` may answer a value for.
+    #[test]
+    fn test_string_times_a_float_sorted_count_still_declines() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let parsed = parse_expression("s * n").expect("test source must parse");
+        let expression = parsed.into_expr();
+        let mut environment = empty_environment();
+        environment.bind("s", known_set(strings(), None, TrustProved, SetKindTag::None));
+        environment.bind("n", known_values(vec![1.5], PrimitiveKind::Float, TrustProved));
+        let value = evaluate_expression(&expression, &environment, &kernel);
+        assert_eq!(value.kind, Kind::Unknown, "a non-integer count is not this row's shape: {value:?}");
+    }
+
     #[test]
     fn test_add_int() {
         let Some(value) = eval("2 + 3") else { return };
@@ -8645,6 +8845,49 @@ mod tests {
         environment.bind("f", retained);
         let result = evaluate_call(&call, &environment, &kernel);
         assert_eq!(result.values, vec![40.0]);
+    }
+
+    /// A bare reference to a SAME-MODULE `def` — `f = identity` — reads
+    /// as `env::same_module_def_alias_value`, never bare `unknown()`:
+    /// `identity` is never separately bound in `environment.bindings`
+    /// (only indexed in `environment.functions()`), so without the new
+    /// `Expr::Name` dispatch arm this would fall to the catch-all.
+    #[test]
+    fn test_a_bare_reference_to_a_same_module_def_reads_as_an_alias_value() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = ruff_python_parser::parse_module("def identity(x):\n    return x\n")
+            .expect("test module parses")
+            .into_syntax();
+        let table = std::sync::Arc::new(crate::function_table::function_table(&module));
+        let mut environment = empty_environment();
+        environment.set_functions(table);
+        let name_expr = parse_expression("identity").expect("test source must parse").into_expr();
+        let value = evaluate_expression(&name_expr, &environment, &kernel);
+        assert_eq!(value.kind, Kind::Object);
+        assert_eq!(value.kind_word, Some("a function value"));
+        assert_eq!(env::same_module_def_alias_name(&value), Some("identity"));
+    }
+
+    /// Calling through a same-module-def alias value (`f = identity;
+    /// f(x)`) reaches `identity`'s own body via `evaluate_call`'s new
+    /// alias-call arm — the same interpretation a direct `identity(x)`
+    /// call would answer, not a bare `unknown()`.
+    #[test]
+    fn test_calling_through_a_same_module_def_alias_answers_the_defs_own_body() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let module = ruff_python_parser::parse_module("def identity(x):\n    return x\n")
+            .expect("test module parses")
+            .into_syntax();
+        let table = std::sync::Arc::new(crate::function_table::function_table(&module));
+        let mut environment = empty_environment();
+        environment.set_functions(table);
+        let name_expr = parse_expression("identity").expect("test source must parse").into_expr();
+        let aliased = evaluate_expression(&name_expr, &environment, &kernel);
+        environment.bind("f", aliased);
+        let call_expr = parse_expression("f(40)").expect("test source must parse").into_expr();
+        let Expr::Call(call) = call_expr else { panic!("expected a call expression") };
+        let result = evaluate_call(&call, &environment, &kernel);
+        assert_eq!(result.values, vec![40.0], "f(40) through the alias must answer identity(40)'s own body");
     }
 
     /// A retained lambda that reads a FREE variable
@@ -9103,6 +9346,38 @@ mod tests {
         assert_eq!(result.kind, Kind::Values);
         assert_eq!(result.kind_tag, Some(PrimitiveKind::Float));
         assert_eq!(result.values, vec![1.0]);
+    }
+
+    /// `[0, 9] ** [0, 9]` — BOTH the base and the exponent are Integer-
+    /// sorted `Kind::Set` windows, neither a known scalar —
+    /// `pow_over_sets`' own windowed-exponent arm: no `exact_nonnegative_
+    /// integer` reading applies (there is no single `k` to pin `x ** 0`
+    /// or the `[1, 64]` corner against), so `exp_set` rides the wire
+    /// exactly as `base_set` already does, and `transferIntegerPow`
+    /// (`theories/pow/binary64.lean`) is the decider for the whole
+    /// question. Only the answer's SHAPE is asserted (a determined set,
+    /// never a decline) — the exact corner hull `[0, 387420489]` is the
+    /// kernel's own composed bound, not a value this file computes
+    /// independently.
+    #[test]
+    fn test_pow_over_a_windowed_base_and_a_windowed_exponent_answers_a_set() {
+        let Some(kernel) = loaded_kernel() else { return };
+        let window = || {
+            AbstractValue {
+                kind_tag: Some(PrimitiveKind::Integer),
+                ..known_set(
+                    make_refined_set(vec![integer(), at_least(0.0), refined_sets::refinement_forms::at_most(9.0)]),
+                    None,
+                    TrustProved,
+                    SetKindTag::None,
+                )
+            }
+        };
+        let base = window();
+        let exponent = window();
+        let result = binary_arithmetic_value_with_kernel(Operator::Pow, &base, &exponent, &kernel);
+        assert_eq!(result.kind, Kind::Set);
+        assert_eq!(result.kind_tag, Some(PrimitiveKind::Integer));
     }
 
     /// Two known single values over an admitted operator (`+`) still

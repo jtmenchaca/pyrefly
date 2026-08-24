@@ -31,6 +31,8 @@ use ruff_text_size::TextRange;
 
 use crate::function_table::FunctionTable;
 use crate::instances::ClassModel;
+use crate::surface::AliasEntry;
+use crate::surface::SurfaceImports;
 use crate::typereading::DeclaredRefinement;
 
 /// The word every retained-callable `AbstractValue` carries on
@@ -91,6 +93,54 @@ pub fn retained_callable_key(value: &AbstractValue) -> Option<u32> {
         return None;
     }
     value.source.parse::<u32>().ok()
+}
+
+/// The bound `AbstractValue` a bare reference to a SAME-MODULE `def`
+/// reads as — `f = identity` (a-statements.py-style aliasing, never a
+/// CALL of `identity`, just naming it): `Expr::Name`'s ordinary read
+/// arm (`expressions.rs::evaluate_expression_dispatch`) finds `identity`
+/// unbound in `environment.bindings` (a module-level `def` is indexed
+/// in `environment.functions()`, never separately bound as a value) and
+/// would otherwise answer bare `unknown()`, discarding which function
+/// `f` actually names. This carries the def's own NAME in `source` —
+/// the identical `source = <identity>` convention `instances::
+/// class_object_value` already uses for a class's own bare-name value —
+/// rather than a table key: no registration, no mutation, and no
+/// retained-body table entry is needed, since the def is ALREADY fully
+/// resolvable by name through `environment.functions()` at the later
+/// call site (`expressions.rs::evaluate_call`'s own alias-call arm).
+/// Shares `FUNCTION_VALUE_WORD` with `retained_callable_value` so `f`
+/// still reads as "a function value" everywhere that word alone matters
+/// (a fire message against a scalar-ground sink, `same_module_def_gate_
+/// open`'s own `kind_word` check) — the two shapes are told apart by
+/// `source`: `retained_callable_key`'s own numeric parse fails on a def
+/// name (`"identity".parse::<u32>()` errors), so a value this function
+/// builds is never misread as a retained-callable key, and vice versa
+/// (a numeric `source` never matches a real Python identifier, which
+/// cannot begin with a digit — `tmp/cpython/Doc/reference/lexical_
+/// analysis.rst`'s `identifier` grammar).
+pub fn same_module_def_alias_value(name: &str) -> AbstractValue {
+    AbstractValue {
+        source: name.to_owned(),
+        ..opaque_value(FUNCTION_VALUE_WORD)
+    }
+}
+
+/// The def name `value` carries, if `value` is a same-module-def alias
+/// value `same_module_def_alias_value` built (`kind_word` is the
+/// function-value word AND `source` is non-empty and does NOT parse as
+/// a retained-callable key — the same disambiguation
+/// `same_module_def_alias_value`'s own doc states). `None` for an
+/// ordinary opaque lambda value (`source` stays empty) or a retained-
+/// callable value (`source` parses as a key).
+pub fn same_module_def_alias_name(value: &AbstractValue) -> Option<&str> {
+    if value.kind != refined_domain::abstract_value::Kind::Object || value.kind_word != Some(FUNCTION_VALUE_WORD) {
+        return None;
+    }
+    if value.source.is_empty() || value.source.parse::<u32>().is_ok() {
+        return None;
+    }
+    Some(value.source.as_str())
 }
 
 /// A lambda's or nested `def`'s own body, retained so a call reached
@@ -202,6 +252,19 @@ pub struct Environment {
     /// anywhere along the call chain. `None` for a walk that never set
     /// one.
     classes: Option<Arc<HashMap<String, ClassModel>>>,
+    /// The module's own compiled alias table and import identities, if
+    /// this environment's walk has one to offer. Rides the environment
+    /// for the same reason `functions`/`classes` do:
+    /// `summaries::declared_return_seed`, called from `call_result_with_
+    /// enclosing`'s own decline points, can read a same-module callee's
+    /// own `-> Age`-shaped return annotation through the ordinary
+    /// `typereading::declared_refinement` table with no signature
+    /// change anywhere along the call chain. `None` for a walk that
+    /// never set one (a test environment, or a body reached before the
+    /// table is threaded through) — that decline path falls back to
+    /// `return_sort_fallback`'s bare `int`/`float`/`str` reading only,
+    /// exactly as it did before this field existed.
+    declared_aliases: Option<(Arc<HashMap<String, AliasEntry>>, Arc<SurfaceImports>)>,
     /// The module's own `datetime` import identities — which local
     /// names mean the `datetime` module, the `datetime.datetime`
     /// class, the `datetime.date` class, and the `datetime.timedelta`
@@ -382,6 +445,7 @@ impl Environment {
             locally_bound,
             functions: None,
             classes: None,
+            declared_aliases: None,
             datetime_imports: None,
             locale_never_set: None,
             entry_directory: None,
@@ -487,6 +551,23 @@ impl Environment {
     /// The module's class table, if this environment carries one.
     pub fn classes(&self) -> Option<&Arc<HashMap<String, ClassModel>>> {
         self.classes.as_ref()
+    }
+
+    /// Attaches the module's compiled alias table and import identities
+    /// so a same-module callee's declared return annotation, evaluated
+    /// against this environment (and any environment forked from it),
+    /// can be read through `typereading::declared_refinement` — the
+    /// same table `check.rs::walk_function_def` already reads a def's
+    /// own `-> Annotation` through, made reachable from
+    /// `summaries.rs`'s decline path too.
+    pub fn set_declared_aliases(&mut self, aliases: Arc<HashMap<String, AliasEntry>>, imports: Arc<SurfaceImports>) {
+        self.declared_aliases = Some((aliases, imports));
+    }
+
+    /// The module's compiled alias table and import identities, if this
+    /// environment carries one.
+    pub fn declared_aliases(&self) -> Option<(&Arc<HashMap<String, AliasEntry>>, &Arc<SurfaceImports>)> {
+        self.declared_aliases.as_ref().map(|(aliases, imports)| (aliases, imports))
     }
 
     /// Attaches this body's callable-return table so a call site
@@ -731,6 +812,7 @@ impl Environment {
             locally_bound: self.locally_bound.clone(),
             functions: self.functions.clone(),
             classes: self.classes.clone(),
+            declared_aliases: self.declared_aliases.clone(),
             datetime_imports: self.datetime_imports.clone(),
             entry_directory: self.entry_directory.clone(),
             callable_returns: self.callable_returns.clone(),
@@ -770,6 +852,7 @@ impl Environment {
         let locally_bound = a.locally_bound;
         let functions = a.functions;
         let classes = a.classes;
+        let declared_aliases = a.declared_aliases;
         let datetime_imports = a.datetime_imports;
         let entry_directory = a.entry_directory;
         let callable_returns = a.callable_returns;
@@ -798,6 +881,7 @@ impl Environment {
             locally_bound,
             functions,
             classes,
+            declared_aliases,
             datetime_imports,
             entry_directory,
             callable_returns,
@@ -934,5 +1018,30 @@ mod tests {
         assert_eq!(retained_callable_key(&value), Some(7));
         let plain = opaque_value(FUNCTION_VALUE_WORD);
         assert_eq!(retained_callable_key(&plain), None);
+    }
+
+    /// `same_module_def_alias_value`/`same_module_def_alias_name`
+    /// round-trip: building a value from a def's own name and reading
+    /// the name back off it answers the same name, and an ordinary
+    /// opaque lambda value (empty `source`) reads back `None`.
+    #[test]
+    fn test_same_module_def_alias_value_name_round_trip() {
+        let value = same_module_def_alias_value("identity");
+        assert_eq!(same_module_def_alias_name(&value), Some("identity"));
+        let plain = opaque_value(FUNCTION_VALUE_WORD);
+        assert_eq!(same_module_def_alias_name(&plain), None);
+    }
+
+    /// The two `source` encodings never collide: a retained-callable
+    /// value's numeric key never reads back as a def-alias name (Python
+    /// identifiers cannot start with a digit, so no real def name is
+    /// ever numeric), and a def-alias value's own name never parses as
+    /// a retained-callable key.
+    #[test]
+    fn test_retained_callable_and_def_alias_encodings_never_collide() {
+        let retained = retained_callable_value(7);
+        assert_eq!(same_module_def_alias_name(&retained), None);
+        let aliased = same_module_def_alias_value("identity");
+        assert_eq!(retained_callable_key(&aliased), None);
     }
 }
