@@ -38,7 +38,3 @@ members = [
   "pyrefly_wasm",
 ]
 resolver = "2"
-
-[workspace.package]
-license = "MIT"
-repository = "https://github.com/facebook/pyrefly"

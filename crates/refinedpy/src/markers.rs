@@ -1,10 +1,3 @@
-/*
- * Copyright (c) TypeRefinery.
- *
- * This source code is licensed under the MIT license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 //! `# refinedpy: expect-error` markers, shared by the check CLI and
 //! the LSP seam. A standalone marker line names the NEXT line it
 //! expects a fire on (host-marker lines may sit between); a trailing

@@ -1,10 +1,3 @@
-/*
- * Copyright (c) TypeRefinery.
- *
- * This source code is licensed under the MIT license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 //! The differential harness for the Python adapter's CONCRETE string
 //! and set-membership paths against the kernel's proved sequence
 //! deciders — THIN-WALK-AUDIT.md's W2 row naming this exact pair:

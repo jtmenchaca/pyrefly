@@ -1,10 +1,3 @@
-/*
- * Copyright (c) TypeRefinery.
- *
- * This source code is licensed under the MIT license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 //! RefinedPy: refinement diagnostics layered onto pyrefly's own.
 //!
 //! RefinedPy judges values against refinement sets (which values are

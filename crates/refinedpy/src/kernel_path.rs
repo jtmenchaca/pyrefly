@@ -1,10 +1,3 @@
-/*
- * Copyright (c) TypeRefinery.
- *
- * This source code is licensed under the MIT license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 //! Kernel artifact resolution, shared by the LSP seam and the check
 //! CLI: the current directory's ancestors are searched for the in-repo
 //! artifact, then the executable's own ancestors — an editor spawns

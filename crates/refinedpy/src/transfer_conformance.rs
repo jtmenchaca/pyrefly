@@ -1,10 +1,3 @@
-/*
- * Copyright (c) TypeRefinery.
- *
- * This source code is licensed under the MIT license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 //! The differential harness for the Python adapter's CONCRETE scalar
 //! arithmetic path against the kernel's proved transfers over singleton
 //! sets — the THIN-WALK-AUDIT.md W1 row that names this exact pair:
@@ -463,38 +456,58 @@ mod tests {
         }
     }
 
-    /// LEDGER ROWS G1 and G2, asserted as gaps rather than failures.
-    /// The adapter's `arithmetic_result` declines an int result outside
-    /// the f64-exact 2^53 window ("CPython ints are unbounded, but this
-    /// file's carrier is f64"), while the kernel's `int.add`/`int.mul`
-    /// are exact unbounded-integer arithmetic and answer there. This is
-    /// a MISSING determination on the adapter side, never a wrong one —
-    /// and the day the adapter starts serving it, this test fails and
-    /// the ledger row above gets deleted.
+    /// LEDGER ROW G1, still a gap; ROW G2, CLOSED.
+    ///
+    /// Both rows once recorded the same gap: the adapter's
+    /// `arithmetic_result` declined any int result outside the f64-exact
+    /// 2^53 window ("CPython ints are unbounded, but this file's carrier
+    /// is f64"), while the kernel's `int.add`/`int.mul` are exact
+    /// unbounded-integer arithmetic and answer there.
+    ///
+    /// `exact_int_arithmetic` (expressions/arithmetic) closed G2: it
+    /// folds int-sorted operands through i128 checked arithmetic and
+    /// carries the result back only when the f64 round trip is exact, so
+    /// 2^53 * 2 = 2^54 — an even power of two, exactly representable —
+    /// now determines. G1's 2^53 + 1 is ODD and lands between adjacent
+    /// binary64 values, so the round-trip test refuses it and the
+    /// decline is correct rather than missing. The two rows differ by
+    /// representability, not by operator.
     #[test]
     fn test_determination_gap_int_arithmetic_outside_the_f64_exact_window() {
         let Some(kernel) = loaded_kernel() else { return };
 
-        // G1: 2^53 + 1. The adapter's carrier cannot hold it exactly.
+        // G1 (open): 2^53 + 1 is not a binary64 value; the carrier
+        // cannot hold it, so the adapter declines and the kernel — whose
+        // exact int theory has no carrier limit — answers.
         let two_53 = 9007199254740992.0;
         let adapter_add = binary_arithmetic_value(Operator::Add, &int_operand(two_53), &int_operand(1.0));
         assert_eq!(
             adapter_add.kind,
             Kind::Unknown,
-            "G1: the adapter is expected to decline 2^53 + 1 (arithmetic_result's exactness gate)"
+            "G1: 2^53 + 1 is odd and unrepresentable in binary64 — the adapter declines"
         );
         let kernel_add = (kernel.transfer)(&binary_question(TransferQuestionOp::IntAdd, two_53, 1.0));
-        // The kernel's exact int theory has no such carrier limit. If it
-        // ever stops answering here, the gap has closed from the other
-        // side and this row needs rereading rather than silent passing.
+        // If the kernel ever stops answering here, the gap has closed
+        // from the other side and this row needs rereading rather than
+        // passing without scrutiny.
         assert_scrutiny_row("G1 int + at 2^53", None, kernel_exact_value(&kernel_add));
 
-        // G2: 2^53 * 2. Same shape on the multiplication row.
+        // G2 (closed): 2^53 * 2 = 2^54 IS exactly representable, so
+        // exact_int_arithmetic serves it and both sides now agree.
         let adapter_mul = binary_arithmetic_value(Operator::Mult, &int_operand(two_53), &int_operand(2.0));
+        let (value, sort) = adapter_exact_value(&adapter_mul)
+            .expect("G2: 2^53 * 2 is exactly representable, so the adapter determines it");
+        assert_eq!(value, 18014398509481984.0, "G2: 2^53 * 2 is 2^54");
         assert_eq!(
-            adapter_mul.kind,
-            Kind::Unknown,
-            "G2: the adapter is expected to decline 2^53 * 2"
+            sort,
+            Some(PrimitiveKind::Integer),
+            "G2: int * int stays int-sorted"
+        );
+        let kernel_mul = (kernel.transfer)(&binary_question(TransferQuestionOp::IntMul, two_53, 2.0));
+        assert_scrutiny_row(
+            "G2 int * at 2^53",
+            Some((18014398509481984.0, Some(PrimitiveKind::Integer))),
+            kernel_exact_value(&kernel_mul),
         );
     }
 

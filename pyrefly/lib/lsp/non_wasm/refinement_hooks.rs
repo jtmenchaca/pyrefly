@@ -1,10 +1,3 @@
-/*
- * Copyright (c) TypeRefinery.
- *
- * This source code is licensed under the MIT license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 //! The seam pyrefly's library calls through to reach RefinedPy, without
 //! depending on the RefinedPy engine itself. `server.rs`'s four call
 //! sites (kernel setup, diagnostics, save-time export, hover) call the

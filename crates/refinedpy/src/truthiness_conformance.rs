@@ -1,10 +1,3 @@
-/*
- * Copyright (c) TypeRefinery.
- *
- * This source code is licensed under the MIT license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 //! The differential harness for the Python adapter's local truthiness
 //! decision (`refined_domain::lattice_operations::truthiness`) against
 //! the kernel's proved `narrow_state` truthy filter — the

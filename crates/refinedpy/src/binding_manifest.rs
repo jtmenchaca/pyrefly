@@ -1,10 +1,3 @@
-/*
- * Copyright (c) TypeRefinery.
- *
- * This source code is licensed under the MIT license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 //! RUNG 2 of the compiled-extension recognition ladder
 //! (`packages/cpp/findings/python-c-extension-boundary.md`, the manifest
 //! reader template — build order item 2): a per-module binding manifest,

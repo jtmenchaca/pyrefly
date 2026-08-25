@@ -2701,6 +2701,7 @@ dependencies = [
  "ruff_python_parser",
  "ruff_text_size",
  "serde_json",
+ "unicode-normalization",
 ]
 
 [[package]]

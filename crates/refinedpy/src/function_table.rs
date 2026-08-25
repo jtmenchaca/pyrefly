@@ -1,10 +1,3 @@
-/*
- * Copyright (c) TypeRefinery.
- *
- * This source code is licensed under the MIT license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 //! The module's own top-level `def`s, indexed by name, so a call site
 //! can look up the callee's AST without re-scanning the module. Only
 //! MODULE-LEVEL functions are indexed — a nested `def` (inside another

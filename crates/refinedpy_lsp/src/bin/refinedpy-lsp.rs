@@ -1,10 +1,3 @@
-/*
- * Copyright (c) TypeRefinery.
- *
- * This source code is licensed under the MIT license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 //! The served RefinedPy LSP binary: pyrefly's own CLI, with RefinedPy's
 //! four hooks registered before any request is served. Everything past
 //! `register_refinedpy_hooks()` is pyrefly's own `bin/main.rs`, copied

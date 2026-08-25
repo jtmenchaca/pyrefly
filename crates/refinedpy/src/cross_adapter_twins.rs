@@ -1,10 +1,3 @@
-/*
- * Copyright (c) TypeRefinery.
- *
- * This source code is licensed under the MIT license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 //! The cross-adapter conformance battery: the mechanical catcher for
 //! the defect class where one adapter's compiled set diverges from
 //! another's for the same declaration. The measured instance this

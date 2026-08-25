@@ -1,10 +1,3 @@
-/*
- * Copyright (c) TypeRefinery.
- *
- * This source code is licensed under the MIT license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 //! A `def`'s body lowered ONCE into the kernel's flow IR, so the kernel
 //! can compile it to a summary that every call site applies. The
 //! interpreter in `summaries.rs` re-walks a callee's statements at every

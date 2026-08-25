@@ -3,7 +3,6 @@ name = "refinedpy_lsp"
 version = "1.3.0-dev.1"
 authors = ["TypeRefinery"]
 edition = "2024"
-license = "MIT"
 
 [lib]
 path = "src/lib.rs"

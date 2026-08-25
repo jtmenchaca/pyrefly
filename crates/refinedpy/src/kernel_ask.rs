@@ -1,10 +1,3 @@
-/*
- * Copyright (c) TypeRefinery.
- *
- * This source code is licensed under the MIT license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 //! Every kernel ask this crate makes is wrapped in `std::panic::
 //! catch_unwind` (`assignability.rs`'s own containment/member asks,
 //! `narrowing.rs`'s narrow ask, and every sibling this file's own doc

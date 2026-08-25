@@ -1,10 +1,3 @@
-/*
- * Copyright (c) TypeRefinery.
- *
- * This source code is licensed under the MIT license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 //! The mirror `kernel_interface.rs:181` names: RefinedPy's own
 //! `join_known` (`refined_domain::lattice_operations`), held to the
 //! kernel's proved `join_state` entry, over every pair of a hand-picked

@@ -1,10 +1,3 @@
-/*
- * Copyright (c) TypeRefinery.
- *
- * This source code is licensed under the MIT license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 //! `json.dumps`'s serialized text as a GRAMMAR (a `RefinedSet` over
 //! codepoints), for the case `expressions.rs::json_dumps_value` cannot
 //! read as one exact string: a closed dict whose OWN members carry SETS
@@ -99,6 +92,22 @@ pub fn integer_window_grammar(lo: i64, hi: i64) -> Option<RefinedSet> {
     let lo_digits = decimal_digit_count(lo) as i64;
     let hi_digits = decimal_digit_count(hi) as i64;
     Some(make_refined_set(vec![repeat_of(one_char_of("0123456789"), lo_digits, Some(hi_digits))]))
+}
+
+/// The exact one-character grammar `format(n, "x")` spells for a
+/// NONNEGATIVE single-hex-digit window `[lo, hi]` (`hi <= 15`) — the
+/// format-spec mini-language's lowercase hexadecimal presentation
+/// (string.rst): each member spells one character, digits below ten
+/// and 'a'..'f' from ten, so the alphabet is exactly the members' own
+/// characters — `[0, 9]` never reaches a letter and `[10, 15]` is
+/// only letters. A window past one hex digit is a wider grammar this
+/// file does not build.
+pub fn hex_digit_window_grammar(lo: i64, hi: i64) -> Option<RefinedSet> {
+    if lo < 0 || hi < lo || hi > 15 {
+        return None;
+    }
+    let chars: String = (lo..=hi).map(|v| char::from_digit(v as u32, 16).expect("v is in [0, 15]")).collect();
+    Some(make_refined_set(vec![repeat_of(one_char_of(&chars), 1, Some(1))]))
 }
 
 /// The exact JSON-quoted-string grammar for a FINITE word set (a

@@ -1,10 +1,3 @@
-/*
- * Copyright (c) TypeRefinery.
- *
- * This source code is licensed under the MIT license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 //! A module's cross-file surface: what an importing file sees when it
 //! reads a name out of another module — a plain top-level binding, a
 //! `def` (through the module's own `FunctionTable`), a class (through

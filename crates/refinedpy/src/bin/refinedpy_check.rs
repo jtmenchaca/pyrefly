@@ -1,10 +1,3 @@
-/*
- * Copyright (c) TypeRefinery.
- *
- * This source code is licensed under the MIT license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 //! refinedpy-check: the corpus judge — the same engine the LSP seam
 //! runs, over files named on the command line. The twin of
 //! refinedts-check-bin's fixture contract:

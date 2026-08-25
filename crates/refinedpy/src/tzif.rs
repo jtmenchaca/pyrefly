@@ -1,10 +1,3 @@
-/*
- * Copyright (c) TypeRefinery.
- *
- * This source code is licensed under the MIT license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 //! A TZif (RFC 8536) reader over the system's compiled zoneinfo files
 //! (`/usr/share/zoneinfo/<Zone/Name>`) — the same binary tzdata format
 //! CPython's `zoneinfo` module reads. This crate has no timezone

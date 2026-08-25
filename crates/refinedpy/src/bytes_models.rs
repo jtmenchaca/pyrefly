@@ -1,10 +1,3 @@
-/*
- * Copyright (c) TypeRefinery.
- *
- * This source code is licensed under the MIT license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 //! Binary-sequence VALUE states: `bytes`/`bytearray` literals and
 //! element reads, `array.array('d', ...)` (the Float64Array twin), and
 //! `memoryview` reads/writes over a `bytearray` buffer. A provable
@@ -426,7 +419,20 @@ pub fn base64_call_result(function: &str, arguments: &[AbstractValue]) -> Option
 /// value) declines — a general UTF-8 decode of arbitrary bytes can
 /// raise `UnicodeDecodeError` on invalid sequences, which this row does
 /// not attempt to prove absent for the untagged case.
+///
+/// One further receiver shape IS decided: a KNOWN `Kind::List` of
+/// concrete byte values, decoded with an explicit `"ascii"` encoding.
+/// Every byte in `[0, 127]` is its own code point under ASCII
+/// (`Doc/library/codecs.rst`'s own "ascii" codec), so a known
+/// all-ASCII byte sequence decodes to an EXACT known string. A byte
+/// outside `[0, 127]` makes `"ascii"` raise `UnicodeDecodeError`
+/// instead — that raise is `expressions`'s own `provable_raise` channel
+/// to speak, so this value row declines rather than fabricate a
+/// substituted character.
 pub fn bytes_decode_call(receiver: &AbstractValue, arguments: &[AbstractValue]) -> Option<AbstractValue> {
+    if let Some(value) = ascii_decoded_known_bytes(receiver, arguments) {
+        return Some(value);
+    }
     if !arguments.is_empty() {
         return None;
     }
@@ -440,6 +446,35 @@ pub fn bytes_decode_call(receiver: &AbstractValue, arguments: &[AbstractValue]) 
         kind_tag: Some(PrimitiveKind::String),
         ..known_set(grammar, None, trust_level_of(receiver), SetKindTag::None)
     })
+}
+
+/// `<known bytes>.decode("ascii")` — the exact string a known all-ASCII
+/// byte sequence decodes to. `bytes_decode_call`'s own doc states the
+/// clause and why a non-ASCII byte declines here.
+fn ascii_decoded_known_bytes(receiver: &AbstractValue, arguments: &[AbstractValue]) -> Option<AbstractValue> {
+    let [encoding] = arguments else { return None };
+    if encoding.kind != Kind::Values || encoding.kind_tag != Some(PrimitiveKind::String) {
+        return None;
+    }
+    let encoding_text: String = encoding.values.iter().filter_map(|point| char::from_u32(*point as i64 as u32)).collect();
+    if encoding_text != "ascii" {
+        return None;
+    }
+    if receiver.kind != Kind::List {
+        return None;
+    }
+    let mut code_points: Vec<f64> = Vec::with_capacity(receiver.items.len());
+    for element in &receiver.items {
+        if element.kind != Kind::Values || element.values.len() != 1 {
+            return None;
+        }
+        let byte = element.values[0];
+        if !(0.0..=127.0).contains(&byte) {
+            return None; // "ascii" raises UnicodeDecodeError past 0x7F
+        }
+        code_points.push(byte);
+    }
+    Some(known_values(code_points, PrimitiveKind::String, TrustProved))
 }
 
 #[cfg(test)]
