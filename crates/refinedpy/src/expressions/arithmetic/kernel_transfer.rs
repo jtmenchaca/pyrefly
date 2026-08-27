@@ -28,12 +28,32 @@ use super::known_values::single_numeric_value;
 /// `Number` normalized to `Integer`/`Float` the same conservative way
 /// (AGENT-BRIEF.md's "unproven int reads as the float row"). `None` for
 /// every other shape (String/Array-sorted, untagged Set, non-numeric
-/// Values) — this is a decline, not a guess.
+/// Values, and a SEQUENCE WINDOW whatever element sort it carries — the
+/// body's own gate) — this is a decline, not a guess.
 pub(in crate::expressions) fn transferable_numeric_operand(value: &AbstractValue) -> Option<(RefinedSet, PrimitiveKind)> {
     if let Some((v, sort)) = single_numeric_value(value) {
         return Some((make_refined_set(vec![refined_sets::refinement_forms::one_of(&[v])]), sort));
     }
     if value.kind == Kind::Set {
+        // A SEQUENCE WINDOW is not a numeric operand, whatever element
+        // sort it carries. A `list[X]` parameter seeds `Kind::Set` over a
+        // repetition of X's own set, tagged with X's numeric sort —
+        // `check::seed::seed_parameters`' sequence arm puts the ELEMENT's
+        // sort on the OUTER sequence value so `sum`/`min`/`max` over the
+        // sequence can read it. That tag makes a `list[int]` operand read
+        // as Integer-sorted here, and without this gate `a + b` over two
+        // such parameters poses a numeric `int.add` question about two
+        // repetition sets — a number question asked of a list
+        // concatenation, whose `Unknown` answer then binds the unbounded
+        // integer ray in place of the concatenated sequence. Reading the
+        // SET's own shape settles it: a repetition (`as_repetition`, the
+        // one recognizer for the window grammar) is a sequence, so it
+        // declines here and the caller's sequence row
+        // (`sequence_binop_value` → `sequence_window_concatenation`)
+        // answers the concatenation instead.
+        if refined_sets::repetition_window_forms::as_repetition(&value.set).is_some() {
+            return None;
+        }
         let sort = match value.kind_tag {
             Some(PrimitiveKind::Integer) => PrimitiveKind::Integer,
             Some(PrimitiveKind::Float) => PrimitiveKind::Float,

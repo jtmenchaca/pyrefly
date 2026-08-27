@@ -448,6 +448,70 @@ fn sorted_over_known_list_ascending() {
     assert_eq!(got.items, vec![integer(1.0), integer(2.0), integer(3.0)]);
 }
 
+/// `sorted(xs)` / `reversed(xs)` over an unknown-length receiver — the
+/// shape a declared `list[int]` parameter seeds. Both calls only
+/// reorder, so the answer is the SAME repetition window
+/// (`order_preserving_over_star`'s own doc), never a decline.
+#[test]
+fn sorted_and_reversed_over_an_unknown_length_window_keep_the_window() {
+    let window = known_set(
+        refined_sets::repetition_window_forms::repetition(make_refined_set(vec![at_least(0.0)]), 0, None),
+        None,
+        TrustSpec,
+        SetKindTag::None,
+    );
+    for callee in ["sorted", "reversed"] {
+        let got = builtin_call_result(callee, &[window.clone()]).expect("a repetition window reorders to itself");
+        assert_eq!(got.kind, Kind::Set);
+        assert_eq!(got.set, window.set, "{callee} states the same element set and the same length window");
+    }
+}
+
+/// `os.listdir(d)` over a string-shaped path — library/os.rst's
+/// `listdir` row: the names are unread strings at an unstated count, so
+/// the answer is the unbounded repetition of `Σ*`, the same shape
+/// `sys.argv` answers for its own external-origin sequence.
+#[test]
+fn os_listdir_answers_the_unbounded_window_of_unread_strings() {
+    let path = known_set(refined_sets::codepoint_sets::strings(), None, TrustSpec, SetKindTag::None);
+    let got = stdlib_call_result("os", "listdir", &[path]).expect("os.listdir models over a string path");
+    assert_eq!(got.kind, Kind::Set);
+    let window = refined_sets::repetition_window_forms::as_repetition(&got.set).expect("a repetition window");
+    assert_eq!(window.lo, 0, "an empty directory lists no names");
+    assert_eq!(window.hi, None, "the entry count is unstated");
+    assert_eq!(window.element, refined_sets::codepoint_sets::strings(), "a name's own content comes from the filesystem");
+}
+
+/// A BYTES path takes the other half of the same clause's element-type
+/// row ("If *path* is of type ``bytes``... the filenames returned will
+/// also be of type ``bytes``"), which this row does not state — so a
+/// path that is not provably string-shaped declines rather than claim
+/// `Σ*` elements.
+#[test]
+fn os_listdir_declines_a_path_that_is_not_string_shaped() {
+    let numeric_path = known_values(vec![3.0], PrimitiveKind::Integer, TrustSpec);
+    assert!(stdlib_call_result("os", "listdir", &[numeric_path]).is_none());
+}
+
+/// `list(<a repetition window>)` copies the window through unchanged —
+/// stdtypes.rst's `list(iterable)` row states the constructor's content
+/// is the iterable's own items in order, and a window already states
+/// exactly that. Read through `as_repetition`, so a window carrying no
+/// scalar sort tag (the `itertools.chain.from_iterable` flattening row's
+/// own answer) copies the same way a tagged one does.
+#[test]
+fn list_constructor_copies_an_untagged_repetition_window() {
+    let window = known_set(
+        refined_sets::repetition_window_forms::repetition(make_refined_set(vec![at_least(0.0)]), 0, None),
+        None,
+        TrustSpec,
+        SetKindTag::None,
+    );
+    let got = builtin_call_result("list", &[window.clone()]).expect("list(<window>) copies through");
+    assert_eq!(got.kind, Kind::Set);
+    assert_eq!(got.set, window.set);
+}
+
 #[test]
 fn list_constructor_copies_a_known_list() {
     let list = known_list(vec![integer(1.0), integer(2.0)], TrustSpec);
@@ -893,7 +957,164 @@ fn urllib_parse_quote_answers_the_whole_strings_ground() {
 }
 
 #[test]
+fn urllib_parse_qs_on_an_unread_query_answers_the_star_of_string_lists() {
+    // a declared `str` parameter's own seed: the sequence-shaped
+    // Kind::Set string ground, carrying NO scalar kind_tag — the shape
+    // A8.seed.boundary's rows pass to parse_qs(qs)
+    let query = known_set(refined_sets::codepoint_sets::strings(), None, TrustSpec, SetKindTag::None);
+    let got = builtin_call_result("parse_qs", &[query]).expect("parse_qs(<unread qs>) models");
+    assert_eq!(got.kind, Kind::ObjectStar);
+    let element = refined_domain::known_constructors::element_of_object_star(&got)
+        .expect("the star wraps the per-key value list");
+    assert_eq!(element.kind, Kind::Set);
+    let window = refined_sets::repetition_window_forms::as_repetition(&element.set)
+        .expect("every present key holds a list of values");
+    assert_eq!(window.element, refined_sets::codepoint_sets::strings());
+}
+
+#[test]
 fn unmodeled_stdlib_module_declines() {
     let got = stdlib_call_result("sys", "exit", &[]);
     assert!(got.is_none());
+}
+
+// --- list(d) / dict(d) / vars(o) / Counter(xs) / copy.deepcopy(x) ---
+
+/// A closed dict `{"AA": 1, "BB": 2}` — the shape A8.xfer.keys builds.
+fn two_key_dict() -> AbstractValue {
+    crate::collection_models::dict_literal_value(
+        &[
+            Some(crate::collection_models::DictKey::string("AA")),
+            Some(crate::collection_models::DictKey::string("BB")),
+        ],
+        &[integer(1.0), integer(2.0)],
+    )
+}
+
+#[test]
+fn list_of_a_dict_answers_its_keys_in_insertion_order() {
+    let got = builtin_call_result("list", &[two_key_dict()]).expect("list(d) models over a known dict");
+    assert_eq!(got.kind, Kind::List);
+    assert_eq!(got.items, vec![string_value("AA"), string_value("BB")]);
+}
+
+#[test]
+fn len_of_a_dicts_key_list_is_its_key_count() {
+    let keys = builtin_call_result("list", &[two_key_dict()]).expect("list(d) models");
+    let counted = crate::collection_models::len_result(&keys).expect("len over a key list decides");
+    // The count is {2}. Only the value is pinned: the grade is the
+    // enclosing derivation's business (a claim's grade is the weakest
+    // boundary in its derivation, TRUST.md), and this model-internal
+    // composition records none of its own.
+    assert_eq!(counted.kind, Kind::Values);
+    assert_eq!(counted.values, vec![2.0]);
+}
+
+#[test]
+fn dict_of_an_unbounded_key_mapping_copies_the_same_mapping() {
+    // `dict(os.environ)` — the copy states exactly what the source states
+    let element = string_value("x");
+    let (star, built) = refined_domain::known_constructors::known_dict_star(element, TrustSpec);
+    assert!(built);
+    let got = builtin_call_result("dict", &[star.clone()]).expect("dict(<mapping>) models");
+    assert_eq!(got.kind, Kind::ObjectStar);
+    assert_eq!(got, star);
+}
+
+#[test]
+fn counter_answers_a_mapping_whose_every_count_is_at_least_one() {
+    // An UNREAD input — the repetition window a declared `list[str]`
+    // parameter seeds — states no elements to tally, so the general
+    // counting law is all this row can claim.
+    let window = known_set(
+        refined_sets::repetition_window_forms::repetition(make_refined_set(vec![at_least(0.0)]), 0, None),
+        None,
+        TrustSpec,
+        SetKindTag::None,
+    );
+    let got = builtin_call_result("Counter", &[window]).expect("Counter(xs) models");
+    assert_eq!(got.kind, Kind::ObjectStar);
+    let count = refined_domain::known_constructors::element_of_object_star(&got).expect("the star wraps a count");
+    assert_eq!(count.kind_tag, Some(PrimitiveKind::Integer));
+    let lower_bounds: Vec<f64> = count
+        .set
+        .forms
+        .iter()
+        .filter(|form| form.form == Form::AtLeast)
+        .map(|form| form.a)
+        .collect();
+    assert_eq!(lower_bounds, vec![1.0]);
+}
+
+#[test]
+fn counter_over_a_known_input_answers_the_exact_per_key_counts() {
+    // `Counter(["a", "b", "a"])` — a fully known construction owes its
+    // exact set: "a" occurs twice, "b" once, and no other key is present
+    let input = known_list(
+        vec![string_value("a"), string_value("b"), string_value("a")],
+        TrustSpec,
+    );
+    let got = builtin_call_result("Counter", &[input]).expect("Counter([...]) models");
+    assert_eq!(got.kind, Kind::Object);
+    assert_eq!(got.keys.len(), 2);
+    assert_eq!(got.keys[0].name, "a");
+    assert_eq!(got.keys[0].value.values, vec![2.0]);
+    assert_eq!(got.keys[1].name, "b");
+    assert_eq!(got.keys[1].value.values, vec![1.0]);
+}
+
+#[test]
+fn set_of_a_repetition_window_copies_the_window_through() {
+    // `set(lst)` on a declared `list[X]` parameter: the window names no
+    // elements, so deduping it must not fabricate an EMPTY known list —
+    // membership against that would read provably false on every run
+    let window = known_set(
+        refined_sets::repetition_window_forms::repetition(make_refined_set(vec![at_least(0.0)]), 0, None),
+        None,
+        TrustSpec,
+        SetKindTag::None,
+    );
+    let got = builtin_call_result("set", &[window.clone()]).expect("set(<window>) copies through");
+    assert_eq!(got.kind, Kind::Set);
+    assert_eq!(got.set, window.set);
+}
+
+#[test]
+fn vars_of_a_constructed_instance_answers_its_own_fields() {
+    let mut instance = refined_domain::known_constructors::known_object(
+        vec![refined_domain::abstract_value::ObjectKey {
+            name: "inst_attr".to_owned(),
+            numeric: false,
+            value: integer(200.0),
+        }],
+        None,
+        true,
+        TrustSpec,
+        false,
+    );
+    instance.instance_identity = Some(1);
+    let got = builtin_call_result("vars", &[instance]).expect("vars(o) models over a constructed instance");
+    assert_eq!(got.kind, Kind::Object);
+    assert_eq!(got.instance_identity, None, "the __dict__ is not the instance itself");
+    assert_eq!(
+        crate::collection_models::subscript_read(&got, &string_value("inst_attr")),
+        Some(integer(200.0))
+    );
+}
+
+#[test]
+fn vars_of_a_plain_dict_declines() {
+    // `vars({})` raises TypeError — a dict has no __dict__ of its own
+    assert!(builtin_call_result("vars", &[two_key_dict()]).is_none());
+}
+
+#[test]
+fn deepcopy_preserves_a_dicts_values_under_a_fresh_referent() {
+    let original = two_key_dict();
+    let got = stdlib_call_result("copy", "deepcopy", &[original.clone()]).expect("copy.deepcopy(d) models");
+    assert_eq!(
+        crate::collection_models::subscript_read(&got, &string_value("AA")),
+        Some(integer(1.0))
+    );
+    assert_ne!(got.instance_identity, original.instance_identity, "a copy is a new object");
 }

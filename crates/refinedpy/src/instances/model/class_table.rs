@@ -248,7 +248,8 @@ pub(super) fn class_model_of(
             .filter(|value| value.kind != Kind::Unknown);
         let name = target_name.id.as_str().to_owned();
         ann_order.push(name.clone());
-        ann_fields.insert(name.clone(), ClassField { name, declared, default });
+        let base_sort = crate::typereading::base_sort_return_refinement(assign.annotation.as_ref());
+        ann_fields.insert(name.clone(), ClassField { name, declared, default, base_sort });
     }
 
     let init = def.body.iter().find_map(|stmt| match stmt {
@@ -356,6 +357,9 @@ fn class_attribute_table(def: &StmtClassDef, environment: &Environment, kernel: 
             name: target_name.id.as_str().to_owned(),
             declared: None,
             default: Some(value),
+            // A class attribute is an UNANNOTATED `name = <literal>`
+            // row, so there is no annotation to read a base sort from.
+            base_sort: None,
         });
     }
     attributes

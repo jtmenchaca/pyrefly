@@ -27,6 +27,10 @@ pub(in crate::expressions) use subprocess::*;
 // re-export here — a glob re-export caps every item at the glob
 // statement's own visibility, regardless of the item's declared one.
 pub use arithmetic::binary_arithmetic_value_with_kernel;
+pub use arithmetic::exact_instant_microseconds_of_expression;
+pub use arithmetic::instant_stepped_by_microseconds;
+pub use arithmetic::timedelta_microseconds_of_expression;
+pub use arithmetic::utc_iso_microseconds;
 pub(crate) use construction::datetime_imports;
 pub(crate) use construction::module_never_calls_setlocale;
 pub use construction::DatetimeImports;

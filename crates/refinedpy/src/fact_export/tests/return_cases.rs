@@ -2,10 +2,10 @@ use super::*;
 
 /// A plain numeric return exports the RULED cases schema exactly: a
 /// one-element `cases` array, its sort "number", carrying the full
-/// kernel wire set. `Age`'s own `Annotated[...]` alias is what makes
-/// this module eligible for the walk at all (`derived_return_values`'s
-/// own early exit: a module with no `type` alias and no recognized
-/// `Annotated` import derives nothing).
+/// kernel wire set. `Age`'s own `Annotated[...]` alias is what gives
+/// `x`/the return their refined set to derive (`derived_return_values`
+/// walks every module regardless of vocabulary; without `Age` here
+/// there would be nothing refined for the case to state).
 #[test]
 fn a_numeric_return_exports_one_number_case() {
     let Some(kernel) = loaded_kernel() else {

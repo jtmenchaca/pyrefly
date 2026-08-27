@@ -170,11 +170,11 @@ fn a_construction_nested_in_a_class_typed_call_argument_fires_on_its_own_field()
 }
 
 /// A module with neither a `type` alias nor a recognized `Annotated`
-/// import — ordinary Python this checker has no vocabulary for —
-/// still returns empty through the same zero-cost early return, never
-/// reaching the walk.
+/// import still reaches the walk (`findings_for_module_at` never
+/// gates on vocabulary) — this body carries no refinement claim at
+/// all, so the walk runs and correctly finds nothing to judge.
 #[test]
-fn a_module_with_no_aliases_and_no_annotated_import_stays_empty() {
+fn a_module_with_no_aliases_and_no_annotated_import_still_walks_and_stays_empty() {
     let Some(kernel) = loaded_kernel() else { return };
     let module = parsed(concat!(
         "def add(a: int, b: int) -> int:\n",
@@ -192,12 +192,10 @@ fn a_module_with_no_aliases_and_no_annotated_import_stays_empty() {
 #[test]
 fn an_annotation_whose_bounds_contradict_denotes_the_empty_set() {
     let Some(kernel) = loaded_kernel() else { return };
-    // `findings_for_module_at` returns no findings at all when the
-    // module has neither a `type X = ...` alias NOR a recognized
-    // `Annotated` import (its own early-return guard) — this
-    // fixture's `from typing import Annotated` line alone already
-    // clears that guard, so the `type Age` alias here is present to
-    // exercise the alias path too, not because it is required.
+    // `findings_for_module_at` walks every module regardless of its
+    // vocabulary — the `type Age` alias here exercises the alias path
+    // alongside the inline `Annotated[...]` statement, not because
+    // either is required to reach the walk.
     let module = parsed(concat!(
         "from typing import Annotated\n",
         "from pydantic import Field\n",
@@ -222,9 +220,9 @@ fn an_annotation_whose_bounds_contradict_denotes_the_empty_set() {
 #[test]
 fn an_ordinary_inhabited_annotation_never_fires_the_empty_set_finding() {
     let Some(kernel) = loaded_kernel() else { return };
-    // see the `type Age` comment above — the `from typing import
-    // Annotated` line alone already clears
-    // `findings_for_module_at`'s alias-or-Annotated-import guard.
+    // see the `type Age` comment above — `findings_for_module_at`
+    // walks every module regardless of vocabulary, so the alias line
+    // here exercises the alias path, not a precondition for the walk.
     let module = parsed(concat!(
         "from typing import Annotated\n",
         "from pydantic import Field\n",
@@ -249,9 +247,9 @@ fn an_ordinary_inhabited_annotation_never_fires_the_empty_set_finding() {
 #[test]
 fn an_annotated_statement_with_an_unrecognized_field_kwarg_is_unhonorable() {
     let Some(kernel) = loaded_kernel() else { return };
-    // see the `type Age` comment above — the `from typing import
-    // Annotated` line alone already clears
-    // `findings_for_module_at`'s alias-or-Annotated-import guard.
+    // see the `type Age` comment above — `findings_for_module_at`
+    // walks every module regardless of vocabulary, so the alias line
+    // here exercises the alias path, not a precondition for the walk.
     let module = parsed(concat!(
         "from typing import Annotated\n",
         "from pydantic import Field\n",
@@ -277,9 +275,9 @@ fn an_annotated_statement_with_an_unrecognized_field_kwarg_is_unhonorable() {
 #[test]
 fn a_plain_unrelated_annotation_never_fires_the_unhonorable_statement_finding() {
     let Some(kernel) = loaded_kernel() else { return };
-    // see the `type Age` comment above — the `from typing import
-    // Annotated` line alone already clears
-    // `findings_for_module_at`'s alias-or-Annotated-import guard.
+    // see the `type Age` comment above — `findings_for_module_at`
+    // walks every module regardless of vocabulary, so the alias line
+    // here exercises the alias path, not a precondition for the walk.
     let module = parsed(concat!(
         "from typing import Annotated\n",
         "from pydantic import Field\n",

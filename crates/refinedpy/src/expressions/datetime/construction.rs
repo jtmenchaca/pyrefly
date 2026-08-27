@@ -540,15 +540,13 @@ pub(in crate::expressions) fn classify_tzinfo_expression(expr: &Expr, environmen
         // datetime gates take when no import table exists; the single
         // positional argument must itself be a recognized
         // `timedelta(...)` call this file can evaluate to a known
-        // `datetime_timedelta`-tagged instance (`timedelta_construction_
-        // value`'s own reading), read back to whole seconds via its
-        // `days` field (a `timedelta(hours=N)` construction, N a
-        // multiple of 24, is the only shape this file's own `timedelta`
-        // constructor recognizes today — `timedelta_construction_value`
-        // reads ONLY `days=`, so an `hours=`-keyed offset reaches here
-        // through `offset_seconds_of_timedelta_call` instead, which
-        // reads the `hours=`/`minutes=` fields directly off the AST
-        // rather than through the `days`-only constructor).
+        // `datetime_timedelta`-tagged instance. Read here by
+        // `offset_seconds_of_timedelta_call`, which takes the
+        // `hours=`/`minutes=`/`seconds=` keywords straight off the AST:
+        // a `timezone(...)` offset is a WHOLE-SECOND count, the one
+        // shape `TzinfoKind::FixedOffset` carries, so this arm reads the
+        // seconds directly rather than normalize through the duration
+        // triple and read it back.
         if callee_name == Some("timezone") {
             if let [offset_arg] = call.arguments.args.as_ref() {
                 if let Some(seconds) = offset_seconds_of_timedelta_call(offset_arg, environment, kernel) {
@@ -581,12 +579,11 @@ pub(in crate::expressions) fn classify_tzinfo_expression(expr: &Expr, environmen
 
 /// `timedelta(hours=…)` / `timedelta(minutes=…)` (optionally combined),
 /// read as its own exact SECOND count — `classify_tzinfo_expression`'s
-/// own `timezone(timedelta(...))` arm. Unlike `timedelta_construction_
-/// value` (which reads ONLY `days=`, the duration-VALUE shape this
-/// file's own `FollowUp`-style rows need), a `timezone`'s own offset
-/// argument is conventionally spelled in `hours=`/`minutes=` — read
-/// directly off the literal keyword arguments here rather than routing
-/// through that narrower constructor. `None` for any other keyword
+/// own `timezone(timedelta(...))` arm. A `timezone`'s own offset is a
+/// WHOLE-SECOND count, so this reader takes the `hours=`/`minutes=`/
+/// `seconds=` keywords straight off the literal AST rather than
+/// normalize through `timedelta_construction_value`'s duration triple
+/// and read it back. `None` for any other keyword
 /// (`days=`, `weeks=`, …), a positional argument, or a non-literal
 /// value — this reader never guesses an offset.
 pub(in crate::expressions) fn offset_seconds_of_timedelta_call(expr: &Expr, environment: &Environment, kernel: &Arc<RefinedTSKernel>) -> Option<i64> {
@@ -810,20 +807,31 @@ pub(in crate::expressions) fn valid_civil_date(year: i64, month: i64, day: i64, 
     asked.get("valid")?.as_bool()
 }
 
-/// `datetime.timedelta(days=n)` — a tagged `Kind::Object` (`source =
-/// "datetime_timedelta"`) carrying one `days` Integer `ObjectKey`.
-/// datetime.rst, `class:: timedelta(days=0, seconds=0, microseconds=0,
-/// milliseconds=0, minutes=0, hours=0, weeks=0)`: only the `days`
-/// keyword is modeled — a positional argument or any OTHER keyword
-/// (`seconds=`, `weeks=`, …) declines the whole construction, matching
+/// `datetime.timedelta(days=…, seconds=…, microseconds=…,
+/// milliseconds=…, minutes=…, hours=…, weeks=…)` — a tagged
+/// `Kind::Object` (`source = "datetime_timedelta"`) carrying the
+/// NORMALIZED `days`/`seconds`/`microseconds` triple as Integer
+/// `ObjectKey`s. datetime.rst, `class:: timedelta(days=0, seconds=0,
+/// microseconds=0, milliseconds=0, minutes=0, hours=0, weeks=0)`:
+/// "Only *days*, *seconds* and *microseconds* are stored internally,"
+/// with the stated conversions (a millisecond is 1000 microseconds, a
+/// minute 60 seconds, an hour 3600 seconds, a week 7 days) and the
+/// normalization datetime.rst:221 pins — `0 <= microseconds < 1000000`,
+/// `0 <= seconds < 3600*24`, `-999999999 <= days <= 999999999`. Every
+/// one of the seven keywords is read; a positional argument or a
+/// keyword outside the seven declines the whole construction, matching
 /// this crate's `datetime_construction_value` convention of declining
-/// rather than guessing at an argument shape it does not read. Validated
-/// through the kernel's `calendar.validDuration` ask (date.5's own
-/// seam): the ten-field vector is `(years, months, weeks, days, hours,
-/// minutes, seconds, milliseconds, microseconds, nanoseconds)`
-/// (`theories/calendar/duration.lean`'s own comment) — every field
-/// besides `days` is `0` here, so the magnitude/sign guards the kernel
-/// checks only ever bind on the one field this file constructs.
+/// rather than guessing at an argument shape it does not read. Each
+/// argument must read as a known Integer (`datetime_field_argument`) —
+/// the constructor also admits floats, and a float argument declines
+/// here rather than round into `timedelta.resolution`.
+///
+/// Validated through the kernel's `calendar.validDuration` ask (date.5's
+/// own seam): the ten-field vector is `(years, months, weeks, days,
+/// hours, minutes, seconds, milliseconds, microseconds, nanoseconds)`
+/// (`theories/calendar/duration.lean`'s own comment), posed over the
+/// NORMALIZED triple so the kernel's magnitude/sign guards see the same
+/// three fields Python stores.
 pub(in crate::expressions) fn timedelta_construction_value(
     call: &ruff_python_ast::ExprCall,
     environment: &Environment,
@@ -832,20 +840,85 @@ pub(in crate::expressions) fn timedelta_construction_value(
     if !call.arguments.args.is_empty() {
         return None;
     }
-    let [keyword] = call.arguments.keywords.as_slice() else {
-        return None;
-    };
-    if keyword.arg.as_ref().map(|name| name.as_str()) != Some("days") {
+    // The whole duration in microseconds, accumulated from whichever of
+    // the seven keywords the call spells, each converted by the factor
+    // datetime.rst states for it.
+    let mut microseconds: i128 = 0;
+    for keyword in &call.arguments.keywords {
+        let name = keyword.arg.as_ref()?;
+        let count = datetime_field_argument(&keyword.value, environment, kernel)? as i128;
+        let per_unit: i128 = match name.as_str() {
+            "days" => 86_400_000_000,
+            "seconds" => 1_000_000,
+            "microseconds" => 1,
+            "milliseconds" => 1_000,
+            "minutes" => 60_000_000,
+            "hours" => 3_600_000_000,
+            "weeks" => 7 * 86_400_000_000,
+            _ => return None,
+        };
+        microseconds = microseconds.checked_add(count.checked_mul(per_unit)?)?;
+    }
+    timedelta_instance_of_microseconds(microseconds, kernel)
+}
+
+/// A tagged `datetime_timedelta` instance built from a whole duration in
+/// MICROSECONDS, normalized to the `days`/`seconds`/`microseconds`
+/// triple datetime.rst:221 pins (`0 <= microseconds < 1000000`,
+/// `0 <= seconds < 3600*24`, the day count carrying the sign). Shared by
+/// `timedelta_construction_value` and `datetime_difference_value` — a
+/// `datetime1 - datetime2` result is the SAME instance shape a literal
+/// `timedelta(...)` construction builds, so every downstream reader
+/// treats the two identically. `None` when the kernel's
+/// `calendar.validDuration` ask refuses the normalized triple (the
+/// `-999999999 <= days <= 999999999` bound), or when the microsecond
+/// total exceeds what an `i64` field can carry.
+pub(in crate::expressions) fn timedelta_instance_of_microseconds(microseconds: i128, kernel: &Arc<RefinedTSKernel>) -> Option<AbstractValue> {
+    const MICROS_PER_DAY: i128 = 86_400_000_000;
+    let days = microseconds.div_euclid(MICROS_PER_DAY);
+    let within_day = microseconds.rem_euclid(MICROS_PER_DAY);
+    let seconds = within_day / 1_000_000;
+    let residual_microseconds = within_day % 1_000_000;
+    let days = i64::try_from(days).ok()?;
+    let seconds = i64::try_from(seconds).ok()?;
+    let residual_microseconds = i64::try_from(residual_microseconds).ok()?;
+    // The kernel's `isValidDuration` (§7.5, theories/calendar/
+    // duration.lean) requires ONE SIGN across all ten fields, which is
+    // the ISO 8601 duration form. Python's stored triple is a different
+    // normalization — datetime.rst:221 puts the whole sign on `days` and
+    // keeps `seconds`/`microseconds` nonnegative, so `timedelta(
+    // microseconds=-175000)` stores `days=-1, seconds=86399,
+    // microseconds=825000`, a mixed-sign vector the ISO validator
+    // rightly refuses. The ask therefore poses the SAME duration in the
+    // single-sign form: the magnitude split into ISO days/seconds/
+    // microseconds, with one sign carried across all three.
+    let iso_magnitude = microseconds.unsigned_abs() as i128;
+    let sign: i64 = if microseconds < 0 { -1 } else { 1 };
+    let iso_days = i64::try_from(iso_magnitude / MICROS_PER_DAY).ok()? * sign;
+    let iso_seconds = i64::try_from(iso_magnitude % MICROS_PER_DAY / 1_000_000).ok()? * sign;
+    let iso_microseconds = i64::try_from(iso_magnitude % 1_000_000).ok()? * sign;
+    if !valid_duration_triple(iso_days, iso_seconds, iso_microseconds, kernel)? {
         return None;
     }
-    let days = datetime_field_argument(&keyword.value, environment, kernel)?;
-    if !valid_duration_days(days, kernel)? {
-        return None;
-    }
-    let instance_keys = vec![integer_object_key("days", days)];
+    let instance_keys = vec![
+        integer_object_key("days", days),
+        integer_object_key("seconds", seconds),
+        integer_object_key("microseconds", residual_microseconds),
+    ];
     let mut instance = known_object(instance_keys, None, true, TrustProved, false);
     instance.source = "datetime_timedelta".to_owned();
-    let point = format!("P{days}D");
+    // The ISO 8601 duration spelling `calendar_interpreter`'s own
+    // `duration_fields` grammar reads: whole days, then the within-day
+    // seconds with the microsecond residue as a fractional second — the
+    // SAME single-sign ISO fields the kernel ask above poses, with the
+    // sign spelled once as a leading `-` over the whole duration.
+    let magnitude = if sign < 0 { "-" } else { "" };
+    let point = format!(
+        "{magnitude}P{}DT{}.{:06}S",
+        iso_days.abs(),
+        iso_seconds.abs(),
+        iso_microseconds.unsigned_abs()
+    );
     instance.temporal = Some(Box::new(refined_sets::calendar_interpreter::TemporalAnnotation {
         chart: refined_sets::calendar_interpreter::TemporalChart::Duration,
         min: Some(point.clone()),
@@ -854,12 +927,30 @@ pub(in crate::expressions) fn timedelta_construction_value(
     Some(instance)
 }
 
-/// `calendar.validDuration` asked over a days-only ten-field vector —
-/// `timedelta_construction_value`'s own validity gate (date.5's kernel
-/// seam), spelled as its own function so the field-order comment lives
-/// beside the one call site that builds the vector.
-pub(in crate::expressions) fn valid_duration_days(days: i64, kernel: &Arc<RefinedTSKernel>) -> Option<bool> {
-    let fields = vec![0.0, 0.0, 0.0, days as f64, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+/// The whole duration in MICROSECONDS carried by a tagged
+/// `datetime_timedelta` instance — the inverse of
+/// `timedelta_instance_of_microseconds`, reading back the normalized
+/// `days`/`seconds`/`microseconds` triple datetime.rst stores. `None`
+/// for an instance carrying no `days` field (the pydantic-surface
+/// instance, which carries its duration only as ISO text).
+pub(in crate::expressions) fn timedelta_total_microseconds(instance: &AbstractValue) -> Option<i128> {
+    let days = super::components::datetime_field(instance, "days")? as i128;
+    let seconds = super::components::datetime_field(instance, "seconds").unwrap_or(0.0) as i128;
+    let microseconds = super::components::datetime_field(instance, "microseconds").unwrap_or(0.0) as i128;
+    Some(days * 86_400_000_000 + seconds * 1_000_000 + microseconds)
+}
+
+/// `calendar.validDuration` asked over a SINGLE-SIGN ISO
+/// `days`/`seconds`/`microseconds` triple —
+/// `timedelta_instance_of_microseconds`'s own validity gate (date.5's
+/// kernel seam), spelled as its own function so the field-order comment
+/// lives beside the one call site that builds the vector. The caller
+/// converts Python's own mixed-sign normalization into this form first;
+/// see its comment for why.
+pub(in crate::expressions) fn valid_duration_triple(days: i64, seconds: i64, microseconds: i64, kernel: &Arc<RefinedTSKernel>) -> Option<bool> {
+    // (years, months, weeks, days, hours, minutes, seconds,
+    // milliseconds, microseconds, nanoseconds)
+    let fields = vec![0.0, 0.0, 0.0, days as f64, 0.0, 0.0, seconds as f64, 0.0, microseconds as f64, 0.0];
     let asked = crate::kernel_ask::ask_kernel(|| {
         (kernel.calendar)(&CalendarQuestion {
             op: CalendarQuestionOp::ValidDuration,

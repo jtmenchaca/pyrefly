@@ -68,16 +68,17 @@ pub struct DeclaredRefinement {
     /// with `set`.
     pub generator: Option<Box<GeneratorRefinement>>,
     /// A TypedDict declaration's own member table: each declared field's
-    /// name paired with the refinement ITS OWN annotation states, in
-    /// declaration order — `PersonDict`'s `age: Age` becomes
-    /// `[("age", <Age's own DeclaredRefinement>)]`. Unlike `element`
-    /// (`dict[str, X]`'s one refinement shared by every member), a
-    /// TypedDict's members are HETEROGENEOUS by name, so this carries one
-    /// refinement per field rather than one shared refinement. `set`/
-    /// `element`/`generator` are unused (empty/None) when this is Some,
-    /// the same "one active field" convention the other container shapes
-    /// already keep.
-    pub members: Option<Vec<(String, DeclaredRefinement)>>,
+    /// name, whether the declaration REQUIRES that key to be present, and
+    /// the refinement ITS OWN annotation states, in declaration order —
+    /// `PersonDict`'s `age: Age` becomes one `TypedDictMember` naming
+    /// `"age"`, required, carrying `Age`'s own `DeclaredRefinement`.
+    /// Unlike `element` (`dict[str, X]`'s one refinement shared by every
+    /// member), a TypedDict's members are HETEROGENEOUS by name, so this
+    /// carries one entry per field rather than one shared refinement.
+    /// `set`/`element`/`generator` are unused (empty/None) when this is
+    /// Some, the same "one active field" convention the other container
+    /// shapes already keep.
+    pub members: Option<Vec<TypedDictMember>>,
     /// A FIXED-ARITY tuple declaration's own per-position table —
     /// `tuple[int, int]`'s slot 0 and slot 1, each read through the
     /// ordinary `declared_refinement` recursion, in declaration order.
@@ -106,6 +107,33 @@ pub struct DeclaredRefinement {
     /// of pydantic's aware/naive `datetime` bases `temporal` was read
     /// from, `Any` for a non-temporal declaration.
     pub temporal_awareness: crate::surface::TemporalAwareness,
+}
+
+/// One declared member of a TypedDict (or of a module-level class read
+/// the same way): the key's name, whether the declaration requires that
+/// key to be PRESENT, and the refinement the key's own annotation
+/// states.
+///
+/// `required` follows typing.rst's own totality rules (library/
+/// typing.rst, `TypedDict`): "By default, all keys must be present in a
+/// ``TypedDict``" and "``True`` is the default, and makes all items
+/// defined in the class body required" — so a class with no `total=`
+/// keyword, or `total=True`, marks every member required. `total=False`
+/// makes every member not required ("a ``Point2D`` ``TypedDict`` can
+/// have any of the keys omitted"). A per-key `Required[X]` /
+/// `NotRequired[X]` marker overrides the class totality for that one key
+/// in either direction ("It is possible to mark individual keys as
+/// non-required using :data:`NotRequired`"; "Individual keys of a
+/// ``total=False`` ``TypedDict`` can be marked as required using
+/// :data:`Required`").
+///
+/// The MEMBERS LAW (`assignability::judge`) reads this to decide whether
+/// a key ABSENT from a flowing value is a refusal or nothing to say.
+#[derive(Clone)]
+pub struct TypedDictMember {
+    pub name: String,
+    pub required: bool,
+    pub declared: DeclaredRefinement,
 }
 
 /// The two checked positions a generator-shaped return annotation
@@ -357,16 +385,110 @@ pub fn declared_refinement(
             // below, which also declines (its own head-identity gate
             // never matches `dict`) — so the whole subscript states
             // nothing, as it did before this arm existed.
+            // `weakref.WeakKeyDictionary[K, V]` / `weakref.
+            // WeakValueDictionary[K, V]` (library/weakref.rst: both are
+            // "Mapping class that references keys weakly" /
+            // "references values weakly") — the SAME one-value-slot shape
+            // the plain `dict[K, X]` arm below reads, at the SAME
+            // argument position (argument 2 of 2 for both classes: which
+            // side of the pair holds the weak reference does not move
+            // the value slot). The mapping's own lookup and membership
+            // semantics are the ordinary ones stdtypes.rst's Mapping
+            // Types section states once for any hashable key — the
+            // "weak" half is a LIFETIME fact (an entry can vanish when a
+            // key/value is collected, weakref.rst's own note), invisible
+            // to a reader that only ever consumes a PRESENT key's value,
+            // the same "collection is invisible to a containment/
+            // subscript reader" note `attribute_call.rs`'s own
+            // `WeakSet`/`WeakKeyDictionary` bare-constructor row already
+            // takes for its zero-argument form. Recognized by the
+            // ATTRIBUTE head `weakref.WeakKeyDictionary`/`weakref.
+            // WeakValueDictionary` — `Expr::Attribute` whose own value is
+            // the bare `Expr::Name` `weakref` — since neither class is a
+            // `SurfaceImports` import identity this table tracks; guarded
+            // by `environment.read("weakref").is_none()`, the same
+            // module-not-shadowed check `attribute_call.rs`'s own
+            // constructor row already takes, so a body that rebinds the
+            // name `weakref` to something else does not fire this arm.
+            // The KEY slot is read only for its own recursive declared
+            // refinement to compose properly with a container VALUE
+            // slot's key (irrelevant here); the WEAK MAP's key sort is
+            // never one of the four `dict[K, X]` states a spelling for
+            // (a weak-referenceable object is never `str`/`int`/`float`,
+            // library/weakref.rst's own "cannot create weak references
+            // to ... int, str" note) so the spelling always carries
+            // `object`, the same "any hashable" spelling the plain dict
+            // arm already gives its own `object` key sort.
+            let is_weak_dict = match subscript.value.as_ref() {
+                Expr::Attribute(attribute) => {
+                    matches!(attribute.value.as_ref(), Expr::Name(module) if module.id.as_str() == "weakref")
+                        && environment.read("weakref").is_none()
+                        && matches!(attribute.attr.as_str(), "WeakKeyDictionary" | "WeakValueDictionary")
+                }
+                _ => false,
+            };
+            if is_weak_dict {
+                if let Expr::Tuple(arguments) = subscript.slice.as_ref() {
+                    if let [_key, value] = arguments.elts.as_slice() {
+                        if let Some(value_declared) = declared_refinement(value, aliases, imports, environment)
+                            .or_else(|| base_sort_return_refinement(value))
+                        {
+                            // The spelling reuses the plain `dict[K, X]`
+                            // arm's OWN shape (`"dict[object, X]"`), never
+                            // a `"WeakKeyDictionary[…]"` word of its own —
+                            // so every reader keyed on the `"dict["`
+                            // spelling prefix (`check::seed_parameters`'
+                            // `is_dict_container`, `check::judge`'s
+                            // `declared_container_slot`, `union_arm_seed`'s
+                            // `"dict[str, "` gate) rides this shape with
+                            // no separate WeakKeyDictionary case of its
+                            // own to keep in step.
+                            let spelling = format!("dict[object, {}]", value_declared.spelling);
+                            return Some(DeclaredRefinement {
+                                set: make_refined_set(Vec::new()),
+                                spelling,
+                                admits_none: false,
+                                element: Some(Box::new(value_declared)),
+                                element_length: None,
+                                generator: None,
+                                members: None,
+                                positions: None,
+                                temporal: None,
+                                temporal_awareness: crate::surface::TemporalAwareness::Any,
+                            });
+                        }
+                    }
+                }
+                return None;
+            }
             let is_dict = matches!(subscript.value.as_ref(), Expr::Name(head) if head.id.as_str() == "dict");
             if is_dict {
                 if let Expr::Tuple(arguments) = subscript.slice.as_ref() {
                     if let [key, value] = arguments.elts.as_slice() {
-                        let key_is_str = matches!(key, Expr::Name(sort) if sort.id.as_str() == "str");
-                        if key_is_str {
+                        // The KEY sort decides which keys the mapping
+                        // admits; the VALUE law — what every present key
+                        // reads back as — is the same whichever sort the
+                        // keys are, since stdtypes.rst's Mapping Types
+                        // section states `d[key]`'s own value rule once,
+                        // for any :term:`hashable` key. So this reader
+                        // admits the four key sorts the corpus declares
+                        // (`str`, `int`, `float`, `object` — the last
+                        // being stdtypes.rst's own "any hashable object"
+                        // spelling) and carries the key sort in the
+                        // SPELLING, so a later reader can still tell them
+                        // apart. Every other key annotation still
+                        // declines this arm unchanged.
+                        let key_sort = match key {
+                            Expr::Name(sort) if matches!(sort.id.as_str(), "str" | "int" | "float" | "object") => {
+                                Some(sort.id.as_str())
+                            }
+                            _ => None,
+                        };
+                        if let Some(key_sort) = key_sort {
                             if let Some(value_declared) = declared_refinement(value, aliases, imports, environment)
                                 .or_else(|| base_sort_return_refinement(value))
                             {
-                                let spelling = format!("dict[str, {}]", value_declared.spelling);
+                                let spelling = format!("dict[{key_sort}, {}]", value_declared.spelling);
                                 return Some(DeclaredRefinement {
                                     set: make_refined_set(Vec::new()),
                                     spelling,
@@ -639,8 +761,13 @@ pub fn declared_refinement(
         // mark the result as admitting None — the `X | None` union
         // syntax (tmp/cpython Doc/library/stdtypes.rst, "Union Type",
         // `types.UnionType`). `None | None` and a union of two non-None
-        // shapes (`Age | Label`) are a different unit — a general union
-        // of two sets — and decline here exactly as before.
+        // shapes (`Age | Label`, `list[Age] | int`) decline here: a
+        // general union states two alternatives a narrowing test picks
+        // BETWEEN, and this table's one-active-field shape has nowhere to
+        // hold them apart. A PARAMETER of that shape is seeded as a
+        // `Kind::KindUnion` directly instead
+        // (`check::seed::union_parameter_seed`), which is the form
+        // `isinstance` narrowing already filters arm by arm.
         Expr::BinOp(binop) if binop.op == ruff_python_ast::Operator::BitOr => {
             let left_is_none = matches!(binop.left.as_ref(), Expr::NoneLiteral(_));
             let right_is_none = matches!(binop.right.as_ref(), Expr::NoneLiteral(_));

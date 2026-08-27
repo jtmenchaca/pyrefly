@@ -24,6 +24,7 @@ pub use callable::callable_return_refinement;
 pub use declared_refinement::declared_refinement;
 pub use declared_refinement::DeclaredRefinement;
 pub use declared_refinement::GeneratorRefinement;
+pub use declared_refinement::TypedDictMember;
 pub use typed_dict::typed_dict_return_refinement;
 
 // Test module is a sibling of the domain children, so re-export the

@@ -508,6 +508,17 @@ pub(super) fn float_call(arguments: &[AbstractValue]) -> Option<AbstractValue> {
         }
         return Some(float_sorted_unknown());
     }
+    // A Boolean-tagged `Kind::Values` operand — the two-member boolean
+    // domain a membership read answers, possibly narrowed to one member
+    // — maps each member straight across: `True` is the `int` subclass
+    // whose value is exactly `1`, `False` exactly `0` (stdtypes.rst's
+    // Boolean Type note), and functions.html#float constructs the same
+    // magnitude Float-sorted. The same reading `int_call` takes through
+    // `boolean_operand_as_int_values`, Float-tagged here.
+    if only.kind == Kind::Values && only.kind_tag == Some(PrimitiveKind::Boolean) && !only.values.is_empty() {
+        let grade = derived_trust_level(TrustSpec, arguments);
+        return Some(known_values(only.values.clone(), PrimitiveKind::Float, grade));
+    }
     if is_string_sorted_argument(only) {
         return Some(float_sorted_unknown());
     }
@@ -696,6 +707,16 @@ pub(super) fn str_call(arguments: &[AbstractValue]) -> Option<AbstractValue> {
     }
     if only.kind == Kind::Object && only.source == "exception" {
         return exception_single_string_message(only);
+    }
+    // `str(None)` is exactly the four-character text `"None"` —
+    // library/stdtypes.rst, "The Null Object": "There is exactly one null
+    // object, named ``None`` (a built-in name)... It is written as
+    // ``None``." One singleton object with one written spelling, so the
+    // conversion's image is the singleton string set, never a sort-only
+    // claim.
+    if only.kind == Kind::Null {
+        let code_points: Vec<f64> = "None".chars().map(|c| c as u32 as f64).collect();
+        return Some(known_values(code_points, PrimitiveKind::String, TrustSpec));
     }
     if let Some(value) = str_call_over_boolean(only) {
         return Some(value);
@@ -1094,7 +1115,7 @@ pub(super) fn urllib_quote_call(arguments: &[AbstractValue]) -> Option<AbstractV
 pub(super) fn parse_qs_call(arguments: &[AbstractValue]) -> Option<AbstractValue> {
     let [query] = arguments else { return None };
     if query.kind != Kind::Values || query.kind_tag != Some(PrimitiveKind::String) {
-        return None;
+        return parse_qs_unread_query(query);
     }
     let text: String = query.values.iter().filter_map(|point| char::from_u32(*point as i64 as u32)).collect();
     if text.contains('%') || text.contains('+') {
@@ -1122,6 +1143,57 @@ pub(super) fn parse_qs_call(arguments: &[AbstractValue]) -> Option<AbstractValue
         }
     }
     Some(known_object(keys, None, true, TrustSpec, false))
+}
+
+/// `urllib.parse.parse_qs(qs)` on a query string this file cannot read
+/// exactly — a `qs: str` parameter's own `Σ*` seed, the shape
+/// A8.seed.boundary's rows pass. The exact key set and the exact values
+/// are unknowable without the text, but the cited clause still pins the
+/// SHAPE of every result the call can produce: "Data are returned as a
+/// dictionary. The dictionary keys are the unique query variable names
+/// and the values are lists of values for each name." Both halves are
+/// strings — a query string carries no other sort — so the answer is the
+/// unbounded-key mapping (`known_dict_star`, the same shape
+/// `check::seed_parameters` builds for a `dict[str, X]` parameter) whose
+/// value at every present key is a LIST of whole strings.
+///
+/// The list's own length is unstated (a name may repeat any number of
+/// times), so it is the bare unbounded repetition window over `Σ*` —
+/// the identical shape a declared `list[str]` parameter seeds, which
+/// means `params.get("code")` then reads "a list of strings, or None"
+/// through the existing dict-star `.get` arm, and `v[0]` reads `Σ*`
+/// through the existing repetition-window subscript arm.
+///
+/// `None` for a `qs` that is not string-SORTED at all
+/// (`is_string_sorted_argument`, the same test `quote`'s row takes) — a
+/// numeric or unread argument states nothing this row could shape an
+/// answer around.
+fn parse_qs_unread_query(query: &AbstractValue) -> Option<AbstractValue> {
+    // Read through the same string-sortedness test `quote`'s own row
+    // takes: a declared `str` parameter's seed is a sequence-shaped
+    // `Kind::Set` that carries NO scalar `kind_tag`, so requiring
+    // `Some(PrimitiveKind::String)` here declined exactly the shape
+    // A8.seed.boundary's rows pass — `parse_qs(qs)` on a `qs: str`
+    // parameter — and left every read through the result with no
+    // reading at all.
+    if !is_string_sorted_argument(query) {
+        return None;
+    }
+    let value_element = AbstractValue {
+        kind_tag: Some(PrimitiveKind::String),
+        ..known_set(strings(), None, TrustSpec, SetKindTag::None)
+    };
+    let value_list = AbstractValue {
+        kind_tag: Some(PrimitiveKind::String),
+        ..known_set(
+            refined_sets::repetition_window_forms::repetition(value_element.set, 0, None),
+            None,
+            TrustSpec,
+            SetKindTag::None,
+        )
+    };
+    let (star, built) = refined_domain::known_constructors::known_dict_star(value_list, TrustSpec);
+    built.then_some(star)
 }
 
 /// Whether `urllib.parse.quote` leaves this code point untouched: the

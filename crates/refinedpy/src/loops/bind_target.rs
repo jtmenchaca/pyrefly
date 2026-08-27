@@ -11,13 +11,12 @@ use ruff_python_ast::Expr;
 use ruff_python_ast::Stmt;
 use crate::env::Environment;
 
-/// The loop target's own bare-name spelling, if the target is one — a
-/// tuple target's own sub-names are read the same way `bind_for_target`
-/// binds them, but every one of these three passes only ever binds a
-/// SINGLE element abstraction to the whole target, so a tuple target
-/// here is out of scope for the same reason it already declines
-/// `bind_for_target` widely elsewhere: this helper only needs the bare
-/// case to build the exclusion set `stabilized_join` compares against.
+/// Every bare name a target names — a bare `Expr::Name` names itself, a
+/// tuple/list target names each of its sub-names, read the same way
+/// `bind_for_target` binds them. Two callers: `stabilized_join`'s own
+/// exclusion set (built from a `for` target, which the abstract passes
+/// bind as a single element abstraction), and `written_names`'s unpack
+/// arm (`k, v = ...`, whose sub-names really are written one per pass).
 pub(super) fn target_names(target: &Expr, names: &mut std::collections::HashSet<String>) {
     match target {
         Expr::Name(name) => {
@@ -58,6 +57,14 @@ pub(super) fn written_names(body: &[Stmt], names: &mut std::collections::HashSet
                                 names.insert(name.id.to_string());
                             }
                         }
+                        // an UNPACK target (`k, v = ...` —
+                        // `run_unpack_assign_once`'s own shape) writes
+                        // every one of its sub-names; `target_names`
+                        // already reads a tuple/list target the same way
+                        // for a `for` target, so it is reused here rather
+                        // than a second walker written for the identical
+                        // shape.
+                        Expr::Tuple(_) | Expr::List(_) => target_names(target, names),
                         _ => {}
                     }
                 }

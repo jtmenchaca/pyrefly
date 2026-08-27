@@ -27,10 +27,10 @@ pub(in crate::check) use body::{
 pub(in crate::check) use receivers::{
     forget_mutated_receivers_in_body,
     forget_mutated_receivers_in_stmt, forget_names_bound_by_stmt, forget_names_bound_in_body,
-    forget_target_from_provably_unbound, forget_target_names,
+    forget_target_from_provably_unbound, forget_target_names, join_pre_try_with_havoc_for_stmt,
 };
 pub(in crate::check) use scope::{
     bind_walrus_targets, collect_bound_names, collect_bound_names_stmt, collect_parameter_names,
     collect_walrus_names, locally_bound_names, statement_kind_name,
 };
-pub(in crate::check) use statement::{record_blocker, walk_statement};
+pub(in crate::check) use statement::{record_blocker, walk_statement, FallsThrough};

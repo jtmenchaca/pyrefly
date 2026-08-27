@@ -47,13 +47,20 @@ pub(super) use known_values::single_numeric_value;
 pub(super) use power::pow_over_sets;
 pub(super) use raise_conditions::call_provable_raise;
 pub(super) use raise_conditions::callee_display_name;
+pub(super) use raise_conditions::absent_receiver_possible_raise;
 pub(super) use raise_conditions::domain_limited_family_possible_raise;
 pub(super) use raise_conditions::eval_literal_value;
 pub(super) use raise_conditions::known_container_index_absent;
 pub(super) use raise_conditions::known_string_index_out_of_range;
 pub(super) use raise_conditions::one_voice_raise_message;
+// Carries wider visibility than the rest of this module's surface —
+// `check::control`'s try walk reads it to decide whether a handler
+// catches a provable raise — so it needs its own `pub(crate)` re-export
+// rather than riding the `pub(super)` block above.
+pub(crate) use raise_conditions::raised_exception_class;
 pub(super) use raise_conditions::subscript_provable_raise;
 pub(super) use sequence_row::date_timedelta_binop_value;
+pub(super) use sequence_row::datetime_difference_provable_raise;
 pub(super) use sequence_row::sequence_binop_value;
 pub(super) use unary::negate_over_set;
 
@@ -162,7 +169,10 @@ fn is_boolean_domained(value: &AbstractValue) -> bool {
 ///
 /// Recognized rows, each cited in the function that decides it: a `/`,
 /// `//`, or `%` divisor set that ADMITS zero without being entirely
-/// zero (`binop_possible_raise`).
+/// zero (`binop_possible_raise`); a domain-limited `math` call whose
+/// operand window straddles its raise domain
+/// (`domain_limited_family_possible_raise`); and a method call whose
+/// receiver admits `None` (`absent_receiver_possible_raise`).
 pub fn possible_raise(
     expression: &Expr,
     environment: &Environment,
@@ -170,7 +180,8 @@ pub fn possible_raise(
 ) -> Option<(TextRange, String)> {
     match expression {
         Expr::BinOp(binop) => binop_possible_raise(binop, environment, kernel),
-        Expr::Call(call) => domain_limited_family_possible_raise(call, environment, kernel),
+        Expr::Call(call) => domain_limited_family_possible_raise(call, environment, kernel)
+            .or_else(|| absent_receiver_possible_raise(call, environment, kernel)),
         _ => None,
     }
 }

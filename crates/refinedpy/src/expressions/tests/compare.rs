@@ -170,3 +170,78 @@ fn test_compare_decides_an_exact_string_outside_a_narrowed_grammar() {
     let twelve = known_values("12".chars().map(|c| c as u32 as f64).collect(), PrimitiveKind::String, TrustProved);
     assert_eq!(compare_pair(CmpOp::Eq, &digits, &twelve, &kernel), None, "an admitted string must not decide ==");
 }
+
+// --- `in`/`not in` over a `set[X]` parameter's REPETITION-WINDOW
+// receiver (A15.xfer.add's own `s: set[int]` seed shape) ---
+
+/// The bare unbounded-window `Kind::Set` a `set[int]` parameter seeds —
+/// `check.rs::seed_parameters`'s own sequence-container arm, mirrored
+/// here as `collection_models::tests::mutation::bounded_ints(0, None)`'s
+/// twin for THIS test module (no shared private helper across the two
+/// test files, matching this crate's own no-shared-private-helper
+/// convention already stated elsewhere).
+fn unbounded_int_set() -> AbstractValue {
+    let whole_ints = make_refined_set(vec![refined_sets::refinement_forms::integer(), at_least(f64::NEG_INFINITY)]);
+    AbstractValue {
+        kind_tag: Some(PrimitiveKind::Integer),
+        ..known_set(refined_sets::repetition_window_forms::repetition(whole_ints, 0, None), None, TrustProved, SetKindTag::None)
+    }
+}
+
+/// `set.add(x)` then `x in s` answers exactly `True` — the recorded
+/// entry `list_set_mutation::set_mutated_receiver`'s own `add` arm
+/// writes into `.keys` is read back here the same way a dict-star's
+/// written key already is (`compare_pair`'s `Kind::ObjectStar` arm, one
+/// row up from the new `Kind::Set` arm this pins).
+#[test]
+fn test_in_over_a_repetition_window_answers_true_for_a_recorded_element() {
+    let Some(kernel) = loaded_kernel() else { return };
+    let mut receiver = unbounded_int_set();
+    receiver.keys.push(refined_domain::abstract_value::ObjectKey {
+        name: "9".to_owned(),
+        numeric: true,
+        value: refined_domain::abstract_value::null_value(),
+    });
+    let nine = known_values(vec![9.0], PrimitiveKind::Integer, TrustProved);
+    assert_eq!(compare_pair(CmpOp::In, &nine, &receiver, &kernel), Some(1.0), "a recorded element must decide `in` True");
+    assert_eq!(compare_pair(CmpOp::NotIn, &nine, &receiver, &kernel), Some(0.0), "a recorded element must decide `not in` False");
+}
+
+/// An element with NO recorded entry over the same window declines —
+/// the window states only what the set MIGHT hold, never that a named
+/// value is absent, so `compare_pair` returns `None` and
+/// `evaluate_compare`'s own caller-side fallback is what turns that
+/// into the exact two-member boolean domain (pinned in
+/// `test_in_over_a_repetition_window_with_no_recorded_entry_is_the_two_
+/// valued_boolean_ground` below, through the full `evaluate_expression`
+/// path rather than `compare_pair` alone, since the two-valued fallback
+/// itself lives in `evaluate_compare`, not `compare_pair`).
+#[test]
+fn test_in_over_a_repetition_window_with_no_recorded_entry_declines() {
+    let Some(kernel) = loaded_kernel() else { return };
+    let receiver = unbounded_int_set();
+    let twelve_thousand_three_forty_five = known_values(vec![12345.0], PrimitiveKind::Integer, TrustProved);
+    assert_eq!(
+        compare_pair(CmpOp::In, &twelve_thousand_three_forty_five, &receiver, &kernel),
+        None,
+        "an unrecorded element must not decide `in` at the compare_pair layer"
+    );
+}
+
+/// The full expression path: `12345 in s` over a repetition-window `s`
+/// with no recorded entry for `12345` answers the exact two-member
+/// boolean domain `{0, 1}` — `evaluate_compare`'s own single-pair
+/// fallback (expressions/subscript.rs), reached because `compare_pair`
+/// declines. This is A15.xfer.add's `other_membership_unchanged` row:
+/// `other = int(12345 in s)` must read `{0, 1}`, never `unknown()`.
+#[test]
+fn test_in_over_a_repetition_window_with_no_recorded_entry_is_the_two_valued_boolean_ground() {
+    let Some(kernel) = loaded_kernel() else { return };
+    let mut environment = empty_environment();
+    environment.bind("s", unbounded_int_set());
+    let parsed = parse_expression("12345 in s").expect("test source must parse");
+    let value = evaluate_expression(&parsed.into_expr(), &environment, &kernel);
+    assert_eq!(value.kind, Kind::Values, "the comparison must decide the two-valued boolean, not stay unknown: {value:?}");
+    assert_eq!(value.kind_tag, Some(PrimitiveKind::Boolean));
+    assert_eq!(value.values, vec![0.0, 1.0], "an unrecorded element must answer the boolean ground, not a guessed True/False: {value:?}");
+}

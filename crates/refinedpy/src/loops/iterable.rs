@@ -18,6 +18,8 @@ use ruff_python_ast::ExprCall;
 use ruff_python_ast::Number;
 use ruff_python_ast::Stmt;
 use ruff_python_ast::UnaryOp;
+use ruff_python_ast::visitor::walk_expr;
+use ruff_python_ast::visitor::Visitor;
 use ruff_text_size::Ranged;
 use ruff_text_size::TextRange;
 use crate::env::Environment;
@@ -112,6 +114,8 @@ pub(super) fn iterable_values(
         Expr::Tuple(tuple) => elements_as_values(&tuple.elts, environment, kernel),
         Expr::Call(call) => range_call_values(call)
             .or_else(|| dict_view_call_values(call, environment, kernel))
+            .or_else(|| enumerate_call_values(call, environment, kernel))
+            .or_else(|| zip_call_values(call, environment, kernel))
             .or_else(|| generator_call_values(call, environment, kernel))
             .or_else(|| finditer_call_values(call, environment, kernel)),
         Expr::Dict(_) => {
@@ -155,6 +159,108 @@ pub(super) fn elements_as_values(
         values.push(evaluated);
     }
     Some(values)
+}
+
+/// `enumerate(<iterable>[, start])` — "the `__next__` method of the
+/// iterator returned by enumerate returns a tuple containing a count
+/// (from *start* which defaults to 0) and the values obtained from
+/// iterating over *iterable*" (library/functions.rst, `enumerate`).
+/// Each element is a 2-element `Kind::List` `[count, value]`, the same
+/// pair shape `.items()` builds, so `bind_for_target`'s existing
+/// tuple-unpack path binds `for i, x in enumerate(xs):` unchanged.
+/// `None` when the callee is not the builtin name `enumerate` (a local
+/// binding shadows it), when the inner iterable is not one this file
+/// already reads concretely, or when `start` is anything but a single
+/// known Integer.
+fn enumerate_call_values(
+    call: &ExprCall,
+    environment: &Environment,
+    kernel: &Arc<RefinedTSKernel>,
+) -> Option<Vec<AbstractValue>> {
+    let Expr::Name(callee) = call.func.as_ref() else {
+        return None;
+    };
+    if callee.id.as_str() != "enumerate" || environment.read("enumerate").is_some() {
+        return None;
+    }
+    let [inner] = call.arguments.args.as_ref() else {
+        return None;
+    };
+    let start = match call.arguments.find_keyword("start") {
+        Some(keyword) => known_integer_argument(&keyword.value, environment, kernel)?,
+        None => 0,
+    };
+    let elements = iterable_values(inner, environment, kernel)?;
+    Some(
+        elements
+            .into_iter()
+            .enumerate()
+            .map(|(offset, value)| {
+                known_list(
+                    vec![known_number_sorted((start + offset as i64) as f64, PrimitiveKind::Integer), value],
+                    TrustProved,
+                )
+            })
+            .collect(),
+    )
+}
+
+/// `zip(<iterable>, ...)` — "By default, zip stops when the shortest
+/// iterable is exhausted" (library/functions.rst, `zip`). Each element
+/// is a `Kind::List` holding one value drawn from each argument at the
+/// same offset, and the element count is the MINIMUM of the arguments'
+/// own lengths. `None` when the callee is not the builtin name `zip`
+/// (a local binding shadows it), when any argument is not an iterable
+/// this file already reads concretely, or when `strict=` is present —
+/// that keyword raises on a length mismatch rather than truncating, a
+/// different rule this row does not decide.
+fn zip_call_values(
+    call: &ExprCall,
+    environment: &Environment,
+    kernel: &Arc<RefinedTSKernel>,
+) -> Option<Vec<AbstractValue>> {
+    let Expr::Name(callee) = call.func.as_ref() else {
+        return None;
+    };
+    if callee.id.as_str() != "zip" || environment.read("zip").is_some() {
+        return None;
+    }
+    if !call.arguments.keywords.is_empty() {
+        return None;
+    }
+    if call.arguments.args.is_empty() {
+        return None;
+    }
+    let mut columns: Vec<Vec<AbstractValue>> = Vec::with_capacity(call.arguments.args.len());
+    for argument in call.arguments.args.iter() {
+        columns.push(iterable_values(argument, environment, kernel)?);
+    }
+    let length = columns.iter().map(|column| column.len()).min()?;
+    Some(
+        (0..length)
+            .map(|offset| {
+                known_list(columns.iter().map(|column| column[offset].clone()).collect(), TrustProved)
+            })
+            .collect(),
+    )
+}
+
+/// One known Integer-sorted argument value, read for its exact number —
+/// the shape `enumerate`'s own `start` keyword needs. `None` for an
+/// unread value or any other sort.
+fn known_integer_argument(
+    expr: &Expr,
+    environment: &Environment,
+    kernel: &Arc<RefinedTSKernel>,
+) -> Option<i64> {
+    let value = evaluate_expression(expr, environment, kernel);
+    if value.kind != Kind::Values || value.values.len() != 1 {
+        return None;
+    }
+    if value.kind_tag != Some(PrimitiveKind::Integer) {
+        return None;
+    }
+    Some(value.values[0] as i64)
 }
 
 /// A dict's keys, each as an exact String `AbstractValue`, in the
@@ -432,6 +538,53 @@ pub(super) fn list_size_changing_mutation_range(body: &[Stmt], list_name: &str) 
         }
     }
     None
+}
+
+/// Whether ANY statement in `body`, at any nesting depth, calls a
+/// list method on `list_name` that changes its length —
+/// `append`/`insert`/`extend`/`pop`/`remove`/`clear`. Unlike
+/// `list_size_changing_mutation_range`, which proves a growth on EVERY
+/// reachable pass at the top level, this asks the weaker question a
+/// CONCRETE element walk needs answered: could the sequence the loop is
+/// stepping differ from the snapshot taken before the first pass? A
+/// list's iterator holds the live list and re-reads its length on each
+/// `__next__` (stdtypes.rst, "Iterator Types" — the iterator keeps a
+/// reference and an index, not a copy), so an append reached on any
+/// pass, however deeply guarded, adds an element the loop still visits,
+/// and a removal drops one it would have. Since this reader cannot say
+/// WHICH branches run, the honest answer to a body that can mutate the
+/// iterated list is to decline the concrete walk entirely rather than
+/// step the stale snapshot and state an exact count that CPython does
+/// not produce.
+pub(super) fn body_can_resize_iterated_list(body: &[Stmt], list_name: &str) -> bool {
+    struct ResizeScan<'a> {
+        list_name: &'a str,
+        found: bool,
+    }
+    impl<'a> Visitor<'a> for ResizeScan<'a> {
+        fn visit_expr(&mut self, expr: &'a Expr) {
+            if let Expr::Call(call) = expr {
+                if let Expr::Attribute(attribute) = call.func.as_ref() {
+                    if matches!(
+                        attribute.attr.as_str(),
+                        "append" | "insert" | "extend" | "pop" | "remove" | "clear"
+                    ) {
+                        if let Expr::Name(receiver) = attribute.value.as_ref() {
+                            if receiver.id.as_str() == self.list_name {
+                                self.found = true;
+                            }
+                        }
+                    }
+                }
+            }
+            walk_expr(self, expr);
+        }
+    }
+    let mut scan = ResizeScan { list_name, found: false };
+    for stmt in body {
+        scan.visit_stmt(stmt);
+    }
+    scan.found
 }
 
 /// `some_generator(args...)` — a bare-Name call to a SAME-MODULE `def`

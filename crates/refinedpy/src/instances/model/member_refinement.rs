@@ -3,7 +3,7 @@
 
 use refined_sets::refinement_forms::make_refined_set;
 
-use crate::typereading::DeclaredRefinement;
+use crate::typereading::{DeclaredRefinement, TypedDictMember};
 
 use super::types::ClassModel;
 
@@ -57,10 +57,22 @@ use super::types::ClassModel;
 /// `check.rs`, not here; this function is exported so whichever route is
 /// chosen has the member-table reader ready.
 pub fn model_members_refinement(model: &ClassModel) -> DeclaredRefinement {
-    let members: Vec<(String, DeclaredRefinement)> = model
+    let members: Vec<TypedDictMember> = model
         .fields
         .iter()
-        .filter_map(|field| field.declared.clone().map(|declared| (field.name.clone(), declared)))
+        .filter_map(|field| {
+            field.declared.clone().map(|declared| TypedDictMember {
+                name: field.name.clone(),
+                // `required` is a TypedDict TOTALITY fact, and an ordinary
+                // class declaration states no totality — a field's presence
+                // on an instance is settled by construction, not by this
+                // table. `false` keeps the MEMBERS LAW's absent-key arm
+                // silent for a class-derived member table, exactly as it
+                // was before requiredness was recorded at all.
+                required: false,
+                declared,
+            })
+        })
         .collect();
     DeclaredRefinement {
         set: make_refined_set(Vec::new()),

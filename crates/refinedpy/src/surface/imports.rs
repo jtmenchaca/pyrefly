@@ -15,7 +15,6 @@ pub struct SurfaceImports {
     pub(super) field_names: HashSet<String>,
     pub(super) pydantic_modules: HashSet<String>,
     pub(crate) annotated_names: HashSet<String>,
-    pub(crate) literal_names: HashSet<String>,
     pub(super) strict_int_names: HashSet<String>,
     pub(super) annotated_types_ge: HashSet<String>,
     pub(super) annotated_types_gt: HashSet<String>,
@@ -58,7 +57,6 @@ pub fn surface_imports(module: &ModModule) -> SurfaceImports {
     let mut field_names = HashSet::new();
     let mut pydantic_modules = HashSet::new();
     let mut annotated_names = HashSet::new();
-    let mut literal_names = HashSet::new();
     let mut strict_int_names = HashSet::new();
     let mut annotated_types_ge = HashSet::new();
     let mut annotated_types_gt = HashSet::new();
@@ -116,15 +114,6 @@ pub fn surface_imports(module: &ModModule) -> SurfaceImports {
                     {
                         annotated_names.insert(local.id.as_str().to_owned());
                     }
-                    if (source.id.as_str() == "typing" || source.id.as_str() == "typing_extensions")
-                        && alias.name.id.as_str() == "Literal"
-                    {
-                        // A `Literal[...]` annotation states an exact value
-                        // set with no alias and no `Annotated` wrapper, so
-                        // this import alone means the module can carry
-                        // refinement vocabulary the checker reads.
-                        literal_names.insert(local.id.as_str().to_owned());
-                    }
                     if source.id.as_str() == "annotated_types" {
                         match alias.name.id.as_str() {
                             "Ge" => {
@@ -160,7 +149,6 @@ pub fn surface_imports(module: &ModModule) -> SurfaceImports {
         field_names,
         pydantic_modules,
         annotated_names,
-        literal_names,
         strict_int_names,
         annotated_types_ge,
         annotated_types_gt,

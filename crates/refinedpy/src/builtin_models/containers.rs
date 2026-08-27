@@ -1,7 +1,8 @@
 //! Container-and-iteration builtins: `list`, `set`, `dict`,
-//! `dict.fromkeys`, `iter`, `next`, `anext`, `cast`, `object`. Every row
-//! cites its clause of docs.python.org/3.12/library/functions.html or
-//! library/stdtypes.html; a row with no citation is not written.
+//! `dict.fromkeys`, `iter`, `next`, `anext`, `cast`, `object`, `vars`,
+//! and `collections.Counter`. Every row cites its clause of
+//! docs.python.org/3.12/library/functions.html, library/stdtypes.html,
+//! or library/collections.html; a row with no citation is not written.
 
 use refined_domain::abstract_value::{known_set, known_values, opaque_value, AbstractValue, Kind, PrimitiveKind, SetKindTag};
 use refined_domain::known_constructors::known_list;
@@ -53,7 +54,23 @@ pub(super) fn list_constructor_call(arguments: &[AbstractValue]) -> Option<Abstr
     if let Some(window) = list_of_unknown_string_characters(iterable) {
         return Some(window);
     }
-    if iterable.kind == Kind::Set && iterable.kind_tag == Some(PrimitiveKind::Integer) {
+    if let Some(keys) = list_of_dict_keys(iterable) {
+        return Some(known_list(keys, derived_trust_level(TrustSpec, arguments)));
+    }
+    // An already-sort-only SEQUENCE value — a repetition window, the
+    // shape `range(n)` answers for an unbounded `n`, the shape
+    // `itertools.chain.from_iterable`'s own abstract row answers for a
+    // `list[list[X]]` argument, and the shape a declared
+    // `list[X]`/`Sequence[X]` parameter seeds. stdtypes.rst's
+    // `list(iterable)` row states the constructor's whole content is
+    // the iterable's own items in order, so a receiver that already
+    // states exactly which elements it holds at which count has nothing
+    // further for this constructor to compute: it copies through
+    // UNCHANGED. Read through `as_repetition` rather than the sort tag,
+    // so a window a reader built without tagging a scalar sort (the
+    // flattening row's own answer) copies through the same way a
+    // tagged Integer window does.
+    if iterable.kind == Kind::Set && iterable.set_kind_tag == SetKindTag::None && as_repetition(&iterable.set).is_some() {
         return Some(iterable.clone());
     }
     if iterable.kind != Kind::List {
@@ -116,6 +133,59 @@ fn list_of_string_characters(value: &AbstractValue) -> Option<Vec<AbstractValue>
             .map(|code_point| known_values(vec![*code_point], PrimitiveKind::String, grade))
             .collect(),
     )
+}
+
+/// `list(d)` on a known DICT receiver (`Kind::Object`) — stdtypes.rst's
+/// Mapping Types section: "Iterating over a dictionary yields its keys...
+/// Dictionaries preserve insertion order. Note that updating a key does
+/// not affect the order." So `list(d)` is the dict's own key list, in the
+/// order the entries were inserted — which is exactly the order this
+/// domain's `ObjectKey` vector already carries (`dict_literal_value`
+/// appends a new key at the end and OVERWRITES a repeated one in place,
+/// matching the cited "updating a key does not affect the order" rule).
+///
+/// Each key becomes the VALUE it spells: a string-keyed entry answers the
+/// String-sorted value of its own characters, a numeric-keyed entry the
+/// Integer value its plain decimal `name` parses back to (`DictKey::
+/// integer`'s own spelling). An IDENTITY key (`DictKey::identity`, a
+/// hashable non-string/non-int key like a bare `object()` sentinel)
+/// carries no value spelling this reader can rebuild — its `name` is a
+/// provenance tag, not the key's own value — so a dict holding one
+/// declines the WHOLE call rather than answer a key list with a
+/// fabricated or omitted entry, the same all-or-nothing honesty
+/// `dict_literal_value` keeps for an unsupported key.
+///
+/// `None` for any non-dict argument, letting the caller's own
+/// `Kind::List` gate try next. A TAGGED opaque object (a `dict.fromkeys`
+/// carrier, a datetime instance) is not a dict and declines here too —
+/// the `fromkeys` carrier has its own reader above, tried first.
+fn list_of_dict_keys(value: &AbstractValue) -> Option<Vec<AbstractValue>> {
+    if value.kind != Kind::Object || value.kind_word.is_some() {
+        return None;
+    }
+    let grade = derived_trust_level(TrustSpec, std::slice::from_ref(value));
+    let mut keys: Vec<AbstractValue> = Vec::with_capacity(value.keys.len());
+    for entry in &value.keys {
+        if entry.numeric {
+            // a numeric key's `name` is its own plain decimal spelling
+            // (`DictKey::integer`); a FRACTIONAL float key spells a
+            // decimal point instead, which no int spelling can carry, so
+            // the whole call declines rather than answer a key list with
+            // a rounded or dropped entry
+            let parsed: i64 = entry.name.parse().ok()?;
+            keys.push(known_values(vec![parsed as f64], PrimitiveKind::Integer, grade));
+        } else {
+            // an identity key's `name` carries a provenance tag under a
+            // reserved NUL-prefixed spelling (`DictKey::identity`), never
+            // the key's own characters — it has no value to rebuild
+            if entry.name.starts_with('\0') {
+                return None;
+            }
+            let code_points: Vec<f64> = entry.name.chars().map(|c| c as u32 as f64).collect();
+            keys.push(known_values(code_points, PrimitiveKind::String, grade));
+        }
+    }
+    Some(keys)
 }
 
 /// The `kind_word` tagging a `dict.fromkeys(iterable, value=None)`
@@ -226,6 +296,22 @@ pub(super) fn set_constructor_call(arguments: &[AbstractValue]) -> Option<Abstra
         return Some(known_list(Vec::new(), TrustSpec));
     }
     let sequence = list_constructor_call(arguments)?;
+    // A WINDOW argument (`set(lst)` on a declared `list[X]` parameter —
+    // `list_constructor_call`'s own repetition row copies such a
+    // receiver through as a `Kind::Set` repetition, which states a
+    // per-element sort and a count but never WHICH elements) carries no
+    // `items` at all. Deduping its (empty) item list would fabricate an
+    // EMPTY known list, and membership against an empty container reads
+    // provably false on every run — killing the guarded body of
+    // A8.seed.conversion's `set_from_list_member_outside`, where
+    // `lst[0] in set(lst)` is true by construction. A set built from a
+    // window states exactly what the window states: the same
+    // per-element sort at the same count, with the membership question
+    // left undecided. Deduplication has nothing to do here anyway — a
+    // window names no two elements to compare.
+    if sequence.kind != Kind::List {
+        return Some(sequence);
+    }
     let mut deduped: Vec<AbstractValue> = Vec::with_capacity(sequence.items.len());
     for item in sequence.items {
         let already_present = deduped.iter().any(|kept| same_known(kept, &item));
@@ -255,6 +341,19 @@ pub(super) fn dict_constructor_call(arguments: &[AbstractValue]) -> Option<Abstr
     if pairs.kind == Kind::Object && pairs.kind_word.is_none() {
         return Some(pairs.clone());
     }
+    // `dict(<some mapping whose key set is unbounded>)` — the same
+    // copy-constructor row ("providing... another dictionary"), where the
+    // argument is an UNBOUNDED-KEY mapping (`Kind::ObjectStar` — a
+    // `dict[str, X]` parameter's own seed, or `os.environ`'s own read,
+    // `expressions::attribute`'s `data:: environ` row). The copy states
+    // exactly what the source states: which values every present key
+    // holds, and nothing about WHICH keys are present — so the star
+    // copies through unchanged. Answering `None` here instead left
+    // `dict(os.environ)` deriving nothing at all, even though the copy
+    // is provably the same mapping the source already read as.
+    if pairs.kind == Kind::ObjectStar {
+        return Some(pairs.clone());
+    }
     if pairs.kind != Kind::List {
         return None;
     }
@@ -277,6 +376,134 @@ pub(super) fn dict_constructor_call(arguments: &[AbstractValue]) -> Option<Abstr
     // does — this file reaches into collection_models.rs for the one
     // shared building block rather than duplicating that merge loop
     Some(crate::collection_models::dict_literal_value(&keys, &values))
+}
+
+/// `collections.Counter(iterable)` — library/collections.rst:
+/// "A `Counter` is a `dict` subclass for counting hashable objects...
+/// Elements are counted from an *iterable*." The class doc pins both
+/// facts a reader needs without knowing the iterable's own contents:
+/// the result IS a dict (so every dict read this domain models applies
+/// to it), and each value is that element's own COUNT.
+///
+/// A count reached by counting an element of the iterable is at least
+/// `1` — an element with no occurrences never becomes a key at all,
+/// which the same doc states directly: "Counter... return[s] a zero
+/// count for missing items instead of raising a KeyError" only on a
+/// LOOKUP, never as a stored entry. So every PRESENT key's value sits in
+/// `[1, +inf)`, whole — which is exactly what an unbounded-key mapping
+/// carries (`known_dict_star`, the same shape `check::seed_parameters`
+/// builds for a `dict[str, X]` parameter): the key set is unstated, the
+/// value law is stated once for every present key.
+///
+/// Answered for ANY single argument, whatever this file can or cannot
+/// read of it: the `[1, +inf)` claim comes from the counting contract
+/// itself, not from the iterable's contents, so an unread `xs:
+/// list[str]` gets the same sound answer a known list would. That is
+/// what A8.seed.library's own rows need — `counts["a"]` reads a count
+/// that is NOT inside Age's `[0, 150]` window on its own, rather than
+/// the binding deriving nothing.
+///
+/// The `Counter(**kwargs)` and `Counter(mapping)` spellings are not this
+/// row (a keyword call is already declined at the call site, and a
+/// mapping argument's counts are the mapping's own values rather than
+/// tallies) — the zero-argument `Counter()` likewise declines, having no
+/// iterable to count.
+pub(super) fn counter_call(arguments: &[AbstractValue]) -> Option<AbstractValue> {
+    let [iterable] = arguments else { return None };
+    // A FULLY KNOWN input — a `Kind::List` whose every element is an
+    // exactly-known string (`Counter(["a", "b"])`) — states its own
+    // tallies outright: the same "Elements are counted from an
+    // *iterable*" row, read over an iterable whose elements this file
+    // can enumerate. Each distinct element becomes a key, and its value
+    // is the EXACT number of times it occurs, not the general
+    // `[1, +inf)` law the unread case falls back to. The closed dict
+    // this answers also states its key set exactly, so a key the input
+    // never held reads as absent rather than undecided.
+    if iterable.kind == Kind::List {
+        let mut keys: Vec<Option<crate::collection_models::DictKey>> = Vec::with_capacity(iterable.items.len());
+        let mut tallies: Vec<usize> = Vec::with_capacity(iterable.items.len());
+        let mut every_element_known = true;
+        for element in &iterable.items {
+            if element.kind != Kind::Values || element.kind_tag != Some(PrimitiveKind::String) {
+                every_element_known = false;
+                break;
+            }
+            let element_text: String = element.values.iter().filter_map(|point| char::from_u32(*point as i64 as u32)).collect();
+            let key = crate::collection_models::DictKey::string(&element_text);
+            match keys.iter().position(|kept| kept.as_ref() == Some(&key)) {
+                Some(slot) => tallies[slot] += 1,
+                None => {
+                    keys.push(Some(key));
+                    tallies.push(1);
+                }
+            }
+        }
+        if every_element_known && !keys.is_empty() {
+            let values: Vec<AbstractValue> = tallies
+                .iter()
+                .map(|tally| known_values(vec![*tally as f64], PrimitiveKind::Integer, TrustSpec))
+                .collect();
+            return Some(crate::collection_models::dict_literal_value(&keys, &values));
+        }
+    }
+    let count = AbstractValue {
+        kind_tag: Some(PrimitiveKind::Integer),
+        ..known_set(
+            make_refined_set(vec![
+                refined_sets::refinement_forms::at_least(1.0),
+                refined_sets::refinement_forms::integer(),
+            ]),
+            None,
+            TrustSpec,
+            SetKindTag::None,
+        )
+    };
+    let (star, built) = refined_domain::known_constructors::known_dict_star(count, TrustSpec);
+    built.then_some(star)
+}
+
+/// `vars(object)` — library/functions.rst: "Return the `__dict__`
+/// attribute for a module, class, instance, or any other object with a
+/// `__dict__` attribute." An instance's `__dict__` holds exactly its OWN
+/// (per-instance) attributes — the ones bound on the instance itself,
+/// never the ones defined on its class, which live in the CLASS's own
+/// `__dict__` instead (reference/datamodel.rst, "Custom classes": "a
+/// class instance has a namespace implemented as a dictionary which is
+/// the first place in which attribute references are searched... class
+/// attributes are not found there").
+///
+/// This domain already carries a constructed instance as a
+/// `Kind::Object` whose `ObjectKey` entries are its own fields
+/// (`instances::judge_construction`'s own doc) — the same shape a dict
+/// takes — so `vars(o)` answers the instance's entries as a plain dict,
+/// with the `instance_identity` DROPPED: `vars(o)` returns the
+/// `__dict__` mapping, a different object from the instance itself, and
+/// carrying the instance's identity onto it would make `vars(o)` read as
+/// the same referent `o` is.
+///
+/// That is what lets A8.xfer.own's rows read `vars(o)["inst_attr"]` as
+/// the stored value, and `"cls_attr" in vars(o)` as False — a class
+/// attribute is not among the instance's own entries, so the closed
+/// key set this answers already states its absence.
+///
+/// Gated on a CONSTRUCTED instance (`instance_identity` present) rather
+/// than any `Kind::Object`: a plain dict has no `__dict__` of its own
+/// (`vars({})` raises `TypeError`, functions.rst's own "If the object
+/// does not have a `__dict__`... a `TypeError` exception is raised"), so
+/// answering a dict's own entries here would be the wrong mapping
+/// entirely. Every other argument declines.
+pub(super) fn vars_call(arguments: &[AbstractValue]) -> Option<AbstractValue> {
+    let [only] = arguments else { return None };
+    if only.kind != Kind::Object || only.instance_identity.is_none() {
+        return None;
+    }
+    Some(refined_domain::known_constructors::known_object(
+        only.keys.clone(),
+        None,
+        true,
+        derived_trust_level(TrustSpec, arguments),
+        false,
+    ))
 }
 
 /// `iter(object)` (one-argument form, no `sentinel`) — library/functions.html#iter:

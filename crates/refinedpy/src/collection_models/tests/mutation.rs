@@ -165,6 +165,75 @@ fn mutated_receiver_set_append_on_an_unbounded_window_stays_unbounded() {
     assert_eq!(window.hi, None);
 }
 
+// `set.add(x)` on the REPETITION-WINDOW shape: widens the window exactly
+// like `append` (A15.xfer.add's `s: set[int]` parameter seed), AND
+// records `x` as a present element when `x` reads as a `known_dict_key`
+// — the seed shape `A15.xfer.add.py`'s own `member_after_add` needs so
+// `expressions::compare::compare_pair`'s `in` row can answer `x in s`
+// exactly `True` right after this add.
+
+#[test]
+fn mutated_receiver_set_add_widens_the_window_by_one() {
+    let set = bounded_ints(0, Some(3));
+    let (new_receiver, result) = mutated_receiver("add", &set, &[integer(9.0)]).expect("add must decide");
+    assert_eq!(new_receiver.kind, Kind::Set);
+    let window = as_repetition(&new_receiver.set).expect("add must keep the repetition shape");
+    assert_eq!(window.lo, 1);
+    assert_eq!(window.hi, Some(4));
+    assert_eq!(result.kind, Kind::Null);
+}
+
+#[test]
+fn mutated_receiver_set_add_records_an_exact_element_as_present() {
+    let set = bounded_ints(0, None);
+    let (new_receiver, _) = mutated_receiver("add", &set, &[integer(9.0)]).expect("add must decide");
+    assert!(
+        new_receiver.keys.iter().any(|entry| entry.name == "9" && entry.numeric),
+        "an exact Integer element added must ride in .keys the same way a dict-star's written key does: {:?}",
+        new_receiver.keys
+    );
+}
+
+#[test]
+fn mutated_receiver_set_add_of_the_same_element_twice_records_one_entry() {
+    let set = bounded_ints(0, None);
+    let (once, _) = mutated_receiver("add", &set, &[integer(9.0)]).expect("first add must decide");
+    let (twice, _) = mutated_receiver("add", &once, &[integer(9.0)]).expect("second add must decide");
+    let recorded: Vec<_> = twice.keys.iter().filter(|entry| entry.name == "9" && entry.numeric).collect();
+    assert_eq!(recorded.len(), 1, "adding the same exact element twice must not duplicate its recorded entry: {:?}", twice.keys);
+}
+
+/// The bare unbounded-int SCALAR window `x: int` seeds
+/// (`check.rs::seed_parameters`'s own scalar-parameter tail) — a plain
+/// `Kind::Set`, never a repetition, since `x` is one number, not a
+/// sequence. `known_dict_key` reads only a single known `Kind::Values`
+/// scalar, so this shape declines it.
+fn unbounded_int_scalar() -> AbstractValue {
+    let whole_ints = make_refined_set(vec![refined_sets::refinement_forms::integer(), at_least(f64::NEG_INFINITY)]);
+    AbstractValue {
+        kind_tag: Some(PrimitiveKind::Integer),
+        ..known_set(whole_ints, None, TrustProved, SetKindTag::None)
+    }
+}
+
+/// An element with no EXACT reading (`x: int`, A15.xfer.add's own
+/// non-literal parameter shape) still widens the window exactly as an
+/// exact element does; only the `.keys` recording is skipped, since no
+/// single value can be named present.
+#[test]
+fn mutated_receiver_set_add_of_a_non_exact_element_still_widens_but_records_no_entry() {
+    let set = bounded_ints(0, None);
+    let (new_receiver, _) =
+        mutated_receiver("add", &set, &[unbounded_int_scalar()]).expect("add of a non-exact element must still widen");
+    let window = as_repetition(&new_receiver.set).expect("add must keep the repetition shape");
+    assert_eq!(window.lo, 1);
+    assert!(
+        new_receiver.keys.is_empty(),
+        "an element with no known_dict_key reading must not fabricate a recorded entry: {:?}",
+        new_receiver.keys
+    );
+}
+
 #[test]
 fn mutated_receiver_set_extend_adds_the_iterables_own_count_window() {
     let set = bounded_ints(0, Some(3));
@@ -197,10 +266,12 @@ fn mutated_receiver_set_extend_with_an_empty_list_is_a_no_op_on_the_window() {
 
 #[test]
 fn mutated_receiver_set_other_methods_decline() {
+    // `add` is no longer among the declining methods — it has its own
+    // modeled arm (window widening plus exact-element recording), pinned
+    // by the add-specific tests above.
     let set = bounded_ints(0, Some(3));
     assert_eq!(mutated_receiver("pop", &set, &[]), None);
     assert_eq!(mutated_receiver("clear", &set, &[]), None);
-    assert_eq!(mutated_receiver("add", &set, &[integer(1.0)]), None);
 }
 
 // --- mutated_receiver: dict ---
@@ -287,6 +358,45 @@ fn mutated_receiver_dict_setdefault_int_key_does_not_match_a_string_key_of_the_s
     // the default, never the string entry's value
     assert_eq!(new_receiver.keys.len(), 2);
     assert_eq!(result, integer(0.0));
+}
+
+#[test]
+fn mutated_receiver_dict_star_setdefault_on_an_unspellable_key_still_answers_the_join() {
+    // `d.setdefault(k, default)` where `d: dict[str, Age]` is a star and
+    // `k: str` states no exact characters: whichever key it names, both
+    // of stdtypes.rst's branches land inside the join of the star's own
+    // element law and the default, so the VALUE is determined. Only the
+    // key-set recording is skipped — no key is claimed present.
+    let element = AbstractValue {
+        kind_tag: Some(PrimitiveKind::Integer),
+        ..known_set(make_refined_set(vec![at_least(0.0)]), None, TrustProved, SetKindTag::None)
+    };
+    let (star, built) = refined_domain::known_constructors::known_dict_star(element.clone(), TrustProved);
+    assert!(built, "the star must build over a scalar-shaped element");
+    let (new_receiver, result) = mutated_receiver("setdefault", &star, &[unknown(), integer(30.0)])
+        .expect("setdefault answers the join even without an exact key");
+    assert_eq!(new_receiver.keys.len(), 0);
+    assert_eq!(result, join_known(element, integer(30.0)));
+}
+
+#[test]
+fn dict_star_get_result_on_an_unspellable_key_answers_the_same_join() {
+    // The READ path's twin of the write-path test above (A8.xfer.
+    // getorinsert's `returned_value_after_insert`: `return d.setdefault(
+    // k, default)` is a value read, never a statement-level write). An
+    // unread `k: str` names no entry to match against the written set,
+    // but the star's own law still describes every value at every key,
+    // so both of stdtypes.rst's branches fold into the one join — the
+    // same answer the write path gives.
+    let element = AbstractValue {
+        kind_tag: Some(PrimitiveKind::Integer),
+        ..known_set(make_refined_set(vec![at_least(0.0)]), None, TrustProved, SetKindTag::None)
+    };
+    let (star, built) = refined_domain::known_constructors::known_dict_star(element.clone(), TrustProved);
+    assert!(built, "the star must build over a scalar-shaped element");
+    let answered = dict_get_result(&star, &unknown(), Some(&integer(30.0)))
+        .expect("the star's value law answers without an exact key");
+    assert_eq!(answered, join_known(element, integer(30.0)));
 }
 
 #[test]

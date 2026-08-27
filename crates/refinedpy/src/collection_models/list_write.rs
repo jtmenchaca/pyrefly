@@ -21,6 +21,14 @@ use super::subscript_read::known_integer_index;
 /// SECOND write to the same name still reads which of the three
 /// bytes-like write rules applies rather than losing the tag the moment
 /// this function rebuilds the list.
+///
+/// The receiver's own `instance_identity` carries forward for the same
+/// reason: an item assignment MUTATES the list in place — it is the same
+/// object afterward (expressions.rst, "Subscriptions": item assignment
+/// on a mutable sequence replaces the item, it does not build a new
+/// sequence) — so every other container holding a reference to it still
+/// holds a reference to it, which is exactly what
+/// `Environment::rebind_referents_of_item` relies on to find them.
 pub fn list_with_item(receiver: &AbstractValue, index: &AbstractValue, value: &AbstractValue) -> Option<AbstractValue> {
     if receiver.kind != Kind::List {
         return None;
@@ -35,5 +43,6 @@ pub fn list_with_item(receiver: &AbstractValue, index: &AbstractValue, value: &A
     items[adjusted as usize] = value.clone();
     let mut written = list_literal_value(&items);
     written.kind_word = receiver.kind_word;
+    written.instance_identity = receiver.instance_identity;
     Some(written)
 }

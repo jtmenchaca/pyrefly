@@ -11,6 +11,7 @@ use refined_domain::abstract_value::AbstractValue;
 use refined_domain::abstract_value::Kind;
 use refined_domain::abstract_value::PrimitiveKind;
 use refined_domain::abstract_value::SetKindTag;
+use refined_domain::known_constructors::known_list;
 use refined_domain::trust_grades::trust_level_of;
 use refined_domain::trust_grades::TrustSpec;
 use refined_kernel::kernel_interface::RefinedTSKernel;
@@ -20,9 +21,11 @@ use refined_sets::refinement_forms::integer;
 use refined_sets::refinement_forms::make_refined_set;
 use refined_sets::refinement_forms::Form;
 use refined_sets::repetition_window_forms::as_repetition;
+use refined_sets::repetition_window_forms::repetition;
 use ruff_python_ast::Expr;
 use ruff_python_ast::StmtFor;
 use crate::env::Environment;
+use crate::expressions::call_one_argument_expression;
 use crate::expressions::evaluate_expression;
 use crate::instances;
 use crate::summaries::iterable_element_sort;
@@ -32,6 +35,7 @@ use super::LoopAnswer;
 use super::bind_target::bind_for_target;
 use super::body_once::BodyOutcome;
 use super::body_once::run_body_once;
+use super::iterable::body_can_resize_iterated_list;
 use super::iterable::dict_size_changing_mutation_range;
 use super::iterable::iterable_values;
 use super::iterable::iterated_dict_name;
@@ -106,6 +110,32 @@ pub(super) fn for_loop_final_environment(
                 }
             }
         }
+        // STALE SNAPSHOT: `elements` was read from the iterable BEFORE
+        // the first pass, but a list's iterator holds the live list and
+        // re-reads its length on every `__next__` (stdtypes.rst,
+        // "Iterator Types"). A body that can append to or remove from
+        // the very list being iterated therefore visits a different
+        // sequence than this snapshot describes, and stepping the
+        // snapshot would state an exact element count CPython does not
+        // produce — so this SNAPSHOT walk stands aside for the LIVE one
+        // (`live_list_element_walk`), which re-reads the list each pass
+        // and marches the index the way stdtypes.rst's own mutable-
+        // sequence-iterator paragraph states; that function declines to
+        // the abstract passes below whenever a pass stops being exactly
+        // readable. Narrower than `list_size_changing_mutation_range`,
+        // which proves a growth on EVERY pass to name non-termination: a
+        // resize reached on ANY pass, however deeply guarded, already
+        // invalidates the snapshot's count.
+        if let Some(list_name) = iterated_list_name(for_stmt.iter.as_ref()) {
+            if body_can_resize_iterated_list(&for_stmt.body, list_name) {
+                // The snapshot is stale, but the LIVE list may still be
+                // exactly readable at every step — `live_list_element_walk`
+                // re-reads the name each pass and steps the index forward
+                // the way stdtypes.rst says the iterator does, answering
+                // exactly when every pass stays concrete.
+                return live_list_element_walk(for_stmt, list_name, environment, kernel, judge_context);
+            }
+        }
         let mut current = environment.fork();
         let mut broke = false;
         for element in elements {
@@ -130,10 +160,257 @@ pub(super) fn for_loop_final_environment(
         }
         return Some(LoopAnswer { environment: current, else_runs: !broke, returned: None, widened_names: Vec::new() });
     }
+    // `windowed_range_element_pass` runs BEFORE
+    // `repetition_window_element_pass`: both can read a `for i in
+    // range(n)` whose stop is not one known scalar, but they answer
+    // different element sets from the same iterable. The range pass
+    // reads the STOP binding itself and answers `[0, max(stop) - 1]`;
+    // the repetition pass reads the value `range(n)` evaluates to,
+    // which `range_expression_value`'s one-argument fallback states as
+    // the sort-only window `integer ∧ [0, +inf)` — every element the
+    // range pass admits and more. Consulting the general window reader
+    // first would discard the stop's own upper bound on every counted
+    // loop over a bounded parameter, so the specific reader is asked
+    // first and the general one keeps every iterable it alone reads.
     abstract_element_sort_pass(for_stmt, environment, kernel, judge_context)
         .or_else(|| custom_iterator_element_pass(for_stmt, environment, kernel, judge_context))
-        .or_else(|| repetition_window_element_pass(for_stmt, environment, kernel, judge_context))
+        .or_else(|| groupby_element_pass(for_stmt, environment, kernel, judge_context))
         .or_else(|| windowed_range_element_pass(for_stmt, environment, kernel, judge_context))
+        .or_else(|| repetition_window_element_pass(for_stmt, environment, kernel, judge_context))
+}
+
+/// `for key, group in groupby(<iterable>[, key=<callable>]):` —
+/// A8.seed.library's own `group_by_parity`. library/itertools.rst,
+/// `groupby(iterable, key=None)`: "Make an iterator that returns
+/// consecutive keys and groups from the *iterable*. The *key* is a
+/// function computing a key value for each element. If not specified or
+/// is ``None``, *key* defaults to an identity function and returns the
+/// element unchanged." The same entry states what a group holds: "The
+/// returned group is itself an iterator that shares the underlying
+/// iterable," and its own equivalent-code block yields values drawn
+/// straight from that iterable — `[list(g) for k, g in
+/// groupby('AAAABBBCCD')] → AAAA BBB CC D`.
+///
+/// Over an iterable this domain reads only as a REPETITION WINDOW (an
+/// unread `list[X]` parameter, possibly through `sorted(...)`, which
+/// leaves the window exactly as it was — `sorted_over_star_with_
+/// keywords`' own doc), no exact grouping exists to walk: the element
+/// values decide both how many groups there are and where the breaks
+/// fall, and none of that is read. What the entry DOES pin, given the
+/// element set:
+///
+/// - the KEY is `key(element)` for some element of the window, so the
+///   key set is the key function's IMAGE over that element set — read
+///   here by calling the key function's own raw expression once against
+///   the element (`call_one_argument_expression`, the same seam
+///   `map`/`filter` fold with). The fixture's key is `lambda x: "even"
+///   if x % 2 == 0 else "odd"`, whose ternary joins both arms into the
+///   closed two-member set {"even", "odd"} — an exact image, not a
+///   sort. An ABSENT `key=` is the entry's own identity default, so the
+///   image is the element set itself.
+/// - the GROUP is a sequence of elements of the SAME iterable, so it is
+///   a repetition window over that same element set. Its own item count
+///   is unstated (a group holds at least one element — every group
+///   `groupby` emits is non-empty, since a group is created by an
+///   element — so the window starts at 1).
+///
+/// The target must be the two-name tuple the entry's own signature
+/// produces (`for k, g in ...`); the body then runs ONE judged pass over
+/// that binding and joins with the pre-loop environment, the same
+/// zero-or-more honesty every other abstract pass in this file states.
+///
+/// `None` when the iterable is not a `groupby(...)` call, when the
+/// receiver is not a bare repetition window, when the target is not a
+/// two-name tuple, when a `key=` is present but its image cannot be
+/// read, or when the one abstract pass hits a statement shape
+/// `run_body_once` does not recognize.
+pub(super) fn groupby_element_pass(
+    for_stmt: &StmtFor,
+    environment: &Environment,
+    kernel: &Arc<RefinedTSKernel>,
+    judge_context: &mut JudgeContext,
+) -> Option<LoopAnswer> {
+    let Expr::Call(call) = for_stmt.iter.as_ref() else {
+        return None;
+    };
+    // `groupby(...)` reaches a module either bare (`from itertools import
+    // groupby`) or qualified (`itertools.groupby(...)`); neither spelling
+    // may be shadowed by a local binding, the same gate every other
+    // module-call row in this checker keeps.
+    let bare = matches!(call.func.as_ref(), Expr::Name(name) if name.id.as_str() == "groupby")
+        && environment.read("groupby").is_none();
+    let qualified = match call.func.as_ref() {
+        Expr::Attribute(attribute) if attribute.attr.as_str() == "groupby" => {
+            matches!(attribute.value.as_ref(), Expr::Name(module) if module.id.as_str() == "itertools")
+                && environment.read("itertools").is_none()
+        }
+        _ => false,
+    };
+    if !bare && !qualified {
+        return None;
+    }
+    // The element set the whole reading rests on: the iterable's own
+    // repetition window, read back to one element.
+    let [iterable_expr] = &*call.arguments.args else {
+        return None;
+    };
+    let iterable = evaluate_expression(iterable_expr, environment, kernel);
+    if iterable.kind != Kind::Set || iterable.set_kind_tag != SetKindTag::None {
+        return None;
+    }
+    let repeated = as_repetition(&iterable.set)?;
+    let grade = trust_level_of(&iterable);
+    let element = AbstractValue {
+        kind_tag: iterable.kind_tag,
+        ..known_set(repeated.element.clone(), None, grade, SetKindTag::None)
+    };
+
+    // The KEY: the key function's image over one element, or — with no
+    // `key=` at all — the entry's own identity default, the element set
+    // itself. `key=None` is spelled explicitly in the signature and means
+    // the same identity function, so it reads the same way.
+    let mut key_expression: Option<&Expr> = None;
+    for keyword in &call.arguments.keywords {
+        let name = keyword.arg.as_ref()?;
+        if name.id.as_str() != "key" {
+            return None;
+        }
+        key_expression = Some(&keyword.value);
+    }
+    let key_value = match key_expression {
+        None => element.clone(),
+        Some(Expr::NoneLiteral(_)) => element.clone(),
+        Some(expression) => call_one_argument_expression(expression, &element, environment, kernel)?,
+    };
+    if key_value.kind == Kind::Unknown {
+        return None;
+    }
+
+    // The GROUP: elements of the same iterable, at least one of them.
+    let group_value = AbstractValue {
+        kind_tag: iterable.kind_tag,
+        ..known_set(repetition(repeated.element, 1, None), None, grade, SetKindTag::None)
+    };
+
+    let pair = known_list(vec![key_value, group_value], grade);
+    let mut one_pass = environment.fork();
+    if !bind_for_target(for_stmt.target.as_ref(), &pair, &mut one_pass) {
+        return None;
+    }
+    match run_body_once(&for_stmt.body, &mut one_pass, kernel, judge_context)? {
+        BodyOutcome::Fell | BodyOutcome::Continued | BodyOutcome::Broke => {}
+        BodyOutcome::Returned(value, range) => {
+            return Some(LoopAnswer {
+                environment: one_pass,
+                else_runs: false,
+                returned: Some((value, range)),
+                widened_names: Vec::new(),
+            });
+        }
+    }
+    let (joined, widened_names) = stabilized_join(
+        environment,
+        &one_pass,
+        &for_stmt.body,
+        for_stmt.target.as_ref(),
+        &pair,
+        kernel,
+        judge_context,
+    )?;
+    Some(LoopAnswer { environment: joined, else_runs: true, returned: None, widened_names })
+}
+
+/// `for x in lst:` where the body MUTATES `lst`'s own length — the case
+/// the snapshot walk above declines because the pre-loop element list no
+/// longer describes what the loop visits. stdtypes.rst, "Common Sequence
+/// Operations," states the mechanism exactly: "Forward and reversed
+/// iterators over mutable sequences access values using an index. That
+/// index will continue to march forward (or backward) even if the
+/// underlying sequence is mutated. The iterator terminates only when an
+/// :exc:`IndexError` or a :exc:`StopIteration` is encountered (or when
+/// the index drops below zero)."
+///
+/// So the loop is not a walk over a snapshot at all — it is an index
+/// starting at 0, incremented after each pass, reading the LIVE list and
+/// ending when the index runs past the live length. This function runs
+/// exactly that: each pass re-reads `list_name` from the CURRENT
+/// environment, stops when the index is at or past the live item count
+/// (the `IndexError` the paragraph names), binds position `index`, runs
+/// the body, and steps. An element appended by pass `i` is therefore
+/// visited by a later pass, and an element removed before the index
+/// reaches it is never visited — both the paragraph's own consequence,
+/// not an extra rule.
+///
+/// Every step must stay EXACT for the answer to stand. The live receiver
+/// must read back as a `Kind::List` with known items on every pass (an
+/// abstract window carries no position to index and no count to stop at),
+/// and each pass's body must run through the same judged `run_body_once`
+/// every concrete walk uses. Anything else declines to `None` and the
+/// caller's abstract passes take the loop.
+///
+/// NON-TERMINATION is not a cap here and is not this function's to
+/// invent: a body that appends on EVERY reachable pass never lets the
+/// index catch the length, and `repetition_window_element_pass`'s own
+/// `list_size_changing_mutation_range` already names that shape and
+/// fires `list_never_terminates_self_append` for it. This function walks
+/// a body whose appends are CONDITIONAL, so the live length stops
+/// growing once the condition stops holding and the index reaches it —
+/// A7.xfer.iterate's own `if len(lst) < 2: lst.append(2)`, which grows
+/// the list once and then leaves the index to run off the end at 2. The
+/// unconditional shape is already fired on before this runs, so a body
+/// that keeps growing past the point where this function can still read
+/// each step exactly falls out through the ordinary decline paths below
+/// rather than being counted.
+fn live_list_element_walk(
+    for_stmt: &StmtFor,
+    list_name: &str,
+    environment: &Environment,
+    kernel: &Arc<RefinedTSKernel>,
+    judge_context: &mut JudgeContext,
+) -> Option<LoopAnswer> {
+    // The unconditional self-append is the non-terminating shape, named
+    // and fired by `repetition_window_element_pass`'s own row. Stepping
+    // it here would run the index behind a length that always outruns
+    // it, so it is refused before the first pass rather than stepped.
+    if list_size_changing_mutation_range(&for_stmt.body, list_name).is_some() {
+        return None;
+    }
+    let mut current = environment.fork();
+    let mut broke = false;
+    let mut index: usize = 0;
+    loop {
+        // re-read the LIVE list, as the iterator's own `__next__` does
+        let live = current.read(list_name)?;
+        if live.kind != Kind::List {
+            return None;
+        }
+        // the index has marched past the live length — the `IndexError`
+        // the paragraph names, which is where the iterator stops
+        if index >= live.items.len() {
+            break;
+        }
+        let element = live.items[index].clone();
+        if !bind_for_target(for_stmt.target.as_ref(), &element, &mut current) {
+            return None;
+        }
+        match run_body_once(&for_stmt.body, &mut current, kernel, judge_context)? {
+            BodyOutcome::Fell | BodyOutcome::Continued => {}
+            BodyOutcome::Broke => {
+                broke = true;
+                break;
+            }
+            BodyOutcome::Returned(value, range) => {
+                return Some(LoopAnswer {
+                    environment: current,
+                    else_runs: false,
+                    returned: Some((value, range)),
+                    widened_names: Vec::new(),
+                });
+            }
+        }
+        index += 1;
+    }
+    Some(LoopAnswer { environment: current, else_runs: !broke, returned: None, widened_names: Vec::new() })
 }
 
 /// `for`/`async for` over a CUSTOM ITERATOR — a class instance whose own

@@ -2,16 +2,21 @@
 //! `pop`/`clear`/`sort`/`reverse` on a `Kind::List` receiver, PLUS the
 //! set-only method names `add`/`discard`/`remove`/`update` (a set
 //! shares the same `Kind::List` receiver shape — `collection_models`'s
-//! own module doc), and `append`/`extend` on a REPETITION-SHAPED
+//! own module doc), and `append`/`add`/`extend` on a REPETITION-SHAPED
 //! `Kind::Set` receiver (the `list[X]`/`set[X]`/`Sequence[X]` parameter
 //! seed's own star shape, which has no concrete items to index into).
-//! See `mutated_receiver`'s own doc (in `collection_models/mod.rs`) for
-//! the cited row-by-row contract.
+//! `add` on that shape also RECORDS the exact element added, in the
+//! receiver's own `keys` field (the same `Vec<ObjectKey>` a dict-star's
+//! written keys ride in) — `expressions::compare::compare_pair` reads it
+//! back to answer `x in s` exactly `True` right after `s.add(x)`. See
+//! `mutated_receiver`'s own doc (in `collection_models/mod.rs`) for the
+//! cited row-by-row contract.
 
 use refined_domain::abstract_value::known_set;
 use refined_domain::abstract_value::null_value;
 use refined_domain::abstract_value::AbstractValue;
 use refined_domain::abstract_value::Kind;
+use refined_domain::abstract_value::ObjectKey;
 use refined_domain::abstract_value::PrimitiveKind;
 use refined_domain::abstract_value::SetKindTag;
 use refined_domain::lattice_operations::join_known;
@@ -20,6 +25,7 @@ use refined_domain::trust_grades::trust_level_of;
 use refined_domain::trust_grades::TrustLevel;
 use refined_sets::repetition_window_forms::as_repetition;
 
+use super::dict_key::known_dict_key;
 use super::list_literal::list_literal_value;
 use super::subscript_read::known_integer_index;
 use super::subscript_read::list_index_read;
@@ -170,7 +176,8 @@ pub(super) fn list_mutated_receiver(method: &str, receiver: &AbstractValue, argu
     }
 }
 
-/// `set.append(x)`/`set.extend(iterable)` on a REPETITION-SHAPED receiver
+/// `append(x)`/`add(x)`/`extend(iterable)`/`reverse()`/`sort()` on a
+/// REPETITION-SHAPED receiver
 /// (`Kind::Set` whose own set is the bare star/window `as_repetition`
 /// reads back — `star_element_read`'s own doc, the shape
 /// `check.rs::seed_parameters` seeds for a `list[X]`/`set[X]`/
@@ -185,6 +192,30 @@ pub(super) fn list_mutated_receiver(method: &str, receiver: &AbstractValue, argu
 ///   one: `lo + 1`, `hi + 1` when `hi` is finite, or unbounded when it
 ///   already was (one more element never turns an unbounded window
 ///   bounded).
+/// - `add(x)` (`set.add(elem)`, stdtypes.rst: "Add element *elem* to the
+///   set") widens the window the SAME way `append` does — the receiver
+///   still has no concrete slot to push into, so the count/element claim
+///   for every OTHER position is exactly `append`'s own answer — and
+///   ADDITIONALLY records `x` as a PRESENT element when `x` reads as a
+///   `known_dict_key` (an exact Integer/Float/String — the same key sorts
+///   `dict_with_item`'s own unbounded-key star arm records a WRITE
+///   under). The recorded entry rides in `receiver.keys` — the identical
+///   `Vec<ObjectKey>` field a `Kind::ObjectStar` dict-star's own written
+///   keys ride in (`dict_write.rs`'s own doc), reused here rather than a
+///   new field: `ObjectKey.value` carries no meaning for a set (a set
+///   member has no payload), so it is filled with `null_value()` and
+///   never read — only `ObjectKey.name`/`.numeric` state which elements
+///   are recorded present. `expressions::compare::compare_pair`'s own
+///   `in`/`not in` row reads this same list back to answer `x in s`
+///   EXACTLY `True` right after this add — set membership holds for the
+///   element just added regardless of whether it was already a member
+///   (stdtypes.rst's own `add` contract states no distinction), which the
+///   window's own {lo, hi}/element claim alone could never prove (a
+///   window states what a set's members MIGHT be, never that one named
+///   value definitely IS one). A `x` with no `known_dict_key` reading (a
+///   class instance, an unread expression) still widens the window; it
+///   simply records no entry, exactly as `dict_with_item`'s own
+///   unread-key arm still writes THROUGH the star without naming a key.
 /// - `extend(iterable)`: the element set joins with the iterable's own
 ///   element set (a `Kind::List` argument's items, each folded in by
 ///   `join_known`, or a `Kind::Set` repetition argument's own element),
@@ -192,10 +223,13 @@ pub(super) fn list_mutated_receiver(method: &str, receiver: &AbstractValue, argu
 ///   (the iterable contributes at least its own minimum), `hi` sums when
 ///   both sides are finite, else unbounded.
 ///
+/// - `reverse()`/`sort()`: a PERMUTATION of the positions, which this
+///   shape records as the identity — see the arm's own comment.
+///
 /// Every other method name declines (`None`) — this receiver shape has
-/// no concrete slot to `pop`/`insert`/`sort` against, and `add`/
-/// `discard`/`remove`/`clear` have no way to test or drop one member of
-/// a window that states no items, only a shape.
+/// no concrete slot to `pop`/`insert` against, and `discard`/`remove`/
+/// `clear` have no way to test or drop one member of a window that
+/// states no items, only a shape.
 pub(super) fn set_mutated_receiver(method: &str, receiver: &AbstractValue, arguments: &[AbstractValue]) -> Option<(AbstractValue, AbstractValue)> {
     if receiver.set_kind_tag != SetKindTag::None {
         return None;
@@ -211,6 +245,23 @@ pub(super) fn set_mutated_receiver(method: &str, receiver: &AbstractValue, argum
                 repetition_receiver(receiver, element_set, window.lo + 1, hi, grade),
                 null_value(),
             ))
+        }
+        "add" => {
+            let [element] = arguments else { return None };
+            let element_set = joined_element_set(window.element.clone(), element, grade)?;
+            let hi = window.hi.map(|h| h + 1);
+            let mut widened = repetition_receiver(receiver, element_set, window.lo + 1, hi, grade);
+            widened.keys = receiver.keys.clone();
+            if let Some(recorded) = known_dict_key(element) {
+                if !widened.keys.iter().any(|entry| entry.name == recorded.name && entry.numeric == recorded.numeric) {
+                    widened.keys.push(ObjectKey {
+                        name: recorded.name,
+                        numeric: recorded.numeric,
+                        value: null_value(),
+                    });
+                }
+            }
+            Some((widened, null_value()))
         }
         "extend" => {
             let [iterable] = arguments else { return None };
@@ -234,6 +285,22 @@ pub(super) fn set_mutated_receiver(method: &str, receiver: &AbstractValue, argum
                 null_value(),
             ))
         }
+        // `list.reverse()` "reverses the items of *s* in place" and
+        // `list.sort()` "sorts the items of *s* in place"
+        // (stdtypes.rst's Mutable-Sequence-Types table). Both PERMUTE the
+        // positions and change nothing else: no item is added, removed,
+        // or replaced, so the receiver's own element set and its count
+        // window both come back exactly as they were. A repetition window
+        // states nothing about WHICH position holds which value anyway —
+        // every position draws from the same element set — so a
+        // permutation is the identity on this shape.
+        //
+        // Answering it rather than declining is what keeps a `list[X]`
+        // parameter READABLE past the call: a decline forgets the
+        // receiver's binding entirely, and every later read of the name
+        // lands undetermined (A7.xfer.fill's own `reverse_in_place`,
+        // whose `return lst` follows `lst.reverse()` directly).
+        "reverse" | "sort" if arguments.is_empty() => Some((receiver.clone(), null_value())),
         _ => None,
     }
 }

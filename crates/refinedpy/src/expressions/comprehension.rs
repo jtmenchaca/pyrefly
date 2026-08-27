@@ -66,7 +66,82 @@ pub(super) fn evaluate_list_or_set_comp(
     if let Some(star) = comprehension_star_elements(element_expr, generators, environment, kernel) {
         return star;
     }
+    if let Some(window) = comprehension_undecided_filter_window(element_expr, generators, environment, kernel) {
+        return window;
+    }
     unknown()
+}
+
+/// A comprehension over a KNOWN-LENGTH list whose own `if` filter this
+/// file cannot decide per element — `[x for x in lst if x > 4]` where
+/// `lst: tuple[int, int, int, int, int]` seeds five slots each holding
+/// the unbounded `int` ray, so `x > 4` is neither provably true nor
+/// provably false at any one slot and `comprehension_elements` declined
+/// the whole walk.
+///
+/// The concrete path is right to decline: it states an exact positional
+/// list, and WHICH positions survive is genuinely unknown. But the two
+/// facts a repetition window states are not unknown at all, and they are
+/// the same two the star path already states for an unread source:
+///
+/// - Every surviving element is drawn from the join of the source's own
+///   slots, narrowed by the filter — a filter can only ever remove
+///   positions, never admit a value the source did not already hold
+///   (`comprehension_star_elements`' own soundness note states this law).
+/// - The COUNT is between `0` and the source's own length: a filter
+///   drops positions down to none at worst, and keeps them all at best
+///   (expressions.rst, "Displays for lists, sets and dictionaries" — the
+///   comprehension evaluates `elt` once per surviving element, so it
+///   never produces more elements than the source has).
+///
+/// So the answer is the repetition window over the mapped element,
+/// `[0, len(source)]` — A7.xfer.filter's own `filtered_length_is_
+/// unbounded` claim, which needs `len(above)` to read `[0, 5]` and
+/// refuse the declared `Literal[5]` rather than sit undetermined.
+///
+/// `None` when there is no filter at all (an unfiltered comprehension
+/// over a known list is fully concrete and `comprehension_elements`
+/// already answered it), when the shape is outside the single-clause
+/// form, or when the mapped element does not itself name a set to
+/// re-window over — the caller's own decline stands unchanged.
+fn comprehension_undecided_filter_window(
+    element_expr: &Expr,
+    generators: &[ruff_python_ast::Comprehension],
+    environment: &Environment,
+    kernel: &Arc<RefinedTSKernel>,
+) -> Option<AbstractValue> {
+    let (target_names, conditions, source_elements) =
+        comprehension_target_and_elements(generators, environment, kernel)?;
+    if conditions.is_empty() {
+        return None;
+    }
+    let source_length = source_elements.len() as i64;
+    let mut element: Option<AbstractValue> = None;
+    for slot in source_elements {
+        element = Some(match element {
+            None => slot,
+            Some(so_far) => refined_domain::lattice_operations::join_known(so_far, slot),
+        });
+    }
+    let element = element?;
+    let mut fork = environment.fork();
+    if !bind_comprehension_target(&mut fork, &target_names, &element) {
+        return None;
+    }
+    // the same narrowing channel the star path folds its own filters
+    // through — a condition this channel does not recognize narrows
+    // nothing, leaving the element exactly as wide as the source's join
+    for condition in conditions {
+        fork = narrowing::assume(condition, fork, kernel, true);
+    }
+    let mapped = evaluate_expression(element_expr, &fork, kernel);
+    if mapped.kind != Kind::Set {
+        return None;
+    }
+    Some(AbstractValue {
+        kind_tag: mapped.kind_tag,
+        ..known_set(repetition(mapped.set.clone(), 0, Some(source_length)), None, TrustSpec, SetKindTag::None)
+    })
 }
 
 /// `{key: value for target in iterable if cond ...}` — the same

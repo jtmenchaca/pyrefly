@@ -27,7 +27,7 @@ mod generator;
 #[cfg(test)]
 mod tests;
 
-pub use construction::{class_object_value, judge_construction, ConstructionVerdict};
+pub use construction::{class_object_value, judge_construction, ConstructionKind, ConstructionVerdict};
 pub use fields::{
     field_read, field_read_through_model, field_write, field_write_judgment, self_attribute_name,
 };

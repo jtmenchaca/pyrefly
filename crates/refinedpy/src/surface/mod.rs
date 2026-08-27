@@ -23,4 +23,5 @@ pub use annotated_set::annotated_expression_set;
 pub use imports::{surface_imports, SurfaceImports};
 pub use literals::literal_number;
 pub use strict_int::strict_int_alias_names;
+pub use temporal::bare_temporal_annotation;
 pub use temporal::temporal_inline_annotation;

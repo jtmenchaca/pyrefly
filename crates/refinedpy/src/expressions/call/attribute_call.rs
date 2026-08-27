@@ -8,13 +8,23 @@ use std::sync::Arc;
 use refined_domain::abstract_value::known_values;
 use refined_domain::abstract_value::null_value;
 use refined_domain::abstract_value::opaque_value;
+use refined_domain::abstract_value::possibly_absent;
 use refined_domain::abstract_value::unknown;
+use refined_domain::abstract_value::AbsentFlavor;
+use refined_domain::abstract_value::known_set;
 use refined_domain::abstract_value::AbstractValue;
 use refined_domain::abstract_value::Kind;
 use refined_domain::abstract_value::PrimitiveKind;
+use refined_domain::abstract_value::SetKindTag;
+use refined_domain::trust_grades::trust_level_of;
 use refined_domain::trust_grades::TrustProved;
+use refined_domain::trust_grades::TrustSpec;
 use refined_kernel::kernel_interface::RefinedTSKernel;
+use refined_sets::codepoint_sets::strings;
+use refined_sets::repetition_window_forms::as_repetition;
+use refined_sets::repetition_window_forms::repetition;
 use ruff_python_ast::Expr;
+use ruff_text_size::Ranged;
 use ruff_text_size::TextRange;
 
 use crate::assignability;
@@ -40,6 +50,8 @@ use super::super::datetime::date_isoweekday_value;
 use super::super::datetime::date_toordinal_value;
 use super::super::datetime::date_weekday_value;
 use super::super::datetime::datetime_timestamp_value;
+use super::super::datetime::datetime_utcoffset_value;
+use super::super::datetime::temporal_flow_utcoffset_value;
 use super::super::datetime::strftime_iso_date_value;
 use super::super::datetime::strptime2_parse;
 use super::super::datetime::strptime2_scan_format;
@@ -185,6 +197,129 @@ pub(in super::super) fn evaluate_attribute_call(
     environment: &Environment,
     kernel: &Arc<RefinedTSKernel>,
 ) -> AbstractValue {
+    // `<ClassName>.model_validate({...}).field` — the SAME pydantic parse
+    // surface `check/calls/construction.rs::construction_call_verdict`
+    // reads at a STATEMENT SINK (`AgeModel.model_validate({...})` alone,
+    // the whole RHS), reached here instead because the call is wrapped in
+    // an outer attribute read (`.value`) — the whole expression is then
+    // `Expr::Attribute`, never itself the `Expr::Call` that dispatcher's
+    // own gate requires, so it falls through `evaluate_expression`'s
+    // ordinary `Expr::Call` arm to THIS function. `judge_construction`
+    // (`instances::judge_construction`) is the identical proof either
+    // route reaches: a field with no declared refinement keeps its
+    // argument's own value, a field that judges Undetermined against its
+    // declared refinement (`assignability::judge`) answers the DECLARED
+    // set instead (never the raw unread value) — so `AgeModel.model_
+    // validate({"value": parsed}).value` reads `parsed`'s own `Any`
+    // sort as `Age`'s declared window once the field judgment resolves
+    // it, the schema parse standing in as the proof
+    // `A5.edge.json`'s own `json_loaded_inside` claim rests on. Every
+    // keyword row anchors at THIS call's own range (`attribute.range()`)
+    // — the per-value ranges the AST-reading `dict_literal_keyword_rows`
+    // carries are gone once the dict argument arrives here already
+    // evaluated to a `Kind::Object`, and this function has no findings
+    // channel to report a fire through regardless (an ordinary
+    // expression-value read, never a sink); a field's own out-of-set
+    // argument still surfaces at the field's LATER sink (the return, the
+    // assignment) reading the constructed instance. Recognized ONLY for
+    // a `Kind::Object` single argument (the dict literal's own evaluated
+    // shape — `dict_literal_keyword_rows`'s AST-reading twin requires a
+    // `Dict` display too) whose receiver names a class in
+    // `environment.classes()`/`context`'s table — any other receiver or
+    // argument shape falls through to the ordinary dispatch below,
+    // unchanged.
+    if attribute.attr.as_str() == "model_validate" {
+        if let Expr::Name(class_name) = attribute.value.as_ref() {
+            let is_own_class_object = match environment.read(class_name.id.as_str()) {
+                None => true,
+                Some(bound) => bound.kind == Kind::Object && bound.source == class_name.id.as_str(),
+            };
+            if is_own_class_object {
+                if let Some(model) = environment.classes().and_then(|classes| classes.get(class_name.id.as_str())) {
+                    if let [dict_argument] = arguments {
+                        if dict_argument.kind == Kind::Object {
+                            let range = attribute.range();
+                            let keyword: Vec<(String, AbstractValue, TextRange)> = dict_argument
+                                .keys
+                                .iter()
+                                .filter(|key| !key.numeric)
+                                .map(|key| (key.name.clone(), key.value.clone(), range))
+                                .collect();
+                            let verdict = instances::judge_construction(
+                                model,
+                                &[],
+                                &keyword,
+                                instances::ConstructionKind::ValidatingParse,
+                                kernel,
+                            );
+                            return verdict.instance;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // `itertools.chain.from_iterable(<iterable of iterables>)` —
+    // "Alternate constructor for chain. Gets chained inputs from a
+    // single iterable argument", equivalent to `for iterable in
+    // iterables: yield from iterable` (library/itertools.rst,
+    // `chain.from_iterable`). One level of flattening, in order: a
+    // known `Kind::List` whose every item is itself a known
+    // `Kind::List` answers the concatenation of those items. Any
+    // other argument shape (an unread outer sequence, an inner element
+    // that is not a known list) declines — the receiver chain is
+    // matched as `<name>.chain` so a rebound `itertools` name, or a
+    // `chain` reached through any other spelling, never reads here.
+    if attribute.attr.as_str() == "from_iterable" {
+        if let Expr::Attribute(chain_attribute) = attribute.value.as_ref() {
+            if chain_attribute.attr.as_str() == "chain" {
+                if let Expr::Name(module_name) = chain_attribute.value.as_ref() {
+                    if module_name.id.as_str() == "itertools" && environment.read("itertools").is_none() {
+                        if let [outer] = arguments {
+                            if outer.kind == Kind::List {
+                                let mut flattened: Vec<AbstractValue> = Vec::new();
+                                let mut every_inner_known = true;
+                                for inner in &outer.items {
+                                    if inner.kind != Kind::List {
+                                        every_inner_known = false;
+                                        break;
+                                    }
+                                    flattened.extend(inner.items.iter().cloned());
+                                }
+                                if every_inner_known {
+                                    return collection_models::list_literal_value(&flattened);
+                                }
+                            }
+                            // The ABSTRACT shape: an unread outer sequence
+                            // whose own element set is itself a sequence
+                            // (a `list[list[int]]` parameter seeds as a
+                            // star whose element is a star). Flattening
+                            // draws every element of the result from that
+                            // INNER element set, and the result's own
+                            // length is unstated — the outer count times
+                            // each inner count, neither of which is known
+                            // — so the answer is a bare star over the
+                            // inner element, the same shape
+                            // `repetition_window_element_pass` reads back.
+                            if outer.kind == Kind::Set && outer.set_kind_tag == SetKindTag::None {
+                                if let Some(outer_repetition) = as_repetition(&outer.set) {
+                                    if let Some(inner_repetition) = as_repetition(&outer_repetition.element) {
+                                        return known_set(
+                                            repetition(inner_repetition.element, 0, None),
+                                            None,
+                                            trust_level_of(outer),
+                                            SetKindTag::None,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        return unknown();
+                    }
+                }
+            }
+        }
+    }
     if let Expr::Name(module_name) = attribute.value.as_ref() {
         if module_name.id.as_str() == "math" && environment.read("math").is_none() {
             if let Some(value) = math_models::math_call_result(attribute.attr.as_str(), arguments, kernel) {
@@ -228,17 +363,31 @@ pub(in super::super) fn evaluate_attribute_call(
             if attribute.attr.as_str() == "compile" {
                 return opaque_value("a compiled pattern");
             }
-            // `re.match(pattern, string)` — library/re.html: "Return a
-            // corresponding match object" (or None on no match). This
-            // file cannot decide WHICH of the two outcomes a real regex
-            // engine would reach (no pattern-matching engine is
-            // modeled), so it answers the match-object sort ONLY, never
-            // the None-on-no-match alternative — an honest over-
-            // approximation of "some value came back," matching the
-            // fixture row's own sort-mismatch framing
-            // (c-reads-and-values.py's `string_match`).
+            // `re.match(pattern, string)` — library/re.html: "If zero or
+            // more characters at the beginning of string match the
+            // regular expression pattern, return a corresponding match
+            // object. Return None if the string does not match the
+            // pattern." This file cannot decide WHICH of the two outcomes
+            // a real regex engine would reach (no pattern-matching engine
+            // is modeled), so the answer admits BOTH: the match-object
+            // side (`string_models::match_object_value`'s own readable-
+            // groups object for a known exact-string pattern, falling
+            // back to the bare opaque match sort for a pattern this file
+            // cannot compile a grammar for) wrapped in the maybe carrier
+            // alongside the exact `None` CPython's own no-match return
+            // documents — `Match | None`, never the match-only claim a
+            // caller could read `.group()` off unguarded
+            // (A5.seed.library's own `re_match_outside` row).
             if attribute.attr.as_str() == "match" {
-                return opaque_value("a match object");
+                let match_side = if let [pattern, _subject] = arguments {
+                    exact_string_values(pattern)
+                        .and_then(code_points_to_string)
+                        .and_then(|text| string_models::match_object_value(&text))
+                        .unwrap_or_else(|| opaque_value("a match object"))
+                } else {
+                    opaque_value("a match object")
+                };
+                return possibly_absent(match_side, AbsentFlavor::NullOnly, Some(TrustSpec), false);
             }
             // `re.search(pattern, string)` — library/re.html, `function::
             // search(pattern, string, flags=0)`: "Scan through string
@@ -473,7 +622,8 @@ pub(in super::super) fn evaluate_attribute_call(
             }
         }
         // `time.time()` / `os.open(path, flags)` / `os.close(fd)` /
-        // `unicodedata.normalize(form, s)` — `builtin_models::
+        // `unicodedata.normalize(form, s)` / `dict.fromkeys(...)` /
+        // `struct.unpack(format, buffer)` — `builtin_models::
         // stdlib_call_result`'s own doc states each row's citation.
         if module_name.id.as_str() == "time" && environment.read("time").is_none() {
             if let Some(value) = builtin_models::stdlib_call_result("time", attribute.attr.as_str(), arguments) {
@@ -492,6 +642,29 @@ pub(in super::super) fn evaluate_attribute_call(
         }
         if module_name.id.as_str() == "dict" && environment.read("dict").is_none() {
             if let Some(value) = builtin_models::stdlib_call_result("dict", attribute.attr.as_str(), arguments) {
+                return value;
+            }
+        }
+        // `struct.unpack(format, buffer)` — `builtin_models::
+        // struct_call_result`'s own doc (library/struct.rst): the
+        // dispatcher already carried this row, and this is the call site
+        // that reaches it, so A7.xfer.typed's own
+        // `struct_unpack_big_endian_designated` reads `(value,) =
+        // struct.unpack(">I", b"\x00\x00\x01\x00")` as the exact `{256}`
+        // rather than leaving `value` with no reading.
+        if module_name.id.as_str() == "struct" && environment.read("struct").is_none() {
+            if let Some(value) = builtin_models::stdlib_call_result("struct", attribute.attr.as_str(), arguments) {
+                return value;
+            }
+        }
+        // `copy.copy(x)` / `copy.deepcopy(x)` — `builtin_models::
+        // copy_call_result`'s own doc (library/copy.rst): the copy holds
+        // the same values the original held, under a fresh referent
+        // identity for a container. A8.xfer.clone's own rows read
+        // `cloned["a"]` as the stored value through this row, rather than
+        // the `cloned` binding deriving nothing at all.
+        if module_name.id.as_str() == "copy" && environment.read("copy").is_none() {
+            if let Some(value) = builtin_models::stdlib_call_result("copy", attribute.attr.as_str(), arguments) {
                 return value;
             }
         }
@@ -593,7 +766,48 @@ pub(in super::super) fn evaluate_attribute_call(
         }
         return unknown();
     }
-    let receiver = evaluate_expression(&attribute.value, environment, kernel);
+    let mut receiver = evaluate_expression(&attribute.value, environment, kernel);
+    // A POSSIBLY-ABSENT receiver (`re.match(...)`'s own `Match | None`,
+    // an `Optional[X]` parameter) dispatches on its PRESENT side. An
+    // attribute reference "either returns a value or raises
+    // `AttributeError`" (reference/expressions.rst, "Attribute
+    // references"), so the absent arm contributes no value to this call
+    // — what flows onward is exactly what the present arm's own method
+    // answers. The absence itself is already reported, at this same
+    // call's range, by `possible_raise`'s own
+    // `absent_receiver_possible_raise` row; the finding and the value
+    // both stand, the same split `split_divisor_transfer` keeps for a
+    // sometimes-zero divisor.
+    if receiver.kind == Kind::PossiblyUndefined {
+        let Some(present) = receiver.inner.clone() else {
+            return unknown();
+        };
+        receiver = *present;
+    }
+    // A FILE OBJECT's own text reads (`open(path)`'s result —
+    // `builtin_models::FILE_OBJECT_WORD`). `read()` and `readline()` both
+    // "Read and return" text from the stream (library/io.rst,
+    // `TextIOBase.read` / `IOBase.readline`), whose content comes from
+    // outside the program, so each answers the whole-strings ground Σ* —
+    // the same honest answer `input()` already gives a line typed at the
+    // terminal. `readlines()` "Read and return a list of lines", a
+    // sequence of those same strings, so it answers the unbounded
+    // repetition over Σ*. Every other file method is unmodeled and falls
+    // through to the ordinary dispatch below.
+    if receiver.kind_word == Some(builtin_models::FILE_OBJECT_WORD) && arguments.is_empty() {
+        match attribute.attr.as_str() {
+            "read" | "readline" => {
+                return AbstractValue {
+                    kind_tag: Some(PrimitiveKind::String),
+                    ..known_set(strings(), None, TrustSpec, SetKindTag::None)
+                };
+            }
+            "readlines" => {
+                return known_set(repetition(strings(), 0, None), None, TrustSpec, SetKindTag::None);
+            }
+            _ => {}
+        }
+    }
     // A tagged `datetime_datetime` instance's own METHODS —
     // `.timestamp()` (exact, aware-UTC-only, `datetime_timestamp_value`'s
     // own doc) and `.isoformat()` (exact — the kernel's `isoDateText`
@@ -602,6 +816,12 @@ pub(in super::super) fn evaluate_attribute_call(
     if receiver.kind == Kind::Object && receiver.source == "datetime_datetime" {
         if attribute.attr.as_str() == "timestamp" && arguments.is_empty() {
             return match datetime_timestamp_value(&receiver, kernel) {
+                Some(value) => value,
+                None => unknown(),
+            };
+        }
+        if attribute.attr.as_str() == "utcoffset" && arguments.is_empty() {
+            return match datetime_utcoffset_value(&receiver, kernel) {
                 Some(value) => value,
                 None => unknown(),
             };
@@ -685,6 +905,17 @@ pub(in super::super) fn evaluate_attribute_call(
             return unknown();
         }
     }
+    // A `temporal_flow`-tagged Instant-window PARAMETER's own
+    // `.utcoffset()` — the bare `d: datetime` shape `check::seed_
+    // parameters` seeds, carrying no exact instant and no awareness bit
+    // to read. See `temporal_flow_utcoffset_value`'s own doc for the
+    // full `Some(timedelta) | None` claim this reader states.
+    if receiver.kind == Kind::Object && receiver.source == "temporal_flow" && attribute.attr.as_str() == "utcoffset" && arguments.is_empty() {
+        if let Some(value) = temporal_flow_utcoffset_value(&receiver) {
+            return value;
+        }
+        return unknown();
+    }
     let receiver_is_exact_string = exact_string_values(&receiver).is_some();
     if receiver_is_exact_string {
         if let Some(value) = string_models::string_method_result(attribute.attr.as_str(), &receiver, arguments) {
@@ -731,15 +962,26 @@ pub(in super::super) fn evaluate_attribute_call(
     }
     // `dict[str, X]` PARAMETER'S own unbounded-key receiver
     // (`Kind::ObjectStar` — `check.rs::seed_parameters`'
-    // `dict_star_value_seed`/`known_dict_star`): `.get(key)` is the ONE
-    // method this shape answers (`collection_models::dict_get_result`'s
-    // own dict-star arm) — checked ahead of, and separately from, the
-    // `Kind::Object` block below, since `.setdefault`/the dict-view
-    // methods that block also handles all assume a CLOSED receiver
-    // (`mutated_receiver`/`dict_with_item`/`dict_view_method_result`
-    // all read `container.keys` directly) and must never see an
-    // unbounded-key receiver.
-    if receiver.kind == Kind::ObjectStar && attribute.attr.as_str() == "get" {
+    // `dict_star_value_seed`/`known_dict_star`): `.get(key)` and
+    // `.setdefault(key, default)` are the methods answered on this VALUE
+    // path (`collection_models::dict_get_result`'s own dict-star arm) —
+    // checked ahead of, and separately from, the `Kind::Object` block
+    // below, whose dict-view rows read `container.keys` as a CLOSED key
+    // set and must never see an unbounded-key receiver.
+    //
+    // `setdefault` reads through the SAME `dict_get_result` its
+    // `Kind::Object` twin below does, and for the same reason: "If key
+    // is in the dictionary, return its value. If not, insert key with a
+    // value of default and return default" (stdtypes.rst, dict's
+    // method:: setdefault) makes the VALUE half identical to
+    // `get(key, default)`'s own present-wins-over-default row. Over a
+    // star the answer is the join of the star's own value law with the
+    // default — either could be what comes back, and both are inside
+    // the declaration. The receiver's own write is the statement-level
+    // sink's business (`mutated_receiver`'s `Kind::ObjectStar` arm); a
+    // nested read like `return d.setdefault(k, default)` only ever
+    // needs the answered value, and without this arm it derived none.
+    if receiver.kind == Kind::ObjectStar && matches!(attribute.attr.as_str(), "get" | "setdefault") {
         let key = arguments.first();
         let default = arguments.get(1);
         if let Some(key) = key {
@@ -765,6 +1007,34 @@ pub(in super::super) fn evaluate_attribute_call(
             if let Some(value) = string_models::matched_group_grammar(&receiver, arguments) {
                 return value;
             }
+        }
+        // `<model>.model_dump()` — pydantic's own BaseModel API doc
+        // ("model_dump: Generate a dictionary representation of the
+        // model"): the zero-argument form answers the model's own FIELDS
+        // as a dict, keyed by field name. A constructed model instance
+        // already carries exactly those fields as its `ObjectKey` entries
+        // (`instances::judge_construction`'s own doc), the same shape a
+        // dict takes, so the dump is those entries as a plain dict — with
+        // the `instance_identity` DROPPED, since the dumped dictionary is
+        // a new object rather than the model itself, the same distinction
+        // `vars(o)` keeps (`builtin_models::vars_call`'s own doc).
+        //
+        // That is what A8.edge.json's and A8.seed.boundary's own rows
+        // need: `len(payload.model_dump())` reads the model's exact field
+        // count — `{a, b}` is 2 — rather than the call deriving nothing.
+        //
+        // The keyword forms (`mode=`, `include=`, `exclude=`,
+        // `exclude_none=` …) each change WHICH fields appear, so only the
+        // bare zero-argument call is answered here; the call-site keyword
+        // guard already declines a call carrying any keyword argument.
+        if attribute.attr.as_str() == "model_dump" && arguments.is_empty() && receiver.instance_identity.is_some() {
+            return refined_domain::known_constructors::known_object(
+                receiver.keys.clone(),
+                None,
+                true,
+                refined_domain::trust_grades::trust_level_of(&receiver),
+                false,
+            );
         }
         // `<bytes-like>.decode()` — library/stdtypes.html#bytes.decode,
         // the zero-argument default-encoding form — on a

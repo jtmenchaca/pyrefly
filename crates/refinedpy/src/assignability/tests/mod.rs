@@ -21,6 +21,7 @@ use refined_sets::refinement_forms::integer;
 use refined_sets::refinement_forms::make_refined_set;
 
 use crate::typereading::DeclaredRefinement;
+use crate::typereading::TypedDictMember;
 
 use super::*;
 
@@ -338,7 +339,11 @@ pub(super) fn ratings_sequence_value(lo: f64, hi: f64) -> AbstractValue {
 /// `PersonDict`'s own `age: Age` member table — the `members`-carrying
 /// declaration h-object-literal-members.py's `dict_return_member`
 /// needs, `age` set to the same `age_refinement` every other test in
-/// this file shares.
+/// this file shares. `age` is REQUIRED: `class PersonDict(TypedDict):
+/// age: Age` states no `total=` keyword and no `NotRequired[...]`
+/// marker, and library/typing.rst's `TypedDict` makes every such member
+/// required ("``True`` is the default, and makes all items defined in
+/// the class body required").
 pub(super) fn person_dict_refinement() -> DeclaredRefinement {
     DeclaredRefinement {
         temporal: None,
@@ -349,7 +354,11 @@ pub(super) fn person_dict_refinement() -> DeclaredRefinement {
         element: None,
         element_length: None,
         generator: None,
-        members: Some(vec![("age".to_owned(), age_refinement())]),
+        members: Some(vec![TypedDictMember {
+            name: "age".to_owned(),
+            required: true,
+            declared: age_refinement(),
+        }]),
         positions: None,
     }
 }

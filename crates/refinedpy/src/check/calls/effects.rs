@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use ruff_text_size::Ranged;
 use ruff_python_ast::Expr;
 
-use crate::check::{judge_and_bind, Finding, WalkContext};
+use crate::check::{body_may_write_through_parameter, judge_and_bind, Finding, WalkContext};
 use crate::env::Environment;
 use crate::expressions::evaluate_expression;
 use crate::summaries;
@@ -35,7 +35,12 @@ use crate::typereading::DeclaredRefinement;
 /// same-module def, a def `call_effects` itself declines — the depth
 /// cap, an unsupported parameter shape, or a body statement the
 /// restricted interpreter does not read), so the caller falls through
-/// to its own existing dispatch order unchanged.
+/// to its own existing dispatch order unchanged. The STALE-ARGUMENT drop
+/// below (a positional argument's recorded star entries, dropped when
+/// the resolved def's body may write through the matched parameter)
+/// runs once `def` itself resolves, regardless of whether `call_effects`
+/// goes on to decline — a mutation already applied to `environment` is
+/// never undone by this function's own later `None` return.
 pub(in crate::check) fn apply_call_effects(
     expr: &Expr,
     context: &WalkContext,
@@ -75,6 +80,32 @@ pub(in crate::check) fn apply_call_effects(
     let def = functions.def(callee_name.id.as_str())?;
     let arguments: Vec<refined_domain::abstract_value::AbstractValue> =
         call.arguments.args.iter().map(|arg| evaluate_expression(arg, environment, context.kernel)).collect();
+    // STALE-RECEIVER SOUNDNESS FOR A GUARD'S RECORDED ENTRIES
+    // (`Environment::forget_recorded_star_entries`'s own doc): a
+    // positional argument that is a bare Name bound to `d`'s matched
+    // parameter is handed to THIS callee's body — if that body may write
+    // through the parameter (`body_may_write_through_parameter`, any
+    // subscript/attribute store/delete or method call on it), the
+    // argument's own recorded presence facts go stale the moment the
+    // callee runs, since the write can happen BEFORE `call_effects`'s own
+    // (unrelated, enclosing-scope-only) effect list is computed below.
+    // Dropped before `call_effects` runs, not after, so this holds
+    // whether or not that channel itself matches this callee at all.
+    let positional_parameters: Vec<&str> = def
+        .parameters
+        .posonlyargs
+        .iter()
+        .chain(def.parameters.args.iter())
+        .map(|parameter| parameter.parameter.name.id.as_str())
+        .collect();
+    for (parameter_name, arg) in positional_parameters.iter().zip(call.arguments.args.iter()) {
+        let Expr::Name(argument_name) = arg else {
+            continue;
+        };
+        if body_may_write_through_parameter(&def.body, parameter_name) {
+            environment.forget_recorded_star_entries(argument_name.id.as_str());
+        }
+    }
     let (_value, effects) = summaries::call_effects(def, &arguments, Some(&functions), context.kernel, environment.call_depth(), environment)?;
     for (name, effect_value) in effects {
         match aug_assign_refinements.get(name.as_str()) {

@@ -4,6 +4,8 @@
 
 use std::collections::HashSet;
 
+use refined_domain::abstract_value::unknown;
+use refined_domain::lattice_operations::join_known;
 use ruff_python_ast::{ExceptHandler, Expr, Stmt};
 
 use crate::env::Environment;
@@ -71,6 +73,46 @@ pub(in crate::check) fn forget_names_bound_by_stmt(stmt: &Stmt, environment: &mu
     }
     for name in &bound {
         environment.forget(name);
+    }
+}
+
+/// The HANDLER-FORK rule for one statement of a `try` body: a name the
+/// statement binds keeps its slot in the handler's environment, holding
+/// the JOIN of its pre-try value with unknown, when the name was already
+/// bound BEFORE the try; a name this statement binds for the FIRST time
+/// is forgotten outright.
+///
+/// The two cases differ in what the handler can actually observe. An
+/// exception may interrupt the try body at any point
+/// (compound_stmts.rst, "The `try` statement"), so the handler may run
+/// before the statement's write happened at all — the name then still
+/// holds its pre-try value — or after it, holding something the write
+/// produced, which this walk does not track per interruption point. The
+/// join of those two states is the sound answer, and it keeps the name
+/// BOUND, which is the difference from a forget: a read in the handler
+/// finds a slot rather than an unbound name. A name FIRST bound inside
+/// the try body has no pre-try value to join with; the handler may run
+/// before it binds at all, so it stays forgotten (zero-iterations
+/// semantics — the same reasoning a loop's own zero-pass arm takes).
+pub(in crate::check) fn join_pre_try_with_havoc_for_stmt(
+    stmt: &Stmt,
+    pre_try: &Environment,
+    handler_env: &mut Environment,
+) {
+    let mut bound = HashSet::new();
+    let mut excluded = HashSet::new();
+    super::collect_bound_names_stmt(stmt, &mut bound, &mut excluded);
+    for name in &excluded {
+        bound.remove(name);
+    }
+    for name in &bound {
+        match pre_try.read(name) {
+            Some(before) => {
+                let joined = join_known(before.clone(), unknown());
+                handler_env.bind(name, joined);
+            }
+            None => handler_env.forget(name),
+        }
     }
 }
 

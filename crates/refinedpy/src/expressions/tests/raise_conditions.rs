@@ -61,6 +61,20 @@ fn test_provable_raise_absent_dict_key() {
 }
 
 #[test]
+fn test_provable_raise_absent_int_dict_key() {
+    // the key reader this row shares with the construction side covers
+    // every key sort that can build an entry, not exact strings alone
+    let Some(found) = provable_raise_of("{15: 1}[16]") else {
+        if loaded_kernel().is_none() {
+            return;
+        }
+        panic!("a missing int dict key must provably raise");
+    };
+    assert!(found.1.contains("KeyError"), "{}", found.1);
+    assert!(found.1.contains("16"), "{}", found.1);
+}
+
+#[test]
 fn test_provable_raise_int_of_unparseable_string() {
     let Some(found) = provable_raise_of("int(\"xyz\")") else {
         if loaded_kernel().is_none() {

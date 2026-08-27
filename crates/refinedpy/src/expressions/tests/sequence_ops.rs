@@ -1,5 +1,88 @@
 use super::*;
 
+use crate::expressions::sequence_ops::list_repetition_sort_only;
+use crate::expressions::sequence_ops::sequence_window_concatenation;
+
+/// One unknown-length numeric sequence — the shape a declared
+/// `list[int]` parameter seeds (`check/seed.rs`'s own sequence arm).
+fn numeric_window(lo: i64, hi: Option<i64>) -> AbstractValue {
+    AbstractValue {
+        kind_tag: Some(PrimitiveKind::Integer),
+        ..refined_domain::abstract_value::known_set(
+            refined_sets::repetition_window_forms::repetition(make_refined_set(vec![integer(), at_least(0.0)]), lo, hi),
+            None,
+            refined_domain::trust_grades::TrustSpec,
+            refined_domain::abstract_value::SetKindTag::None,
+        )
+    }
+}
+
+/// `a + b` over two unknown-length sequences — stdtypes.rst's `s + t`
+/// row. The element set unions (concatenation introduces no value
+/// neither side held) and the lengths sum.
+#[test]
+fn test_two_unknown_length_sequences_concatenate_to_the_union_at_the_summed_length() {
+    let joined = sequence_window_concatenation(&numeric_window(2, Some(3)), &numeric_window(1, Some(4)))
+        .expect("two repetition windows concatenate");
+    let window = refined_sets::repetition_window_forms::as_repetition(&joined.set).expect("a repetition window");
+    assert_eq!(window.lo, 3, "the minimum lengths add");
+    assert_eq!(window.hi, Some(7), "the maximum lengths add");
+}
+
+/// A `list[int]` seed carries the ELEMENT's numeric sort on the OUTER
+/// sequence value (`check::seed::seed_parameters`' sequence arm), so a
+/// tag read alone would take it for a number. `transferable_numeric_
+/// operand` must read the SET's own shape and decline a repetition —
+/// otherwise `a + b` over two such parameters poses an `int.add`
+/// question about two windows and never reaches the concatenation row.
+#[test]
+fn test_a_sequence_window_is_not_a_transferable_numeric_operand() {
+    let window = numeric_window(0, None);
+    assert_eq!(
+        window.kind_tag,
+        Some(PrimitiveKind::Integer),
+        "the seed carries the element's sort, which is what makes the set-shape read necessary"
+    );
+    assert!(
+        transferable_numeric_operand(&window).is_none(),
+        "a repetition window is a sequence, never a numeric transfer operand"
+    );
+}
+
+/// An UNBOUNDED side makes the result unbounded: adding any number of
+/// further elements to an already-unbounded sequence states no ceiling.
+#[test]
+fn test_concatenating_an_unbounded_sequence_states_no_ceiling() {
+    let joined = sequence_window_concatenation(&numeric_window(0, None), &numeric_window(1, Some(4)))
+        .expect("two repetition windows concatenate");
+    let window = refined_sets::repetition_window_forms::as_repetition(&joined.set).expect("a repetition window");
+    assert_eq!(window.hi, None);
+}
+
+/// `[0] * n` with `n` unread — stdtypes.rst's `s * n` row plus note (2)
+/// ("Values of *n* less than ``0`` are treated as ``0``"). Every element
+/// is still exactly `{0}` (repetition only re-references `s`'s own
+/// items), and the count is `[0, +inf)` once `n` is unread.
+#[test]
+fn test_list_repetition_by_an_unread_count_keeps_the_element_and_unbounds_the_length() {
+    let zero = known_values(vec![0.0], PrimitiveKind::Integer, refined_domain::trust_grades::TrustProved);
+    let list = refined_domain::known_constructors::known_list(vec![zero], refined_domain::trust_grades::TrustProved);
+    let count = AbstractValue {
+        kind_tag: Some(PrimitiveKind::Integer),
+        ..refined_domain::abstract_value::known_set(
+            make_refined_set(vec![integer(), at_least(f64::NEG_INFINITY)]),
+            None,
+            refined_domain::trust_grades::TrustSpec,
+            refined_domain::abstract_value::SetKindTag::None,
+        )
+    };
+    let repeated = list_repetition_sort_only(&list, &count).expect("[0] * n models over an unread count");
+    let window = refined_sets::repetition_window_forms::as_repetition(&repeated.set).expect("a repetition window");
+    assert_eq!(window.lo, 0, "note (2) treats a negative n as 0");
+    assert_eq!(window.hi, None, "n itself is unread");
+    assert_eq!(window.element, make_refined_set(vec![one_of(&[0.0])]), "every element is still exactly {{0}}");
+}
+
 // --- set display and set operators/methods ---
 
 #[test]

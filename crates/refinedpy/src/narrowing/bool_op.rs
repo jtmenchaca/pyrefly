@@ -150,7 +150,7 @@ pub(super) fn narrow(condition: &Expr, environment: &mut Environment, kernel: &A
                 return;
             }
             narrow_isinstance_call(call, environment, truth);
-            narrow_regex_module_call(call, environment, truth);
+            narrow_regex_module_call(call, environment, kernel, truth);
             narrow_all_generator_call(call, environment, kernel, truth);
         }
         Expr::Name(_) => narrow_name_truthiness(condition, environment, truth),

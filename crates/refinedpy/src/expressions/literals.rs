@@ -31,7 +31,10 @@ pub(super) fn evaluate_list(list: &ruff_python_ast::ExprList, environment: &Envi
     let Some(elements) = evaluate_display_elements(list.elts.iter(), environment, kernel) else {
         return unknown();
     };
-    collection_models::list_literal_value(&elements)
+    // A container element is one OBJECT the display holds a reference to,
+    // so it carries a referent identity a later shallow copy shares —
+    // `with_referent_identities`' own doc (library/copy.rst).
+    collection_models::list_literal_value(&collection_models::with_referent_identities(elements))
 }
 
 /// `(a, b, c)` — the same element-evaluation and starred-element decline
@@ -42,7 +45,10 @@ pub(super) fn evaluate_tuple(tuple: &ruff_python_ast::ExprTuple, environment: &E
     let Some(elements) = evaluate_display_elements(tuple.elts.iter(), environment, kernel) else {
         return unknown();
     };
-    collection_models::tuple_literal_value(&elements)
+    // A tuple is immutable, but its ITEMS need not be — `([1, 2],)`'s own
+    // inner list is one object a copy of the tuple still shares, exactly
+    // as a list display's is (`with_referent_identities`' own doc).
+    collection_models::tuple_literal_value(&collection_models::with_referent_identities(elements))
 }
 
 /// `{a, b, c}` — a set DISPLAY, evaluated the same way a list display
@@ -178,12 +184,70 @@ pub(super) fn evaluate_dict(dict: &ruff_python_ast::ExprDict, environment: &Envi
 /// `container[index]` — expressions.rst, "Subscriptions." A `Slice`
 /// index (`s[1:3]`) routes through `evaluate_slice` for a known
 /// exact-string OR known list/tuple receiver.
+///
+/// A literal-index read that a guard already narrowed answers from that
+/// PLACE's own fact first (`env::tracked_place_of` spells `v[0]` as a
+/// place; a computed index spells none) — the same one-level-deeper
+/// read `evaluate_attribute_read` already makes for `a.n`. This is what
+/// makes a guard over `v[0]` reach the `v[0]` read inside its branch:
+/// both name the same place, and a write to `v` drops the fact through
+/// the one forget resolver, so the fact stands only while the base is
+/// unwritten between them.
 pub(super) fn evaluate_subscript(subscript: &ruff_python_ast::ExprSubscript, environment: &Environment, kernel: &Arc<RefinedTSKernel>) -> AbstractValue {
+    if let Some(place) = crate::env::tracked_place_of(&Expr::Subscript(subscript.clone())) {
+        if let Some(narrowed) = environment.read_path(&place) {
+            return narrowed.clone();
+        }
+    }
     if let Expr::Slice(slice) = subscript.slice.as_ref() {
         let container = evaluate_expression(&subscript.value, environment, kernel);
         return evaluate_slice(&container, slice, environment, kernel);
     }
     let container = evaluate_expression(&subscript.value, environment, kernel);
+    // A BINDING-KEYED PRESENCE FACT (`narrowing::compare::narrow_dict_
+    // membership_against_literal_key`'s own doc): `key in m` over an
+    // unbounded-key `Kind::ObjectStar` receiver, where `key` is a plain
+    // name, records an `ObjectKey` entry tagged by `key`'s OWN BINDING
+    // IDENTITY rather than by any value `key` states — the shape a
+    // weak-referenceable class-instance key (no `instance_identity` of
+    // its own to read through the ordinary evaluated-index path below)
+    // still needs a guarded `m[key]` to answer. Read here, BEFORE the
+    // index is evaluated to a plain value, by rebuilding the identical
+    // tag from the read's own key EXPRESSION — the same tag the guard
+    // recorded, valid only while `key` (and `m`) stand unwritten between
+    // the guard and this read, which `Environment::bind`'s own binding-
+    // rebind invalidation and the ordinary "a write replaces the whole
+    // receiver" rule together enforce. Declines (falls through to the
+    // ordinary evaluated-index path) for any other receiver kind, any
+    // other key-expression shape, or a binding this receiver recorded no
+    // entry for.
+    if container.kind == Kind::ObjectStar {
+        if let Expr::Name(key_name) = subscript.slice.as_ref() {
+            // The guard records this entry under the GUARD provenance
+            // (`DictKey::guarded`, `narrowing::compare::narrow_dict_
+            // membership_against_literal_key`'s own doc), so the read
+            // rebuilds the identical guarded spelling to find it. A
+            // SUBSCRIPT read (`d[k]`) is still sound to answer from a
+            // guard entry here: `d[k]`/`k in d` consult the same keys,
+            // and this receiver's own recorded entries are dropped the
+            // moment either `d` or `k` is written between the guard and
+            // this read (`Environment::bind`/`forget_recorded_star_
+            // entries`'s own docs) — the honest presence claim the guard
+            // proved still stands exactly while that holds.
+            let tag = collection_models::DictKey::guarded(&collection_models::DictKey::identity(&format!(
+                "binding:{}",
+                key_name.id.as_str()
+            )));
+            if let Some(value) = container
+                .keys
+                .iter()
+                .find(|entry| entry.name == tag.name && entry.numeric == tag.numeric)
+                .map(|entry| entry.value.clone())
+            {
+                return value;
+            }
+        }
+    }
     let index = evaluate_expression(&subscript.slice, environment, kernel);
     match collection_models::subscript_read(&container, &index) {
         Some(value) => value,

@@ -30,6 +30,33 @@ fn type_adapter_validate_python_on_an_alias_judges_the_scalar_argument() {
     assert!(fires[0].message.contains("'200'"), "{}", fires[0].message);
 }
 
+/// THE PARSE-IS-A-GUARD LAW (D3.guard's own row, A8.edge.process's
+/// `parsed_value_validated` shape): an argument that is a WIDER SET
+/// than the alias — a declared `str` parameter's own Σ* against
+/// `Code`'s two-upper-letter pattern — never fires. Some of its
+/// members validate and the rest raise `ValidationError`, which is
+/// the parse doing its job; the call answers `Code`'s own set, so the
+/// enclosing `-> Code` return is a trivial self-match. Only an
+/// EXACTLY-KNOWN out-of-set argument still fires, which the tests
+/// above pin.
+#[test]
+fn type_adapter_validate_python_on_a_wider_set_argument_never_fires() {
+    let Some(kernel) = loaded_kernel() else { return };
+    let module = parsed(concat!(
+        "from typing import Annotated\n",
+        "from pydantic import Field, TypeAdapter\n",
+        "type Code = Annotated[str, Field(pattern=r\"^[A-Z]{2}$\")]\n",
+        "def validated(text: str) -> Code:\n",
+        "    return TypeAdapter(Code).validate_python(text)\n",
+    ));
+    let findings = findings_for_module(&module, &kernel);
+    assert!(
+        findings.is_empty(),
+        "a parse over a wider set is the guard narrowing to Code, never a fire: {:?}",
+        findings.iter().map(|f| (&f.code, &f.message)).collect::<Vec<_>>()
+    );
+}
+
 /// UNIT 3, sites 6 and 7 (`adapter_alias_verdict`'s Fire and
 /// Undetermined arms, both built through the shared
 /// `declared_set_instance`): `Age`'s own declared set is
@@ -324,4 +351,64 @@ fn type_adapter_validate_python_on_a_literal_union_alias_fires_outside_both_arms
         findings.iter().map(|f| &f.message).collect::<Vec<_>>()
     );
     assert!(fires[0].message.contains("'25'"), "{}", fires[0].message);
+}
+
+// --- THE VALIDATING-PARSE LAW (A5.edge.json) ---
+
+/// A5.edge.json's own `json_loaded_inside` shape: `json.loads(text)`
+/// answers the full JSON union (a None arm, a str arm, a list arm, an
+/// unbounded integer arm), and `AgeModel.model_validate({"value":
+/// parsed}).value` reads that through a pydantic parse. The parse
+/// either raises `ValidationError` or answers an instance whose every
+/// field satisfies its declaration, so the field answers `Age`'s own
+/// window and NO error is reported — the union's non-conforming arms
+/// never reach the field.
+#[test]
+fn TestA5_edge_json_AValidatingParseOfAnInexactArgumentCarriesNoError() {
+    let Some(kernel) = loaded_kernel() else { return };
+    let module = parsed(concat!(
+        "import json\n",
+        "from typing import Annotated\n",
+        "from pydantic import BaseModel, Field\n",
+        "type Age = Annotated[int, Field(ge=0, le=150)]\n",
+        "class AgeModel(BaseModel):\n",
+        "    value: Age\n",
+        "def json_loaded_inside(text: str) -> Age:\n",
+        "    parsed = json.loads(text)\n",
+        "    return AgeModel.model_validate({\"value\": parsed}).value\n",
+    ));
+    let findings = findings_for_module(&module, &kernel);
+    assert!(
+        findings.is_empty(),
+        "a validating parse of an inexact argument answers the declared set with no \
+         error: {:?}",
+        findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+    );
+}
+
+/// The law's own boundary: an EXACTLY known out-of-set argument still
+/// judges, so `model_validate({"value": 200})` against `Age`'s [0, 150]
+/// window keeps its provable refusal — the parse law suppresses only
+/// what it cannot pin down, never a value this table reads exactly.
+#[test]
+fn TestA5_edge_json_AValidatingParseOfAnExactOutOfSetArgumentIsRefused() {
+    let Some(kernel) = loaded_kernel() else { return };
+    let module = parsed(concat!(
+        "from typing import Annotated\n",
+        "from pydantic import BaseModel, Field\n",
+        "type Age = Annotated[int, Field(ge=0, le=150)]\n",
+        "class AgeModel(BaseModel):\n",
+        "    value: Age\n",
+        "def exact_outside() -> Age:\n",
+        "    return AgeModel.model_validate({\"value\": 200}).value\n",
+    ));
+    let findings = findings_for_module(&module, &kernel);
+    let fires: Vec<&Finding> = findings.iter().filter(|f| f.code == "RTS7001").collect();
+    assert_eq!(
+        fires.len(),
+        1,
+        "an exactly-known out-of-set argument still refuses at a validating parse: {:?}",
+        findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+    );
+    assert!(fires[0].message.contains("'200'"), "{}", fires[0].message);
 }

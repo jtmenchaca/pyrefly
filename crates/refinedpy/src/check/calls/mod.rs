@@ -11,6 +11,7 @@ mod effects;
 mod manifest;
 mod method_call;
 mod mutation;
+mod parameter_write;
 mod same_module;
 
 pub(in crate::check) use construction::{
@@ -22,6 +23,7 @@ pub(in crate::check) use effects::apply_call_effects;
 pub(in crate::check) use manifest::manifest_call_fires;
 pub(in crate::check) use method_call::{instance_method_call_result, keyword_arguments_by_position};
 pub(in crate::check) use mutation::walk_mutating_call_statement;
+pub(in crate::check) use parameter_write::body_may_write_through_parameter;
 pub(in crate::check) use same_module::{
     callable_variable_call_result, judge_one_call_argument, same_module_call_argument_fires,
     same_module_def_call_result_already_reported,

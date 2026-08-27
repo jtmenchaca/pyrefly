@@ -307,3 +307,87 @@ fn varargs_after_a_plain_parameter_collects_only_the_remaining_arguments() {
         .expect("rest binds to the known (2, 3) tuple");
     assert_eq!(result, known_int(2.0));
 }
+
+// --- A8.edge.process: unpack targets inside a summarized body ---
+
+/// A8.edge.process's own `parse_key_value_lines`, called with an EXACT
+/// payload: `out.splitlines()` states the two lines exactly, each
+/// `line.split("=", 1)` states its two pieces exactly, and the unpack
+/// binds them positionally — so the built dict's key count is the exact
+/// {2} `parsed_key_count` returns.
+#[test]
+fn a_dict_accumulation_loop_over_an_exact_payload_answers_the_exact_key_count() {
+    let Some(kernel) = loaded_kernel() else { return };
+    let def = parsed_def(concat!(
+        "def parse_key_value_lines(out: str) -> int:\n",
+        "    result = {}\n",
+        "    for line in out.splitlines():\n",
+        "        k, v = line.split(\"=\", 1)\n",
+        "        result[k] = v\n",
+        "    return len(result)\n",
+    ));
+    let result = call_result(&def, &[known_string_value("a=1\nb=2")], None, &kernel, 0)
+        .expect("an exact payload walks the loop concretely");
+    assert_eq!(result, known_int(2.0), "two lines, two distinct keys");
+}
+
+/// The same body over an unread payload: the pieces are unread, so the
+/// dict's key set is unnameable and the result is the unbounded-key
+/// shape — its own key COUNT is then a floor, never nothing at all.
+#[test]
+fn a_dict_accumulation_loop_over_an_unread_payload_still_answers_a_count() {
+    let Some(kernel) = loaded_kernel() else { return };
+    let def = parsed_def(concat!(
+        "def parse_key_value_lines(out: str) -> int:\n",
+        "    result = {}\n",
+        "    for line in out.splitlines():\n",
+        "        k, v = line.split(\"=\", 1)\n",
+        "        result[k] = v\n",
+        "    return len(result)\n",
+    ));
+    let unread = AbstractValue {
+        kind_tag: Some(PrimitiveKind::String),
+        ..known_set(refined_sets::codepoint_sets::strings(), None, TrustSpec, SetKindTag::None)
+    };
+    let result =
+        call_result(&def, &[unread], None, &kernel, 0).expect("an unread payload still states a count, never nothing");
+    assert_ne!(result.kind, Kind::Unknown, "the count is a window, not a decline: {result:?}");
+}
+
+// --- A8.seed.library: itertools.groupby inside a summarized body ---
+
+/// A8.seed.library's own `group_by_parity`. itertools.rst's `groupby`
+/// entry pins the two facts read here: the key is the key function's
+/// image over the elements, and each group is a sequence of those same
+/// elements. The built dict is therefore readable, where the whole call
+/// previously declined at the `for` statement.
+#[test]
+fn a_groupby_loop_over_an_unread_sequence_builds_a_readable_dict() {
+    let Some(kernel) = loaded_kernel() else { return };
+    let def = parsed_def(concat!(
+        "def group_by_parity(xs):\n",
+        "    result = {}\n",
+        "    for key, group in groupby(sorted(xs, key=lambda x: x % 2), key=lambda x: \"even\" if x % 2 == 0 else \"odd\"):\n",
+        "        result[key] = list(group)\n",
+        "    return result\n",
+    ));
+    let element = make_refined_set(vec![integer(), at_least(0.0), refined_sets::refinement_forms::at_most(200.0)]);
+    let sequence = AbstractValue {
+        kind_tag: Some(PrimitiveKind::Integer),
+        ..known_set(
+            make_refined_set(vec![refined_sets::refinement_forms::repeat_of(element, 0, None)]),
+            None,
+            TrustProved,
+            SetKindTag::None,
+        )
+    };
+    let result = call_result(&def, &[sequence], None, &kernel, 0).expect("the groupby body summarizes");
+    assert_eq!(
+        result.kind,
+        Kind::ObjectStar,
+        "the key set is a two-member image, not one spelling, so the dict states one claim about every present key: {result:?}"
+    );
+    let element = refined_domain::known_constructors::element_of_object_star(&result)
+        .expect("the star wraps each group's own value");
+    assert_eq!(element.kind, Kind::Set, "a group is a sequence of the iterable's elements");
+}

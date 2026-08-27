@@ -1,9 +1,16 @@
 //! Rendering a tagged instance back to text: `date.strftime` and the
-//! `date`/`datetime` ISO renderings.
+//! `date`/`datetime` ISO renderings; `datetime.utcoffset()`'s own exact
+//! `timedelta | None` reading.
 
 use std::sync::Arc;
 
+use refined_domain::abstract_value::null_value;
+use refined_domain::abstract_value::possibly_absent;
+use refined_domain::abstract_value::AbsentFlavor;
 use refined_domain::abstract_value::AbstractValue;
+use refined_domain::abstract_value::Kind;
+use refined_domain::known_constructors::known_object;
+use refined_domain::trust_grades::TrustSpec;
 use refined_kernel::kernel_interface::CalendarQuestion;
 use refined_kernel::kernel_interface::CalendarQuestionOp;
 use refined_kernel::kernel_interface::RefinedTSKernel;
@@ -12,6 +19,7 @@ use crate::string_models::string_literal_value;
 
 use super::components::datetime_field;
 use super::construction::offset_iso_suffix;
+use super::construction::timedelta_instance_of_microseconds;
 
 /// The kernel's `YYYY-MM-DD` render of a civil date —
 /// `exports_calendar.lean`'s `"isoDateText"` arm,
@@ -136,4 +144,60 @@ fn datetime_offset_seconds(instance: &AbstractValue) -> Option<i64> {
     let hours: i64 = suffix.get(1..3)?.parse().ok()?;
     let minutes: i64 = suffix.get(4..6)?.parse().ok()?;
     Some(sign * (hours * 3600 + minutes * 60))
+}
+
+/// `<a tagged datetime_datetime instance>.utcoffset()` — datetime.rst,
+/// `method:: datetime.utcoffset()`: "If tzinfo is None, returns None,
+/// else returns `self.tzinfo.utcoffset(self)`." A NAIVE instance
+/// (`aware` tag 0) therefore answers the exact `None` this crate's own
+/// `null_value()` builds. An AWARE instance with an EXACTLY known offset
+/// (`aware` tag 1 — UTC or a fixed `timezone(timedelta(...))` offset,
+/// `TzinfoKind`'s own doc) answers the exact `timedelta` that offset
+/// names, built through `timedelta_instance_of_microseconds` so the
+/// result is the SAME tagged shape a literal `timedelta(...)`
+/// construction carries — every downstream reader (`//`, a comparison
+/// guard) treats it identically. An `aware` tag 2 (`OtherAware`, an
+/// offset this crate never resolved) declines (`None`): no timedelta
+/// value can be spelled without the offset in hand.
+pub(in crate::expressions) fn datetime_utcoffset_value(instance: &AbstractValue, kernel: &Arc<RefinedTSKernel>) -> Option<AbstractValue> {
+    let aware = datetime_field(instance, "aware")? as i64;
+    match aware {
+        0 => Some(null_value()),
+        1 => {
+            let offset_seconds = datetime_offset_seconds(instance)?;
+            timedelta_instance_of_microseconds(offset_seconds as i128 * 1_000_000, kernel)
+        }
+        _ => None,
+    }
+}
+
+/// `<a temporal_flow-tagged Instant-window parameter>.utcoffset()` —
+/// the same clause `datetime_utcoffset_value` reads, applied to a bare
+/// `d: datetime` PARAMETER (`check::seed_parameters`' own window seed,
+/// `Kind::Object` tagged `source = "temporal_flow"`) rather than a
+/// concrete construction. `seed_parameters` carries no awareness bit on
+/// the seeded value itself (`bare_temporal_annotation`'s own
+/// `TemporalAwareness` is read into the parameter's DECLARED refinement
+/// only, never onto the value `environment.bind` stores), so this
+/// reader states no more than datetime.rst's own clause literally does:
+/// the parameter MAY be naive (tzinfo is None) or aware — the full `Some
+/// timedelta | None` union, `NullOnly` for the naive side (Python's
+/// `None`, never JS's `undefined`). The present side carries the
+/// UNBOUNDED integer sort on the SAME `datetime_timedelta` tag a
+/// concrete offset carries — `timedelta_floordiv_value`'s own window
+/// branch already reads a no-keys `datetime_timedelta` instance as
+/// exactly that claim, so `d.utcoffset() // timedelta(minutes=1)` still
+/// answers the unbounded integer a later guard narrows, the same shape
+/// this function's exact sibling gives a resolved offset.
+pub(in crate::expressions) fn temporal_flow_utcoffset_value(instance: &AbstractValue) -> Option<AbstractValue> {
+    if instance.kind != Kind::Object || instance.source != "temporal_flow" {
+        return None;
+    }
+    let window = instance.temporal.as_ref()?;
+    if window.chart != refined_sets::calendar_interpreter::TemporalChart::Instant {
+        return None;
+    }
+    let mut present = known_object(Vec::new(), None, true, TrustSpec, false);
+    present.source = "datetime_timedelta".to_owned();
+    Some(possibly_absent(present, AbsentFlavor::NullOnly, Some(TrustSpec), false))
 }

@@ -2,9 +2,12 @@
 
 use std::sync::Arc;
 
+use refined_domain::abstract_value::known_set;
 use refined_domain::abstract_value::AbstractValue;
 use refined_domain::abstract_value::Kind;
 use refined_domain::abstract_value::PrimitiveKind;
+use refined_domain::abstract_value::SetKindTag;
+use refined_domain::trust_grades::trust_level_of;
 use refined_kernel::kernel_interface::RefinedTSKernel;
 use refined_sets::codepoint_sets::is_codepoint_alphabet;
 use refined_sets::format_string_shapes::format_py_number;
@@ -18,6 +21,7 @@ use crate::diagnostic_sentences::at_slot;
 use crate::diagnostic_sentences::containment_refutation;
 use crate::diagnostic_sentences::cross_sort_of_value;
 use crate::diagnostic_sentences::element_set_refutation;
+use crate::diagnostic_sentences::missing_required_key;
 use crate::diagnostic_sentences::refutation;
 use crate::diagnostic_sentences::required_words;
 use crate::diagnostic_sentences::SENTENCE;
@@ -415,6 +419,38 @@ pub fn judge(
             }
             return Verdict::Silent;
         }
+        // An UNBOUNDED-KEY mapping (`Kind::ObjectStar` —
+        // `check::seed_parameters`' `known_dict_star` seed) under a
+        // container declaration. It is a dict, so a list/set declaration
+        // refuses it the same way a closed dict is refused above. Under a
+        // DICT declaration, the value states two things this judgment can
+        // read: `inner`, the law every present key's value obeys, and any
+        // recorded entries a write put there
+        // (`collection_models::dict_with_item`'s own star arm). Both are
+        // judged against the declared element — the recorded entries by
+        // name, so a refusal names the offending key, and `inner` on its
+        // own for every other key.
+        //
+        // This is what `declared_dict`'s own `return d` needs: a
+        // `dict[str, int]` parameter flowing to a `dict[str, int]` return
+        // must land determined, rather than reaching the judging table
+        // with no arm that reads its shape at all.
+        if value.kind == Kind::ObjectStar {
+            if declares_sequence {
+                return Verdict::Fire(refutation("a dict", &declared.spelling, &declared.set));
+            }
+            for key in &value.keys {
+                match judge(&key.value, element, kernel) {
+                    Verdict::Fire(message) => return Verdict::Fire(at_key(&message, &key.name)),
+                    Verdict::Undetermined(sentence) => return Verdict::Undetermined(sentence),
+                    Verdict::Silent => {}
+                }
+            }
+            let Some(star_element) = refined_domain::known_constructors::element_of_object_star(value) else {
+                return Verdict::Undetermined(SENTENCE.value_not_readable.to_owned());
+            };
+            return judge(&star_element, element, kernel);
+        }
         if value.kind == Kind::List {
             if !declares_sequence {
                 return Verdict::Fire(refutation("a list", &declared.spelling, &declared.set));
@@ -521,6 +557,62 @@ pub fn judge(
             }
             return Verdict::Silent;
         }
+        // AN UNKNOWN-LENGTH SEQUENCE against a FIXED-ARITY tuple: a
+        // `Kind::Set` whose only form is a repetition window (the shape
+        // a declared `list[X]`/`Sequence[X]` parameter seeds). The
+        // window states its own length bounds `{lo, hi}` directly, and a
+        // fixed-arity tuple admits exactly `positions.len()` elements —
+        // so the two are comparable without any kernel round trip, the
+        // same way the known-List arm above compares `items.len()`.
+        //
+        // The window is admitted only when it can hold nothing BUT that
+        // arity: `lo == hi == positions.len()`. Any window admitting a
+        // different length holds at least one value the tuple refuses,
+        // and the declaration is refused — the identical structural
+        // reading the known-List arm gives a length mismatch. An
+        // UNBOUNDED window (`hi` None) always admits a longer sequence
+        // than any fixed arity, so it is refused too: `list[int]`'s
+        // `[0, +inf)` against `tuple[int, int]` is A7.sink.assign's own
+        // `assign_to_tuple` claim, and against `tuple[int, int, int]` is
+        // A7.sink.ret's own `returns_three`.
+        //
+        // The element itself is judged only where the arity agrees:
+        // every position of the window draws from one element set (the
+        // repetition grammar's own definition), so each declared
+        // position is judged against that one set rather than against a
+        // per-slot value the window does not carry.
+        if value.kind == Kind::Set && value.set_kind_tag == SetKindTag::None {
+            if let Some(window) = refined_sets::repetition_window_forms::as_repetition(&value.set) {
+                let arity = positions.len() as i64;
+                if window.lo != arity || window.hi != Some(arity) {
+                    let stated = match window.hi {
+                        Some(hi) if hi == window.lo => format!("exactly {} element{}", window.lo, if window.lo == 1 { "" } else { "s" }),
+                        Some(hi) => format!("between {} and {hi} elements", window.lo),
+                        None => format!("{} or more elements", window.lo),
+                    };
+                    return Verdict::Fire(format!(
+                        "a value of {stated} is not assignable to type {} — the position states {} element{}",
+                        required_words(&declared.spelling, &declared.set),
+                        arity,
+                        if arity == 1 { "" } else { "s" },
+                    ));
+                }
+                let element = AbstractValue {
+                    kind_tag: value.kind_tag,
+                    ..known_set(window.element, None, trust_level_of(value), SetKindTag::None)
+                };
+                for (index, position_declared) in positions.iter().enumerate() {
+                    match judge(&element, position_declared, kernel) {
+                        Verdict::Fire(message) => {
+                            return Verdict::Fire(at_slot(&message, index, positions.len(), &position_declared.set));
+                        }
+                        Verdict::Undetermined(sentence) => return Verdict::Undetermined(sentence),
+                        Verdict::Silent => {}
+                    }
+                }
+                return Verdict::Silent;
+            }
+        }
         return Verdict::Undetermined(SENTENCE.tuple_position.to_owned());
     }
     // The MEMBERS LAW: a TypedDict declaration (`declared.members` Some,
@@ -535,17 +627,31 @@ pub fn judge(
     // mismatch the element law already fires for a container
     // declaration. Anything else this table has not yet read (an opaque
     // object, an unresolved value) falls through undetermined rather
-    // than guessing a structural mismatch that may not hold. A declared
-    // member ABSENT from the value's own keys is not judged at all (an
-    // absent key states nothing this table can read into a member's own
-    // set, matching `judge_construction`'s honest-absence convention
-    // elsewhere in this checker); an extra key the declaration does not
-    // name is likewise not judged — TypedDict's own `total=True` default
-    // requires every declared key to be present at runtime, but a
-    // structural extra-key refusal is a different check this row does
-    // not ask for. The first Fire among the declared members wins,
-    // naming the offending member; any Undetermined member makes the
-    // whole judgment Undetermined; all declared members present and
+    // than guessing a structural mismatch that may not hold.
+    //
+    // A declared member ABSENT from the value's own keys is a REFUSAL
+    // exactly when all three of these hold, and states nothing
+    // otherwise:
+    //
+    //   1. the flowing value is CLOSED (`value.complete`) — its key set
+    //      is the complete one, so "the key is not among these" proves
+    //      the key absent rather than merely unread. A dict literal is
+    //      closed (`dict_literal_value`); an open or widened object is
+    //      not, and an absent key there states nothing.
+    //   2. the declaration REQUIRES the key
+    //      (`TypedDictMember::required`) — library/typing.rst,
+    //      `TypedDict`: "By default, all keys must be present in a
+    //      ``TypedDict``" and "``True`` is the default, and makes all
+    //      items defined in the class body required." A `total=False`
+    //      class, or a `NotRequired[...]` key, requires nothing and
+    //      keeps the lenient path.
+    //   3. the key is not among the value's own keys.
+    //
+    // An extra key the declaration does not name is not judged here — a
+    // structural extra-key refusal is a different check this law does
+    // not carry. The first Fire among the declared members wins, naming
+    // the offending member; any Undetermined member makes the whole
+    // judgment Undetermined; every declared member accounted for and
     // Silent is Silent.
     if let Some(members) = &declared.members {
         if value.kind == Kind::Null {
@@ -559,14 +665,16 @@ pub fn judge(
             return Verdict::Fire(refutation("a list", &declared.spelling, &declared.set));
         }
         if value.kind == Kind::Object && value.kind_word.is_none() {
-            for (member_name, member_declared) in members {
-                let Some(member_value) = value.keys.iter().find(|key| key.name == *member_name && !key.numeric)
-                else {
+            for member in members {
+                let Some(member_value) = value.keys.iter().find(|key| key.name == member.name && !key.numeric) else {
+                    if member.required && value.complete {
+                        return Verdict::Fire(missing_required_key(&member.name, &declared.spelling));
+                    }
                     continue;
                 };
-                match judge(&member_value.value, member_declared, kernel) {
+                match judge(&member_value.value, &member.declared, kernel) {
                     Verdict::Fire(message) => {
-                        return Verdict::Fire(at_member(&message, member_name, &member_declared.set));
+                        return Verdict::Fire(at_member(&message, &member.name, &member.declared.set));
                     }
                     Verdict::Undetermined(sentence) => return Verdict::Undetermined(sentence),
                     Verdict::Silent => {}
@@ -843,7 +951,24 @@ pub fn judge(
             sequence_shaped_safely(&value.set, kernel) || sequence_shaped_safely(&declared.set, kernel);
         let numeric_repetition_into_scalar =
             states_sequence(&value.set) && on_one_tuple_layer(&declared.set);
-        if sequence_question || numeric_repetition_into_scalar {
+        // The same numeric repetition flowing into a SEQUENCE-declared
+        // slot rather than a scalar one — `concat_two(a: list[int], b:
+        // list[int]) -> list[int]` returning `a + b`, where the flowing
+        // value is the concatenated window
+        // (`sequence_window_concatenation`) and the declared side is
+        // `list[int]`'s own window (`seed::sequence_element_window`).
+        // Both sides state a repetition form at the top layer and
+        // NEITHER is codepoints, so `sequence_shaped_safely` is false on
+        // both and `on_one_tuple_layer` is false on the declared side —
+        // leaving the pair unrouted and falling to `scalar_subset`, whose
+        // export refuses any non-1-tuple shape outright. `states_sequence`
+        // on BOTH sides (the sort-blind top-layer test, the same
+        // recognizer the scalar row above uses) names this pair, and
+        // `seq_subset` is the decider that reads two windows against each
+        // other. Same fallback-to-`scalar_subset`-on-refusal discipline as
+        // the two gates beside it.
+        let repetition_into_repetition = states_sequence(&value.set) && states_sequence(&declared.set);
+        if sequence_question || numeric_repetition_into_scalar || repetition_into_repetition {
             let seq_asked = crate::kernel_ask::ask_kernel(|| (kernel.seq_subset)(&value.set, &declared.set));
             match seq_asked {
                 Ok(true) => return Verdict::Silent,
@@ -919,5 +1044,49 @@ pub fn judge(
         }
         return Verdict::Silent;
     }
-    Verdict::Undetermined(SENTENCE.value_not_readable.to_owned())
+    // THE DECLINE HELPER (DERIVATION-TRACE.md, "The projection rule"):
+    // this is the generic catch-all — every value shape no law above
+    // read. It is the one site the corpus's seven open A6 rows all land
+    // on, and the reason they all print the same anonymous sentence.
+    //
+    // `decline` records the named gate, the failing operand, and what
+    // that operand held onto the innermost open span, and then RENDERS
+    // the sentence by the projection template — so the printed sentence
+    // and the trace are one carrier and cannot drift. Off, it answers the
+    // generic sentence exactly as before, byte for byte.
+    //
+    // This SUBSUMES the named-blocker machinery in
+    // `check::name_unmodeled_call_sentence` rather than adding a third
+    // channel: that step only ever sharpens the generic sentence, and it
+    // recognizes this sentence by its exact wording. A traced run
+    // therefore hands it a projected sentence it leaves alone (it is not
+    // the generic wording), and an untraced run hands it the generic
+    // wording it sharpens exactly as it does today — see this crate's
+    // `trace` module doc on the reconciliation.
+    Verdict::Undetermined(decline_value_not_readable(value))
+}
+
+/// The generic catch-all's own decline: the gate that failed is that no
+/// reader in this table derived a reading for the flowing value, and the
+/// operand that failed is the flowing value itself, holding whatever
+/// spelling it carries.
+///
+/// Returns the projected sentence when tracing, and the unchanged generic
+/// sentence otherwise — so an ordinary check's output is byte-identical
+/// to what it was before the trace existed.
+fn decline_value_not_readable(value: &AbstractValue) -> String {
+    if !crate::trace::is_tracing() {
+        return SENTENCE.value_not_readable.to_owned();
+    }
+    let held = crate::expressions::spelled_value(value);
+    crate::trace::record_decline(
+        "no reader in the judging table derived a reading for the flowing value",
+        None,
+        Some(&held),
+    );
+    // The sentence IS the projection of the span just recorded — read
+    // back off the collector rather than composed here, so the two can
+    // never state different things.
+    crate::trace::projected_sentence_of_innermost_decline()
+        .unwrap_or_else(|| SENTENCE.value_not_readable.to_owned())
 }

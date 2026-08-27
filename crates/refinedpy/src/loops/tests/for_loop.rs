@@ -131,6 +131,51 @@ fn aug_assign_folds_a_set_shaped_operand_through_the_kernel_aware_transfer() {
     assert_ne!(result.read("total").unwrap().kind, Kind::Unknown);
 }
 
+/// UNIT: `live_list_element_walk` — a `for` over a KNOWN list whose body
+/// CONDITIONALLY appends to that same list. stdtypes.rst, "Common
+/// Sequence Operations": "Forward and reversed iterators over mutable
+/// sequences access values using an index. That index will continue to
+/// march forward... even if the underlying sequence is mutated. The
+/// iterator terminates only when an :exc:`IndexError` or a
+/// :exc:`StopIteration` is encountered." So the element appended during
+/// pass 0 IS visited: the body runs exactly twice over an initially
+/// one-element list, and `count` lands on exactly `{2}`.
+#[test]
+fn a_list_grown_inside_its_own_loop_iterates_the_appended_element() {
+    let Some(kernel) = loaded_kernel() else { return };
+    let stmt = parsed_loop("for x in lst:\n    count += 1\n    if len(lst) < 2:\n        lst.append(2)\n");
+    let mut environment = Environment::new(HashSet::from(["lst".to_owned(), "x".to_owned(), "count".to_owned()]));
+    environment.bind("lst", known_list(vec![integer(1.0)], TrustProved));
+    environment.bind("count", integer(0.0));
+    let result = run(&stmt, &environment, &kernel).expect("the live list steps exactly");
+    assert_eq!(
+        result.read("count").unwrap().values,
+        vec![2.0],
+        "the appended element is visited — the index marches past the original length"
+    );
+    assert_eq!(
+        result.read("lst").unwrap().items.len(),
+        2,
+        "the list grew once and then the guard stopped it growing"
+    );
+}
+
+/// UNIT: the same walk over a body that never appends at all still ends
+/// at the original length — the live re-read agrees with the snapshot
+/// whenever nothing mutates, so this row proves the index rule and not
+/// an off-by-one of its own.
+#[test]
+fn a_conditional_append_that_never_fires_leaves_the_count_at_the_original_length() {
+    let Some(kernel) = loaded_kernel() else { return };
+    let stmt = parsed_loop("for x in lst:\n    count += 1\n    if len(lst) < 1:\n        lst.append(9)\n");
+    let mut environment = Environment::new(HashSet::from(["lst".to_owned(), "x".to_owned(), "count".to_owned()]));
+    environment.bind("lst", known_list(vec![integer(1.0), integer(2.0)], TrustProved));
+    environment.bind("count", integer(0.0));
+    let result = run(&stmt, &environment, &kernel).expect("the live list steps exactly");
+    assert_eq!(result.read("count").unwrap().values, vec![2.0]);
+    assert_eq!(result.read("lst").unwrap().items.len(), 2, "the guard never held, so nothing was appended");
+}
+
 /// UNIT: `list_size_changing_mutation_range`'s own fire —
 /// `for x in lst: lst.append(x)` on a `list[int]`-shaped (repetition-
 /// window) parameter provably never terminates. Pins C5.rangefor's
@@ -522,4 +567,250 @@ fn setdefault_append_over_a_ternary_key_groups_by_the_per_iterate_branch() {
     assert_eq!(young.value.items[0].values, vec![40.0]);
     let old = grouped.keys.iter().find(|k| k.name == "old").expect("old key exists");
     assert_eq!(old.value.items[0].values, vec![200.0]);
+}
+
+/// A1.xfer.loop's own mechanism: `for i in range(n)` over a bounded
+/// scalar `n` keeps the counter's UPPER bound. Two readers can answer
+/// this loop — `windowed_range_element_pass`, which reads `n`'s own
+/// `atMost 200` edge and states the counter `[0, 199]`, and
+/// `repetition_window_element_pass`, which reads what `range(n)`
+/// evaluates to and states the sort-only window `integer ∧ [0, +inf)`.
+/// The range reader is consulted first, so the counter left bound after
+/// the loop carries `<= 199` rather than being unbounded above.
+#[test]
+fn TestA1_xfer_loop_RangeOverBoundedScalarKeepsCounterUpper() {
+    let Some(kernel) = loaded_kernel() else { return };
+    let stmt = parsed_loop("for i in range(n):\n    last = i\n");
+    let mut environment = Environment::new(HashSet::from(["n".to_owned(), "i".to_owned(), "last".to_owned()]));
+    environment.bind(
+        "n",
+        AbstractValue {
+            kind_tag: Some(PrimitiveKind::Integer),
+            ..known_set(
+                make_refined_set(vec![integer_form(), at_least(0.0), at_most(200.0)]),
+                None,
+                TrustProved,
+                SetKindTag::None,
+            )
+        },
+    );
+    environment.bind("last", integer(0.0));
+    let result = run(&stmt, &environment, &kernel).expect("range over a bounded scalar runs");
+    let last = result.read("last").expect("last stays bound");
+    let upper = last
+        .set
+        .forms
+        .iter()
+        .find(|form| form.form == refined_sets::refinement_forms::Form::AtMost)
+        .expect("the counter carries an upper edge — the reader that drops it would leave none");
+    assert_eq!(upper.a, 199.0, "range(n) with n <= 200 yields counters at most 199");
+}
+
+// --- unpack targets and unread-key dict writes (A8.edge.process) ---
+
+/// The whole-strings ground `Σ*`, repeated from zero — what
+/// `string_models::sort_only`'s own `splitlines` row answers for an
+/// unread `str` receiver, and what `check.rs::seed_parameters` seeds a
+/// declared `list[str]` parameter with.
+fn string_window(low: i64) -> AbstractValue {
+    known_set(
+        repetition(refined_sets::codepoint_sets::strings(), low, None),
+        None,
+        TrustProved,
+        SetKindTag::None,
+    )
+}
+
+/// A8.edge.process's own body shape, one statement at a time: `k, v =
+/// line.split("=", 1)` over an EXACT line binds both names to the exact
+/// pieces the split states — simple_stmts.rst's "the items are assigned,
+/// from left to right, to the corresponding targets."
+#[test]
+fn an_unpack_target_over_an_exact_split_binds_each_piece_positionally() {
+    let Some(kernel) = loaded_kernel() else { return };
+    let stmt = parsed_loop("for line in [\"a=1\", \"b=2\"]:\n    k, v = line.split(\"=\", 1)\n");
+    let environment = Environment::new(HashSet::from(["line".to_owned(), "k".to_owned(), "v".to_owned()]));
+    let result = run(&stmt, &environment, &kernel).expect("an exact-split unpack runs");
+    // the LAST iterate's own pieces, the target's documented post-loop
+    // binding (compound_stmts.rst, "the for statement")
+    let key = result.read("k").expect("k stays bound");
+    let value = result.read("v").expect("v stays bound");
+    assert_eq!(key.values, vec!['b' as u32 as f64], "the last line's key is exactly \"b\"");
+    assert_eq!(value.values, vec!['2' as u32 as f64], "the last line's value is exactly \"2\"");
+}
+
+/// The same statement over an UNREAD line: `line.split("=", 1)` answers
+/// a repetition window of unread strings, whose every position draws
+/// from ONE element set, so both targets bind that element — never a
+/// decline, which is what left A8.edge.process:11 undetermined.
+///
+/// The loop is walked by `repetition_window_element_pass`, whose answer
+/// is `stabilized_join`'s join of the PRE-LOOP environment with the one
+/// judged pass — the loop's own zero-or-more honesty, and
+/// `Environment::join`'s own rule that only a name BOTH sides know
+/// survives. `k`/`v` are therefore seeded here with an exact word, the
+/// way real code binds a name before a loop that may run zero times.
+/// The seeded word is strictly narrower than the split's own `Σ*`
+/// element, so the post-loop set being EXACTLY `Σ*` is the loop's own
+/// contribution — the string-ground absorption arm of `join_known`
+/// answers the ground itself once the kernel proves the seeded word is
+/// inside it.
+#[test]
+fn an_unpack_target_over_a_repetition_window_binds_every_name_to_the_element() {
+    let Some(kernel) = loaded_kernel() else { return };
+    let stmt = parsed_loop("for line in lines:\n    k, v = line.split(\"=\", 1)\n");
+    let mut environment =
+        Environment::new(HashSet::from(["lines".to_owned(), "line".to_owned(), "k".to_owned(), "v".to_owned()]));
+    environment.bind("lines", string_window(0));
+    environment.bind("k", known_string("seed"));
+    environment.bind("v", known_string("seed"));
+    let result = run(&stmt, &environment, &kernel).expect("a window-split unpack runs");
+    for name in ["k", "v"] {
+        let bound = result.read(name).unwrap_or_else(|| panic!("{name} stays bound"));
+        assert_eq!(bound.kind, Kind::Set, "{name} binds the window's element set, not one value");
+        assert_eq!(
+            bound.set,
+            refined_sets::codepoint_sets::strings(),
+            "{name} binds the split's own ELEMENT — the whole-strings ground — never the window one nesting level above it"
+        );
+    }
+}
+
+/// A8.edge.process's whole loop: an unread-key dict write inside a
+/// window walk. The result is an unbounded-key dict whose one element
+/// claim covers every value written — the dict really was built, so a
+/// later read through it answers a set rather than nothing at all.
+#[test]
+fn a_dict_written_at_an_unread_key_inside_a_loop_answers_an_unbounded_key_dict() {
+    let Some(kernel) = loaded_kernel() else { return };
+    let stmt = parsed_loop("for line in lines:\n    k, v = line.split(\"=\", 1)\n    result[k] = v\n");
+    let mut environment = Environment::new(HashSet::from([
+        "lines".to_owned(),
+        "line".to_owned(),
+        "k".to_owned(),
+        "v".to_owned(),
+        "result".to_owned(),
+    ]));
+    environment.bind("lines", string_window(0));
+    environment.bind("result", known_object(vec![], None, true, TrustProved, false));
+    let answer = run(&stmt, &environment, &kernel).expect("the dict-accumulation loop runs");
+    let built = answer.read("result").expect("result stays bound");
+    assert_eq!(
+        built.kind,
+        Kind::ObjectStar,
+        "an unread key leaves no key list to record, so the dict states one claim about every present key"
+    );
+    let element = refined_domain::known_constructors::element_of_object_star(&built)
+        .expect("the star wraps the written value's own set");
+    assert_eq!(element.kind, Kind::Set, "the values written were the split's own unread pieces");
+}
+
+// --- itertools.groupby (A8.seed.library) ---
+
+/// itertools.rst's `groupby` entry, read over an unread iterable: the
+/// KEY is the key function's image over the element set — for the
+/// fixture's `lambda x: "even" if x % 2 == 0 else "odd"`, the ternary
+/// joins both arms into a CLOSED two-member set, not a sort — and the
+/// GROUP is a sequence of the iterable's own elements.
+///
+/// `groupby_element_pass` answers through `stabilized_join`, so what a
+/// name holds AFTER the loop is the join of its PRE-LOOP value with the
+/// one judged pass's — the loop's own zero-or-more honesty, and
+/// `Environment::join`'s own rule that only a name BOTH sides know
+/// survives a join. Both read names are therefore seeded here the way
+/// real code binds a name before a loop that may run zero times, each
+/// seeded with the value the entry's own clause says the pass must
+/// produce: the ternary's two-arm image for the key, and the element
+/// set repeated from one for the group. A pass that answered ANY other
+/// value would join to something else and havoc the name to `unknown()`
+/// (`stabilized_join`'s own containment path), so the seed pins the
+/// pass's answer exactly rather than merely surviving alongside it.
+#[test]
+fn groupby_binds_the_key_functions_image_and_a_group_window() {
+    let Some(kernel) = loaded_kernel() else { return };
+    let stmt = parsed_loop(
+        "for key, group in groupby(sorted(xs, key=lambda x: x % 2), key=lambda x: \"even\" if x % 2 == 0 else \"odd\"):\n    last_key = key\n    last_group = group\n",
+    );
+    // the ternary's own image, built through the SAME domain join the
+    // lambda body's two arms take — never through the pass under test
+    let ternary_image = refined_domain::lattice_operations::join_known(known_string("even"), known_string("odd"));
+    let element_set = make_refined_set(vec![integer_form(), at_least(0.0), at_most(200.0)]);
+    let group_window = AbstractValue {
+        kind_tag: Some(PrimitiveKind::Integer),
+        ..known_set(repetition(element_set, 1, None), None, TrustProved, SetKindTag::None)
+    };
+    let mut environment = Environment::new(HashSet::from([
+        "xs".to_owned(),
+        "key".to_owned(),
+        "group".to_owned(),
+        "last_key".to_owned(),
+        "last_group".to_owned(),
+    ]));
+    environment.bind("xs", wide_list_parameter());
+    environment.bind("last_key", ternary_image.clone());
+    environment.bind("last_group", group_window);
+    let result = run(&stmt, &environment, &kernel).expect("the groupby pass runs");
+    let bound_key = result.read("last_key").expect("last_key stays bound");
+    assert_ne!(bound_key.kind, Kind::Unknown, "the key set is the lambda's own image, never nothing");
+    assert_eq!(
+        bound_key.set, ternary_image.set,
+        "the key set is the ternary's own two-arm image — a CLOSED member set, never a bare string sort"
+    );
+    let bound_group = result.read("last_group").expect("last_group stays bound");
+    assert_eq!(bound_group.kind, Kind::Set, "a group is a sequence of the iterable's elements");
+    let window = as_repetition(&bound_group.set).expect("the group is a repetition over the element set");
+    assert_eq!(window.lo, 1, "every group groupby emits holds at least the element that created it");
+    assert_eq!(window.hi, None, "the group count is exactly what groupby leaves unread");
+}
+
+/// No `key=` at all — itertools.rst's own default: "If not specified or
+/// is ``None``, *key* defaults to an identity function and returns the
+/// element unchanged," so the key set IS the element set.
+///
+/// `last_key` is seeded pre-loop for the reason the two-key pin above
+/// states — `stabilized_join`'s answer keeps only names the PRE-LOOP
+/// environment knows too — and the seed is `xs`'s own element set, the
+/// exact value the identity default must bind. A pass answering the
+/// WINDOW instead of the element (one nesting level too many) would
+/// join to a different value and havoc the name.
+#[test]
+fn groupby_with_no_key_function_binds_the_element_set_itself() {
+    let Some(kernel) = loaded_kernel() else { return };
+    let stmt = parsed_loop("for key, group in groupby(xs):\n    last_key = key\n");
+    let element_set = make_refined_set(vec![integer_form(), at_least(0.0), at_most(200.0)]);
+    let element = AbstractValue {
+        kind_tag: Some(PrimitiveKind::Integer),
+        ..known_set(element_set.clone(), None, TrustProved, SetKindTag::None)
+    };
+    let mut environment =
+        Environment::new(HashSet::from(["xs".to_owned(), "key".to_owned(), "group".to_owned(), "last_key".to_owned()]));
+    environment.bind("xs", wide_list_parameter());
+    environment.bind("last_key", element);
+    let result = run(&stmt, &environment, &kernel).expect("the identity-key groupby pass runs");
+    let bound_key = result.read("last_key").expect("last_key stays bound");
+    assert_eq!(bound_key.kind, Kind::Set, "the identity default makes the key set the element set");
+    assert_eq!(
+        bound_key.set, element_set,
+        "the key is one ELEMENT of the iterable, never the whole window"
+    );
+    assert!(
+        as_repetition(&bound_key.set).is_none(),
+        "the key is one ELEMENT of the iterable, never the whole window"
+    );
+}
+
+/// A locally bound `groupby` name is not itertools' own — the same
+/// shadow gate every module-call row in this checker keeps.
+#[test]
+fn a_shadowed_groupby_name_is_not_read_as_itertools_groupby() {
+    let Some(kernel) = loaded_kernel() else { return };
+    let stmt = parsed_loop("for key, group in groupby(xs):\n    last_key = key\n");
+    let mut environment =
+        Environment::new(HashSet::from(["xs".to_owned(), "groupby".to_owned(), "key".to_owned(), "group".to_owned()]));
+    environment.bind("xs", wide_list_parameter());
+    environment.bind("groupby", integer(1.0));
+    assert!(
+        run(&stmt, &environment, &kernel).is_none(),
+        "a shadowed name states nothing about itertools' own grouping"
+    );
 }

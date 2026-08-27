@@ -63,6 +63,41 @@ fn test_upper_no_arg() {
     assert_eq!(exact_string_text(&result).as_deref(), Some("AB"));
 }
 
+/// `str.splitlines()` over an exact receiver — stdtypes.rst's own
+/// worked example for the clause: `'ab c\n\nde fg\rkl\r\n'.splitlines()`
+/// is `['ab c', '', 'de fg', 'kl']`. Exercises three of the boundary
+/// table's rows at once (`\n`, a bare `\r`, and `\r\n` as ONE boundary)
+/// plus the clause's own "a terminal line break does not result in an
+/// extra line".
+#[test]
+fn test_splitlines_matches_the_clauses_worked_example() {
+    let receiver = string_literal_value("ab c\n\nde fg\rkl\r\n");
+    let result = string_method_result("splitlines", &receiver, &[]).expect("splitlines must decide");
+    let lines: Vec<Option<String>> = result.items.iter().map(|line| exact_string_text(line)).collect();
+    assert_eq!(
+        lines,
+        vec![
+            Some("ab c".to_owned()),
+            Some(String::new()),
+            Some("de fg".to_owned()),
+            Some("kl".to_owned()),
+        ]
+    );
+}
+
+/// The same clause's two edge cases, which `str.split` behaves
+/// differently on: `"".splitlines()` is `[]`, and `"One line\n".
+/// splitlines()` is `['One line']`.
+#[test]
+fn test_splitlines_empty_string_has_no_lines_and_a_terminal_break_adds_none() {
+    let empty = string_method_result("splitlines", &string_literal_value(""), &[]).expect("splitlines must decide");
+    assert_eq!(empty.items.len(), 0);
+
+    let terminal = string_method_result("splitlines", &string_literal_value("One line\n"), &[]).expect("splitlines must decide");
+    let lines: Vec<Option<String>> = terminal.items.iter().map(|line| exact_string_text(line)).collect();
+    assert_eq!(lines, vec![Some("One line".to_owned())]);
+}
+
 #[test]
 fn test_lower_no_arg() {
     let receiver = string_literal_value("AB");

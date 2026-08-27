@@ -269,7 +269,23 @@ fn match_singleton_outcome(
 /// this function taught about it. `None` means "not decidable" (an
 /// unknown or otherwise unread subject); `Some(true)`/`Some(false)` is
 /// the decided identity.
+///
+/// A `Kind::PossiblyUndefined` subject against `Singleton::None`
+/// declines outright (`None`), never `Some(false)`: this maybe-carrier
+/// admits BOTH `None` and its own inner present value
+/// (`check/seed.rs::seed_parameters`'s `Optional[X]`/`X | None` seed),
+/// so `case None:` is neither provably taken nor provably dead — the
+/// caller (`match_taken_environment`) is the one place that can still
+/// decide it, by splitting the carrier through `values::narrow_maybe_
+/// subject_on_none` the same way a decidable scalar subject splits
+/// through `narrow_scalar_subject`. Answering `Some(false)` here (this
+/// function's reading before this arm existed) wrongly marked `case
+/// None:` a dead arm no runtime value could ever reach, when a `None`
+/// runtime value plainly can.
 fn subject_is_singleton(subject: &AbstractValue, target: Singleton) -> Option<bool> {
+    if subject.kind == Kind::PossiblyUndefined && target == Singleton::None {
+        return None;
+    }
     match target {
         Singleton::None => Some(subject.kind == Kind::Null),
         Singleton::True => Some(is_exact_boolean(subject, 1.0)),

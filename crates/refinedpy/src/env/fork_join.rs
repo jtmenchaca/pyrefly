@@ -15,6 +15,7 @@ impl Environment {
         Environment {
             bindings: self.bindings.clone(),
             path_bindings: self.path_bindings.clone(),
+            temporal_offsets: self.temporal_offsets.clone(),
             locally_bound: self.locally_bound.clone(),
             functions: self.functions.clone(),
             classes: self.classes.clone(),
@@ -40,6 +41,10 @@ impl Environment {
             // evaluated inside this arm must still reach whoever asked
             // for the whole module walk's recordings
             evaluations: self.evaluations.clone(),
+            // the SAME collector too, for the identical reason — a span
+            // opened inside this arm is part of the one derivation the
+            // asker reads back, never a per-arm tree that the join drops
+            trace: self.trace.clone(),
         }
     }
 
@@ -74,6 +79,9 @@ impl Environment {
         // same reasoning: both arms share the one evaluations `Arc`,
         // so carrying `a`'s loses nothing either arm recorded
         let evaluations = a.evaluations;
+        // same reasoning again: both arms share the one collector `Arc`,
+        // so carrying `a`'s loses no span either arm recorded
+        let trace = a.trace;
         for (name, value_a) in a.bindings {
             if let Some(value_b) = b.bindings.get(&name) {
                 bindings.insert(
@@ -94,9 +102,26 @@ impl Environment {
                 );
             }
         }
+        // a derivation ledger entry survives the join only where BOTH
+        // arms still hold the SAME derivation — an arm that rewrote the
+        // derived name broke the tie, and the joined value is the
+        // lattice join of two differently-derived values, which no
+        // single derivation describes
+        let mut temporal_offsets = HashMap::new();
+        for (name, derivation_a) in a.temporal_offsets {
+            if let Some(derivation_b) = b.temporal_offsets.get(&name) {
+                if derivation_b.instant_name == derivation_a.instant_name
+                    && derivation_b.origin_microseconds == derivation_a.origin_microseconds
+                    && derivation_b.unit_microseconds == derivation_a.unit_microseconds
+                {
+                    temporal_offsets.insert(name, derivation_a);
+                }
+            }
+        }
         Environment {
             bindings,
             path_bindings,
+            temporal_offsets,
             locally_bound,
             functions,
             classes,
@@ -115,6 +140,7 @@ impl Environment {
             evaluated_node: Vec::new(),
             returned_values,
             evaluations,
+            trace,
         }
     }
 }

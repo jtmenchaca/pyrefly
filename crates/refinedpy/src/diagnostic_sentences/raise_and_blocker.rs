@@ -64,6 +64,37 @@ pub fn division_by_a_set_that_admits_zero() -> String {
         .to_owned()
 }
 
+/// The unreachable-statement fire — the statement sits after an `if`
+/// whose test proved TRUE on every run and whose selected arm returns
+/// or raises. CPython evaluates no later test once an earlier one is
+/// known true (reference/expressions.rst, "Boolean operations"), so no
+/// path arrives here at all. The companion of
+/// `"this condition is provably false on every run"`: that sentence
+/// names a branch never taken, this one names code never reached.
+pub fn statement_is_unreachable() -> String {
+    "this statement is unreachable: the condition above is provably true on every run and the arm \
+    it selects never falls through"
+        .to_owned()
+}
+
+/// The possibly-absent-receiver fire — an attribute reference or method
+/// call whose receiver admits `None` alongside a present value
+/// (`re.match(...)`'s own `Match | None`, an `Optional[X]` parameter).
+/// An attribute reference "either returns a value or raises
+/// `AttributeError`" (reference/expressions.rst, "Attribute
+/// references"), and `None` carries no such attribute, so the runs where
+/// the receiver is absent raise while the rest produce a value — the
+/// same sometimes-raising shape `division_by_a_set_that_admits_zero`
+/// names for a divisor window that admits 0. Names the attribute and the
+/// guard that discharges it, the same teaching move that sentence makes.
+pub fn attribute_on_a_receiver_that_admits_none(attribute_name: &str) -> String {
+    format!(
+        "this expression's receiver admits None — reading '.{attribute_name}' off None raises \
+        AttributeError (reference/expressions.rst, \"Attribute references\"); a presence guard on \
+        the receiver (for example `if receiver is not None:`) discharges this before the read runs"
+    )
+}
+
 /// A `for` loop's own abstract pass names, per iteration, a written name
 /// whose value never reached a fixed point across the two judged passes
 /// (`loops.rs::stabilized_join`'s own doc) — the loop reaches a real

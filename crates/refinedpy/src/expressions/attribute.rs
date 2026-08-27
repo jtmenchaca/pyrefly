@@ -243,6 +243,31 @@ pub(super) fn evaluate_attribute_read(
                 return value;
             }
         }
+        // `os.environ` — library/os.rst, `data:: environ`: "A mapping
+        // object representing the string environment... For example,
+        // environ['HOME']... is equivalent to getenv('HOME')." Every key
+        // and value this mapping can hold is an arbitrary string whose
+        // content comes from outside the program — the same external-
+        // origin reading `sys.argv` above gives its own elements — so the
+        // read answers an UNBOUNDED-KEY dict-star (`known_dict_star`,
+        // the same constructor `check/seed.rs::dict_star_value_seed`
+        // builds for a `dict[str, X]`-declared parameter) whose value
+        // slot is the whole-strings ground `Σ*`. `.get(k)`
+        // (`collection_models::dict_get_result`'s own `Kind::ObjectStar`
+        // arm) then reads it as "the string value if the key is present,
+        // else `None`" — `str | None`, A5.seed.boundary's own
+        // `env_get_outside` claim.
+        if module_name.id.as_str() == "os" && environment.read("os").is_none() && attribute.attr.as_str() == "environ" {
+            let string_element = AbstractValue {
+                kind_tag: Some(PrimitiveKind::String),
+                ..known_set(refined_sets::codepoint_sets::strings(), None, TrustSpec, SetKindTag::None)
+            };
+            let (star, ok) = refined_domain::known_constructors::known_dict_star(string_element, TrustSpec);
+            if ok {
+                return star;
+            }
+            return unknown();
+        }
         // `sys.maxsize` — library/sys.rst: "the value of the largest
         // Py_ssize_t... usually 2**31 - 1 on a 32-bit platform and
         // 2**63 - 1 on a 64-bit platform", and always at least
@@ -330,7 +355,23 @@ pub(super) fn evaluate_attribute_read(
         }
         return unknown();
     }
-    let receiver = evaluate_expression(&attribute.value, environment, kernel);
+    let mut receiver = evaluate_expression(&attribute.value, environment, kernel);
+    // A POSSIBLY-ABSENT receiver (`o: Optional[Box]` read without a
+    // presence guard) reads through its PRESENT side. An attribute
+    // reference "either returns a value or raises AttributeError"
+    // (reference/expressions.rst, "Attribute references"), and `None`
+    // carries no attribute named by any class field, so the absent arm
+    // raises and contributes NO value to this expression — what flows
+    // onward is exactly the present arm's own field. The raise itself
+    // is not this read's to report: the receiver's own absence is the
+    // subject of the presence-guard rows, and a value read here still
+    // has to be right for the path that survives.
+    if receiver.kind == Kind::PossiblyUndefined {
+        let Some(present) = receiver.inner.clone() else {
+            return unknown();
+        };
+        receiver = *present;
+    }
     if receiver.kind != Kind::Object {
         return unknown();
     }

@@ -57,6 +57,48 @@ pub fn temporal_inline_annotation(value: &Expr, imports: &SurfaceImports) -> Opt
     temporal_annotation_of(value, imports, None)
 }
 
+/// A BARE `date`/`timedelta`/`datetime`/`AwareDatetime`/`NaiveDatetime`
+/// parameter annotation — no `Annotated[…, Field(…)]` wrapper, no stated
+/// bound — read as the UNBOUNDED window on that name's own chart. This
+/// is the temporal twin of `typereading::base_sort_return_refinement`'s
+/// bare-`int` ray: `d: datetime` states "any instant," exactly as `n:
+/// int` states "any whole number," and it is a claim, not an absence.
+/// The window carries no `min` and no `max`, and `bounds_imply` reads
+/// that as REFUTING any bounded target window (its own doc) — so `d:
+/// datetime` reaching a `Year2021`-declared position is refused, which
+/// is what an unconstrained instant against a stated year window owes.
+///
+/// Resolved by import identity through the module's own `SurfaceImports`
+/// table, the same discipline every other recognition in this file
+/// keeps. `AwareDatetime`/`NaiveDatetime` additionally carry their
+/// awareness requirement, so a bare `d: AwareDatetime` still refuses a
+/// naive construction through `temporal_admission_refusal`.
+///
+/// SCOPED TO PARAMETERS: `check::seed_parameters` is the one caller, for
+/// the same reason the bare-sort reader is scoped there — reading bare
+/// temporal names in the general annotation table would make every
+/// `-> datetime` helper return a judged position and turn each unreadable
+/// helper body into a fresh blocker.
+pub fn bare_temporal_annotation(value: &Expr, imports: &SurfaceImports) -> Option<(TemporalAnnotation, TemporalAwareness)> {
+    let Expr::Name(name) = value else {
+        return None;
+    };
+    let (chart, awareness) = if imports.date_names.contains(name.id.as_str()) {
+        (TemporalChart::PlainDate, TemporalAwareness::Any)
+    } else if imports.timedelta_names.contains(name.id.as_str()) {
+        (TemporalChart::Duration, TemporalAwareness::Any)
+    } else if imports.datetime_names.contains(name.id.as_str()) {
+        (TemporalChart::Instant, TemporalAwareness::Any)
+    } else if imports.aware_datetime_names.contains(name.id.as_str()) {
+        (TemporalChart::Instant, TemporalAwareness::RequireAware)
+    } else if imports.naive_datetime_names.contains(name.id.as_str()) {
+        (TemporalChart::Instant, TemporalAwareness::RequireNaive)
+    } else {
+        return None;
+    };
+    Some((TemporalAnnotation { chart, min: None, max: None }, awareness))
+}
+
 /// The shared recognition both `temporal_alias_annotation` (module-level
 /// alias RHS) and `temporal_inline_annotation` (inline parameter
 /// annotation) drive: see `temporal_alias_annotation`'s own doc for the

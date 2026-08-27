@@ -1,6 +1,7 @@
 //! Parsing text into a tagged instance: `date.fromisoformat`, its
-//! raise-side twin, and `datetime.strptime`'s directive-by-directive
-//! grammar (STAGE 1's ISO shortcut and STAGE 2's full scanner/parser).
+//! raise-side twin, `datetime.fromisoformat`, and `datetime.strptime`'s
+//! directive-by-directive grammar (STAGE 1's ISO shortcut and STAGE 2's
+//! full scanner/parser).
 
 use std::sync::Arc;
 
@@ -13,6 +14,7 @@ use refined_domain::trust_grades::TrustProved;
 use refined_kernel::kernel_interface::RefinedTSKernel;
 
 use super::construction::integer_object_key;
+use super::construction::offset_iso_suffix;
 use super::construction::python_year_in_range;
 use super::construction::valid_civil_date;
 
@@ -126,6 +128,160 @@ pub(in crate::expressions) fn date_fromisoformat_raises(text: &str, kernel: &Arc
     }
     let date_ok = valid_civil_date(year, month, day, kernel)?;
     Some(!date_ok)
+}
+
+/// `datetime.datetime.fromisoformat(date_string)` — datetime.rst,
+/// `classmethod:: datetime.fromisoformat(date_string)`: "Return a
+/// datetime corresponding to date_string... datetime.fromisoformat() can
+/// be used to parse most ISO 8601 formats." Modeled ONLY for the
+/// `YYYY-MM-DD[THH:MM:SS[.ffffff]][+HH:MM[:SS[.ffffff]]]` shape this
+/// file's own writer (`datetime_isoformat_value`) and `%z`'s own offset
+/// grammar (`read_utc_offset_field`) already cover: a bare date-only
+/// text (`"2024-06-01"`) reuses `date_fromisoformat_value` outright but
+/// re-tags the result `datetime_datetime` at midnight — datetime.rst's
+/// own note, "If date_string is a date-only string, the result is a
+/// datetime with hour/minute/second/microsecond all zero, tzinfo None."
+/// A `T`-separated clock (`HH:MM:SS`, optionally `.ffffff`) reads the
+/// same fixed two-digit fields `date_fromisoformat_value`'s own
+/// year/month/day split does; a trailing offset (`Z`, or `±HH:MM[:SS]`)
+/// is read by `read_utc_offset_field` and folded into the SAME
+/// `TzinfoKind` distinction `datetime_construction_value` already
+/// carries — an exactly-zero offset is `aware = 1, aware_utc = 1` (UTC),
+/// any OTHER offset is `aware = 1, aware_utc = 0` (`FixedOffset`, this
+/// crate's own ISO-suffix spelling reused for `instance.temporal`), and
+/// no offset at all is naive (`aware = 0`). Every other ISO 8601 variant
+/// datetime.rst's own note lists (week dates, ordinal dates, a bare
+/// `HH:MM` with no seconds, a `,` fractional separator) is not read by
+/// this function — a text this reader cannot split declines (`None`),
+/// leaving the whole call `unknown()` at its caller rather than a
+/// guessed value.
+pub(in crate::expressions) fn datetime_fromisoformat_value(text: &str, kernel: &Arc<RefinedTSKernel>) -> Option<AbstractValue> {
+    let (date_text, rest) = match text.split_once('T') {
+        Some((date_text, rest)) => (date_text, Some(rest)),
+        None => (text, None),
+    };
+    let Some(rest) = rest else {
+        // date-only — datetime.rst's own "hour/minute/second/microsecond
+        // all zero, tzinfo None" rule, re-tagged onto the date reader's
+        // own value rather than re-deriving the year/month/day split.
+        let date_instance = date_fromisoformat_value(date_text, kernel)?;
+        let year = super::components::datetime_field(&date_instance, "year")? as i64;
+        let month = super::components::datetime_field(&date_instance, "month")? as i64;
+        let day = super::components::datetime_field(&date_instance, "day")? as i64;
+        let keys = vec![
+            integer_object_key("year", year),
+            integer_object_key("month", month),
+            integer_object_key("day", day),
+            integer_object_key("hour", 0),
+            integer_object_key("minute", 0),
+            integer_object_key("second", 0),
+            integer_object_key("microsecond", 0),
+            ObjectKey {
+                name: "aware_utc".to_owned(),
+                numeric: false,
+                value: known_values(vec![0.0], PrimitiveKind::Boolean, TrustProved),
+            },
+            integer_object_key("aware", 0),
+        ];
+        let mut instance = known_object(keys, None, true, TrustProved, false);
+        instance.source = "datetime_datetime".to_owned();
+        let point = format!("{year:04}-{month:02}-{day:02}T00:00:00");
+        instance.temporal = Some(Box::new(refined_sets::calendar_interpreter::TemporalAnnotation {
+            chart: refined_sets::calendar_interpreter::TemporalChart::Instant,
+            min: Some(point.clone()),
+            max: Some(point),
+        }));
+        return Some(instance);
+    };
+    let mut date_parts = date_text.split('-');
+    let year_text = date_parts.next()?;
+    let month_text = date_parts.next()?;
+    let day_text = date_parts.next()?;
+    if date_parts.next().is_some() || year_text.len() != 4 || month_text.len() != 2 || day_text.len() != 2 {
+        return None;
+    }
+    if !year_text.bytes().all(|b| b.is_ascii_digit())
+        || !month_text.bytes().all(|b| b.is_ascii_digit())
+        || !day_text.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let year: i64 = year_text.parse().ok()?;
+    let month: i64 = month_text.parse().ok()?;
+    let day: i64 = day_text.parse().ok()?;
+    if !python_year_in_range(year, kernel)? {
+        return None;
+    }
+    if !valid_civil_date(year, month, day, kernel)? {
+        return None;
+    }
+    // The clock half: `HH:MM:SS`, each a fixed two-digit field (datetime.rst's
+    // own isoformat writer, `datetime_isoformat_value`'s own doc, spells the
+    // identical widths this reader now reads back), an optional `.ffffff`
+    // microsecond tail, then an optional trailing offset.
+    let (hour_text, rest) = take_fixed_digits(rest, 2)?;
+    let rest = rest.strip_prefix(':')?;
+    let (minute_text, rest) = take_fixed_digits(rest, 2)?;
+    let rest = rest.strip_prefix(':')?;
+    let (second_text, mut rest) = take_fixed_digits(rest, 2)?;
+    let hour: i64 = hour_text.parse().ok()?;
+    let minute: i64 = minute_text.parse().ok()?;
+    let second: i64 = second_text.parse().ok()?;
+    if !(0..=23).contains(&hour) || !(0..=59).contains(&minute) || !(0..=59).contains(&second) {
+        return None;
+    }
+    let mut microsecond: i64 = 0;
+    if let Some(after_dot) = rest.strip_prefix('.') {
+        let (digits, tail) = take_variable_digits(after_dot, 1, 6)?;
+        let mut padded = digits.to_owned();
+        while padded.len() < 6 {
+            padded.push('0');
+        }
+        microsecond = padded.parse().ok()?;
+        rest = tail;
+    }
+    let (aware_tag, aware_utc, offset_seconds) = if rest.is_empty() {
+        (0, false, None)
+    } else {
+        let (offset_seconds, tail) = read_utc_offset_field(rest)?;
+        if !tail.is_empty() {
+            return None;
+        }
+        (1, offset_seconds == 0, Some(offset_seconds))
+    };
+    let keys = vec![
+        integer_object_key("year", year),
+        integer_object_key("month", month),
+        integer_object_key("day", day),
+        integer_object_key("hour", hour),
+        integer_object_key("minute", minute),
+        integer_object_key("second", second),
+        integer_object_key("microsecond", microsecond),
+        ObjectKey {
+            name: "aware_utc".to_owned(),
+            numeric: false,
+            value: known_values(vec![if aware_utc { 1.0 } else { 0.0 }], PrimitiveKind::Boolean, TrustProved),
+        },
+        integer_object_key("aware", aware_tag),
+    ];
+    let mut instance = known_object(keys, None, true, TrustProved, false);
+    instance.source = "datetime_datetime".to_owned();
+    let zone = match offset_seconds {
+        Some(_) if aware_utc => "Z".to_owned(),
+        Some(seconds) => offset_iso_suffix(seconds),
+        None => String::new(),
+    };
+    let point = if microsecond == 0 {
+        format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}{zone}")
+    } else {
+        format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{microsecond:06}{zone}")
+    };
+    instance.temporal = Some(Box::new(refined_sets::calendar_interpreter::TemporalAnnotation {
+        chart: refined_sets::calendar_interpreter::TemporalChart::Instant,
+        min: Some(point.clone()),
+        max: Some(point),
+    }));
+    Some(instance)
 }
 
 /// date.12 STAGE 1 — the ISO-equivalent directive subset of

@@ -7,12 +7,17 @@
 
 use std::sync::Arc;
 
+use refined_domain::abstract_value::known_set;
 use refined_domain::abstract_value::null_value;
 use refined_domain::abstract_value::unknown;
 use refined_domain::abstract_value::AbstractValue;
 use refined_domain::abstract_value::Kind;
+use refined_domain::abstract_value::SetKindTag;
 use refined_domain::lattice_operations::truthiness;
+use refined_domain::trust_grades::trust_level_of;
 use refined_kernel::kernel_interface::RefinedTSKernel;
+use refined_sets::repetition_window_forms::as_repetition;
+use refined_sets::repetition_window_forms::repetition;
 use ruff_python_ast::AtomicNodeIndex;
 use ruff_python_ast::Expr;
 use ruff_python_ast::ModModule;
@@ -26,6 +31,7 @@ use ruff_text_size::TextRange;
 
 use crate::env::Environment;
 use crate::expressions::binary_arithmetic_value;
+use crate::expressions::call_one_argument_expression;
 use crate::expressions::evaluate_expression;
 use crate::instances::class_table;
 use crate::instances::field_read;
@@ -176,18 +182,77 @@ pub(crate) fn interpret_body(
             // `Stmt::Return` on any iteration ends the loop immediately
             // (real CPython: a `return` inside a `for` body exits the
             // function, no further elements bind), reported through the
-            // ordinary `returns` accumulator. Any other iterable shape
-            // (unknown, a non-List value, an element that is itself
-            // unknown), a non-bare-Name target, or a non-empty `else`
-            // clause declines the WHOLE call — never a partial summary.
+            // ordinary `returns` accumulator.
+            //
+            // A REPETITION WINDOW receiver has no element list to step and
+            // is read abstractly instead — ONE pass over the window's own
+            // element set, the arm's own doc below. Any OTHER iterable
+            // shape (unknown, a non-List non-window value, an element that
+            // is itself unknown), a non-bare-Name target, or a non-empty
+            // `else` clause declines the WHOLE call — never a partial
+            // summary.
+            //
+            // `for key, group in groupby(...)` is the ONE other shape
+            // read here: a tuple target over an iterable whose grouping
+            // is unread, answered ABSTRACTLY (one pass over the key
+            // image and a group window) rather than concretely — see
+            // `groupby_pass_bindings`' own doc for the clause reading.
+            // Tried FIRST, since its target is a tuple the bare-Name
+            // gate below would decline outright.
             Stmt::For(for_stmt) => {
                 if !for_stmt.orelse.is_empty() {
                     return None;
+                }
+                if let Some(bindings) = groupby_pass_bindings(for_stmt, environment, kernel) {
+                    for (name, value) in bindings {
+                        environment.bind(&name, value);
+                    }
+                    let falls_through =
+                        interpret_body(&for_stmt.body, kernel, depth, environment, returns, super_resolver)?;
+                    if !falls_through {
+                        return Some(false);
+                    }
+                    continue;
                 }
                 let Expr::Name(target_name) = for_stmt.target.as_ref() else {
                     return None;
                 };
                 let receiver = evaluate_expression(for_stmt.iter.as_ref(), environment, kernel);
+                // A REPETITION WINDOW receiver — `out.splitlines()` over an
+                // UNREAD `out` (`string_models::sort_only`'s own
+                // `splitlines` row answers `repetition(strings(), 0,
+                // None)`), or a declared `list[X]` parameter's own seed.
+                // There is no element LIST to step: the window states one
+                // element set and no count. Every position draws from that
+                // SAME set (`repetition_window_forms::as_repetition`), so
+                // one pass over the element is the whole reading — exactly
+                // the stand-in `loops::for_loop::repetition_window_element_
+                // pass` makes for the identical receiver, and the same
+                // one-abstract-pass posture `groupby_pass_bindings` above
+                // already takes in this file.
+                //
+                // The pass runs on the SAME environment rather than a join
+                // of the zero-iteration and one-pass states: this
+                // interpreter has no per-name join channel, and the values
+                // a body accumulates through it are read back through
+                // claims that already cover the zero-iteration case (a
+                // dict written at an unread key widens to the
+                // unbounded-key star, whose own `len` is the floor `[0,
+                // +inf)` — true of the empty dict too).
+                if receiver.kind == Kind::Set && receiver.set_kind_tag == SetKindTag::None {
+                    let repeated = as_repetition(&receiver.set)?;
+                    let element = AbstractValue {
+                        kind_tag: receiver.kind_tag,
+                        ..known_set(repeated.element, None, trust_level_of(&receiver), SetKindTag::None)
+                    };
+                    environment.bind(target_name.id.as_str(), element);
+                    let falls_through =
+                        interpret_body(&for_stmt.body, kernel, depth, environment, returns, super_resolver)?;
+                    if !falls_through {
+                        return Some(false);
+                    }
+                    continue;
+                }
                 if receiver.kind != Kind::List || receiver.items.iter().any(|item| item.kind == Kind::Unknown) {
                     return None;
                 }
@@ -496,34 +561,167 @@ fn interpret_assign(assign: &StmtAssign, kernel: &Arc<RefinedTSKernel>, environm
     write_self_field(target, assign.value.as_ref(), kernel, environment)
 }
 
+/// The `(key, group)` pair one pass of `for key, group in
+/// groupby(<iterable>[, key=<callable>]):` binds, as `(name, value)`
+/// rows ready to bind — A8.seed.library's own `group_by_parity`, read
+/// inside a summarized body. The same clause reading
+/// `loops::for_loop::groupby_element_pass` states for the ordinary walk,
+/// reimplemented locally per this file's own "no importing loops.rs"
+/// precedent:
+///
+/// library/itertools.rst, `groupby(iterable, key=None)`: "Make an
+/// iterator that returns consecutive keys and groups from the
+/// *iterable*. The *key* is a function computing a key value for each
+/// element. If not specified or is ``None``, *key* defaults to an
+/// identity function and returns the element unchanged." And on the
+/// group: "The returned group is itself an iterator that shares the
+/// underlying iterable," yielding values drawn from it.
+///
+/// Over an iterable this domain reads only as a REPETITION WINDOW, no
+/// exact grouping exists — the element values decide both the group
+/// count and where the breaks fall, and neither is read. What the entry
+/// pins, given the element set: the KEY is the key function's IMAGE over
+/// that set (the element set itself when `key=` is absent or `None`, the
+/// entry's own identity default), and the GROUP is a sequence of
+/// elements of the same iterable — a repetition window over that same
+/// element set, starting at 1 since every group `groupby` emits holds at
+/// least the element that created it.
+///
+/// One pass, never a per-group walk: the group COUNT is exactly what is
+/// unread, so there is no element list to step. `None` for any other
+/// shape — a non-`groupby` iterable, a shadowed `groupby`/`itertools`
+/// name, a receiver that is not a bare repetition window, a target that
+/// is not a two-name tuple, a `key=` whose image cannot be read, or a
+/// keyword the entry's signature does not name.
+fn groupby_pass_bindings(
+    for_stmt: &ruff_python_ast::StmtFor,
+    environment: &Environment,
+    kernel: &Arc<RefinedTSKernel>,
+) -> Option<Vec<(String, AbstractValue)>> {
+    let Expr::Tuple(target) = for_stmt.target.as_ref() else {
+        return None;
+    };
+    let [key_target, group_target] = &*target.elts else {
+        return None;
+    };
+    let (Expr::Name(key_name), Expr::Name(group_name)) = (key_target, group_target) else {
+        return None;
+    };
+    let Expr::Call(call) = for_stmt.iter.as_ref() else {
+        return None;
+    };
+    let bare = matches!(call.func.as_ref(), Expr::Name(name) if name.id.as_str() == "groupby")
+        && environment.read("groupby").is_none();
+    let qualified = match call.func.as_ref() {
+        Expr::Attribute(attribute) if attribute.attr.as_str() == "groupby" => {
+            matches!(attribute.value.as_ref(), Expr::Name(module) if module.id.as_str() == "itertools")
+                && environment.read("itertools").is_none()
+        }
+        _ => false,
+    };
+    if !bare && !qualified {
+        return None;
+    }
+    let [iterable_expr] = &*call.arguments.args else {
+        return None;
+    };
+    let iterable = evaluate_expression(iterable_expr, environment, kernel);
+    if iterable.kind != Kind::Set || iterable.set_kind_tag != SetKindTag::None {
+        return None;
+    }
+    let repeated = as_repetition(&iterable.set)?;
+    let grade = trust_level_of(&iterable);
+    let element = AbstractValue {
+        kind_tag: iterable.kind_tag,
+        ..known_set(repeated.element.clone(), None, grade, SetKindTag::None)
+    };
+    let mut key_expression: Option<&Expr> = None;
+    for keyword in &call.arguments.keywords {
+        let name = keyword.arg.as_ref()?;
+        if name.id.as_str() != "key" {
+            return None;
+        }
+        key_expression = Some(&keyword.value);
+    }
+    let key_value = match key_expression {
+        None => element.clone(),
+        Some(Expr::NoneLiteral(_)) => element.clone(),
+        Some(expression) => call_one_argument_expression(expression, &element, environment, kernel)?,
+    };
+    if key_value.kind == Kind::Unknown {
+        return None;
+    }
+    let group_value = AbstractValue {
+        kind_tag: iterable.kind_tag,
+        ..known_set(repetition(repeated.element, 1, None), None, grade, SetKindTag::None)
+    };
+    Some(vec![
+        (key_name.id.to_string(), key_value),
+        (group_name.id.to_string(), group_value),
+    ])
+}
+
 /// `(a, b, ...) = value` / `[a, b, ...] = value` inside a restricted
 /// body — e-class-and-function.py's own `unpack_first`: `a, _b = ages`
 /// where `ages` is the def's own tuple-typed PARAMETER (`ages: tuple[int,
-/// int]`), a known `Kind::List` value bound at call time. No starred
-/// element (`a, *rest = value` is out of this restricted interpreter's
-/// scope — the mission names no fixture row needing it here, and
+/// int]`), a known `Kind::List` value bound at call time; and
+/// A8.edge.process's own `k, v = line.split("=", 1)`. No starred element
+/// (`a, *rest = value` is out of this restricted interpreter's scope —
+/// the mission names no fixture row needing it here, and
 /// `check.rs::bind_known_sequence_target` already owns that shape for the
 /// ordinary walk); every target must be a bare `Expr::Name` (a nested
-/// tuple/list sub-target is also out of scope, same reasoning). `None`
-/// (the whole call declines) when `value` is not a known `Kind::List`,
-/// the element COUNT does not match the target list's own length exactly
-/// (CPython's own `ValueError` — this restricted interpreter has no
-/// finding sink to report it through, so a mismatch is an honest decline
-/// rather than a silently-wrong bind), or any target is not a bare name.
+/// tuple/list sub-target is also out of scope, same reasoning).
+///
+/// simple_stmts.rst, "Assignment statements", states the rule for a
+/// target list that is not a single target: "The object must be an
+/// iterable with the same number of items as there are targets in the
+/// target list, and the items are assigned, from left to right, to the
+/// corresponding targets." Two right-side shapes carry that reading, the
+/// same two `loops::body_once::run_unpack_assign_once` reads for the
+/// identical statement inside a loop body:
+///
+/// - an EXACT `Kind::List`: the arity is known, so a matching count
+///   binds positionally and a mismatch is CPython's own `ValueError`,
+///   which this restricted interpreter has no finding sink for — an
+///   honest decline rather than a silently-wrong bind.
+/// - a REPETITION WINDOW (`Kind::Set` reading back through
+///   `as_repetition` — `line.split("=", 1)` over an unread `line`): the
+///   window states no exact item count, but every position draws from
+///   the SAME element set, so on every run whose arity does match — the
+///   only runs that do not raise — each target's item is somewhere in
+///   that one element set, and binding every target to the element is
+///   the claim the window supports.
+///
+/// `None` (the whole call declines) for any other right-side value.
 fn bind_unpack_target(target: &Expr, value: &AbstractValue, environment: &mut Environment) -> Option<()> {
     let elements: &[Expr] = match target {
         Expr::Tuple(tuple) => &tuple.elts,
         Expr::List(list) => &list.elts,
         _ => return None,
     };
-    if value.kind != Kind::List || elements.len() != value.items.len() {
-        return None;
-    }
-    for (element, item) in elements.iter().zip(value.items.iter()) {
+    let mut names: Vec<&str> = Vec::with_capacity(elements.len());
+    for element in elements {
         let Expr::Name(name) = element else {
             return None;
         };
-        environment.bind(name.id.as_str(), item.clone());
+        names.push(name.id.as_str());
+    }
+    if value.kind == Kind::Set && value.set_kind_tag == SetKindTag::None {
+        let repeated = as_repetition(&value.set)?;
+        let element = AbstractValue {
+            kind_tag: value.kind_tag,
+            ..known_set(repeated.element, None, trust_level_of(value), SetKindTag::None)
+        };
+        for name in &names {
+            environment.bind(name, element.clone());
+        }
+        return Some(());
+    }
+    if value.kind != Kind::List || names.len() != value.items.len() {
+        return None;
+    }
+    for (name, item) in names.iter().zip(value.items.iter()) {
+        environment.bind(name, item.clone());
     }
     Some(())
 }

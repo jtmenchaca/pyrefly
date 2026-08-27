@@ -46,7 +46,10 @@
 //!
 //! A binding of any other kind (`Kind::Null`, `Kind::Object`, …)
 //! passes through unchanged on both channels: the honest default is to
-//! narrow nothing.
+//! narrow nothing. The one exception is a window-flowing TEMPORAL
+//! binding (`Kind::Object`, `source == "temporal_flow"`), which the
+//! temporal channel (`temporal_window`) narrows by tightening its
+//! calendar window rather than a numeric set.
 //!
 //! Chained comparisons lower to a conjunction of adjacent pairs
 //! (`a op1 b op2 c` == `a op1 b and b op2 c`, CPython
@@ -62,6 +65,7 @@ mod isinstance_guards;
 mod none_truthiness;
 mod path;
 mod predicates;
+mod temporal_window;
 
 #[cfg(test)]
 mod tests;
@@ -85,6 +89,7 @@ use bool_op::narrow;
 use bool_op::narrow_set_kind_names;
 use compare::literal_numeric_collection;
 use path::narrow_path_comparisons;
+use temporal_window::narrow_temporal_windows;
 
 /// Tighten `environment` by what `condition` being `truth` says.
 /// Returns the narrowed environment for that arm. The honest default
@@ -107,6 +112,13 @@ pub fn assume(
     narrow(condition, &mut environment, kernel, truth);
     narrow_set_kind_names(condition, &mut environment, kernel, truth);
     narrow_path_comparisons(condition, &mut environment, truth);
+    // the TEMPORAL channel: a calendar-component test over a
+    // window-flowing temporal name tightens that name's own window
+    // (`temporal_window`'s own doc). Keyed on a `Kind::Object` binding
+    // the three channels above all pass through untouched, so its
+    // position among them is free; it runs last to keep the two
+    // name-keyed channels' order stable.
+    narrow_temporal_windows(condition, &mut environment, kernel, truth);
     environment
 }
 

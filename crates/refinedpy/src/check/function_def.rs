@@ -135,10 +135,12 @@ pub struct DerivedReturns {
     pub blockers: HashMap<String, String>,
 }
 
-/// An empty answer when the module states no `type` alias AND no
-/// recognized `Annotated` import (the same early exit
-/// `findings_for_module_at` takes). A def whose body produced no
-/// `return` value this walk could read is simply absent from `values`
+/// Every def walks on its own merits, whether or not the module states
+/// any `type` alias or recognized `Annotated` import — a def with no
+/// refinement vocabulary in scope still has a derivable return value
+/// and a nameable blocker (`findings_for_module_at`'s own rule). A
+/// def whose body produced no `return` value this walk could read is
+/// simply absent from `values`
 /// — never an entry holding a guessed value. `blockers` names the FIRST
 /// construct that stopped a def's own walk (the same RTS7002 sentence
 /// `findings_for_module` would report for this body), independent of
@@ -174,12 +176,10 @@ pub fn derived_return_values_at(
 ) -> DerivedReturns {
     let aliases = compile_aliases(module);
     let imports = surface_imports(module);
-    if aliases.is_empty()
-        && imports.annotated_names.is_empty()
-        && imports.literal_names.is_empty()
-    {
-        return DerivedReturns { values: HashMap::new(), blockers: HashMap::new() };
-    }
+    // Every module reaches the walk, the same rule
+    // `findings_for_module_at` keeps: what a def derives comes from its
+    // own statements, so a def with no refinement vocabulary in its
+    // module still has a derivable return value and a nameable blocker.
     let surface = module_surface(module, resolver, kernel);
     let own_functions = function_table(module);
     let functions = Arc::new(merged(&own_functions, surface.functions.as_ref()));
@@ -216,6 +216,7 @@ pub fn derived_return_values_at(
         caller_arguments,
         entry_directory: entry_directory.map(|dir| dir.to_path_buf()),
         evaluations_recorder: None,
+        trace_collector: None,
     };
     let mut values = HashMap::new();
     let mut blockers = HashMap::new();

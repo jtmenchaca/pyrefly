@@ -30,7 +30,7 @@ use crate::check::{
     seed_parameters, walk_method_def, walk_relational_sum, Finding, RelationalSum, WalkContext,
 };
 
-use super::{record_blocker, walk_statement};
+use super::{record_blocker, walk_statement, FallsThrough};
 
 /// One body's walk: build its environment from every name it locally
 /// binds, then dispatch each statement in order. `parameters` seeds a
@@ -270,6 +270,13 @@ pub(in crate::check) fn walk_body_with_self_binding(
     // recordings from every body but the outermost would be lost.
     if let Some(recorder) = context.evaluations_recorder.clone() {
         environment.set_evaluations_recorder(recorder);
+    }
+    // The same sharing, for the same reason, for the derivation-trace
+    // collector: a nested `def`'s own body builds a fresh `Environment`
+    // here, and the blocked position the caller asked about may sit
+    // inside it.
+    if let Some(collector) = context.trace_collector.clone() {
+        environment.set_trace_collector(collector);
     }
     environment.set_functions(Arc::new(merged(&local_function_table(body), &context.functions)));
     environment.set_classes(merged_classes_for_body(body, context));
@@ -520,7 +527,7 @@ pub(in crate::check) fn walk_body_with_self_binding(
         } else {
             return_refinement
         };
-        let terminates = walk_statement(
+        let falls_through = walk_statement(
             stmt,
             effective_return_refinement,
             yield_refinement,
@@ -553,7 +560,16 @@ pub(in crate::check) fn walk_body_with_self_binding(
         // read past the try from reporting an unreadable-value blocker
         // for a name only the (unreachable) fall-through path would have
         // left unbound.
-        if terminates {
+        // A statement that provably never falls through ends this body's
+        // walk, whichever of the two reasons carried it: a try whose arms
+        // all terminate, or an if whose test proved true and whose arm
+        // terminates. In the second case whatever follows is provably
+        // unreachable — but no corpus row designates an unreachable
+        // STATEMENT (the dead-code convention designates the CONDITION,
+        // the sink.dead rows' own shape), so the walk stops without
+        // reporting rather than landing a true determination at a
+        // position no designation covers.
+        if falls_through != FallsThrough::Yes {
             break;
         }
     }

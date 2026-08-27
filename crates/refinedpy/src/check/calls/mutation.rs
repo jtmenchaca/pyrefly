@@ -2,12 +2,22 @@
 //! call replays the mutation or forgets the receiver, so a stale
 //! pre-call fact never survives it.
 
-use ruff_python_ast::Expr;
+use std::collections::HashMap;
 
+use refined_domain::abstract_value::AbstractValue;
+use refined_domain::abstract_value::Kind;
+use ruff_python_ast::Expr;
+use ruff_text_size::Ranged;
+use ruff_text_size::TextRange;
+
+use crate::assignability::judge;
+use crate::assignability::Verdict;
+use crate::check::Finding;
 use crate::check::WalkContext;
 use crate::collection_models::mutated_receiver;
 use crate::env::Environment;
 use crate::expressions::provable_raise;
+use crate::typereading::DeclaredRefinement;
 
 use super::construction::evaluate_positional_arguments;
 
@@ -28,6 +38,27 @@ use super::construction::evaluate_positional_arguments;
 /// (a-statements.py's `collection_mutators`; c-reads-and-values.py's
 /// `list_append`/`dict_set_item` rows).
 ///
+/// THE ELEMENT SINK: an `append`/`extend` onto a receiver whose own
+/// DECLARATION states an element refinement (`xs: list[Age]`, whose
+/// `DeclaredRefinement.element` carries `Age`'s window) judges the
+/// appended value against THAT element, at the argument's own range,
+/// before the replay rebinds anything. Without it, `xs.append(200)`
+/// merely WIDENED `xs`'s own element window to admit 200
+/// (`set_mutated_receiver`'s join is the right answer for an
+/// undeclared receiver) and said nothing at the append itself — the
+/// out-of-window value then surfaced at whatever LATER sink read `xs`,
+/// which reported the same one defect at a position that is not where
+/// it was introduced.
+///
+/// A judged element also STOPS the widening: where the append is
+/// admitted, the receiver keeps its declared element set rather than
+/// joining the argument in (the declaration already states that the
+/// argument is inside it, so the join adds nothing); where it fires,
+/// the receiver likewise keeps its declared set, since the program is
+/// being told to fix the append rather than to carry a widened claim
+/// downstream. Only a receiver with NO declared element still widens,
+/// exactly as before.
+///
 /// Returns `true` when this shape matched (whether or not
 /// `mutated_receiver` itself recognized the method) — the caller then
 /// skips its own `sink_value` call, since the receiver name has already
@@ -41,6 +72,8 @@ pub(in crate::check) fn walk_mutating_call_statement(
     expr: &Expr,
     context: &WalkContext,
     environment: &mut Environment,
+    declared_refinements: &HashMap<String, DeclaredRefinement>,
+    out: &mut Vec<Finding>,
 ) -> bool {
     let Expr::Call(call) = expr else {
         return false;
@@ -66,9 +99,53 @@ pub(in crate::check) fn walk_mutating_call_statement(
     let arguments = evaluate_positional_arguments(&call.arguments.args, environment, context.kernel);
     let argument_values: Vec<refined_domain::abstract_value::AbstractValue> =
         arguments.iter().map(|(value, _)| value.clone()).collect();
+    // THE ELEMENT SINK (this function's own doc): judge the appended /
+    // extended value against the receiver's DECLARED element, at the
+    // argument's own range, and keep the declared element set rather
+    // than widening it.
+    if let Some(element) = declared_refinements
+        .get(receiver_name.id.as_str())
+        .and_then(|declared| declared.element.as_deref())
+    {
+        let judged: Vec<(&AbstractValue, TextRange)> = match method {
+            "append" => arguments.iter().map(|(value, range)| (value, *range)).collect(),
+            // `extend`'s argument is the ITERABLE — its own items are what
+            // land in the receiver, so a known `Kind::List` argument is
+            // judged item by item at the iterable's own range. An
+            // unread iterable states no items to judge, and falls
+            // through to the ordinary replay unchanged.
+            "extend" => match arguments.as_slice() {
+                [(iterable, range)] if iterable.kind == Kind::List => {
+                    iterable.items.iter().map(|item| (item, *range)).collect()
+                }
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
+        };
+        if !judged.is_empty() {
+            for (value, range) in judged {
+                if let Verdict::Fire(message) = judge(value, element, context.kernel) {
+                    out.push(Finding { range, code: "RTS7001", message });
+                }
+            }
+            // the declaration already states which elements this receiver
+            // holds; the append is judged against it rather than widening
+            // it, so the binding stays exactly what the declaration says
+            return true;
+        }
+    }
     match mutated_receiver(method, &receiver_value, &argument_values) {
         Some((new_receiver, _result)) => environment.bind(receiver_name.id.as_str(), new_receiver),
-        None => environment.forget(receiver_name.id.as_str()),
+        // An unmodeled method may have mutated the receiver in a way this
+        // walk cannot replay: forgets it NAMING the call itself as the
+        // cause (`expr`'s own range — the whole `name.method(args)` call)
+        // so the LAST-TOUCH LEDGER's later stamp on a declined read of
+        // this name reads "havocked by `s.add(x)` @…" rather than the
+        // bare "forgotten" a cause-less forget would leave.
+        None => environment.forget_with_cause(
+            receiver_name.id.as_str(),
+            (usize::from(expr.range().start()), usize::from(expr.range().end())),
+        ),
     }
     true
 }

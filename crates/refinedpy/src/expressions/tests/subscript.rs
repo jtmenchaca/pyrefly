@@ -22,6 +22,32 @@ fn test_list_tuple_literal_and_subscript_read() {
     assert_eq!(subscripted.values, vec![20.0]);
 }
 
+/// `sys.argv[1:]` — a slice of an UNKNOWN-LENGTH sequence
+/// (`repetition_window_slice`'s own row). Both facts a repetition
+/// window states survive: the element set is unchanged (a slice selects
+/// positions, never building a value outside the sequence's own
+/// alphabet), and the length window relaxes at the low end, since
+/// "Slicings" clamps an out-of-range bound rather than raising.
+#[test]
+fn test_slice_of_an_unknown_length_sequence_keeps_the_element_and_relaxes_the_length() {
+    let Some(value) = eval("sys.argv[1:]") else { return };
+    assert_eq!(value.kind, Kind::Set);
+    let window = refined_sets::repetition_window_forms::as_repetition(&value.set).expect("a repetition window");
+    assert_eq!(window.element, refined_sets::codepoint_sets::strings(), "an argv element is still an unread string");
+    assert_eq!(window.lo, 0, "a slice can select nothing at all");
+    assert_eq!(window.hi, None, "argv's own count was already unstated");
+}
+
+/// `sys.argv[:]` — the WHOLE slice: both bounds absent selects every
+/// position, so the receiver copies through with its own length window
+/// intact rather than relaxed.
+#[test]
+fn test_whole_slice_of_an_unknown_length_sequence_copies_the_receiver_through() {
+    let Some(sliced) = eval("sys.argv[:]") else { return };
+    let Some(whole) = eval("sys.argv") else { return };
+    assert_eq!(sliced.set, whole.set);
+}
+
 /// `[*xs, 30]` splices a known list's own elements in place, in
 /// order (expressions.rst, "List displays").
 #[test]
@@ -303,13 +329,15 @@ fn test_slice_prefix_declines_a_step_slice() {
     assert_eq!(result.kind, Kind::Unknown, "a step slice must still decline: {result:?}");
 }
 
-/// A NEGATIVE `upper` bound over the same set-shaped receiver
-/// declines: `sequence_prefix_slice` refuses `n < 0` rather than
-/// asking the kernel a nonsensical prefix length, and the length-based
-/// fallback below it has no known length for a `Kind::Set` receiver
-/// either, so the whole slice stays `unknown()`.
+/// A NEGATIVE `upper` bound over the same set-shaped receiver answers
+/// the relaxed repetition window: `repetition_window_slice` keeps the
+/// element set (every slice member is a receiver member) and opens the
+/// length at the low end (a slice can select as few as zero
+/// positions), reading nothing from the upper bound itself. That is a
+/// weaker claim than the receiver's, and every member of `padded[:-1]`
+/// is in it.
 #[test]
-fn test_slice_prefix_declines_a_negative_upper_bound() {
+fn test_slice_with_a_negative_upper_bound_keeps_the_element_window() {
     let Some(kernel) = loaded_kernel() else { return };
     let receiver = AbstractValue {
         kind_tag: None,
@@ -325,7 +353,16 @@ fn test_slice_prefix_declines_a_negative_upper_bound() {
     let parsed = parse_expression("padded[:-1]").expect("test source must parse");
     let Expr::Subscript(subscript) = parsed.into_expr() else { panic!("expected a Subscript") };
     let result = evaluate_subscript(&subscript, &environment, &kernel);
-    assert_eq!(result.kind, Kind::Unknown, "a negative upper bound must decline: {result:?}");
+    assert_eq!(result.kind, Kind::Set, "the slice keeps a set answer: {result:?}");
+    let window = refined_sets::repetition_window_forms::as_repetition(&result.set)
+        .expect("the slice answers a repetition window");
+    assert_eq!(window.lo, 0, "a slice can select zero positions");
+    assert_eq!(window.hi, None, "the receiver's open ceiling stays open");
+    assert_eq!(
+        window.element,
+        refined_sets::codepoint_sets::codepoints(),
+        "the element set is the receiver's own"
+    );
 }
 
 /// The KERNEL's own decline — not a shape `sequence_prefix_slice`'s

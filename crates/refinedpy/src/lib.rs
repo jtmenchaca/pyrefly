@@ -35,6 +35,7 @@ pub mod string_models;
 pub mod summaries;
 pub mod summary_lowering;
 pub mod surface;
+pub mod trace;
 pub mod transfer_conformance;
 pub mod truthiness_conformance;
 pub mod typereading;

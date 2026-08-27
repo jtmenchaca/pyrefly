@@ -17,6 +17,7 @@ use refined_domain::trust_grades::trust_level_of;
 use refined_sets::repetition_window_forms::as_repetition;
 
 use super::dict_key::known_dict_key;
+use super::dict_key::name_is_guarded;
 use super::dict_key::DictKey;
 use super::kernel_join::dict_key_set_read;
 
@@ -170,6 +171,25 @@ pub(super) fn dict_key_read(keys: &[ObjectKey], key: &DictKey) -> Option<Abstrac
         .map(|entry| entry.value.clone())
 }
 
+/// `dict_key_read`, restricted to a WRITE-provenance entry: an entry
+/// recorded under `DictKey::guarded`'s own wrapper (a membership guard's
+/// "present at the guard" claim, `narrowing::compare::narrow_dict_
+/// membership_against_literal_key`'s own doc) is excluded even when its
+/// spelling matches, because that claim can go stale from a mutation
+/// the guard's own presence fact never ruled out. What is left — a
+/// plain or identity-tagged entry with no guard wrapper — was put there
+/// by an actual WRITE (`dict_write::dict_with_item`'s star arm,
+/// `dict_mutation`'s own `setdefault` arm), which really did put the
+/// value there, so a read of it is exact with no miss branch to fold
+/// in. Used by `len_and_get::dict_star_get_result`'s own written-key
+/// shortcut, which must not extend a write's unconditional certainty to
+/// a guard's conditional one.
+pub(super) fn dict_key_read_written(keys: &[ObjectKey], key: &DictKey) -> Option<AbstractValue> {
+    keys.iter()
+        .find(|entry| entry.name == key.name && entry.numeric == key.numeric && !name_is_guarded(&entry.name))
+        .map(|entry| entry.value.clone())
+}
+
 /// `container[index]` on a KNOWN-LENGTH-UNKNOWN, known-element-set
 /// receiver: `Kind::Set` whose only form is `Form::Star(element)` — the
 /// shape `check.rs::seed_parameters` builds for a `list[X]`/`set[X]`/
@@ -204,32 +224,89 @@ pub(super) fn star_element_read(container: &AbstractValue, index: &AbstractValue
     })
 }
 
-/// `container[key]` on a `dict[str, X]` PARAMETER'S own unbounded-key
+/// `container[key]` on a `dict[K, X]` PARAMETER'S own unbounded-key
 /// receiver (`Kind::ObjectStar` — `check.rs::seed_parameters`' own
-/// `known_dict_star` seed, `element_of_object_star`'s doc): every
-/// STRING key, if present, reads the star's wrapped element — the same
-/// value `.get(k)` reads on its own present-key branch
-/// (`dict_get_result`'s dict-star arm below). Gated on a STRING key
-/// (`known_dict_key` proving a `numeric: false` identity) because the
-/// declaration is `dict[str, X]`, never an int key — an Integer- or
-/// unrecognized-sorted index answers `None`, the same "not this dict's
-/// key sort" decline `dict_key_read` gives a closed dict.
+/// `known_dict_star` seed, `element_of_object_star`'s doc): every key,
+/// if present, reads the star's wrapped element — the same value
+/// `.get(k)` reads on its own present-key branch (`dict_get_result`'s
+/// dict-star arm below). The key must be one this domain can read at all
+/// (`known_dict_key` — a string, an int, or an identity-comparable
+/// sentinel), but its SORT does not gate the read: the star's element is
+/// the value law stdtypes.rst's Mapping Types section states once for any
+/// hashable key. An index this domain cannot read as a key at all
+/// answers `None`.
 ///
-/// This does not itself prove the key is PRESENT (an unbounded dict
-/// states no fixed key set to check against) — it reads the value the
-/// declaration states EVERY present key holds, the same way a closed
+/// A key this receiver was WRITTEN at is the one exception to "the star's
+/// law": that write recorded the key's own entry
+/// (`dict_write::dict_with_item`'s star arm), which states that key's
+/// value exactly, so a read of the same key answers what was written.
+///
+/// This does not itself prove an unwritten key is PRESENT (an unbounded
+/// dict states no fixed key set to check against) — it reads the value
+/// the declaration states EVERY present key holds, the same way a closed
 /// dict's own `dict_key_read` answers a value without separately
 /// proving the runtime dict was literally built with that key. CPython
 /// raises `KeyError` on a genuinely missing key either way
 /// (`stdtypes.rst`'s `d[key]` row); this domain carries no exception
 /// channel for that miss on a closed dict either, so an unbounded dict
 /// keeps the identical honesty.
+///
+/// The written-key shortcut here reads through the UNRESTRICTED
+/// `dict_key_read`, deliberately not `dict_key_read_written`
+/// (`len_and_get::dict_star_get_result`'s own restricted reader): a
+/// GUARD-recorded entry (`DictKey::guarded`'s own doc) proves presence
+/// AT THE GUARD, and a `d[key]` SUBSCRIPT read raises `KeyError` rather
+/// than folding a miss branch in, so the guard's presence claim is
+/// exactly the fact this read needs — sound for as long as neither `d`
+/// nor the key binding has been written since (`Environment::bind`/
+/// `forget_recorded_star_entries`'s own docs enforce that half). This is
+/// what keeps A8.guard.forget's own `guard_standing_read` and A8.xfer.
+/// weak's `guarded_weak_read` determined.
 pub(super) fn dict_star_index_read(container: &AbstractValue, index: &AbstractValue) -> Option<AbstractValue> {
-    let key = known_dict_key(index)?;
-    if key.numeric {
+    // A key this receiver was WRITTEN at carries its own recorded entry
+    // (`dict_with_item`'s own star arm), which states that key's value
+    // exactly rather than the whole mapping's law — so a read of the same
+    // key answers what was written, not the declaration's wider set.
+    if let Some(key) = known_dict_key(index) {
+        if let Some(written) = dict_key_read(&container.keys, &key) {
+            return Some(written);
+        }
+        return element_of_object_star(container);
+    }
+    if !readable_star_key(index) {
         return None;
     }
-    element_of_object_star(container)
+    // An UNREAD key (a `k: str` parameter's own `Σ*` seed) could be any
+    // key at all — including one this receiver was written at — so the
+    // answer is the star's own law JOINED with every recorded entry's
+    // value, never the law alone. That is the loosest claim that covers
+    // both, and the exact one: those are all the values any key of this
+    // mapping can hold.
+    let mut answer = element_of_object_star(container)?;
+    for entry in &container.keys {
+        answer = join_known(answer, entry.value.clone());
+    }
+    Some(answer)
+}
+
+/// Whether `index` is a key an unbounded-key dict read can accept even
+/// though no EXACT key spelling is known for it — a `k: str` parameter's
+/// own `Σ*` seed, or any other sort-only scalar (`Kind::Set`) or exact
+/// value (`Kind::Values`) this domain reads as a hashable scalar.
+///
+/// A closed dict needs the exact key to pick which entry to read, so
+/// `known_dict_key` is the right gate there. A STAR receiver has no
+/// entries to pick between: it states one value law every present key
+/// obeys, so the read answers that law whether or not the key's own
+/// value is pinned. That is what `d[k]` on a `dict[str, Age]` parameter
+/// with an unread `k: str` needs — A8.xfer.computed's own `read_computed`
+/// row, which must read `Age`, not nothing at all.
+///
+/// An UNKNOWN index is still refused: a value this domain cannot read as
+/// a scalar at all may not be hashable, and an unhashable key is
+/// CPython's own `TypeError` rather than a read this row answers.
+fn readable_star_key(index: &AbstractValue) -> bool {
+    matches!(index.kind, Kind::Values | Kind::Set)
 }
 
 /// `container[index]` — the subscription read (expressions.rst,
@@ -244,8 +321,9 @@ pub(super) fn dict_star_index_read(container: &AbstractValue, index: &AbstractVa
 /// UNION of known strings where every named entry is present
 /// (`dict_key_set_read`'s own doc), an unbounded-key `dict[str, X]`
 /// receiver with a known string key (`dict_star_index_read`'s own
-/// doc), or an unknown-length sequence whose element set is known
-/// (`star_element_read`'s own doc). Every other receiver shape or
+/// doc), an unknown-length sequence whose element set is known
+/// (`star_element_read`'s own doc), or `json.loads`'s own return union
+/// (`json_union_element_read`'s own doc). Every other receiver shape or
 /// index/key shape answers `None` — an unknown receiver, a
 /// non-Integer index into a list or string, an unsupported key sort
 /// into a dict, or a slice — none of those are modeled here and this
@@ -268,6 +346,40 @@ pub fn subscript_read(container: &AbstractValue, index: &AbstractValue) -> Optio
         },
         Kind::ObjectStar => dict_star_index_read(container, index),
         Kind::Set => star_element_read(container, index),
+        Kind::KindUnion => json_union_element_read(container),
         _ => None,
     }
+}
+
+/// `parsed[i]` / `parsed[k]` where `parsed` is `json.loads`'s own return
+/// space (`expressions::json_re::json_loads_value_space` — the JSON
+/// conversion table read as one union, whose list and dict arms are
+/// `opaque_value`s naming the kind of thing without its contents).
+///
+/// A JSON array's items and a JSON object's values are themselves JSON
+/// values (library/json.rst's conversion table is closed under nesting:
+/// an `array`'s elements and an `object`'s values are drawn from the
+/// same `value` production), so the element read answers the SAME union
+/// the container itself came from. That is the exact claim, not an
+/// approximation — and it is what A7.seed.library's own
+/// `parse_digits_element_window` needs: `digits[0]` must read as
+/// something Age's `[0, 150]` cannot contain, so the read refuses,
+/// instead of carrying no value at all and leaving the position
+/// undetermined. Its guarded sibling `parse_digits_element_guarded` then
+/// narrows the same union by `isinstance(first, int) and 0 <= first <=
+/// 9` through the ordinary arm-filtering and set-narrowing channels.
+///
+/// `None` for any other union — one whose arms this reader has no
+/// closure law for. Recognized by the presence of a container arm: a
+/// union with no list or dict arm was never a subscriptable value in the
+/// first place.
+fn json_union_element_read(container: &AbstractValue) -> Option<AbstractValue> {
+    let has_container_arm = container
+        .arms
+        .iter()
+        .any(|arm| matches!(arm.kind_word, Some("a list") | Some("a dict")));
+    if !has_container_arm {
+        return None;
+    }
+    Some(container.clone())
 }

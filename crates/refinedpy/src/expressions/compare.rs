@@ -5,6 +5,7 @@ use refined_domain::abstract_value::unknown;
 use refined_domain::abstract_value::AbstractValue;
 use refined_domain::abstract_value::Kind;
 use refined_domain::abstract_value::PrimitiveKind;
+use refined_domain::abstract_value::SetKindTag;
 use refined_domain::lattice_operations::join_known;
 use refined_domain::lattice_operations::truthiness;
 use refined_kernel::kernel_interface::RefinedTSKernel;
@@ -64,6 +65,64 @@ pub(super) fn compare_pair(op: CmpOp, left: &AbstractValue, right: &AbstractValu
     // in y)`" — this row reads the `==` half, since exact-value equality
     // already decides `is` for two equal known scalars).
     if op == CmpOp::In || op == CmpOp::NotIn {
+        // `key in d` on a MAPPING receiver — the same "Comparisons" row
+        // names dict among its container types, and stdtypes.rst's own
+        // Mapping Types section states what membership means there:
+        // "`key in d` — Return `True` if *d* has a key *key*, else
+        // `False`." So this is a question about the KEY SET, never about
+        // the values, and a closed dict states its key set exactly.
+        if right.kind == Kind::Object && right.kind_word.is_none() {
+            let key = crate::collection_models::known_dict_key(left)?;
+            let present = right.keys.iter().any(|entry| entry.name == key.name && entry.numeric == key.numeric);
+            let result = if op == CmpOp::In { present } else { !present };
+            return Some(if result { 1.0 } else { 0.0 });
+        }
+        // An UNBOUNDED-KEY mapping (`Kind::ObjectStar`) states no key set
+        // to decide against — except for the keys it was WRITTEN at,
+        // which are recorded entries and are therefore PRESENT
+        // (`collection_models::dict_with_item`'s own star arm). A key with
+        // no recorded entry stays undecided: the declaration never said
+        // which keys the mapping arrived holding, so its absence is not
+        // provable. That is what A8.xfer.getorinsert's own
+        // `presence_after_insert` row needs — `setdefault` inserts the
+        // key, so `k in d` afterward is provably True.
+        if right.kind == Kind::ObjectStar {
+            let key = crate::collection_models::known_dict_key(left)?;
+            let present = right.keys.iter().any(|entry| entry.name == key.name && entry.numeric == key.numeric);
+            if !present {
+                return None;
+            }
+            return Some(if op == CmpOp::In { 1.0 } else { 0.0 });
+        }
+        // A `set[X]` parameter's own REPETITION-WINDOW receiver
+        // (`Kind::Set` over the bare star/window shape
+        // `refined_sets::repetition_window_forms::as_repetition` reads
+        // back — `check.rs::seed_parameters`'s own sequence-container
+        // seed) states no fixed member list to decide against, the same
+        // "no key list of its own" shape `Kind::ObjectStar` reads just
+        // above — EXCEPT for an element `set.add(x)` just WROTE, which
+        // is a recorded entry (`collection_models::list_set_mutation::
+        // set_mutated_receiver`'s own `add` arm) and therefore PROVABLY
+        // present, mirroring the dict-star's "written keys are present"
+        // row one arm up. An unrecorded element declines here (`None`)
+        // rather than guess absent: the window states only what the set
+        // MIGHT hold, never that a given value is NOT a member. The
+        // caller (`expressions::subscript::evaluate_compare`) turns that
+        // decline into the exact two-member boolean domain for a
+        // single-pair `in`/`not in` chain — sound, since `in` always
+        // evaluates to `bool` (expressions.rst, "Comparisons") even when
+        // WHICH of the two values it resolves to is not pinned.
+        if right.kind == Kind::Set
+            && right.set_kind_tag == SetKindTag::None
+            && refined_sets::repetition_window_forms::as_repetition(&right.set).is_some()
+        {
+            let key = crate::collection_models::known_dict_key(left)?;
+            let present = right.keys.iter().any(|entry| entry.name == key.name && entry.numeric == key.numeric);
+            if !present {
+                return None;
+            }
+            return Some(if op == CmpOp::In { 1.0 } else { 0.0 });
+        }
         if right.kind != Kind::List {
             return None;
         }

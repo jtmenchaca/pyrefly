@@ -12,8 +12,10 @@ use refined_domain::abstract_value::AbstractValue;
 use refined_domain::abstract_value::Kind;
 use refined_domain::abstract_value::SetKindTag;
 use refined_domain::lattice_operations::truthiness;
+use refined_domain::trust_grades::trust_level_of;
 use refined_domain::trust_grades::TrustSpec;
 use refined_kernel::kernel_interface::RefinedTSKernel;
+use refined_sets::repetition_window_forms::as_repetition;
 use ruff_python_ast::Expr;
 use ruff_python_ast::ExprAttribute;
 use ruff_python_ast::ExprCall;
@@ -129,6 +131,10 @@ pub(super) fn run_statement_once(
             };
             if let Expr::Subscript(subscript) = target {
                 run_subscript_assign_once(subscript, assign.value.as_ref(), environment, kernel)?;
+                return Some(StatementOutcome::Next);
+            }
+            if matches!(target, Expr::Tuple(_) | Expr::List(_)) {
+                run_unpack_assign_once(target, assign.value.as_ref(), environment, kernel)?;
                 return Some(StatementOutcome::Next);
             }
             run_assign_once(target, assign.value.as_ref(), stmt.range(), environment, kernel, judge_context)?;
@@ -289,6 +295,94 @@ pub(super) fn run_assign_once(
     bind_checked(name.id.as_str(), value, stmt_range, environment, kernel, judge_context)
 }
 
+/// `(a, b, ...) = value` / `[a, b, ...] = value` inside a loop body —
+/// A8.edge.process's own `k, v = line.split("=", 1)`. simple_stmts.rst,
+/// "Assignment statements", states the rule for a target list that is
+/// not a single target: "The object must be an iterable with the same
+/// number of items as there are targets in the target list, and the
+/// items are assigned, from left to right, to the corresponding
+/// targets."
+///
+/// Two right-side shapes carry that reading here:
+///
+/// - an EXACT `Kind::List` (`"a=1".split("=", 1)` over a known string —
+///   `string_models::method_result`'s own `split` rows answer the exact
+///   two-element list): the arity is known, so a count that matches
+///   binds positionally and a count that does not is CPython's own
+///   `ValueError`, which this domain has no exception channel for, so a
+///   mismatch declines the whole loop rather than bind partially — the
+///   same posture `bind_for_target` keeps for a `for k, v in ...`
+///   target.
+/// - a REPETITION WINDOW (`line.split("=", 1)` over an unread `line` —
+///   `string_models::sort_only`'s own `split` row answers
+///   `repetition(strings(), 1, None)`, an unbounded list of unread
+///   strings): the window states no exact item count, but every
+///   position of a repetition draws from the SAME element set
+///   (`repetition_window_forms::as_repetition`, the reading
+///   `star_element_read` already gives one indexed position), so on
+///   every run whose arity DOES match the target list — the only runs
+///   that do not raise — each target's item is somewhere in that one
+///   element set. Binding every target to the element is therefore the
+///   claim the window supports. A run whose arity does not match raises
+///   `ValueError`, the same unmodeled raise the exact arm declines on;
+///   this domain states nothing about it either way, exactly as
+///   `bind_for_target`'s own tuple arm does not.
+///
+/// `None` for any other right-side value (nothing is known about the
+/// items to bind), a nested tuple/list sub-target, or a starred target
+/// (a different clause of the same paragraph, with its own item-count
+/// rule — out of this function's scope). Every sub-target must be a
+/// bare `Expr::Name`: this function only ever writes a name it can name,
+/// the same restriction `run_assign_once` keeps.
+///
+/// Unlike `run_assign_once`, no sub-target is judged against
+/// `judge_context.declared`: an unpack writes several names at once and
+/// the corpus's own shapes (`k, v = ...`) name plain locals, so there is
+/// no declared slot to judge. A declared name reached this way binds
+/// unjudged, matching `run_subscript_assign_once`'s own reasoning that
+/// the read side catches what the write side does not judge.
+pub(super) fn run_unpack_assign_once(
+    target: &Expr,
+    value_expr: &Expr,
+    environment: &mut Environment,
+    kernel: &Arc<RefinedTSKernel>,
+) -> Option<()> {
+    let targets: &[Expr] = match target {
+        Expr::Tuple(tuple) => &tuple.elts,
+        Expr::List(list) => &list.elts,
+        _ => return None,
+    };
+    let mut names: Vec<&str> = Vec::with_capacity(targets.len());
+    for sub_target in targets {
+        let Expr::Name(name) = sub_target else {
+            return None;
+        };
+        names.push(name.id.as_str());
+    }
+    let value = evaluate_expression(value_expr, environment, kernel);
+    if value.kind == Kind::List {
+        if value.items.len() != names.len() {
+            return None;
+        }
+        for (name, item) in names.iter().zip(value.items.iter()) {
+            environment.bind(name, item.clone());
+        }
+        return Some(());
+    }
+    if value.kind == Kind::Set && value.set_kind_tag == SetKindTag::None {
+        let repeated = as_repetition(&value.set)?;
+        let element = AbstractValue {
+            kind_tag: value.kind_tag,
+            ..known_set(repeated.element, None, trust_level_of(&value), SetKindTag::None)
+        };
+        for name in &names {
+            environment.bind(name, element.clone());
+        }
+        return Some(());
+    }
+    None
+}
+
 /// `name[k] = v` — the MUTATION CONTRACT's subscript-target shape.
 /// `name` must be a bare name already bound to a known receiver;
 /// `collection_models::dict_with_item`/`list_with_item` (dispatched by
@@ -315,7 +409,16 @@ pub(super) fn run_subscript_assign_once(
     let key = evaluate_expression(subscript.slice.as_ref(), environment, kernel);
     let value = evaluate_expression(value_expr, environment, kernel);
     let new_receiver = match receiver.kind {
-        Kind::Object => collection_models::dict_with_item(&receiver, &key, &value)?,
+        // `Kind::ObjectStar` is the UNBOUNDED-KEY dict — a `dict[K, X]`
+        // parameter's own seed, and what a keyed dict becomes once this
+        // same statement writes it at a key no spelling names
+        // (`dict_write.rs::dict_widened_at_unread_key`). A loop's SECOND
+        // judged pass (`stabilized_join`) reads back exactly that widened
+        // receiver, so it must route to the same `dict_with_item` the
+        // first pass took — that function's own star arm records the
+        // written key or absorbs an unread one, and declining here left
+        // every dict-accumulation loop over an unread key unwalked.
+        Kind::Object | Kind::ObjectStar => collection_models::dict_with_item(&receiver, &key, &value)?,
         Kind::List => collection_models::list_with_item(&receiver, &key, &value)?,
         _ => return None,
     };

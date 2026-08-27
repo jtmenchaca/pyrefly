@@ -781,8 +781,8 @@ fn pattern_captures_names_class_positional_subpatterns_from_match_args_order() {
         ClassModel {
             name: "Point".to_owned(),
             fields: vec![
-                crate::instances::ClassField { name: "x".to_owned(), declared: None, default: None },
-                crate::instances::ClassField { name: "y".to_owned(), declared: None, default: None },
+                crate::instances::ClassField { name: "x".to_owned(), declared: None, default: None, base_sort: None },
+                crate::instances::ClassField { name: "y".to_owned(), declared: None, default: None, base_sort: None },
             ],
             properties: HashMap::new(),
             methods: HashMap::new(),
@@ -804,8 +804,8 @@ fn pattern_captures_declines_a_class_pattern_with_more_positions_than_fields() {
         ClassModel {
             name: "Point".to_owned(),
             fields: vec![
-                crate::instances::ClassField { name: "x".to_owned(), declared: None, default: None },
-                crate::instances::ClassField { name: "y".to_owned(), declared: None, default: None },
+                crate::instances::ClassField { name: "x".to_owned(), declared: None, default: None, base_sort: None },
+                crate::instances::ClassField { name: "y".to_owned(), declared: None, default: None, base_sort: None },
             ],
             properties: HashMap::new(),
             methods: HashMap::new(),
@@ -932,8 +932,8 @@ fn pattern_bound_captures_reads_positional_class_fields_off_a_known_instance_sub
         ClassModel {
             name: "Point".to_owned(),
             fields: vec![
-                crate::instances::ClassField { name: "x".to_owned(), declared: None, default: None },
-                crate::instances::ClassField { name: "y".to_owned(), declared: None, default: None },
+                crate::instances::ClassField { name: "x".to_owned(), declared: None, default: None, base_sort: None },
+                crate::instances::ClassField { name: "y".to_owned(), declared: None, default: None, base_sort: None },
             ],
             properties: HashMap::new(),
             methods: HashMap::new(),
@@ -960,8 +960,8 @@ fn pattern_bound_captures_declines_positional_class_subpatterns_past_field_count
         ClassModel {
             name: "Point".to_owned(),
             fields: vec![
-                crate::instances::ClassField { name: "x".to_owned(), declared: None, default: None },
-                crate::instances::ClassField { name: "y".to_owned(), declared: None, default: None },
+                crate::instances::ClassField { name: "x".to_owned(), declared: None, default: None, base_sort: None },
+                crate::instances::ClassField { name: "y".to_owned(), declared: None, default: None, base_sort: None },
             ],
             properties: HashMap::new(),
             methods: HashMap::new(),

@@ -26,7 +26,7 @@ fn property_read_aliases_the_backing_field() {
     assert!(aged.properties.contains_key("age"));
     assert_eq!(aged.properties["age"].backing, "_held");
 
-    let verdict = judge_construction(aged, &[], &[], &kernel);
+    let verdict = judge_construction(aged, &[], &[], ConstructionKind::DirectCall, &kernel);
     assert_eq!(
         field_read_through_model(aged, &verdict.instance, "age"),
         Some(integer_value(40.0)),
@@ -132,7 +132,7 @@ fn method_def_of_prefers_the_childs_own_override_over_the_inherited_def() {
     let imports = crate::surface::surface_imports(&module);
     let table = class_table(&module, &aliases, &imports, &kernel);
     let kid = table.get("KidYears").expect("KidYears class recorded");
-    let instance = judge_construction(kid, &[(integer_value(40.0), range_of("40"))], &[], &kernel).instance;
+    let instance = judge_construction(kid, &[(integer_value(40.0), range_of("40"))], &[], ConstructionKind::DirectCall, &kernel).instance;
 
     let effective = method_def_of(kid, "label").expect("label is declared");
     let (_after, effective_result) = method_call_result(&instance, kid, effective, &[], None, None, None, &kernel, 0)
@@ -166,7 +166,7 @@ fn method_call_result_write_then_read_survives_on_the_returned_instance() {
     let imports = crate::surface::surface_imports(&module);
     let table = class_table(&module, &aliases, &imports, &kernel);
     let outlaw = table.get("Outlaw").expect("Outlaw class recorded");
-    let instance = judge_construction(outlaw, &[(integer_value(40.0), range_of("40"))], &[], &kernel).instance;
+    let instance = judge_construction(outlaw, &[(integer_value(40.0), range_of("40"))], &[], ConstructionKind::DirectCall, &kernel).instance;
     let method = method_def_of(outlaw, "spoil").expect("spoil is declared");
     let (after, _result) = method_call_result(&instance, outlaw, method, &[], None, None, None, &kernel, 0)
         .expect("spoil's straight-line self-write must interpret");
@@ -197,7 +197,7 @@ fn method_call_result_resolves_a_super_call_through_parent_methods() {
     let imports = crate::surface::surface_imports(&module);
     let table = class_table(&module, &aliases, &imports, &kernel);
     let kid = table.get("KidYears").expect("KidYears class recorded");
-    let instance = judge_construction(kid, &[(integer_value(40.0), range_of("40"))], &[], &kernel).instance;
+    let instance = judge_construction(kid, &[(integer_value(40.0), range_of("40"))], &[], ConstructionKind::DirectCall, &kernel).instance;
     let method = method_def_of(kid, "call_super_method").expect("call_super_method is declared");
     let (_after, result) = method_call_result(&instance, kid, method, &[], None, None, None, &kernel, 0)
         .expect("the super().years() call must resolve through parent_methods");
@@ -230,7 +230,7 @@ fn method_body_bare_imported_date_construction_matches_the_qualified_spelling() 
     let table = class_table(&module, &aliases, &imports, &kernel);
     let anniversary = table.get("Anniversary").expect("Anniversary class recorded");
     let instance =
-        judge_construction(anniversary, &[(integer_value(1.0), range_of("1"))], &[], &kernel).instance;
+        judge_construction(anniversary, &[(integer_value(1.0), range_of("1"))], &[], ConstructionKind::DirectCall, &kernel).instance;
     let method = method_def_of(anniversary, "occasion").expect("occasion is declared");
     let datetime_imports = Arc::new(crate::expressions::datetime_imports(&module));
 

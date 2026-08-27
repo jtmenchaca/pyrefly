@@ -6,7 +6,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use refined_domain::abstract_value::{
-    known_set, unknown, AbstractValue, ObjectKey, SetKindTag,
+    known_set, unknown, AbstractValue, Kind, ObjectKey, SetKindTag,
 };
 use refined_domain::known_constructors::known_object;
 use refined_domain::lattice_operations::truthiness;
@@ -48,7 +48,10 @@ pub struct ConstructionVerdict {
 /// `dict_literal_value`'s own "still holds a value" convention rather
 /// than substituting the declared set the way `judge_and_bind` does
 /// for a name binding — an object field slot has no reassignable name
-/// downstream the way a plain variable does). `Undetermined` also
+/// downstream the way a plain variable does). Under
+/// `ConstructionKind::ValidatingParse` an INEXACT argument skips that
+/// judgment entirely and takes the declared set, since the parse
+/// filters what reaches the field. `Undetermined` also
 /// keeps the argument's own value at that field (the DECLARED set,
 /// per the mission: "the field holds the DECLARED set as a known_set
 /// value, TrustSpec — same construction check.rs's seed_parameters
@@ -74,10 +77,37 @@ fn next_instance_identity() -> u32 {
     NEXT_INSTANCE_IDENTITY.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Which of the two construction surfaces a `judge_construction` call
+/// came from — they judge an inexact field argument differently.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ConstructionKind {
+    /// An ordinary constructor call (`Person(40)`, `Person(age=40)`,
+    /// a `@dataclass`'s generated `__init__`). The argument the caller
+    /// wrote IS the field's value; whatever it states, the field holds.
+    DirectCall,
+    /// pydantic's own parse surface — `model_validate`,
+    /// `model_validate_json`, `TypeAdapter(...).validate_python`. The
+    /// call either raises `ValidationError` or answers an instance
+    /// whose every field satisfies its own declaration, so an inexact
+    /// argument is filtered by the parse rather than carried into the
+    /// field.
+    ValidatingParse,
+}
+
+/// Whether `value` pins down a single runtime value — an exact literal
+/// (`Kind::Values` with one entry) and nothing else. A set, a kind
+/// union, an opaque value and an unknown all state a RANGE of possible
+/// runtime values, which a validating parse narrows and this predicate
+/// therefore reports as inexact.
+fn states_one_exact_value(value: &AbstractValue) -> bool {
+    value.kind == Kind::Values && value.values.len() == 1
+}
+
 pub fn judge_construction(
     model: &ClassModel,
     positional: &[(AbstractValue, TextRange)],
     keyword: &[(String, AbstractValue, TextRange)],
+    parse: ConstructionKind,
     kernel: &Arc<RefinedTSKernel>,
 ) -> ConstructionVerdict {
     if positional.len() > model.fields.len() {
@@ -109,6 +139,28 @@ pub fn judge_construction(
 
         let field_value = match argument {
             Some((value, range)) => match &field.declared {
+                // A VALIDATING PARSE whose argument is not an exactly
+                // known value: pydantic's `model_validate` family
+                // either raises `ValidationError` or answers an
+                // instance whose every field satisfies its own
+                // declaration, so a field fed an inexact argument
+                // (`json.loads(text)`'s own kind union — a None arm, a
+                // str arm, a list arm and an unbounded integer arm all
+                // riding as one value) states nothing this position
+                // can refuse: the arm that survives the parse is by
+                // construction inside the declared set, and the arms
+                // that do not survive never reach the field at all.
+                // The field answers its DECLARED set, the same answer
+                // `construction.rs`'s own `model_validate_json` arm
+                // already gives for an opaque JSON string, and no fire
+                // is raised. An EXACTLY known argument still judges
+                // below, so `model_validate({"age": 200})` keeps its
+                // provable refusal.
+                Some(declared)
+                    if parse == ConstructionKind::ValidatingParse && !states_one_exact_value(&value) =>
+                {
+                    known_set(declared.set.clone(), None, TrustSpec, SetKindTag::None)
+                }
                 Some(declared) => match judge(&value, declared, kernel) {
                     Verdict::Fire(message) => {
                         fires.push((range, message));

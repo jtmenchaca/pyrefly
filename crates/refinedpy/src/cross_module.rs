@@ -141,6 +141,14 @@ pub fn module_surface_of(
 
     let mut function_environment = Environment::new(Default::default());
     function_environment.set_functions(Arc::new(function_table_from_module(module, module_name)));
+    // The module's own `datetime` import identities, so a top-level
+    // `REFERENCE = datetime(2024, 1, 1, tzinfo=timezone.utc)` reads
+    // through the same construction gates a function body's own call
+    // reads through — those gates answer by canonical import identity
+    // (`expressions::DatetimeImports`), and without the table here a
+    // module-level construction resolves to nothing and the constant
+    // reaches every body as an unreadable value.
+    function_environment.set_datetime_imports(Arc::new(crate::expressions::datetime_imports(module)));
 
     let mut bindings = HashMap::new();
     for stmt in module.body.iter() {
@@ -152,6 +160,15 @@ pub fn module_surface_of(
                 bind_plain_ann_assign(assign, &function_environment, kernel, &mut bindings);
             }
             _ => {}
+        }
+        // Each top-level constant becomes readable to the constants
+        // BELOW it, the way module execution order makes it readable:
+        // `CUTOFF = REFERENCE + timedelta(...)` reads `REFERENCE`
+        // because the line above it already ran. Without this, every
+        // constant is read against the same empty scope and any
+        // constant defined in terms of an earlier one is unreadable.
+        for (name, value) in &bindings {
+            function_environment.bind(name, value.clone());
         }
     }
 
@@ -394,6 +411,7 @@ fn pull_member(
                         name: field.name.clone(),
                         declared: field.declared.clone(),
                         default: field.default.clone(),
+                        base_sort: field.base_sort.clone(),
                     })
                     .collect(),
                 properties: class_model

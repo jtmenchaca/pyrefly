@@ -17,6 +17,7 @@ use crate::expressions::evaluate_expression;
 
 use super::kernel_transfer::divisor_provably_excludes_zero;
 use super::known_values::single_numeric_value;
+use super::sequence_row::datetime_difference_provable_raise;
 
 /// `a / b` for a divisor window `b` that ADMITS zero (`0.0 ∈ b`) but is
 /// not itself always zero (`divisor_is_provably_always_zero` already owns
@@ -182,6 +183,20 @@ pub(in crate::expressions) fn binop_provable_raise(
     environment: &Environment,
     kernel: &Arc<RefinedTSKernel>,
 ) -> Option<(TextRange, String)> {
+    // The MIXED-AWARENESS DATETIME SUBTRACTION row — a `Sub` this
+    // function's own zero-divisor rows never speak to, decided from the
+    // two operands' `aware` tags rather than from a divisor window
+    // (`datetime_difference_provable_raise`'s own doc carries note (3)'s
+    // citation). It sits ahead of the operator gate below because that
+    // gate admits only `/`, `//`, and `%`; only a `Sub` evaluates the
+    // operands for it, so no other operator pays for this row.
+    if binop.op == Operator::Sub {
+        let left_value = evaluate_expression(&binop.left, environment, kernel);
+        let right_value = evaluate_expression(&binop.right, environment, kernel);
+        if let Some(message) = datetime_difference_provable_raise(binop.op, &left_value, &right_value) {
+            return Some((binop.range(), message));
+        }
+    }
     if !matches!(binop.op, Operator::Div | Operator::FloorDiv | Operator::Mod) {
         return None;
     }

@@ -303,6 +303,38 @@ pub(super) fn sorted_call(arguments: &[AbstractValue]) -> Option<AbstractValue> 
     Some(known_list(sorted_items, grade))
 }
 
+/// `sorted(iterable)` / `reversed(sequence)` over an UNKNOWN-LENGTH,
+/// known-element receiver — a `Kind::Set` whose only form is a
+/// repetition window (`as_repetition`, the shape a declared
+/// `list[X]`/`Sequence[X]` parameter seeds and the shape
+/// `attribute.rs`'s `sys.argv` read answers). The exact ORDER is
+/// unstated once the elements themselves are unread, but both calls'
+/// own clauses pin the two facts this domain reads a sequence through:
+///
+/// - `sorted(iterable)`: "Return a new sorted list from the items in
+///   *iterable*" (library/functions.rst) — the result holds exactly the
+///   ITEMS of `iterable`, reordered, so every element stays inside the
+///   receiver's own alphabet and the count is unchanged.
+/// - `reversed(seq)`: "Return a reverse iterator" (the same file) — a
+///   reversal is a permutation, so the identical two facts hold.
+///
+/// The answer is therefore the receiver's own repetition window,
+/// unchanged: same element set, same `{lo, hi}` length window. This is
+/// exact for the length and for element membership; the POSITION of any
+/// particular element is what neither call states over an unread
+/// receiver, and a repetition window makes no positional claim to lose.
+///
+/// `None` when the receiver is not a repetition window, so the caller's
+/// own exact-list rows and final decline stand unchanged.
+pub(super) fn order_preserving_over_star(arguments: &[AbstractValue]) -> Option<AbstractValue> {
+    let [iterable] = arguments else { return None };
+    if iterable.kind != Kind::Set || iterable.set_kind_tag != SetKindTag::None {
+        return None;
+    }
+    as_repetition(&iterable.set)?;
+    Some(iterable.clone())
+}
+
 /// `reversed(sequence)` over a known `Kind::List` —
 /// library/functions.html#reversed: "Return a reversed iterator... *seq*
 /// must be an object which has a `__reversed__()` method or supports the

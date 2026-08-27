@@ -28,11 +28,12 @@ pub(super) use construction::is_builtin_exception_constructor;
 pub(super) use construction::is_utc_tzinfo_expression;
 pub(super) use construction::known_byte_sequence;
 pub(crate) use construction::math_from_imports;
-pub(super) use functional::call_one_argument_expression;
+pub(crate) use functional::call_one_argument_expression;
 pub(super) use functional::call_two_argument_expression;
 pub(super) use functional::filter_expression_value;
 pub(super) use functional::map_expression_value;
 pub(super) use functional::reduce_expression_value;
+pub(super) use functional::sorted_over_star_with_keywords;
 pub(super) use helpers::eval_whole_integers;
 pub(super) use helpers::evaluate_bytes_literal;
 pub(super) use helpers::is_generator_def;
@@ -78,6 +79,7 @@ use super::compare::exact_string_values;
 use super::datetime::date_construction_value;
 use super::datetime::date_fromisoformat_value;
 use super::datetime::datetime_construction_value;
+use super::datetime::datetime_fromisoformat_value;
 use super::datetime::datetime_fromtimestamp_value;
 use super::datetime::is_datetime_date_attribute;
 use super::datetime::is_datetime_datetime_attribute;
@@ -259,7 +261,13 @@ pub(super) fn evaluate_call(call: &ruff_python_ast::ExprCall, environment: &Envi
                     // a construction is a VALUE here — the verdict's fires
                     // belong to whichever statement sink hosts this call
                     // expression, not to this nested value read
-                    let verdict = instances::judge_construction(model, &positional, &keyword, kernel);
+                    let verdict = instances::judge_construction(
+                        model,
+                        &positional,
+                        &keyword,
+                        instances::ConstructionKind::DirectCall,
+                        kernel,
+                    );
                     return verdict.instance;
                 }
             }
@@ -466,6 +474,37 @@ pub(super) fn evaluate_call(call: &ruff_python_ast::ExprCall, environment: &Envi
             }
             return unknown();
         }
+        // `sorted(iterable, key=<callable>)` / `sorted(iterable,
+        // reverse=<bool>)` — recognized HERE, before the keyword gate
+        // further down, because a `key=` argument is what
+        // A8.seed.library's own `sorted(xs, key=lambda x: x % 2)` passes
+        // and the gate would otherwise answer `unknown()` for the whole
+        // call. functions.rst, `sorted`: "Return a new sorted list from
+        // the items in *iterable*," and `key` "specifies a function of
+        // one argument that is used to extract a comparison key from
+        // each element" while `reverse` sorts "as if each comparison
+        // were reversed." Both keywords change only the ORDER items come
+        // out in, never WHICH items are there — the clause names the
+        // result's contents as "the items in *iterable*" independently
+        // of either.
+        //
+        // So this row answers only for a receiver whose own value states
+        // no order to begin with: a REPETITION WINDOW (`Kind::Set`
+        // reading back through `as_repetition` — a declared
+        // `list[X]`/`Sequence[X]` parameter's own seed), where every
+        // position draws from one element set and reordering is the
+        // identity. That is exactly `sorted_over_star`'s answer, the
+        // same reading `order_preserving_over_star` already gives the
+        // no-keyword `sorted(xs)` spelling. A KNOWN `Kind::List`
+        // receiver is deliberately NOT answered here: its items are
+        // exact and in a stated order, so the key function really does
+        // decide the result's order, which this row does not compute.
+        if name.id.as_str() == "sorted" && environment.read("sorted").is_none() && !call.arguments.keywords.is_empty() {
+            if let Some(value) = sorted_over_star_with_keywords(call, environment, kernel) {
+                return value;
+            }
+            return unknown();
+        }
         // `Exception(message)` / `ValueError(message)` / `RuntimeError(message)`
         // / `TypeError(message)` — a BUILT-IN exception class constructor
         // call (never shadowed by a same-module def/class here, the same
@@ -619,6 +658,28 @@ pub(super) fn evaluate_call(call: &ruff_python_ast::ExprCall, environment: &Envi
         if is_datetime_datetime_attribute(attribute.value.as_ref(), environment) && attribute.attr.as_str() == "fromtimestamp" {
             if let Some(value) = datetime_fromtimestamp_value(call, environment, kernel) {
                 return value;
+            }
+            return unknown();
+        }
+        // `datetime.datetime.fromisoformat(date_string)` — the same
+        // receiver shape `.fromtimestamp`/`.now`/`.strptime` read (a
+        // two-level qualified chain, or a one-level bare aliased class
+        // name). See `datetime_fromisoformat_value`'s own doc for the
+        // exact ISO grammar read; any text outside that grammar (or a
+        // non-literal argument) declines to `unknown()`, matching every
+        // other datetime parse row in this file.
+        if is_datetime_datetime_attribute(attribute.value.as_ref(), environment) && attribute.attr.as_str() == "fromisoformat" {
+            if let [text] = &*call.arguments.args {
+                if call.arguments.keywords.is_empty() {
+                    let argument = evaluate_expression(text, environment, kernel);
+                    if let Some(code_points) = exact_string_values(&argument) {
+                        if let Some(spelling) = code_points_to_string(code_points) {
+                            if let Some(value) = datetime_fromisoformat_value(&spelling, kernel) {
+                                return value;
+                            }
+                        }
+                    }
+                }
             }
             return unknown();
         }

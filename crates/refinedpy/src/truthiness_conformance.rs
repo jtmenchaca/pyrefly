@@ -78,14 +78,21 @@ mod tests {
         above, at_least, at_most, below, integer, make_refined_set, one_of,
     };
 
-    /// `loaded_kernel` mirrors `lattice_conformance.rs`'s own helper.
+    /// `loaded_kernel` mirrors `lattice_conformance.rs`'s own helper —
+    /// and installs every kernel seam, exactly as both binaries do right
+    /// after loading. Without the install, `truthiness`'s `Kind::Set`
+    /// arm would take its no-hook fallback here while the shipped
+    /// checker asks the kernel, and these rows would measure a code
+    /// path production never runs.
     fn loaded_kernel() -> Option<Arc<RefinedTSKernel>> {
         let path = dylib_path();
         if !kernel_artifacts_present(&path) {
             eprintln!("native kernel dylib absent — build it first");
             return None;
         }
-        Some(load_kernel(&path).expect("load_kernel"))
+        let kernel = load_kernel(&path).expect("load_kernel");
+        crate::kernel_ask::install_kernel_seams(&kernel);
+        Some(kernel)
     }
 
     /// `empty_set` is `EMPTY` in the TS source — the same spelling
@@ -296,27 +303,27 @@ mod tests {
         );
     }
 
-    /// LEDGER ROWS T1 and T2, asserted as gaps: the audit's slice-9
-    /// finding made executable. `truthiness` answers `(false, false)`
-    /// for `Kind::Set` OUTRIGHT — the `Kind::Set | Kind::Variable |
-    /// PossiblyUndefined | PossiblyNaN | Unknown => (false, false)` arm —
-    /// while the kernel's proved narrowing DECIDES these two states.
-    ///
-    /// The day the adapter asks `narrow_state` here, this test fails and
-    /// the T1/T2 ledger rows get deleted. That is the point of pinning
-    /// it: a gap that closes silently is a gap nobody notices closing.
+    /// LEDGER ROWS T1 and T2, now asserted as AGREEMENT: the adapter's
+    /// `Kind::Set` arm asks the kernel's proved narrowing through the
+    /// `TruthyNum` seam (`kernel_seam::ask_truthy_num`, installed by
+    /// `install_kernel_seams`), so the two routes must decide these
+    /// states identically. This test's earlier form pinned the OPPOSITE
+    /// — the arm answered undecided outright and the rows were ledger
+    /// gaps — precisely so the closing would fail the test and be
+    /// noticed rather than land silently. It did; this is the rewrite
+    /// that earlier form's own doc called for.
     #[test]
-    fn test_determination_gap_kind_set_truthiness_is_never_asked_of_the_kernel() {
+    fn test_kind_set_truthiness_asks_the_kernel() {
         let Some(kernel) = loaded_kernel() else { return };
 
         // T1: every member is at least 1, so no member is zero — the
-        // state is definitely truthy, and the kernel says so.
+        // state is definitely truthy, and both routes say so.
         let definitely_truthy = numeric_set(vec![at_least(1.0)]);
         let adapter = truthiness(&definitely_truthy);
         assert_eq!(
             adapter,
-            (false, false),
-            "T1: the adapter's Kind::Set arm answers undecided outright"
+            (true, true),
+            "T1: the adapter's Kind::Set arm decides atLeast(1) truthy through the seam"
         );
         let state = state_of(&definitely_truthy).expect("a numeric set has a scalar state");
         let kernel_verdict = kernel_truthiness(&kernel, &state);
@@ -325,10 +332,7 @@ mod tests {
             (true, true),
             "T1: the kernel's proved narrowing decides atLeast(1) is definitely truthy"
         );
-        assert!(
-            is_determination_gap(adapter, kernel_verdict),
-            "T1 is a determination gap: the kernel decides, the adapter does not"
-        );
+        assert_agrees("T1 atLeast(1)", adapter.0, kernel_verdict.0);
 
         // T2: the singleton zero, carried as a SET rather than a value.
         // The same number the adapter decides instantly as Kind::Values
@@ -337,8 +341,8 @@ mod tests {
         let adapter = truthiness(&definitely_falsy);
         assert_eq!(
             adapter,
-            (false, false),
-            "T2: the adapter's Kind::Set arm answers undecided even for the singleton zero"
+            (false, true),
+            "T2: the adapter's Kind::Set arm decides the singleton zero falsy through the seam"
         );
         let state = state_of(&definitely_falsy).expect("a numeric set has a scalar state");
         let kernel_verdict = kernel_truthiness(&kernel, &state);
@@ -347,24 +351,23 @@ mod tests {
             (false, true),
             "T2: the kernel's proved narrowing decides {{0}} is definitely falsy"
         );
-        assert!(is_determination_gap(adapter, kernel_verdict), "T2 is a determination gap");
+        assert_agrees("T2 oneOf([0])", adapter.0, kernel_verdict.0);
 
-        // and the SAME value as Kind::Values IS decided by the adapter —
-        // which is what makes T2 a representation gap rather than a
-        // semantic one
+        // and the SAME value as Kind::Values is decided identically —
+        // the representation gap the earlier form recorded is closed:
+        // set-spelled and value-spelled zero now answer alike.
         assert_eq!(
             truthiness(&int_value(0.0)),
             (false, true),
-            "T2: the identical value decided instantly in the Kind::Values representation"
+            "T2: the identical value decided in the Kind::Values representation"
         );
     }
 
-    /// More `Kind::Set` rows, swept: every set below is one the kernel
-    /// decides and the adapter does not. Counted rather than enumerated
-    /// one assertion at a time, so the gap's SIZE is visible and not
-    /// just its existence.
+    /// More `Kind::Set` rows, swept: every set below is decidable, and
+    /// with the seam installed BOTH routes must decide it — the count
+    /// that used to measure the gap's size now measures agreement's.
     #[test]
-    fn test_determination_gap_sweep_over_decidable_numeric_sets() {
+    fn test_kind_set_truthiness_agrees_over_decidable_numeric_sets() {
         let Some(kernel) = loaded_kernel() else { return };
 
         // sets whose members are all nonzero (definitely truthy) or all
@@ -397,15 +400,19 @@ mod tests {
                 agreed += 1;
             }
         }
-        // Every row above is a set the adapter's outright `Kind::Set`
-        // arm refuses. If this count ever drops, the adapter started
-        // asking — reread the ledger rather than lowering the number.
+        // Every row above is a set the seam now carries to the kernel.
+        // If gaps ever rises above zero, a decidable shape stopped being
+        // asked — read which row and why rather than lowering the bar.
         assert_eq!(
-            gaps,
-            decidable.len(),
-            "expected every decidable numeric set to be a determination gap today \
+            gaps, 0,
+            "expected every decidable numeric set to agree through the seam \
              (gaps={gaps}, agreed={agreed}, rows={})",
             decidable.len()
+        );
+        assert_eq!(
+            agreed,
+            decidable.len(),
+            "every decidable row must be decided on both routes (agreed={agreed})"
         );
     }
 

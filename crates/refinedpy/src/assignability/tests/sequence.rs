@@ -499,7 +499,21 @@ fn a_vitals_construction_with_spo2_out_of_set_fires_the_shown_words_key_wording(
         element: None,
         element_length: None,
         generator: None,
-        members: Some(vec![("heart_rate".to_owned(), heart_rate_refinement()), ("spo2".to_owned(), spo2_refinement)]),
+        // `required: false` on both, mirroring `instances::
+        // model_members_refinement` — `Vitals` is an ordinary class, not
+        // a TypedDict, so its member table states no totality.
+        members: Some(vec![
+            TypedDictMember {
+                name: "heart_rate".to_owned(),
+                required: false,
+                declared: heart_rate_refinement(),
+            },
+            TypedDictMember {
+                name: "spo2".to_owned(),
+                required: false,
+                declared: spo2_refinement,
+            },
+        ]),
         positions: None,
     };
     let value = refined_domain::known_constructors::known_object(
@@ -549,14 +563,45 @@ fn a_typed_dict_with_its_member_in_set_is_silent() {
     assert!(matches!(judge(&value, &declared, &kernel), Verdict::Silent));
 }
 
-/// A declared member the dict literal never writes is not judged at
-/// all — the honest-absence rule this law's own doc states — so a
-/// dict missing `age` entirely is still Silent rather than
-/// Undetermined or a false Fire.
+/// A CLOSED dict literal missing a REQUIRED declared member fires,
+/// naming the missing key — `PersonDict` states no `total=` keyword, so
+/// `age` is required (library/typing.rst, `TypedDict`: "By default, all
+/// keys must be present in a ``TypedDict``"), and an empty dict literal
+/// states its complete key set, so the key is proved absent.
 #[test]
-fn a_typed_dict_missing_a_declared_member_is_silent() {
+fn a_closed_typed_dict_missing_a_required_member_fires_naming_the_key() {
     let Some(kernel) = loaded_kernel() else { return };
     let declared = person_dict_refinement();
+    let value = refined_domain::known_constructors::known_object(Vec::new(), None, true, TrustProved, false);
+    let message = fire_message(judge(&value, &declared, &kernel));
+    assert!(message.contains("'age'"), "{message}");
+    assert!(message.contains("missing the required key"), "{message}");
+}
+
+/// The same missing member on an OPEN value states nothing: an
+/// incomplete key set cannot prove a key absent, only unread, so the
+/// lenient path holds and the judgment is Silent.
+#[test]
+fn an_open_value_missing_a_required_member_is_silent() {
+    let Some(kernel) = loaded_kernel() else { return };
+    let declared = person_dict_refinement();
+    let value = refined_domain::known_constructors::known_object(Vec::new(), None, false, TrustProved, false);
+    assert!(matches!(judge(&value, &declared, &kernel), Verdict::Silent));
+}
+
+/// A `total=False` TypedDict requires nothing, so a closed dict literal
+/// missing every declared member is Silent — library/typing.rst,
+/// `TypedDict`: "a ``Point2D`` ``TypedDict`` can have any of the keys
+/// omitted."
+#[test]
+fn a_total_false_typed_dict_missing_its_member_is_silent() {
+    let Some(kernel) = loaded_kernel() else { return };
+    let mut declared = person_dict_refinement();
+    declared.members = Some(vec![TypedDictMember {
+        name: "age".to_owned(),
+        required: false,
+        declared: age_refinement(),
+    }]);
     let value = refined_domain::known_constructors::known_object(Vec::new(), None, true, TrustProved, false);
     assert!(matches!(judge(&value, &declared, &kernel), Verdict::Silent));
 }
@@ -728,6 +773,72 @@ fn a_list_of_the_wrong_length_fires_as_a_structural_mismatch() {
     );
     let message = fire_message(judge(&value, &declared, &kernel));
     assert!(message.contains("'tuple[Age, Label]'"), "{message}");
+}
+
+/// A `tuple[Age, Age]`-declared sink, for the unknown-length arm below
+/// — both slots the same set, so the ARITY is the only thing under
+/// test rather than a per-slot sort mismatch.
+fn age_pair_tuple_refinement() -> DeclaredRefinement {
+    DeclaredRefinement {
+        temporal: None,
+        temporal_awareness: crate::surface::TemporalAwareness::Any,
+        set: make_refined_set(Vec::new()),
+        spelling: "tuple[Age, Age]".to_owned(),
+        admits_none: false,
+        element: None,
+        element_length: None,
+        generator: None,
+        members: None,
+        positions: Some(vec![age_refinement(), age_refinement()]),
+    }
+}
+
+/// One unknown-length sequence carrying `Age`'s own element window —
+/// the shape a declared `list[Age]`/`Sequence[Age]` parameter seeds.
+fn age_window(lo: i64, hi: Option<i64>) -> AbstractValue {
+    AbstractValue {
+        kind_tag: Some(PrimitiveKind::Integer),
+        ..refined_domain::abstract_value::known_set(
+            refined_sets::repetition_window_forms::repetition(age_refinement().set, lo, hi),
+            None,
+            TrustProved,
+            refined_domain::abstract_value::SetKindTag::None,
+        )
+    }
+}
+
+/// An UNBOUNDED-length sequence against a fixed-arity tuple fires as a
+/// structural mismatch: `list[int]`'s `[0, +inf)` always admits a
+/// sequence longer than any fixed arity. Before this arm the judgment
+/// sat undetermined and said nothing — A7.sink.assign's own
+/// `assign_to_tuple` and A7.sink.ret's own `returns_three`.
+#[test]
+fn an_unbounded_length_sequence_against_a_fixed_arity_tuple_fires() {
+    let Some(kernel) = loaded_kernel() else { return };
+    let declared = age_pair_tuple_refinement();
+    let message = fire_message(judge(&age_window(0, None), &declared, &kernel));
+    assert!(message.contains("'tuple[Age, Age]'"), "{message}");
+    assert!(message.contains("2 elements"), "{message}");
+}
+
+/// A window whose length is pinned to EXACTLY the declared arity is
+/// admitted, and each declared position is judged against the window's
+/// one element set.
+#[test]
+fn a_sequence_pinned_to_the_declared_arity_is_silent() {
+    let Some(kernel) = loaded_kernel() else { return };
+    let declared = age_pair_tuple_refinement();
+    assert!(matches!(judge(&age_window(2, Some(2)), &declared, &kernel), Verdict::Silent));
+}
+
+/// A window pinned to a DIFFERENT exact length still fires — the same
+/// structural reading the known-List arm gives a length mismatch.
+#[test]
+fn a_sequence_pinned_to_the_wrong_arity_fires() {
+    let Some(kernel) = loaded_kernel() else { return };
+    let declared = age_pair_tuple_refinement();
+    let message = fire_message(judge(&age_window(3, Some(3)), &declared, &kernel));
+    assert!(message.contains("exactly 3 elements"), "{message}");
 }
 
 /// `None` against a plain (non-`Optional`) fixed-arity tuple

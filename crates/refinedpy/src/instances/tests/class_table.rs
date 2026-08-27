@@ -69,9 +69,50 @@ fn typed_dict_table_reads_each_members_own_refinement() {
     let imports = crate::surface::surface_imports(&module);
     let table = typed_dict_table(&module, &aliases, &imports);
     let members = table.get("PersonDict").expect("PersonDict recorded");
-    assert_eq!(members.len(), 1, "only age reads a refinement; bare str states none");
-    assert_eq!(members[0].0, "age");
-    assert_eq!(members[0].1.spelling, "Age");
+    assert_eq!(
+        members.len(),
+        2,
+        "age reads its alias's refinement; bare str reads its base sort"
+    );
+    assert_eq!(members[0].name, "age");
+    assert_eq!(members[0].declared.spelling, "Age");
+    assert_eq!(members[1].name, "label");
+    assert_eq!(
+        members[1].declared.spelling, "str",
+        "a plain builtin member falls back to its base sort, the same source a class field's own base_sort reads"
+    );
+    for member in members {
+        assert!(
+            member.required,
+            "no `total=` keyword makes every member required (library/typing.rst, TypedDict)"
+        );
+    }
+}
+
+/// A bare builtin member (`a: int`) reaches the table through its BASE
+/// SORT — the exact shape A8.sink.assign/A8.sink.ret declare. Without
+/// the fallback `declared_refinement` declines a bare `int` (it is not
+/// an alias), the member list comes back EMPTY, and the MEMBERS LAW
+/// iterates zero times and answers Silent, so no member fire and no
+/// missing-required-key fire is reachable for such a class at all.
+#[test]
+fn typed_dict_table_reads_bare_builtin_members_through_their_base_sort() {
+    let module = parsed(concat!(
+        "from typing import TypedDict\n",
+        "class P(TypedDict):\n",
+        "    a: int\n",
+        "    b: int\n",
+    ));
+    let aliases = crate::surface::compile_aliases(&module);
+    let imports = crate::surface::surface_imports(&module);
+    let table = typed_dict_table(&module, &aliases, &imports);
+    let members = table.get("P").expect("P recorded");
+    assert_eq!(members.len(), 2, "both bare-int members reach the table");
+    assert_eq!(members[0].name, "a");
+    assert_eq!(members[1].name, "b");
+    for member in members {
+        assert!(member.required, "no `total=` keyword makes both members required");
+    }
 }
 
 /// A12.xfer.typeops's own shape: `Required[Age]` on a `total=False`
@@ -96,8 +137,12 @@ fn typed_dict_table_reads_a_required_wrapped_members_own_refinement() {
     let table = typed_dict_table(&module, &aliases, &imports);
     let members = table.get("Record").expect("Record recorded");
     assert_eq!(members.len(), 1, "Required[Age] must still read Age's own refinement");
-    assert_eq!(members[0].0, "a");
-    assert_eq!(members[0].1.spelling, "Age", "Required peels to the wrapped annotation's own spelling");
+    assert_eq!(members[0].name, "a");
+    assert_eq!(members[0].declared.spelling, "Age", "Required peels to the wrapped annotation's own spelling");
+    assert!(
+        members[0].required,
+        "Required overrides the class's own total=False for this one key"
+    );
 }
 
 /// The `NotRequired[X]` twin, on an otherwise `total=True` class —
@@ -116,8 +161,34 @@ fn typed_dict_table_reads_a_not_required_wrapped_members_own_refinement() {
     let table = typed_dict_table(&module, &aliases, &imports);
     let members = table.get("Record").expect("Record recorded");
     assert_eq!(members.len(), 1, "NotRequired[Age] must still read Age's own refinement");
-    assert_eq!(members[0].0, "a");
-    assert_eq!(members[0].1.spelling, "Age");
+    assert_eq!(members[0].name, "a");
+    assert_eq!(members[0].declared.spelling, "Age");
+    assert!(
+        !members[0].required,
+        "NotRequired overrides the class's own total=True default for this one key"
+    );
+}
+
+/// `total=False` with no per-key marker makes every member NOT required
+/// — library/typing.rst, `TypedDict`: "It is also possible to mark all
+/// keys as non-required by default by specifying a totality of
+/// ``False``... a ``Point2D`` ``TypedDict`` can have any of the keys
+/// omitted."
+#[test]
+fn typed_dict_table_reads_a_total_false_classs_members_as_not_required() {
+    let module = parsed(concat!(
+        "from typing import Annotated, TypedDict\n",
+        "from pydantic import Field\n",
+        "type Age = Annotated[int, Field(ge=0, le=120)]\n",
+        "class Record(TypedDict, total=False):\n",
+        "    a: Age\n",
+    ));
+    let aliases = crate::surface::compile_aliases(&module);
+    let imports = crate::surface::surface_imports(&module);
+    let table = typed_dict_table(&module, &aliases, &imports);
+    let members = table.get("Record").expect("Record recorded");
+    assert_eq!(members.len(), 1);
+    assert!(!members[0].required, "total=False makes every member not required");
 }
 
 #[test]
@@ -180,8 +251,8 @@ fn class_model_of_reads_a_field_annotated_with_another_module_level_class() {
     let address_field = resident.fields.iter().find(|field| field.name == "address").expect("address field present");
     let declared = address_field.declared.as_ref().expect("Address reads as a member-carrying declaration");
     let members = declared.members.as_ref().expect("a class-typed field carries a per-member table");
-    let zip_code = members.iter().find(|(name, _)| name == "zip_code").expect("zip_code member present");
-    assert_eq!(zip_code.1.spelling, "ZipCode");
+    let zip_code = members.iter().find(|member| member.name == "zip_code").expect("zip_code member present");
+    assert_eq!(zip_code.declared.spelling, "ZipCode");
 }
 
 /// The same shape one level deeper: `Resident.person: Person` where
@@ -208,8 +279,8 @@ fn class_model_of_reads_a_doubly_nested_member_class() {
     let person_field = resident.fields.iter().find(|field| field.name == "person").expect("person field present");
     let declared = person_field.declared.as_ref().expect("Person reads as a member-carrying declaration");
     let members = declared.members.as_ref().expect("a class-typed field carries a per-member table");
-    let age = members.iter().find(|(name, _)| name == "age").expect("age member present");
-    assert_eq!(age.1.spelling, "Age");
+    let age = members.iter().find(|member| member.name == "age").expect("age member present");
+    assert_eq!(age.declared.spelling, "Age");
 }
 
 /// A field annotated with a class name the module never declares

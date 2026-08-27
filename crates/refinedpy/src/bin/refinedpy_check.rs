@@ -31,14 +31,32 @@
 //! module-level alias name (`compile_aliases`'s own three spellings)
 //! and every `def` name is hovered. Exit 0 always — a position with
 //! nothing to say prints "(no refinement hover)" rather than failing.
+//!
+//! `--trace-verdict <file.py>:<line>` is the FOURTH mode: the derivation trace
+//! (`packages/tests/DERIVATION-TRACE.md`). It judges the file with
+//! recording switched on for that one line and prints the schema-valid
+//! trace JSON (`packages/tests/diagnostics/trace.schema.json`) on stdout,
+//! with the RTS7002 the walk reported for that line echoed on stderr so
+//! the printed sentence and the trace's projection can be read side by
+//! side. The walk is the ORDINARY one — nothing about the judging
+//! changes; the trace records the derivation the walk was going to
+//! discard. Exit 0 always: an explain run reports a derivation, it never
+//! judges the file.
 
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use refinedpy::check::findings_for_module_at;
+use refinedpy::check::findings_for_module_traced;
 use refinedpy::check::refined_set_at_position;
+use refinedpy::trace::projection_of_chained_root;
+use refinedpy::trace::render_json;
+use refinedpy::trace::take_trace;
+use refinedpy::trace::TraceCollector;
+use refinedpy::trace::TraceRequest;
 use refinedpy::cross_module::disk_resolver;
 use refinedpy::fact_export::export_module;
 use refinedpy::foreign_edge_artifact::cache_artifact_path;
@@ -318,6 +336,88 @@ fn hover_file(path: &str, names: &[String], kernel: &Arc<RefinedTSKernel>) -> Ex
     ExitCode::SUCCESS
 }
 
+/// `--trace-verdict <path>:<line>` mode: judges `path` with derivation-trace
+/// recording switched on for `line`, then prints the schema-valid trace
+/// JSON for the judged positions on that line
+/// (`packages/tests/diagnostics/trace.schema.json`).
+///
+/// The walk is the ORDINARY one — the same `findings_for_module_*` entry
+/// every check takes, with a collector installed. Nothing about the
+/// judging changes; the trace records the derivation the walk was going
+/// to discard.
+///
+/// Prints, after the JSON, the projected sentence of the deepest declined
+/// span beside the RTS7002 the walk actually reported for that line, so a
+/// reader sees the two are one carrier. Exit 0 always: an explain run
+/// reports a derivation, it never judges the file.
+fn explain_file(path: &str, line: usize, kernel: &Arc<RefinedTSKernel>) -> ExitCode {
+    let Ok(source) = std::fs::read_to_string(path) else {
+        eprintln!("{path}: the entry file could not be read");
+        return ExitCode::from(2);
+    };
+    let Ok(parsed) = ruff_python_parser::parse_module(&source) else {
+        eprintln!("{path}: the entry file did not parse");
+        return ExitCode::from(2);
+    };
+    let module = parsed.into_syntax();
+    let entry_directory = Path::new(path).parent().filter(|dir| !dir.as_os_str().is_empty());
+    let resolver = disk_resolver(entry_directory.unwrap_or_else(|| Path::new(".")).to_path_buf());
+    let line_starts = line_starts_of(&source);
+
+    let collector = Arc::new(Mutex::new(TraceCollector::new(TraceRequest::new(
+        path.to_owned(),
+        source.clone(),
+        line_starts.clone(),
+        line,
+    ))));
+    let findings = findings_for_module_traced(
+        &module,
+        &resolver,
+        kernel,
+        Some(entry_directory.unwrap_or_else(|| Path::new("."))),
+        Some(collector.clone()),
+    );
+
+    let document = match take_trace(collector) {
+        Some(document) => document,
+        None => {
+            println!("{{}}");
+            eprintln!("{path}:{line}: no judged position on this line");
+            return ExitCode::SUCCESS;
+        }
+    };
+    println!("{}", render_json(&document));
+    // THE BINDING LEDGER's reclaimed roots, nearest binding first: where
+    // the main derivation stopped at a bare name, these are the binding
+    // statements behind it, each projected to the construct that left the
+    // name carrying nothing. This is the whole point of the ledger — the
+    // originating construct without a second explain run at the binding
+    // line.
+    if !document.chain.is_empty() {
+        eprintln!("bound from:");
+        for root in &document.chain {
+            // A CHAINED root is a binding statement's own derivation, not
+            // the judged position, so its own top counts as a candidate —
+            // a binding whose statement-level span is the only declining
+            // one still states where it stopped.
+            match projection_of_chained_root(root) {
+                Some(sentence) => eprintln!("  {} — {sentence}", root.range),
+                None => eprintln!("  {} — {}", root.range, root.construct),
+            }
+        }
+    }
+    // The reported RTS7002 on that line, beside the projection — the
+    // spec's conformance check 3 ("the printed sentence equals the
+    // projection of that span"), readable straight off one run.
+    for finding in &findings {
+        let (finding_line, _) = line_col(&line_starts, usize::from(finding.range.start()));
+        if finding_line == line && finding.code == "RTS7002" {
+            eprintln!("reported: {}", finding.message);
+        }
+    }
+    ExitCode::SUCCESS
+}
+
 /// Writes `path`'s fact artifact to `output` (the path `-o` named, or
 /// `<path>.refined.json`). Every omitted def is named on stderr with the
 /// construct that stopped it; the artifact itself carries only computed
@@ -401,10 +501,16 @@ enum Invocation {
     Judge { files: Vec<String>, timing: bool },
     Export { file: String, output: PathBuf },
     Hover { file: String, names: Vec<String> },
+    /// `--trace-verdict <path>:<line>` — the derivation-trace entry point
+    /// (DERIVATION-TRACE.md, "Gating"). Judges `path` with recording
+    /// switched on for `line`, then prints the schema-valid trace JSON
+    /// for the judged positions on that line.
+    Explain { file: String, line: usize },
 }
 
 fn read_invocation(arguments: &[String]) -> Option<Invocation> {
     let mut export_target: Option<String> = None;
+    let mut explain_target: Option<String> = None;
     let mut hover_target: Option<String> = None;
     let mut hover_names: Vec<String> = Vec::new();
     let mut output: Option<PathBuf> = None;
@@ -420,6 +526,10 @@ fn read_invocation(arguments: &[String]) -> Option<Invocation> {
             }
             "--export-fact" => {
                 export_target = Some(arguments.get(index + 1)?.clone());
+                index += 2;
+            }
+            "--trace-verdict" => {
+                explain_target = Some(arguments.get(index + 1)?.clone());
                 index += 2;
             }
             "--hover" => {
@@ -450,6 +560,21 @@ fn read_invocation(arguments: &[String]) -> Option<Invocation> {
     if let Some(root) = &project_root {
         set_project_root_override(Some(root.clone()));
     }
+    if let Some(target) = explain_target {
+        // --trace-verdict owns the whole line, the same way --hover does
+        if export_target.is_some() || hover_target.is_some() || output.is_some() || timing || !files.is_empty() {
+            return None;
+        }
+        // `<path>:<line>` — the line is the LAST colon-separated field,
+        // so a Windows-shaped or otherwise colon-carrying path still
+        // splits correctly.
+        let (file, line) = target.rsplit_once(':')?;
+        let line = line.parse::<usize>().ok()?;
+        if line == 0 {
+            return None;
+        }
+        return Some(Invocation::Explain { file: file.to_owned(), line });
+    }
     if let Some(file) = hover_target {
         // --hover owns the whole line; --export-fact/-o/--timing/extra
         // files alongside it would be silently ignored otherwise
@@ -475,10 +600,15 @@ fn read_invocation(arguments: &[String]) -> Option<Invocation> {
 
 fn main() -> ExitCode {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
+    if arguments.iter().any(|argument| argument == "--explain") {
+        eprintln!("flag --explain was renamed: use --trace-verdict <file.py>:<line>");
+        return ExitCode::from(2);
+    }
     let Some(invocation) = read_invocation(&arguments) else {
         eprintln!("usage: refinedpy-check <file.py> [...] [--timing] [--project-root <path>]");
         eprintln!("       refinedpy-check --export-fact <file.py> [-o <path>] [--project-root <path>]");
         eprintln!("       refinedpy-check --hover <file.py> [name ...]");
+        eprintln!("       refinedpy-check --trace-verdict <file.py>:<line>");
         return ExitCode::from(2);
     };
     let Some(dylib) = resolve_kernel_dylib() else {
@@ -499,6 +629,7 @@ fn main() -> ExitCode {
     let (files, timing) = match invocation {
         Invocation::Export { file, output } => return export_file(&file, &output, &kernel),
         Invocation::Hover { file, names } => return hover_file(&file, &names, &kernel),
+        Invocation::Explain { file, line } => return explain_file(&file, line, &kernel),
         Invocation::Judge { files, timing } => (files, timing),
     };
 

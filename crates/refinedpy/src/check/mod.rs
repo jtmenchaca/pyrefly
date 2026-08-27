@@ -41,7 +41,7 @@ use crate::function_table::{function_table, merged, FunctionTable};
 use crate::instances;
 use crate::instances::{class_table, ClassModel};
 use crate::surface::{compile_aliases, strict_int_alias_names, surface_imports, AliasEntry};
-use crate::typereading::{callable_return_refinement, DeclaredRefinement};
+use crate::typereading::{callable_return_refinement, DeclaredRefinement, TypedDictMember};
 
 mod hover;
 mod walk;
@@ -145,7 +145,7 @@ pub(super) struct WalkContext<'a> {
     /// rather than a `type X = …` alias, so a dict literal judged
     /// against it is judged member-by-member (`typed_dict_return_
     /// refinement`) instead of reading as unrefined.
-    pub(super) typed_dicts: Arc<HashMap<String, Vec<(String, DeclaredRefinement)>>>,
+    pub(super) typed_dicts: Arc<HashMap<String, Vec<TypedDictMember>>>,
     /// Every module-level def's own direct callers' positional argument
     /// lists, keyed by the def's name (`function_table::
     /// caller_argument_positions`) — a def missing from this table either
@@ -173,6 +173,14 @@ pub(super) struct WalkContext<'a> {
     /// module_at`, `derived_return_values`) — ordinary walks never pay
     /// for recording they never asked for.
     pub(super) evaluations_recorder: Option<Arc<Mutex<Vec<(TextRange, AbstractValue)>>>>,
+    /// The whole module walk's shared derivation-trace collector, when a
+    /// caller asked for one (`refinedpy-check --trace-verdict`).
+    /// `walk_body_with_self_binding` installs this SAME `Arc` on every
+    /// body's fresh `Environment` the moment it builds one, exactly the
+    /// way `evaluations_recorder` above is installed and for the same
+    /// reason: the blocked position may sit inside any nested `def`'s own
+    /// body. `None` for every ordinary check.
+    pub(super) trace_collector: Option<Arc<Mutex<crate::trace::TraceCollector>>>,
 }
 
 /// `surface.bindings` (the cross-module resolver's own map) plus every
@@ -237,6 +245,28 @@ pub fn findings_for_module_at(
     kernel: &Arc<RefinedTSKernel>,
     entry_directory: Option<&std::path::Path>,
 ) -> Vec<Finding> {
+    findings_for_module_traced(module, resolver, kernel, entry_directory, None)
+}
+
+/// `findings_for_module_at` plus an optional derivation-trace collector
+/// (`trace`'s own module doc). With `None` — every ordinary check, every
+/// existing caller — this walks byte-identically to before the trace
+/// existed: the collector field is `None` all the way down and every
+/// recording entry point returns on its first `Cell<bool>` read.
+///
+/// With `Some`, the SAME `Arc` is installed on every body's environment
+/// AND published into the thread-local slot the two `Environment`-less
+/// seams read (`trace::install`), for the whole duration of the walk.
+pub fn findings_for_module_traced(
+    module: &ModModule,
+    resolver: ModuleResolver,
+    kernel: &Arc<RefinedTSKernel>,
+    entry_directory: Option<&std::path::Path>,
+    trace_collector: Option<Arc<Mutex<crate::trace::TraceCollector>>>,
+) -> Vec<Finding> {
+    // The guard lives for the whole walk and clears the thread-local on
+    // the way out, including on an unwind.
+    let _trace_guard = trace_collector.clone().map(crate::trace::install);
     let surface = module_surface(module, resolver, kernel);
     // The module's own aliases, plus every alias an import pulled in
     // under a local name (`from support import Age`); an own alias wins
@@ -246,20 +276,13 @@ pub fn findings_for_module_at(
         aliases.insert(name, alias);
     }
     let imports = surface_imports(module);
-    if aliases.is_empty()
-        && imports.annotated_names.is_empty()
-        && imports.literal_names.is_empty()
-    {
-        // No refinement alias (own or imported), no recognized
-        // `Annotated` import, and no `Literal` import — no statement in
-        // this module can carry refinement vocabulary this checker
-        // reads, so nothing is judged. A module whose only vocabulary is
-        // an inline `Annotated[...]` or `Literal[...]` annotation still
-        // has the matching import set populated (`surface_imports` reads
-        // only import statements), so it reaches the walk below rather
-        // than being skipped without judgment.
-        return Vec::new();
-    }
+    // Every module reaches the walk. Refinement vocabulary decides what a
+    // STATED set is, never whether this module has anything to judge: a
+    // dead guard, a comparison the kernel proves, a temporal transfer,
+    // and every designated position are all judgments the walk makes from
+    // the statements themselves, with no alias, `Annotated`, or `Literal`
+    // anywhere in the file. A module that truly states nothing walks and
+    // reports nothing, which is the same answer at the cost of running.
     let own_functions = function_table(module);
     let functions = Arc::new(merged(&own_functions, surface.functions.as_ref()));
     let own_classes = class_table(module, &aliases, &imports, kernel);
@@ -321,6 +344,7 @@ pub fn findings_for_module_at(
         caller_arguments,
         entry_directory: entry_directory.map(|dir| dir.to_path_buf()),
         evaluations_recorder: None,
+        trace_collector,
     };
     let mut out = Vec::new();
     walk_body(&module.body, None, None, None, &context, &mut out);

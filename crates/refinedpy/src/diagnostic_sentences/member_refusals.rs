@@ -2,9 +2,10 @@
 //! dict/list element suffix), `at_member`/`at_slot` (the sharper
 //! key-prefixed / ordinal-slot rewrites, both recognizing ONLY
 //! `refutation`'s own plain composed shape via `plain_refutation_
-//! value_words`), `slot_word` (the ordinal-slot name), and
-//! `element_set_refutation` (a container-typed sink's own whole-range
-//! refusal).
+//! value_words`), `slot_word` (the ordinal-slot name),
+//! `missing_required_key` (a closed value's own absent-required-key
+//! refusal), and `element_set_refutation` (a container-typed sink's own
+//! whole-range refusal).
 
 use refined_sets::format_for_diagnostics::format_for_diagnostics;
 use refined_sets::refinement_forms::RefinedSet;
@@ -36,6 +37,23 @@ pub fn at_member(message: &str, key: &str, member_set: &RefinedSet) -> String {
         );
     }
     at_key(message, key)
+}
+
+/// The refusal a CLOSED value earns for a declared key it does not
+/// carry — the MEMBERS LAW's own absent-required-key sentence, the twin
+/// of the Go checker's `"<what> is missing the key '<name>'"`
+/// (`walk/object_assignability.go`'s `CheckObjectTarget`). `judge` is
+/// sink-agnostic by this module's own design, so the flowing thing is
+/// "a value" — the same word every sibling law here uses — rather than a
+/// sink-specific word (return/argument/key) `judge` cannot know.
+///
+/// Says WHY the absence is a refusal rather than nothing: the
+/// declaration requires the key (library/typing.rst, `TypedDict`: "By
+/// default, all keys must be present in a ``TypedDict``"), and the value
+/// states its complete key set, so the key is proved absent rather than
+/// merely unread.
+pub fn missing_required_key(key: &str, spelling: &str) -> String {
+    format!("a value is missing the required key '{key}' — '{spelling}' requires it, and this value states its complete key set")
 }
 
 /// A member's own refutation, keyed by the index it escaped at — the

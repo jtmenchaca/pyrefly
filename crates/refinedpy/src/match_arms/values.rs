@@ -205,6 +205,44 @@ pub(super) fn guarded_bare_capture_narrowed(
     Some(known_values(kept, subject_kind_tag, grade))
 }
 
+/// `case None:` against a MAYBE-CARRIER subject (`Kind::PossiblyUndefined`
+/// — an `Optional[X]`/`X | None`-declared parameter's own seed,
+/// `check/seed.rs::seed_parameters`), narrowed the same two ways the
+/// `is None` reader already narrows one: `keep_matched: true` is the
+/// exact `None` value (`null_value` — compound_stmts.rst's
+/// `MatchSingleton` clause: "For the singletons `None`, `True` and
+/// `False`, the `is` operator is used", and `x is None` true means the
+/// binding holds exactly that one singleton), `keep_matched: false` is
+/// the wrapper's own INNER value unwrapped (the present side, all that
+/// remains once the absent side is consumed). This is
+/// `narrowing::none_truthiness`'s own `Kind::PossiblyUndefined` law read
+/// for a match arm's question instead of an `if` condition's, so the two
+/// spellings narrow a maybe-carrier identically.
+///
+/// `None` for any other pattern (a value/capture/sequence pattern, or
+/// `case True:`/`case False:` — a maybe carrier's present side is not
+/// decidably a boolean singleton) or any non-wrapper subject, leaving
+/// those arms to the outcome rules unchanged.
+pub(super) fn narrow_maybe_subject_on_none(subject: &AbstractValue, pattern: &Pattern, keep_matched: bool) -> Option<AbstractValue> {
+    if subject.kind != Kind::PossiblyUndefined {
+        return None;
+    }
+    let Pattern::MatchSingleton(singleton) = pattern else {
+        return None;
+    };
+    if singleton.value != ruff_python_ast::Singleton::None {
+        return None;
+    }
+    if keep_matched {
+        return Some(refined_domain::abstract_value::null_value());
+    }
+    let inner = subject
+        .inner
+        .as_deref()
+        .expect("Kind::PossiblyUndefined always carries an inner value");
+    Some(inner.clone())
+}
+
 /// Whether `narrowed` is the SAME admitted set as `remaining` — both
 /// read through `enumerable_numeric_members` and compared as sets
 /// (order-independent: a join can enumerate its members in either

@@ -15,18 +15,26 @@ fn typed_dict_return_refinement_wraps_the_classs_own_member_table() {
         temporal: None,
         temporal_awareness: crate::surface::TemporalAwareness::Any,
     };
-    typed_dicts.insert("PersonDict".to_owned(), vec![("age".to_owned(), age_declared)]);
+    typed_dicts.insert(
+        "PersonDict".to_owned(),
+        vec![TypedDictMember {
+            name: "age".to_owned(),
+            required: true,
+            declared: age_declared,
+        }],
+    );
 
     let got = typed_dict_return_refinement(&name_expr("PersonDict"), &typed_dicts)
         .expect("a recorded TypedDict name resolves");
     assert_eq!(got.spelling, "PersonDict");
     let members = got.members.expect("members carries the per-field table");
     assert_eq!(members.len(), 1);
-    assert_eq!(members[0].0, "age");
+    assert_eq!(members[0].name, "age");
+    assert!(members[0].required, "a total TypedDict's own member is required");
 }
 
 #[test]
 fn typed_dict_return_refinement_declines_a_name_absent_from_the_table() {
-    let typed_dicts: HashMap<String, Vec<(String, DeclaredRefinement)>> = HashMap::new();
+    let typed_dicts: HashMap<String, Vec<TypedDictMember>> = HashMap::new();
     assert!(typed_dict_return_refinement(&name_expr("PersonDict"), &typed_dicts).is_none());
 }

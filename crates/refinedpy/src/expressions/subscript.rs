@@ -9,12 +9,14 @@ use refined_domain::abstract_value::AbstractValue;
 use refined_domain::abstract_value::Kind;
 use refined_domain::abstract_value::PrimitiveKind;
 use refined_domain::abstract_value::SetKindTag;
+use refined_domain::trust_grades::trust_level_of;
 use refined_domain::trust_grades::TrustProved;
 use refined_domain::trust_grades::TrustSpec;
 use refined_kernel::kernel_interface::RefinedTSKernel;
 use refined_sets::refinement_forms::Form;
 use refined_sets::refinement_forms::make_refined_set;
 use refined_sets::refinement_forms::RefinedSet;
+use refined_sets::repetition_window_forms::as_repetition;
 use ruff_python_ast::CmpOp;
 use ruff_python_ast::Expr;
 
@@ -68,6 +70,9 @@ pub(super) fn evaluate_slice(
         return unknown();
     }
     if let Some(result) = sequence_prefix_slice(container, slice, environment, kernel) {
+        return result;
+    }
+    if let Some(result) = repetition_window_slice(container, slice, environment, kernel) {
         return result;
     }
     let length = match container.kind {
@@ -157,6 +162,71 @@ pub(super) fn sequence_prefix_slice(
     }
     let prefix_set = (kernel.seq_prefix)(&unbounded_repeats(&receiver_set), n)?;
     Some(known_set(prefix_set, None, TrustProved, SetKindTag::None))
+}
+
+/// `xs[lower:upper]` on an UNKNOWN-LENGTH, known-element sequence — a
+/// `Kind::Set` whose only form is a repetition window (`as_repetition`,
+/// the shape `check/seed.rs::seed_parameters` builds for a declared
+/// `list[X]`/`Sequence[X]` parameter, and the shape `attribute.rs`'s
+/// `sys.argv` read answers). Distinct from `sequence_prefix_slice`
+/// above, which asks the kernel about a STRING-shaped window's exact
+/// prefix grammar: this row answers the LIST-shaped window's own two
+/// facts, which need no kernel round trip at all.
+///
+/// Both facts come from expressions.rst, "Slicings," and stdtypes.rst's
+/// "Common Sequence Operations" `s[i:j]` row ("slice of *s* from *i* to
+/// *j*"): every element of the slice is an element of `s` (a slice
+/// selects positions, it never builds a value outside the sequence's own
+/// alphabet), and the slice's length is at most `s`'s own length (a
+/// slice never grows a sequence). So the answer is the SAME element set
+/// repeated, with the length window relaxed at the low end to `0` — a
+/// slice can select nothing at all, since "Slicings" clamps an
+/// out-of-range bound rather than raising — and unchanged at the high
+/// end.
+///
+/// The WHOLE slice `s[:]` is its own arm: both bounds absent selects
+/// every position, so the receiver copies through unchanged rather than
+/// losing its own length window to the relaxation below.
+///
+/// A KNOWN non-negative `lower` tightens the high end further by
+/// dropping that many positions (`hi - lower`, floored at 0), the exact
+/// count `s[lower:]` skips. An unknown or negative `lower`, or any
+/// `upper` this file cannot read, keeps the receiver's own `hi` — still
+/// sound, since neither can make the slice longer than `s`. A `step`
+/// never reaches here (the caller returns before this row).
+///
+/// `None` when the receiver is not a repetition window at all, so the
+/// caller's own exact-length rows and final decline stand unchanged.
+pub(super) fn repetition_window_slice(
+    container: &AbstractValue,
+    slice: &ruff_python_ast::ExprSlice,
+    environment: &Environment,
+    kernel: &Arc<RefinedTSKernel>,
+) -> Option<AbstractValue> {
+    if container.kind != Kind::Set || container.set_kind_tag != SetKindTag::None {
+        return None;
+    }
+    let repeated = as_repetition(&container.set)?;
+    // `s[:]` — BOTH bounds absent — is the whole sequence, so the length
+    // is unchanged rather than merely bounded above by it: "Slicings"'
+    // own defaults make `lower` 0 and `upper` `len(s)`, which selects
+    // every position. This is `A7.xfer.copy`'s own `shallow_copy` shape,
+    // where relaxing `lo` would discard a length fact the copy actually
+    // keeps.
+    let whole_sequence = slice.lower.is_none() && slice.upper.is_none();
+    if whole_sequence {
+        return Some(container.clone());
+    }
+    let dropped = match &slice.lower {
+        Some(expr) => slice_bound_index(expr, environment, kernel).filter(|bound| *bound >= 0).unwrap_or(0),
+        None => 0,
+    };
+    let high = repeated.hi.map(|hi| (hi - dropped).max(0));
+    let sliced = refined_sets::repetition_window_forms::repetition(repeated.element, 0, high);
+    Some(AbstractValue {
+        kind_tag: container.kind_tag,
+        ..known_set(sliced, None, trust_level_of(container), SetKindTag::None)
+    })
 }
 
 /// Relaxes every `Repeat`/`RepeatWord` form reachable through the set's

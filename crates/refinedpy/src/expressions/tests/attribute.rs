@@ -217,7 +217,14 @@ fn test_super_bare_bound_method_reference_is_opaque() {
     let classes =
         std::sync::Arc::new(crate::instances::class_table(&module, &aliases, &imports, &kernel));
     let child = classes.get("Child").expect("Child class recorded");
-    let constructed_child = crate::instances::judge_construction(child, &[], &[], &kernel).instance;
+    let constructed_child = crate::instances::judge_construction(
+        child,
+        &[],
+        &[],
+        crate::instances::ConstructionKind::DirectCall,
+        &kernel,
+    )
+    .instance;
     let mut environment = empty_environment();
     environment.set_classes(classes.clone());
     environment.bind("self", constructed_child);
@@ -259,9 +266,18 @@ fn test_re_compile_reads_opaque() {
     assert_eq!(value.kind_word, Some("a compiled pattern"));
 }
 
+/// `re.match` answers the match object OR `None` — library/re.rst,
+/// `function::match`: "Return `None` if the string does not match the
+/// pattern." The answer is the maybe carrier over the match-object
+/// sort, never the match-only claim a caller could read `.group()` off
+/// unguarded.
 #[test]
-fn test_re_match_reads_opaque() {
+fn test_re_match_reads_a_match_object_or_none() {
     let Some(value) = eval("re.match(\"a\", \"banana\")") else { return };
-    assert_eq!(value.kind, Kind::Object);
-    assert_eq!(value.kind_word, Some("a match object"));
+    assert_eq!(value.kind, Kind::PossiblyUndefined);
+    let present = value.inner.as_deref().expect("the maybe carrier holds its present side");
+    assert_eq!(present.kind, Kind::Object);
+    // `"a"` compiles as a pattern, so the present side is the readable-
+    // groups match object rather than the bare opaque match sort.
+    assert_eq!(present.kind_word, Some("a match object with readable groups"));
 }

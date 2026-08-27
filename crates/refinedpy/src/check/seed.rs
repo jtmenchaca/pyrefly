@@ -2,7 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use refined_domain::abstract_value::{
-    known_set, possibly_absent, AbsentFlavor, AbstractValue, Kind, ObjectKey, PrimitiveKind, SetKindTag,
+    kind_union_of, known_set, possibly_absent, AbsentFlavor, AbstractValue, Kind, ObjectKey, PrimitiveKind,
+    SetKindTag,
 };
 use refined_domain::known_constructors::{known_dict_star, known_list, known_object};
 use refined_domain::trust_grades::TrustSpec;
@@ -14,6 +15,8 @@ use crate::assignability::states_sequence;
 use crate::env::Environment;
 use crate::expressions::evaluate_expression;
 use crate::instances::ClassModel;
+use crate::surface::AliasEntry;
+use crate::surface::SurfaceImports;
 use crate::typereading::{callable_return_refinement, declared_refinement, DeclaredRefinement};
 
 use super::*;
@@ -85,6 +88,34 @@ pub(super) fn seed_parameters(
                 continue;
             }
         }
+        // `Optional[ClassName]` (`request: Optional[AudioRequest]`) is the
+        // SAME tagged-instance shape the bare `Expr::Name` arm above seeds,
+        // wrapped in the maybe carrier: "Optional[X] is equivalent to X |
+        // None" (tmp/cpython Doc/library/typing.rst, "Optional"), so the
+        // instance the class arm would build for a non-Optional `request:
+        // AudioRequest` parameter is exactly what a present `Optional
+        // [AudioRequest]` parameter holds, plus the None admission. Without
+        // this arm, the whole annotation is `Expr::Subscript`, never
+        // `Expr::Name`, so the class arm above never fires — the parameter
+        // fell through every table this file has, landing `Kind::Unknown`,
+        // and an attribute read off it (`expressions/attribute.rs`'s own
+        // `receiver.kind != Kind::Object` fallthrough) answered `unknown()`
+        // rather than the field's own declared set. `possibly_absent`'s
+        // `NullOnly` flavor is Python's `None`, the same flavor the scalar
+        // Optional tail below this loop already wraps with.
+        if let Expr::Subscript(subscript) = annotation {
+            let is_optional = matches!(subscript.value.as_ref(), Expr::Name(head) if head.id.as_str() == "Optional");
+            if is_optional {
+                if let Expr::Name(class_name) = subscript.slice.as_ref() {
+                    if let Some(model) = context.classes.get(class_name.id.as_str()) {
+                        let instance = class_parameter_object(model);
+                        let seeded = possibly_absent(instance, AbsentFlavor::NullOnly, Some(TrustSpec), false);
+                        environment.bind(parameter.parameter.name.id.as_str(), seeded);
+                        continue;
+                    }
+                }
+            }
+        }
         // A `Callable[[...], R]`-ANNOTATED PARAMETER (`declared_refinement`
         // states nothing for it — a `Callable[...]` subscript is not a set
         // the parameter itself binds to) states a fact a LATER `f(...)`
@@ -125,9 +156,27 @@ pub(super) fn seed_parameters(
         // narrows it. Scoped to parameters ONLY: the general annotation
         // table does not read base sorts, so `-> int` returns stay
         // unjudged and helper bodies gain no new blockers.
+        // A BARE `date`/`timedelta`/`datetime`/`AwareDatetime`/
+        // `NaiveDatetime` PARAMETER seeds the UNBOUNDED window on its own
+        // chart — the temporal twin of the bare-sort ray just described,
+        // and scoped to parameters for the same reason
+        // (`surface::bare_temporal_annotation`'s own doc). Tried AFTER
+        // `declared_refinement`, so an `Annotated[datetime, Field(ge=…)]`
+        // or a module-level alias keeps its stated window; only an
+        // annotation that states no window at all reaches this reader.
+        // A GENERAL UNION annotation (`list[Age] | int`, neither side
+        // `None`) seeds a `Kind::KindUnion` holding both sides apart, so
+        // a later `isinstance(x, list)` can keep one and drop the other —
+        // `union_parameter_seed`'s own doc. Tried before the readers
+        // below, none of which state anything for this shape.
+        if let Some(union) = union_parameter_seed(annotation, context.aliases, context.imports, environment) {
+            environment.bind(parameter.parameter.name.id.as_str(), union);
+            continue;
+        }
         let Some(declared) =
             declared_refinement(annotation, context.aliases, context.imports, environment)
                 .or_else(|| crate::typereading::base_sort_return_refinement(annotation))
+                .or_else(|| bare_temporal_refinement(annotation, context.imports))
         else {
             continue;
         };
@@ -205,19 +254,57 @@ pub(super) fn seed_parameters(
                     environment.bind(parameter.parameter.name.id.as_str(), sequence);
                     continue;
                 }
+                // A NESTED sequence container (`list[list[X]]`,
+                // `Sequence[list[X]]` — the element is itself a
+                // sequence, so `element.set` is empty and the scalar arm
+                // above declined). The same repetition grammar states
+                // this shape one level down: the outer window's element
+                // is the INNER window, `Repeat(Repeat(X, ...), ...)`.
+                // `sequence_element_window` builds the inner window from
+                // the element's own declaration, recursing for as many
+                // levels as the declaration nests.
+                //
+                // No new reading is introduced: `subscript_read`'s own
+                // `star_element_read` already answers any index of a
+                // repetition as "some member of the element," which here
+                // IS the inner window — so `nested[0][0]` reads X, and
+                // `itertools.chain.from_iterable(nested)`'s own abstract
+                // row (`attribute_call.rs`) reads the inner element back
+                // through the same `as_repetition`. The outer value
+                // carries NO scalar sort tag: its members are sequences,
+                // not numbers, so `sum`/`min`/`max` over it correctly
+                // find no numeric tag to read.
+                if let Some(nested_window) = sequence_element_window(element) {
+                    let (lo, hi) = declared.element_length.unwrap_or((0, None));
+                    let sequence = known_set(
+                        make_refined_set(vec![repeat_of(nested_window, lo, hi)]),
+                        None,
+                        TrustSpec,
+                        SetKindTag::None,
+                    );
+                    environment.bind(parameter.parameter.name.id.as_str(), sequence);
+                    continue;
+                }
             }
         }
-        // A `dict[str, X]` PARAMETER (`declared.element` Some, spelling
-        // `"dict[str, …]"` — `typereading.rs`'s own dict arm) seeds an
+        // A `dict[K, X]` PARAMETER (`declared.element` Some, spelling
+        // `"dict[…]"` — `typereading.rs`'s own dict arm) seeds an
         // unbounded-key object: `dict_star_value_seed` (below) reads X —
-        // scalar, or itself another `dict[str, Y]` — and wraps it as the
-        // claim every STRING key, if present, reads back as, the dict
-        // twin of the sequence-star seed just above, but keyed by string
-        // identity rather than position.
+        // scalar, or itself another `dict[K, Y]` — and wraps it as the
+        // claim every key, if present, reads back as, the dict twin of
+        // the sequence-star seed just above, but keyed by key identity
+        // rather than position.
         // `collection_models.rs::dict_get_result`/`subscript_read` read
         // an `ObjectStar` receiver by unwrapping the element back off
         // this same shape.
-        let is_dict_container = declared.spelling.starts_with("dict[str, ");
+        //
+        // Every key sort `declared_refinement`'s own dict arm admits
+        // (`str`/`int`/`float`/`object`) seeds the same shape: the star
+        // states what every PRESENT key reads back as, which
+        // stdtypes.rst's Mapping Types section states once for any
+        // hashable key, so the key sort in the spelling does not change
+        // the value law this seed carries.
+        let is_dict_container = declared.spelling.starts_with("dict[");
         if is_dict_container {
             if let Some(element) = &declared.element {
                 if let Some(star) = dict_star_value_seed(element) {
@@ -316,6 +403,145 @@ pub(super) fn seed_parameters(
     }
 }
 
+/// A GENERAL UNION parameter annotation — `list[Age] | int`, `dict[str,
+/// Wide] | int`, `int | list[Age]` (stdtypes.rst, "Union Type": `X | Y`
+/// "means either X or Y") — seeded as a `Kind::KindUnion` whose arms are
+/// the two sides' own seeds, in source order.
+///
+/// The union is a KindUnion rather than a lattice join for one reason:
+/// `isinstance(x, list)` has to be able to KEEP one side and DROP the
+/// other, which only a shape that still holds the sides apart can do
+/// (`narrowing::isinstance_guards::narrow_isinstance_call`'s own
+/// arm-filtering path, the same one `json.loads`'s return space already
+/// narrows through). A join would answer one merged value neither
+/// isinstance arm could ever pick a side out of, so A7.guard.sort's
+/// `x: list[Age] | int` would read the same after the guard as before
+/// it.
+///
+/// `X | None` NEVER reaches here — `declared_refinement`'s own one-sided
+/// arm reads that shape and marks `admits_none` on the non-None side, and
+/// the caller tries this function only after that read declined.
+///
+/// `None` when either side states no seed this function can build: a
+/// sequence container (`list[X]`/`set[X]`/`Sequence[X]`), a `dict[str,
+/// X]`, and a scalar/base-sort side are the three it reads, matching the
+/// three shapes `seed_parameters`' own single-annotation dispatch builds
+/// above. The caller then falls through to its existing readers, which
+/// decline the union exactly as they did before this arm existed.
+fn union_parameter_seed(
+    annotation: &Expr,
+    aliases: &HashMap<String, AliasEntry>,
+    imports: &SurfaceImports,
+    environment: &Environment,
+) -> Option<AbstractValue> {
+    let Expr::BinOp(binop) = annotation else {
+        return None;
+    };
+    if binop.op != ruff_python_ast::Operator::BitOr {
+        return None;
+    }
+    if matches!(binop.left.as_ref(), Expr::NoneLiteral(_)) || matches!(binop.right.as_ref(), Expr::NoneLiteral(_)) {
+        return None;
+    }
+    let left = union_arm_seed(binop.left.as_ref(), aliases, imports, environment)?;
+    let right = union_arm_seed(binop.right.as_ref(), aliases, imports, environment)?;
+    Some(kind_union_of(vec![left, right]))
+}
+
+/// One side of a general union annotation, seeded — the same three
+/// shapes `seed_parameters`' own single-annotation dispatch builds, read
+/// through the identical helpers so a union arm and a bare parameter of
+/// the same annotation seed to the same value: a sequence container
+/// through `sequence_element_window`, a `dict[str, X]` through
+/// `dict_star_value_seed`, and a scalar or bare sort through its own
+/// declared set. `None` for anything else.
+fn union_arm_seed(
+    side: &Expr,
+    aliases: &HashMap<String, AliasEntry>,
+    imports: &SurfaceImports,
+    environment: &Environment,
+) -> Option<AbstractValue> {
+    let declared = declared_refinement(side, aliases, imports, environment)
+        .or_else(|| crate::typereading::base_sort_return_refinement(side))?;
+    if declared.spelling.starts_with("dict[str, ") {
+        let element = declared.element.as_deref()?;
+        return dict_star_value_seed(element);
+    }
+    if let Some(window) = sequence_element_window(&declared) {
+        // A sequence arm carries the element's own numeric sort on the
+        // OUTER value's tag, the same reading `seed_parameters`' own
+        // sequence arm gives (`star_numeric_hull` and its siblings read
+        // the sequence value's tag, never the element's).
+        let element = declared.element.as_deref();
+        let kind_tag = element.and_then(|element| {
+            if element.set.forms.is_empty() {
+                None
+            } else if requires_integer(&element.set) {
+                Some(PrimitiveKind::Integer)
+            } else {
+                Some(PrimitiveKind::Float)
+            }
+        });
+        return Some(AbstractValue {
+            kind_tag,
+            ..known_set(window, None, TrustSpec, SetKindTag::None)
+        });
+    }
+    if declared.set.forms.is_empty() {
+        return None;
+    }
+    let sort = if on_one_tuple_layer(&declared.set) && !states_sequence(&declared.set) {
+        if requires_integer(&declared.set) {
+            Some(PrimitiveKind::Integer)
+        } else {
+            Some(PrimitiveKind::Float)
+        }
+    } else {
+        None
+    };
+    Some(AbstractValue {
+        kind_tag: sort,
+        ..known_set(declared.set, None, TrustSpec, SetKindTag::None)
+    })
+}
+
+/// The repetition window a SEQUENCE-CONTAINER declaration states — the
+/// set `Repeat(X, lo, hi)` where `X` is the element's own set. Called by
+/// `seed_parameters`' nested arm for a `list[list[X]]`/`Sequence[list[X]]`
+/// parameter, where the ELEMENT is itself a sequence container and so
+/// carries no scalar set of its own for the plain arm to repeat over.
+///
+/// Recurses for as many container levels as the declaration nests, the
+/// same way `dict_star_value_seed` recurses through a nested
+/// `dict[str, dict[str, Y]]` value slot: a scalar element (`set`
+/// non-empty) is the base case, and an element that is itself a
+/// sequence container builds its own window first and becomes the outer
+/// window's element. `element_length` tightens each level's own
+/// `{lo, hi}` where the declaration carries one, and is the bare
+/// unbounded window otherwise.
+///
+/// `None` for a `declared` that is not a sequence container at all, or
+/// whose element is neither a scalar nor another sequence container (a
+/// `dict[str, X]`, tuple, or TypedDict element) — the caller leaves the
+/// parameter unseeded rather than guess at a shape this window cannot
+/// state.
+pub(super) fn sequence_element_window(declared: &DeclaredRefinement) -> Option<refined_sets::refinement_forms::RefinedSet> {
+    let is_sequence_container = declared.spelling.starts_with("list[")
+        || declared.spelling.starts_with("set[")
+        || declared.spelling.starts_with("Sequence[");
+    if !is_sequence_container {
+        return None;
+    }
+    let element = declared.element.as_deref()?;
+    let element_set = if !element.set.forms.is_empty() {
+        element.set.clone()
+    } else {
+        sequence_element_window(element)?
+    };
+    let (lo, hi) = declared.element_length.unwrap_or((0, None));
+    Some(make_refined_set(vec![repeat_of(element_set, lo, hi)]))
+}
+
 /// The unbounded-key dict-star value a `dict[str, X]` PARAMETER's own
 /// VALUE SLOT declaration (`element`, a `DeclaredRefinement`) seeds —
 /// `seed_parameters`' own dict arm calls this, and it recurses for a
@@ -337,8 +563,8 @@ pub(super) fn seed_parameters(
 ///   function recurses on `element.element` to build the INNER
 ///   dict-star first, then wraps THAT as the outer star's own element —
 ///   `dict[str, dict[str, int]]`'s outer star holds an inner star at
-///   every string key, exactly as a `list[list[int]]` parameter would
-///   nest two star levels if this crate modeled that shape.
+///   every string key, the same way `sequence_element_window` below
+///   nests two repetition levels for a `list[list[int]]` parameter.
 ///
 /// Either way, `element.admits_none` (`dict[str, Optional[X]]`) wraps
 /// the starred element in the maybe carrier first, `NullOnly` —
@@ -361,7 +587,7 @@ pub(super) fn dict_star_value_seed(element: &DeclaredRefinement) -> Option<Abstr
             kind_tag: Some(sort),
             ..known_set(element.set.clone(), None, TrustSpec, SetKindTag::None)
         }
-    } else if element.spelling.starts_with("dict[str, ") {
+    } else if element.spelling.starts_with("dict[") {
         let nested = element.element.as_deref()?;
         dict_star_value_seed(nested)?
     } else {
@@ -478,17 +704,25 @@ pub(super) fn caller_exact_string_text(value: &AbstractValue) -> Option<String> 
 /// for a real call — the tag `evaluate_attribute_read` and every other
 /// `receiver.source`-keyed reader already consult), one `ObjectKey` per
 /// declared field IN `model.fields`' own order. A field with no declared
-/// refinement (`ClassField.declared` `None`) seeds NOTHING for that key —
-/// absent from `keys` entirely, not a fabricated unrefined set — so a
-/// later read of it stays undetermined naming the true blocker (there is
-/// no declaration to read), rather than reading as a false "any value at
-/// all" claim this seed did not earn.
+/// refinement (`ClassField.declared` `None`) takes its BASE SORT
+/// (`ClassField.base_sort`) instead. A field whose annotation states
+/// NEITHER (a class name this table does not model, an unread generic)
+/// seeds NOTHING for that key — absent from `keys` entirely, not a
+/// fabricated unrefined set — so a later read of it stays undetermined
+/// naming the true blocker (there is no declaration to read), rather
+/// than reading as a false "any value at all" claim this seed did not
+/// earn.
 pub(super) fn class_parameter_object(model: &ClassModel) -> AbstractValue {
     let entries: Vec<ObjectKey> = model
         .fields
         .iter()
         .filter_map(|field| {
-            let declared = field.declared.as_ref()?;
+            // A field with no refinement of its own falls back to its
+            // BASE SORT — the whole-int ray for `a: int`, the identical
+            // claim a bare `raw: int` PARAMETER seeds above — so an
+            // ordinary range guard over `o.a` narrows the field exactly
+            // as it narrows a parameter.
+            let declared = field.declared.as_ref().or(field.base_sort.as_ref())?;
             Some(ObjectKey {
                 name: field.name.clone(),
                 numeric: false,
@@ -547,4 +781,27 @@ pub(super) fn class_field_value(declared: &DeclaredRefinement) -> AbstractValue 
         };
     }
     known_set(declared.set.clone(), None, TrustSpec, SetKindTag::None)
+}
+
+/// A bare `date`/`timedelta`/`datetime`/`AwareDatetime`/`NaiveDatetime`
+/// parameter annotation as a `DeclaredRefinement` carrying the unbounded
+/// window on its own chart — `surface::bare_temporal_annotation`'s
+/// reading, wrapped in the shape `seed_parameters`' own chain consumes.
+/// The `set` field stays empty, the same "one active field" convention
+/// every temporal `DeclaredRefinement` in this crate keeps.
+fn bare_temporal_refinement(annotation: &Expr, imports: &crate::surface::SurfaceImports) -> Option<DeclaredRefinement> {
+    let (temporal, awareness) = crate::surface::bare_temporal_annotation(annotation, imports)?;
+    let spelling = refined_sets::calendar_interpreter::format_temporal(&temporal);
+    Some(DeclaredRefinement {
+        set: make_refined_set(Vec::new()),
+        spelling,
+        admits_none: false,
+        element: None,
+        element_length: None,
+        generator: None,
+        members: None,
+        positions: None,
+        temporal: Some(temporal),
+        temporal_awareness: awareness,
+    })
 }

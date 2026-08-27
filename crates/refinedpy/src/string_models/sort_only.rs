@@ -105,6 +105,22 @@ pub fn string_method_sort_only_result(method: &str, receiver: &AbstractValue, ar
             return Some(known_set(pieces, None, grade, SetKindTag::None));
         }
     }
+    // `s.splitlines()` over an unread receiver — the LINES are unread,
+    // but their sort is pinned: "Return a list of the lines in the
+    // string, breaking at line boundaries" (stdtypes.rst,
+    // str.splitlines), and every piece of a `str` split is another
+    // `str`. Unlike `str.split`'s own row above, the count is bounded
+    // below by ZERO, not one: the same clause states "this method
+    // returns an empty list for the empty string." So the answer is the
+    // unbounded repetition of unread strings from 0 — which is what lets
+    // `len(out.splitlines())` read `[0, +inf)` and an element read
+    // (`lines[0]`, through `subscript_read`'s own `star_element_read`)
+    // read `Σ*`, rather than the whole call declining.
+    if method == "splitlines" && arguments.is_empty() {
+        let lines = repetition(strings(), 0, None);
+        let grade = trust_level_of(receiver);
+        return Some(known_set(lines, None, grade, SetKindTag::None));
+    }
     let is_shaped_row = match method {
         "upper" | "lower" | "strip" | "lstrip" | "rstrip" => arguments.is_empty(),
         "casefold" => arguments.is_empty(),

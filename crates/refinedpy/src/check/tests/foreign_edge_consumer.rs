@@ -177,11 +177,7 @@ fn a_call_whose_range_no_later_statement_contains_has_no_consumer_position() {
 /// target) foreign edge that consumes nothing further — the walk
 /// records it as `blockers`, never `values` (no `return` anywhere in
 /// the body), so the blocker sentence is exactly what
-/// `discharge_edge_premises` names for this decline. Carries a
-/// `type` alias with no other role than clearing
-/// `derived_return_values_at`'s own early exit (`aliases.is_empty()
-/// && imports.annotated_names.is_empty()`) — with neither present
-/// the walk never runs at all, foreign edge included.
+/// `discharge_edge_premises` names for this decline.
 fn foreign_edge_only_module() -> ModModule {
     parsed(concat!(
         "from typing import Annotated\n",

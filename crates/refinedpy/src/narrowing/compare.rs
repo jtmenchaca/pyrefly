@@ -7,14 +7,17 @@ use refined_domain::abstract_value::known_set;
 use refined_domain::abstract_value::known_values;
 use refined_domain::abstract_value::AbstractValue;
 use refined_domain::abstract_value::Kind;
+use refined_domain::abstract_value::ObjectKey;
 use refined_domain::abstract_value::PrimitiveKind;
 use refined_domain::abstract_value::SetKindTag;
+use refined_domain::known_constructors::element_of_object_star;
 use refined_domain::trust_grades::trust_level_of;
 use refined_domain::trust_grades::TrustSpec;
 use refined_kernel::kernel_interface::RefinedTSKernel;
 use ruff_python_ast::CmpOp;
 use ruff_python_ast::Expr;
 
+use crate::collection_models::DictKey;
 use crate::env::Environment;
 
 use super::literal_number;
@@ -71,6 +74,7 @@ pub(super) fn narrow_one_comparison(left: &Expr, op: CmpOp, right: &Expr, enviro
         if let Some(name) = name_of(left) {
             narrow_name_against_membership(name, right, environment, op == CmpOp::In, truth);
         }
+        narrow_dict_membership_against_literal_key(left, right, environment, op == CmpOp::In, truth);
         return;
     }
     let Some(numeric_op) = numeric_cmp_op(op) else {
@@ -486,6 +490,113 @@ pub(super) fn narrow_name_against_membership(name: &str, collection: &Expr, envi
         .filter(|value| members.contains(value) == keep_present)
         .collect();
     environment.bind(name, known_values(kept, kind_tag, grade));
+}
+
+/// `"a" in d` / `"a" not in d` / `k in d` / `k not in d` — the mirror of
+/// `narrow_name_against_membership`'s shape: the tested NAME is here the
+/// dict `d`, on the RIGHT of `in`/`not in`, with either a plain string
+/// literal (`"a" not in d`, A8.xfer.delete's own exit-guard row) or a
+/// plain NAME (`k in d`, A8.guard.forget's own `read_after_key_rebind`;
+/// `k in m` over a WEAK map, A8.xfer.weak's own `guarded_weak_read`) on
+/// the left. Reads only an unbounded-key dict binding (`Kind::ObjectStar`
+/// — `check.rs::seed_parameters`'s `known_dict_star` seed for a
+/// `dict[str, X]`/`weakref.WeakKeyDictionary[K, X]` parameter), the shape
+/// a raise-guard needs: the star states no key list of its own, so
+/// `known_container_index_absent` cannot prove absence for a later read
+/// the way a closed `Kind::Object` dict already can
+/// (`expressions::compare::compare_pair`'s own `Kind::Object` arm reads
+/// the key set directly there).
+///
+/// The arm that proves PRESENCE (`in` true, or `not in` false) records a
+/// fresh `ObjectKey` entry, the same (name, numeric) identity
+/// `known_dict_key`/`ObjectKey` already share
+/// (`collection_models::dict_write`'s own star-write arm records the
+/// identical shape for `d[key] = value`) — every entry the receiver
+/// already recorded survives untouched, since a membership test writes
+/// nothing to the dict itself (stdtypes.rst, "Mapping Types," `key in
+/// d`: "Return `True` if *d* has a key *key*, else `False`" — a pure
+/// read). The recorded value is the star's own declared element
+/// (`element_of_object_star`) — the ONE claim the parameter's own
+/// declaration already makes about every present key's value, not a
+/// narrower one this test could not have proved. A key already
+/// recorded (an earlier write or an earlier membership guard) is left
+/// as-is rather than overwritten, since this leaf has no narrower value
+/// to add.
+///
+/// A STRING LITERAL on the left keys the entry by its own text
+/// (`DictKey::string`) — the same value-comparable key `d[key] = value`
+/// records. A plain NAME on the left keys the entry by that BINDING's
+/// own identity (`DictKey::identity`, tagged `"binding:<name>"`) rather
+/// than by anything the name's VALUE states — this is what lets a
+/// class-instance key (a weak-referenceable `_Key` parameter, no
+/// `instance_identity` of its own to read `known_dict_key`'s ordinary
+/// identity arm) still record presence: `key in m` and `m[key]` name the
+/// same runtime object because the same UNWRITTEN BINDING supplies it on
+/// both sides (stdtypes.rst's Mapping Types section: membership and
+/// subscript consult the same keys), not because the value itself is
+/// spellable. `Environment::bind`'s own doc states the staleness half:
+/// any write to the key binding, OR to the receiver binding, drops the
+/// fact — a write to `d`/`m` replaces its whole `Kind::ObjectStar` value
+/// (this entry along with it), and a write to `k`/`key` strips every
+/// `"binding:<name>"`-tagged entry naming it, from every receiver, the
+/// moment the name is rebound.
+///
+/// The arm that proves ABSENCE (`in` false, or `not in` true) narrows
+/// nothing: `Kind::ObjectStar` has no key-list slot to record a missing
+/// key in (the same asymmetry `expressions::compare::compare_pair`'s
+/// own star arm documents — presence is recordable, absence is not),
+/// and inventing one would let a later `del`/write silently resurrect a
+/// key this checker had wrongly called impossible.
+///
+/// Any other left/right shape (the left is neither a string literal nor
+/// a plain name, the name is not currently `Kind::ObjectStar`, or the
+/// receiver's star element cannot be read) narrows nothing — the honest
+/// default.
+pub(super) fn narrow_dict_membership_against_literal_key(
+    left: &Expr,
+    right: &Expr,
+    environment: &mut Environment,
+    is_in: bool,
+    truth: bool,
+) {
+    let Some(name) = name_of(right) else {
+        return;
+    };
+    let inner_key = match left {
+        Expr::StringLiteral(literal) => DictKey::string(literal.value.to_str()),
+        Expr::Name(key_name) => DictKey::identity(&format!("binding:{}", key_name.id.as_str())),
+        _ => return,
+    };
+    // Recorded under the GUARD provenance, never the inner key's own
+    // plain spelling: this test proves presence AT THE GUARD, not that
+    // the key survives to the read (`DictKey::guarded`'s own doc) — a
+    // mutation between here and a later read, including one inside a
+    // callee handed the receiver, can remove it, which the WRITTEN-key
+    // shortcut (`dict_star_get_result`) must never assume away.
+    let key = DictKey::guarded(&inner_key);
+    let Some(current) = environment.read(name).cloned() else {
+        return;
+    };
+    if current.kind != Kind::ObjectStar {
+        return;
+    }
+    let proves_present = is_in == truth;
+    if !proves_present {
+        return;
+    }
+    let Some(element) = element_of_object_star(&current) else {
+        return;
+    };
+    if current.keys.iter().any(|entry| entry.name == key.name && entry.numeric == key.numeric) {
+        return;
+    }
+    let mut narrowed = current;
+    narrowed.keys.push(ObjectKey {
+        name: key.name,
+        numeric: key.numeric,
+        value: element,
+    });
+    environment.bind(name, narrowed);
 }
 
 /// A literal list/tuple/set of plain number literals, read as `f64`s — the

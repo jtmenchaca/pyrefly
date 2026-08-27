@@ -92,6 +92,57 @@ where
     let result = catch_unwind(AssertUnwindSafe(f));
     KERNEL_ASK_NANOS.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
     KERNEL_ASK_COUNT.fetch_add(1, Ordering::Relaxed);
+    // THE ONE ASK CHOKEPOINT (DERIVATION-TRACE.md, "Kernel-ask spans"):
+    // every kernel ask this crate makes routes through this function, so
+    // recording the ask here is the whole of question 3 — "who was
+    // asked, and what did the kernel answer" — and no reader ever does
+    // per-ask work of its own. A caught refusal records a DECLINED child
+    // (the kernel did not decide this set shape); an ordinary return
+    // records an ANSWERED one.
+    //
+    // The closure is opaque at this seam — it captures its own kernel
+    // entry point and operands, and this function is generic over its
+    // return type, so neither the op name nor the wire text is
+    // reconstructable here. `ask_kernel_named` is the spelling a caller
+    // uses to record both; this bare entry point records the ask's
+    // outcome under the generic op name so no ask is missing from the
+    // tree. See this crate's `trace` module doc / the spec feedback on
+    // this seam.
+    if crate::trace::is_tracing() {
+        crate::trace::record_kernel_ask(
+            "ask",
+            "the asking reader's own question (this seam carries no wire text — see ask_kernel_named)",
+            match &result {
+                Ok(_) => Some("decided"),
+                Err(_) => None,
+            },
+        );
+    }
+    result
+}
+
+/// `ask_kernel` with the op name and the wire question text stated by the
+/// caller — the spelling a reader uses where it CAN name what it asked,
+/// so the trace's kernel child carries `kernel.<op>` and
+/// `refinery.question` rather than the generic pair `ask_kernel` records.
+/// Identical behaviour otherwise: same catch, same suppression, same
+/// timing accounting.
+pub fn ask_kernel_named<F, T>(op: &str, question: &str, f: F) -> std::thread::Result<T>
+where
+    F: FnOnce() -> T,
+{
+    let tracing = crate::trace::is_tracing();
+    let result = ask_kernel(f);
+    if tracing {
+        crate::trace::record_kernel_ask(
+            op,
+            question,
+            match &result {
+                Ok(_) => Some("decided"),
+                Err(_) => None,
+            },
+        );
+    }
     result
 }
 
@@ -128,6 +179,69 @@ pub fn install_kernel_seams(kernel: &std::sync::Arc<refined_kernel::kernel_inter
             })
         });
     }
+    {
+        let kernel = kernel.clone();
+        refined_domain::kernel_seam::install_truthy_num_ask(move |set| {
+            truthy_num_verdict(&kernel, set)
+        });
+    }
+}
+
+/// Whether `state` provably admits no value at all — the same reading
+/// `truthiness_conformance.rs`'s own `state_is_uninhabited` takes: a
+/// top state or any admitted flag (undef/null/NaN/thrown) is inhabited
+/// outright; otherwise the scalar emptiness decider is asked first and,
+/// on a kernel refusal (caught, never a crash), the sequence one.
+/// `None` means neither decider spoke to this set's shape — not
+/// decided, and never read as either answer.
+fn state_is_uninhabited(
+    kernel: &refined_kernel::kernel_interface::RefinedTSKernel,
+    state: &refined_kernel::narrow_questions::KnownStateWire,
+) -> Option<bool> {
+    if state.top || state.undef || state.null || state.nan || state.thrown {
+        return Some(false);
+    }
+    if let Ok(empty) = ask_kernel(|| (kernel.scalar_empty)(&state.set)) {
+        return Some(empty);
+    }
+    ask_kernel(|| (kernel.seq_empty)(&state.set)).ok()
+}
+
+/// The `TruthyNum` seam's implementation: narrow a bare scalar set by
+/// the kernel's proved `js.truthyNum` filter and read each side's
+/// emptiness. The numeric fragment this poses is language-shared —
+/// zero is the one falsy number in Python exactly as in JS
+/// (`truthiness_conformance.rs`'s "Why js.truthyNum and not a
+/// Python-named op") — and the caller's `Kind::Set` arm never carries
+/// the NaN/absent flags where the two languages diverge, so the wire
+/// state below is the set alone. Falsy side empty → definitely truthy;
+/// truthy side empty → definitely falsy; both inhabited → a real
+/// undecided answer; either side REFUSED by both emptiness deciders →
+/// `None`, and the caller keeps its own weaker reading (a refusal is
+/// never a claim that a side is empty). Both sides empty would mean no
+/// value flows at all, which is not a truthiness verdict — undecided.
+fn truthy_num_verdict(
+    kernel: &refined_kernel::kernel_interface::RefinedTSKernel,
+    set: &refined_sets::refinement_forms::RefinedSet,
+) -> Option<(bool, bool)> {
+    let state = refined_kernel::narrow_questions::KnownStateWire {
+        top: false,
+        set: set.clone(),
+        undef: false,
+        null: false,
+        nan: false,
+        thrown: false,
+    };
+    let (when_true, when_false) =
+        ask_kernel(|| (kernel.narrow_state)(&state, "js.truthyNum", 0.0, false)).ok()?;
+    let truthy_empty = state_is_uninhabited(kernel, &when_true)?;
+    let falsy_empty = state_is_uninhabited(kernel, &when_false)?;
+    Some(match (truthy_empty, falsy_empty) {
+        (true, true) => (false, false),
+        (false, true) => (true, true),
+        (true, false) => (false, true),
+        (false, false) => (false, false),
+    })
 }
 
 #[cfg(test)]

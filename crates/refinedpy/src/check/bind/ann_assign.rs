@@ -17,6 +17,7 @@ use crate::surface::AliasEntry;
 use crate::typereading::base_sort_return_refinement;
 use crate::typereading::callable_return_refinement;
 use crate::typereading::declared_refinement;
+use crate::typereading::typed_dict_return_refinement;
 use crate::typereading::DeclaredRefinement;
 
 use super::super::Finding;
@@ -29,9 +30,10 @@ use super::sink_value;
 use super::forget_target_names;
 
 /// `x: Annotation = value` — the judging channel. Reads the annotation
-/// through `declared_refinement` first (the general table); when that
-/// states nothing, the direct alias-Name path still runs so existing
-/// fires do not regress. An annotation whose Name is an alias but is
+/// through `declared_refinement` first (the general table), then through
+/// `typed_dict_return_refinement` (a bare Name naming a module-level
+/// TypedDict class); when both state nothing, the direct alias-Name path
+/// still runs so existing fires do not regress. An annotation whose Name is an alias but is
 /// locally rebound in this body states nothing — that is a blocker
 /// candidate naming the rebinding, never a judged 7001. A successfully
 /// read declaration is also recorded into `aug_assign_refinements`
@@ -64,6 +66,14 @@ pub(in crate::check) fn walk_ann_assign(
 ) {
     let declared =
         declared_refinement(assign.annotation.as_ref(), context.aliases, context.imports, environment)
+            // A bare Name naming a module-level TypedDict class states
+            // its own per-member table, which `declared_refinement`'s
+            // general table does not read (a class name is not an alias).
+            // The SAME `.or_else` step `check::function_def` already
+            // takes for a `-> X` return annotation, so an annotated
+            // BINDING declared with a TypedDict judges its dict literal
+            // member-by-member exactly as a returned one does.
+            .or_else(|| typed_dict_return_refinement(assign.annotation.as_ref(), &context.typed_dicts))
             .or_else(|| direct_alias_annotation(assign.annotation.as_ref(), context.aliases, environment))
             .or_else(|| optional_base_sort_annotation(assign.annotation.as_ref()));
 

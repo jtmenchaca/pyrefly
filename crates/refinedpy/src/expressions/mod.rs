@@ -95,8 +95,14 @@ use literals::evaluate_subscript;
 
 pub use arithmetic::binary_arithmetic_value;
 pub use datetime::binary_arithmetic_value_with_kernel;
+pub use datetime::exact_instant_microseconds_of_expression;
+pub use datetime::instant_stepped_by_microseconds;
+pub use datetime::timedelta_microseconds_of_expression;
+pub use datetime::utc_iso_microseconds;
 pub use arithmetic::possible_raise;
+pub(crate) use arithmetic::raised_exception_class;
 pub use sequence_ops::provable_raise;
+pub(crate) use call::call_one_argument_expression;
 pub(crate) use call::exception_construction_value;
 pub(crate) use call::fieldless_exception_value;
 pub(crate) use call::math_from_imports;
@@ -125,13 +131,209 @@ pub fn evaluate_expression(
     if let Some(published) = environment.evaluated_node(expression.range()) {
         return published.clone();
     }
+    // THE DISPATCH SEAM (DERIVATION-TRACE.md, "Threading: dispatchers,
+    // not readers"): one span per evaluated sub-expression, opened here
+    // and closed when this scope drops, so every reader beneath keeps its
+    // own signature and never manages a span. `refinery.construct` is
+    // this node's OWN source spelling and `refinery.range` its own range
+    // — never the enclosing statement's, which is exactly what makes the
+    // deepest declined span name the blocking sub-expression.
+    //
+    // Off, this is one thread-local `Cell<bool>` read per node and
+    // nothing else.
+    let _span = crate::trace::span_scope(
+        expression_reader_id(expression),
+        usize::from(expression.range().start()),
+        usize::from(expression.range().end()),
+    );
+    // THE BINDING LEDGER's lookup key on this node, where the node names
+    // a place at all (`env::tracked_place_of`: a bare name, or a chain of
+    // attribute reads over one). A read that ends up the trace's deepest
+    // decline is exactly the bare-name leaf the ledger reclaims a binding
+    // derivation for, and the tag is what says WHICH place to reclaim.
+    // THE BINDING LEDGER's lookup key on this node, where the node names
+    // a place at all (`env::tracked_place_of`: a bare name, or a chain of
+    // attribute reads over one). A read that ends up the trace's deepest
+    // decline is exactly the bare-name leaf the ledger reclaims a binding
+    // derivation for, and the tag is what says WHICH place to reclaim.
+    if crate::trace::is_tracing() {
+        if let Some(place) = crate::env::tracked_place_of(expression) {
+            crate::trace::record_read_place(&place.words());
+        }
+    }
     let value = evaluate_expression_dispatch(expression, environment, kernel);
+    // What this node derived, in the kernel's own diagnostic spelling —
+    // recorded for an ANSWERED node only. A node whose value is unknown
+    // declined: it is a candidate blocker, and the decline helper at the
+    // judging seam names the gate.
+    if crate::trace::is_tracing() {
+        record_expression_outcome(expression, environment, &value);
+    }
     // Recorded ONLY when a caller asked for it (env.rs's own doc on
     // `evaluations`/`record_evaluation`) — an ordinary check never
     // opts in, so this is a no-op `Option` check for every node on
     // every walk except `check.rs::refined_set_at_position`'s own.
     environment.record_evaluation(expression.range(), value.clone());
     value
+}
+
+/// The adapter-local reader id for one expression form — the `name` its
+/// dispatch span carries. Named after the arm of
+/// `evaluate_expression_dispatch` that owns the form, so a trace reader
+/// can go straight from a span to the code that produced it.
+fn expression_reader_id(expression: &Expr) -> &'static str {
+    match expression {
+        Expr::NumberLiteral(_) => "number_literal",
+        Expr::BooleanLiteral(_) => "boolean_literal",
+        Expr::NoneLiteral(_) => "none_literal",
+        Expr::StringLiteral(_) => "string_literal",
+        Expr::BytesLiteral(_) => "bytes_literal",
+        Expr::Name(_) => "name_read",
+        Expr::UnaryOp(_) => "evaluate_unary",
+        Expr::BinOp(_) => "evaluate_binop",
+        Expr::List(_) => "evaluate_list",
+        Expr::Set(_) => "evaluate_set",
+        Expr::Tuple(_) => "evaluate_tuple",
+        Expr::Dict(_) => "evaluate_dict",
+        Expr::Subscript(_) => "evaluate_subscript",
+        Expr::Compare(_) => "evaluate_compare",
+        Expr::BoolOp(_) => "evaluate_boolop",
+        Expr::FString(_) => "evaluate_fstring",
+        Expr::If(_) => "evaluate_ternary",
+        Expr::Named(_) => "walrus_read",
+        Expr::Call(_) => "evaluate_call",
+        Expr::Attribute(_) => "evaluate_attribute_read",
+        Expr::ListComp(_) => "evaluate_list_comp",
+        Expr::SetComp(_) => "evaluate_set_comp",
+        Expr::Generator(_) => "evaluate_generator_comp",
+        Expr::DictComp(_) => "evaluate_dict_comp",
+        Expr::Await(_) => "await_read",
+        Expr::Lambda(_) => "lambda_read",
+        _ => "unread_expression_form",
+    }
+}
+
+/// Records what one evaluated node derived onto its own open span: an
+/// ANSWER for a value this domain actually read, and a DECLINE naming the
+/// gate for a value it did not.
+///
+/// Sets and windows are spelled by `refined_sets::format_for_diagnostics`
+/// — the kernel's own diagnostic formatter, the one spelling all three
+/// adapters share (DERIVATION-TRACE.md's attribute-vocabulary rule). A
+/// value shape with no kernel spelling states its own word, and that is a
+/// gap to close rather than a convention.
+fn record_expression_outcome(expression: &Expr, environment: &Environment, value: &AbstractValue) {
+    use refined_domain::abstract_value::Kind;
+    let spelled = spelled_value(value);
+    match value.kind {
+        // A NAME THIS BODY NEVER BINDS reading unbound is not a lost
+        // binding: `time` in `time.monotonic_ns()` names an imported
+        // module, and a module is never a refined value in the first
+        // place. Recording it as a decline would make the trace's leaf
+        // blame the import statement instead of the call whose model is
+        // actually missing — the wrong construct to hand a reader as the
+        // work item. `alias_is_visible` is the same "the body never
+        // rebinds this name" test the module-level alias table already
+        // uses, applied here to tell an outer name apart from a local
+        // whose own binding statement derived nothing.
+        Kind::Unknown if is_never_bound_outer_name(expression, environment) => {
+            crate::trace::record_answer("a name this body never binds — an imported module or an outer global")
+        }
+        // The one shape that carries no reading at all — every reader
+        // that could have answered this node declined, so the node itself
+        // declines and becomes a blocker candidate.
+        Kind::Unknown => crate::trace::record_decline(&unknown_gate(expression), None, Some(&spelled)),
+        _ => crate::trace::record_answer(&spelled),
+    }
+}
+
+/// Whether this expression is a bare Name that reads unbound AND that
+/// this body never binds anywhere — an imported module name, or an outer
+/// global. The same `alias_is_visible` test the module-level alias table
+/// uses for "the body never rebinds this name".
+fn is_never_bound_outer_name(expression: &Expr, environment: &Environment) -> bool {
+    let Expr::Name(name) = expression else {
+        return false;
+    };
+    environment.read(name.id.as_str()).is_none() && environment.alias_is_visible(name.id.as_str())
+}
+
+/// The named gate an UNREAD node earns, by its own syntactic form — the
+/// distinction a reader of the trace needs, since "nothing derived this"
+/// means something different for each form. A bare NAME that derived
+/// nothing means its own binding never carried a value to this point,
+/// which is the construct to go fix; a CALL that derived nothing means no
+/// model answered that callee; and so on.
+fn unknown_gate(expression: &Expr) -> String {
+    match expression {
+        Expr::Name(name) => format!(
+            "'{}' carries no derived value at this read — the statement that binds it was never read into a set",
+            name.id.as_str()
+        ),
+        Expr::Call(_) => {
+            "no model answers this call, so it derives no value".to_owned()
+        }
+        Expr::Attribute(attribute) => format!(
+            "reading '.{}' off this receiver derives no value",
+            attribute.attr.as_str()
+        ),
+        Expr::BinOp(_) => "no arithmetic transfer answers this operator over these operands".to_owned(),
+        Expr::Subscript(_) => "this subscript read derives no value".to_owned(),
+        _ => "this expression's value was never derived by any reader".to_owned(),
+    }
+}
+
+/// One abstract value in the kernel's own diagnostic spelling, where a
+/// kernel formatter covers its shape. A `Kind::Set`'s refined set and a
+/// `Kind::Values`' exact word both go through
+/// `format_for_diagnostics`; the shapes that carry no refined set of
+/// their own (an object, a list, `None`) state their own word.
+pub(crate) fn spelled_value(value: &AbstractValue) -> String {
+    use refined_domain::abstract_value::Kind;
+    match value.kind {
+        Kind::Set => refined_sets::format_for_diagnostics::format_for_diagnostics(&value.set),
+        // An exact word: a string value IS its codepoint tuple, spelled
+        // back as text; a numeric value is spelled the Python way. The
+        // same two spellings `assignability::judge` puts in its own fire
+        // messages, so a trace and a fire never name one value two ways.
+        Kind::Values if value.kind_tag == Some(PrimitiveKind::String) => {
+            refined_sets::format_string_shapes::from_points(&value.values)
+                .unwrap_or_else(|| "a string value".to_owned())
+        }
+        Kind::Values => {
+            let is_float = value.kind_tag == Some(PrimitiveKind::Float);
+            let words: Vec<String> = value
+                .values
+                .iter()
+                .map(|v| refined_sets::format_string_shapes::format_py_number(*v, is_float))
+                .collect();
+            match words.len() {
+                1 => words.into_iter().next().expect("length checked"),
+                _ => format!("{{{}}}", words.join(", ")),
+            }
+        }
+        // An object states its own kind word where it has one. A TEMPORAL
+        // construction carries its window instead — the calendar window
+        // IS its refined reading, so spelling it "a dict" (the plain
+        // dict-literal word) would name the carrier and hide the content.
+        Kind::Object => match (value.kind_word, &value.temporal) {
+            (Some(word), _) => word.to_owned(),
+            // `format_temporal` is the ONE existing spelling for a
+            // calendar window (`assignability::temporal`'s own refutation
+            // sentences spell both sides with it) — never a second one
+            // invented here.
+            (None, Some(temporal)) => refined_sets::calendar_interpreter::format_temporal(temporal),
+            (None, None) => "a dict".to_owned(),
+        },
+        Kind::List => "a list".to_owned(),
+        Kind::Null => "None".to_owned(),
+        Kind::NaN => "NaN".to_owned(),
+        Kind::PossiblyNaN => "a value that may be NaN".to_owned(),
+        Kind::PossiblyUndefined => "a value that may be absent".to_owned(),
+        Kind::KindUnion => "a union of sorts".to_owned(),
+        Kind::Unknown => "no reading".to_owned(),
+        _ => "a value this domain carries no spelling for".to_owned(),
+    }
 }
 
 fn evaluate_expression_dispatch(

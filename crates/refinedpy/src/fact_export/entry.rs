@@ -13,6 +13,7 @@ use crate::env::Environment;
 use crate::surface::AliasEntry;
 use crate::surface::SurfaceImports;
 use crate::typereading::DeclaredRefinement;
+use crate::typereading::TypedDictMember;
 use crate::typereading::base_sort_return_refinement;
 use crate::typereading::declared_refinement;
 use crate::typereading::typed_dict_return_refinement;
@@ -62,7 +63,7 @@ pub(super) fn entry_rows(
     def: &StmtFunctionDef,
     aliases: &HashMap<String, AliasEntry>,
     imports: &SurfaceImports,
-    typed_dicts: &HashMap<String, Vec<(String, DeclaredRefinement)>>,
+    typed_dicts: &HashMap<String, Vec<TypedDictMember>>,
 ) -> Result<Vec<EntryRow>, String> {
     // A variadic tail has no fixed arity and therefore no entry row a
     // caller on the other side of the wire could fill — checked before
@@ -167,21 +168,25 @@ pub(super) fn entry_shape(declared: &DeclaredRefinement) -> Result<EntryShape, S
 /// declared member recurses through `entry_shape` so a nested
 /// TypedDict-typed field becomes its own nested object case, exactly as
 /// a nested member does on the return side. `closed: true`
-/// unconditionally: a `class X(TypedDict): ...` declaration states its
-/// complete key set by construction (this table reads no
-/// `NotRequired`/`total=False` relaxation), unlike the return side's
-/// `closed` (read off a runtime value's own `complete` bit) — there is
-/// no literal here to read completeness FROM, so the class declaration
-/// itself is the fact this case states. A member whose own declared
+/// unconditionally: a `class X(TypedDict): ...` declaration NAMES its
+/// complete key set by construction — no key outside the class body is
+/// ever a member — which is what `closed` states here, and is unrelated
+/// to per-key REQUIREDNESS (`TypedDictMember::required`, which says
+/// whether a named key may be omitted, not whether an unnamed key may
+/// appear). Unlike the return side's `closed` (read off a runtime
+/// value's own `complete` bit), there is no literal here to read
+/// completeness FROM, so the class declaration itself is the fact this
+/// case states. A member whose own declared
 /// refinement has no crossable shape (a plain `dict`, a generator, a
 /// bare tuple — a nested TypedDict member recurses through
 /// `entry_shape` instead of hitting this case) stops the WHOLE object
 /// case, naming that member — the same all-or-nothing rule
 /// `object_case_of` already applies to a derived member.
-fn declared_object_case(members: &[(String, DeclaredRefinement)]) -> Result<Case, String> {
+fn declared_object_case(members: &[TypedDictMember]) -> Result<Case, String> {
     let mut cases = Vec::with_capacity(members.len());
-    for (name, declared) in members {
-        let shape = entry_shape(declared).map_err(|reason| {
+    for member in members {
+        let name = &member.name;
+        let shape = entry_shape(&member.declared).map_err(|reason| {
             format!("its member '{name}' is {reason}, which has no faithful cases reading")
         })?;
         let member_cases = match shape {

@@ -214,6 +214,24 @@ pub fn string_method_result(
             }
             Some(string_literal_value(&padded))
         }
+        // "Return a list of the lines in the string, breaking at line
+        // boundaries. Line breaks are not included in the resulting list
+        // unless *keepends* is given and true... this method returns an
+        // empty list for the empty string, and a terminal line break does
+        // not result in an extra line." (library/stdtypes.rst,
+        // str.splitlines, the no-argument `keepends=False` row.) The
+        // clause's own boundary table lists eleven line boundaries — a
+        // superset of universal newlines — so the split is over that
+        // exact set, not just `\n`; `split_at_line_boundaries` below walks
+        // it. The `keepends=True` form is a different reading (the breaks
+        // stay attached) and is not written here.
+        "splitlines" if arguments.is_empty() => {
+            let lines: Vec<AbstractValue> = split_at_line_boundaries(&receiver_text)
+                .iter()
+                .map(|line| string_literal_value(line))
+                .collect();
+            Some(known_list(lines, TrustProved))
+        }
         // "Return a string which is the concatenation of the strings in
         // *iterable*... The separator between elements is the string
         // providing this method." (str.join, one-arg row — the
@@ -256,6 +274,56 @@ pub fn string_method_result(
         }
         _ => None,
     }
+}
+
+/// Splits `text` at every line boundary `str.splitlines`'s own clause
+/// names, dropping the breaks — library/stdtypes.rst, str.splitlines,
+/// whose boundary table lists exactly these eleven representations:
+/// `\n` (Line Feed), `\r` (Carriage Return), `\r\n` (Carriage Return +
+/// Line Feed, matched as ONE boundary before the bare `\r` row so it
+/// never yields an empty line between the two characters), `\v`
+/// (`\x0b`, Line Tabulation), `\f` (`\x0c`, Form Feed), `\x1c` (File
+/// Separator), `\x1d` (Group Separator), `\x1e` (Record Separator),
+/// `\x85` (Next Line), ` ` (Line Separator), and ` `
+/// (Paragraph Separator).
+///
+/// The same clause pins the two edge cases `str.split` behaves
+/// differently on: the empty string answers NO lines (the empty list),
+/// and a TERMINAL break adds no extra empty line — so a line is only
+/// emitted when there is content or a boundary still ahead of it, never
+/// after the final boundary.
+fn split_at_line_boundaries(text: &str) -> Vec<String> {
+    let is_boundary = |character: char| {
+        matches!(
+            character,
+            '\n' | '\r' | '\u{0b}' | '\u{0c}' | '\u{1c}' | '\u{1d}' | '\u{1e}' | '\u{85}' | '\u{2028}' | '\u{2029}'
+        )
+    };
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let characters: Vec<char> = text.chars().collect();
+    let mut position = 0;
+    while position < characters.len() {
+        let character = characters[position];
+        if !is_boundary(character) {
+            current.push(character);
+            position += 1;
+            continue;
+        }
+        lines.push(std::mem::take(&mut current));
+        // `\r\n` is ONE boundary, per the table's own third row
+        if character == '\r' && characters.get(position + 1) == Some(&'\n') {
+            position += 2;
+        } else {
+            position += 1;
+        }
+    }
+    // a terminal break already flushed its line above, so a non-empty
+    // remainder here is the final unterminated line
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
 }
 
 /// The lowest CODE-POINT index of `needle` in `haystack`, or -1 if

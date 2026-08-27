@@ -169,6 +169,11 @@ pub(super) fn serve_foreign_edge_in_walrus_test(
 /// AnnAssign, so it carries no entry in `aug_assign_refinements` at all —
 /// the exception's own `declared.admits_none` check simply finds nothing
 /// and the dead-branch law still fires for it.
+///
+/// Returns whether NOTHING reaches the post-if point: a test proved
+/// TRUE and the one arm it selected terminates, so no path arrives
+/// below this statement at all. The caller reports whatever statement
+/// follows as unreachable code and stops walking.
 pub(super) fn walk_if(
     if_stmt: &StmtIf,
     return_refinement: Option<&DeclaredRefinement>,
@@ -178,7 +183,7 @@ pub(super) fn walk_if(
     aug_assign_refinements: &mut HashMap<String, DeclaredRefinement>,
     blocked: &mut bool,
     out: &mut Vec<Finding>,
-) {
+) -> bool {
     let mut arms: Vec<(Option<&Expr>, &[Stmt])> = Vec::new();
     arms.push((Some(if_stmt.test.as_ref()), if_stmt.body.as_slice()));
     for clause in &if_stmt.elif_else_clauses {
@@ -198,6 +203,20 @@ pub(super) fn walk_if(
     // test already assumed false): no later arm and no fall-through can
     // run, so the post-if state is the join of the surviving arms alone.
     let mut chain_exhausted = false;
+    // Set when the test that proved TRUE is one a DECLARATION already
+    // made redundant — `if 0 <= x <= 150:` on a parameter declared
+    // `x: Age`, or a bare-literal walrus sanity guard. Restating a
+    // declared bound before using a value is ordinary, idiomatic
+    // Python (every total function in this corpus ends in a fall-
+    // through default under exactly such a guard), so the statement
+    // below it is NOT reported as dead code — the same reasoning the
+    // DEAD-BRANCH LAW's own `is_admits_none_peel_test` exception makes
+    // for an `Optional` peel that reads provably false against one
+    // concrete assignment. A test whose truth comes from a COMPUTED
+    // value instead (`y = x or 0.5` then `if y == 0.5:`) states a real
+    // fact about the computation, and the unreachable statement below
+    // it is reported.
+    let mut exhausting_test_is_a_declared_redundancy = false;
     for (test, body) in &arms {
         if let Some(test) = test {
             let test_value = evaluate_expression(test, &mut path, context.kernel);
@@ -218,6 +237,8 @@ pub(super) fn walk_if(
                 continue;
             }
             if known && truthy {
+                exhausting_test_is_a_declared_redundancy =
+                    test_truth_follows_from_a_declaration(test, aug_assign_refinements);
                 let mut arm_environment = path.fork();
                 arm_environment = assume(test, arm_environment, context.kernel, true);
                 // A fresh, empty PROVABLY-UNBOUND-READS set per arm body:
@@ -338,6 +359,16 @@ pub(super) fn walk_if(
         surviving.push(path.fork());
     }
 
+    // NOTHING REACHES THE POST-IF POINT when a test proved TRUE and the
+    // one arm it selected terminates: CPython evaluates no later test
+    // once an earlier one is known true, and the taken arm returns or
+    // raises, so no path at all arrives below this statement. The caller
+    // reports whatever statement follows as unreachable and stops
+    // walking — the same fact `walk_try` already answers for a try whose
+    // every arm terminates, decided here for the branch shape.
+    let nothing_falls_through =
+        chain_exhausted && surviving.is_empty() && !exhausting_test_is_a_declared_redundancy;
+
     *environment = match surviving.len() {
         0 => path,
         1 => surviving.into_iter().next().unwrap(),
@@ -349,6 +380,7 @@ pub(super) fn walk_if(
             joined
         }
     };
+    nothing_falls_through
 }
 
 /// THE RELATIONAL LEDGER's own fact collector: every `left < right` /
@@ -538,6 +570,79 @@ pub(super) fn aug_assign_floor(value: &AbstractValue) -> Option<f64> {
             .map(|form| form.a)
             .reduce(f64::max),
         _ => None,
+    }
+}
+
+/// Whether a PROVABLY-TRUE `test`'s truth follows from a DECLARATION
+/// rather than from a computed value — the shape whose fall-through is
+/// idiomatic rather than dead code (`walk_if`'s own
+/// `exhausting_test_is_a_declared_redundancy` doc). Two recognized
+/// shapes, matching how the corpus spells a redundant guard:
+///
+/// - Every bare Name the test compares carries a DECLARED refinement
+///   (`aug_assign_refinements`, populated at that name's own AnnAssign
+///   or by `seed_parameters` for a declared parameter) — `if 0 <= x <=
+///   150:` on `x: Age` restates `Age`'s own window, so the default
+///   below it is the ordinary total-function spelling.
+/// - The test carries a WALRUS binding (`if (over := 200) > 0:`) — the
+///   guarded name is introduced by the test itself against a literal,
+///   a sanity guard whose fall-through is likewise ordinary.
+///
+/// `false` for a test over a name with no declaration — `y = x or 0.5`
+/// then `if y == 0.5:` states a fact about the `or` transfer, and the
+/// statement below it is genuinely unreachable.
+pub(super) fn test_truth_follows_from_a_declaration(
+    test: &Expr,
+    aug_assign_refinements: &HashMap<String, DeclaredRefinement>,
+) -> bool {
+    let mut names = Vec::new();
+    collect_compared_names(test, &mut names);
+    if names.is_empty() {
+        // A walrus test binds its own target and compares it; no bare
+        // Name operand survives `collect_compared_names` for it.
+        return contains_walrus(test);
+    }
+    names.iter().all(|name| aug_assign_refinements.contains_key(name.as_str()))
+}
+
+/// Every bare-Name operand of a comparison inside `test`, descending
+/// through `and`/`or`/`not` — the names whose declarations decide
+/// whether a provably-true test merely restates what was already
+/// declared.
+fn collect_compared_names(test: &Expr, names: &mut Vec<String>) {
+    match test {
+        Expr::BoolOp(bool_op) => {
+            for value in &bool_op.values {
+                collect_compared_names(value, names);
+            }
+        }
+        Expr::UnaryOp(unary) => collect_compared_names(unary.operand.as_ref(), names),
+        Expr::Compare(compare) => {
+            if let Expr::Name(name) = compare.left.as_ref() {
+                names.push(name.id.as_str().to_owned());
+            }
+            for comparator in compare.comparators.iter() {
+                if let Expr::Name(name) = comparator {
+                    names.push(name.id.as_str().to_owned());
+                }
+            }
+        }
+        Expr::Name(name) => names.push(name.id.as_str().to_owned()),
+        _ => {}
+    }
+}
+
+/// Whether `test` introduces a name through a walrus binding anywhere
+/// inside it — `if (over := 200) > 0:`'s own shape.
+fn contains_walrus(test: &Expr) -> bool {
+    match test {
+        Expr::Named(_) => true,
+        Expr::BoolOp(bool_op) => bool_op.values.iter().any(contains_walrus),
+        Expr::UnaryOp(unary) => contains_walrus(unary.operand.as_ref()),
+        Expr::Compare(compare) => {
+            contains_walrus(compare.left.as_ref()) || compare.comparators.iter().any(contains_walrus)
+        }
+        _ => false,
     }
 }
 

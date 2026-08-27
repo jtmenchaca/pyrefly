@@ -9,7 +9,7 @@ use ruff_text_size::TextRange;
 
 use crate::env::Environment;
 use crate::instances;
-use crate::instances::{class_table, judge_construction, ClassModel};
+use crate::instances::{class_table, judge_construction, ClassModel, ConstructionKind};
 use crate::surface::AliasEntry;
 use crate::typereading::{base_sort_return_refinement, declared_refinement, typed_dict_return_refinement, DeclaredRefinement};
 
@@ -123,7 +123,8 @@ pub(super) fn walk_method_def(def: &StmtFunctionDef, class: &ClassModel, context
     });
     let (return_refinement, yield_refinement) = generator_body_refinements(def, return_refinement);
     let bare_sort_return_refinement = def.returns.as_deref().and_then(base_sort_return_refinement);
-    let self_instance = judge_construction(class, &[], &[], context.kernel).instance;
+    let self_instance =
+        judge_construction(class, &[], &[], ConstructionKind::DirectCall, context.kernel).instance;
     walk_body_with_self_binding(
         &def.body,
         Some(def.parameters.as_ref()),

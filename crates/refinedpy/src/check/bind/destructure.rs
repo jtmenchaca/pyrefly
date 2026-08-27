@@ -1,12 +1,18 @@
 use std::collections::HashMap;
 
+use refined_domain::abstract_value::known_set;
 use refined_domain::abstract_value::AbstractValue;
 use refined_domain::abstract_value::Kind;
+use refined_domain::abstract_value::SetKindTag;
+use refined_domain::trust_grades::TrustSpec;
+use refined_sets::repetition_window_forms::as_repetition;
+use refined_sets::repetition_window_forms::repetition;
 use ruff_python_ast::Expr;
 use ruff_python_ast::ExprSubscript;
 use ruff_text_size::Ranged;
 use ruff_text_size::TextRange;
 
+use crate::assignability::judge;
 use crate::assignability::Verdict;
 use crate::bytes_models;
 use crate::bytes_models::BytesAnswer;
@@ -15,6 +21,7 @@ use crate::collection_models::dict_without_item;
 use crate::collection_models::list_literal_value;
 use crate::collection_models::list_with_item;
 use crate::collection_models::sliced_delete_receiver;
+use crate::collection_models::subscript_read;
 use crate::env::Environment;
 use crate::expressions::evaluate_expression;
 use crate::expressions::slice_bound_index;
@@ -150,7 +157,15 @@ pub(in crate::check) fn bind_or_forget_target(
             }
         }
         Expr::Subscript(subscript) => {
-            bind_or_forget_subscript_target(subscript, value, context, environment);
+            bind_or_forget_subscript_target(
+                subscript,
+                value,
+                value_range,
+                context,
+                aug_assign_refinements,
+                environment,
+                out,
+            );
         }
         _ => {}
     }
@@ -240,11 +255,13 @@ pub(in crate::check) fn write_named_field(
 /// CPython does not distinguish list vs. tuple targets or RHS shape for
 /// unpacking, simple_stmts.rst's `target: "(" [target_list] ")" | "["
 /// [target_list] "]"` grammar treats both parenthesized and bracketed
-/// target lists the same way). Returns `false` (no binding performed,
-/// caller falls back to forgetting every name) when `value` is not a
-/// known list — an unknown RHS states nothing about how many elements
-/// there are, so this law does not apply and the existing forget-all
-/// answer is the sound one.
+/// target lists the same way). A value that is not a known list is
+/// offered to `bind_window_sequence_target`, which states the weaker
+/// per-element claim an unknown-length repetition window supports; only
+/// when THAT declines too does this return `false` (no binding performed,
+/// caller falls back to forgetting every name) — an RHS with neither
+/// exact items nor a known element set states nothing about what any
+/// target receives, and the forget-all answer is the sound one.
 ///
 /// With no starred element: `elements.len()` must equal `items.len()`
 /// exactly — a mismatch is CPython's own `ValueError` ("too many values
@@ -279,7 +296,7 @@ pub(in crate::check) fn bind_known_sequence_target(
     out: &mut Vec<Finding>,
 ) -> bool {
     if value.kind != Kind::List {
-        return false;
+        return bind_window_sequence_target(elements, value, context, aug_assign_refinements, environment, out);
     }
     let items = &value.items;
     let starred_position = elements.iter().position(|element| matches!(element, Expr::Starred(_)));
@@ -334,6 +351,73 @@ pub(in crate::check) fn bind_known_sequence_target(
     if let Expr::Name(name) = starred.value.as_ref() {
         let middle = list_literal_value(&items[head.len()..tail_start]);
         environment.bind(name.id.as_str(), middle);
+    }
+    true
+}
+
+/// `a, b, *rest = xs` where `xs` is an UNKNOWN-LENGTH sequence known by
+/// its element set — the repetition window a declared `list[X]`/`set[X]`/
+/// `Sequence[X]` parameter seeds (`check::seed::seed_parameters`).
+///
+/// The concrete path above states exact positional slots and is right to
+/// decline: WHICH values sit at which position is unknown, and the length
+/// may not even be enough for the targets, in which case CPython raises
+/// `ValueError` (simple_stmts.rst, "Assignment statements": the sequence
+/// "must have the same number of items as there are targets"). A raise is
+/// not a fire this walk reports — the value never flows past it — so what
+/// remains to state is what holds on the runs that DO complete, and on
+/// those runs every non-starred target draws from the window's own
+/// element set (every position of a repetition draws from the same
+/// element, the grammar's own definition) and the starred target holds a
+/// sequence of those same elements.
+///
+/// The starred target's own window is `[max(0, lo - n), hi - n]` where
+/// `n` is the count of non-starred targets: those `n` positions are
+/// consumed off the source, so the remainder is shorter by exactly `n`,
+/// and a source that could be as short as `lo` leaves as few as zero.
+///
+/// `false` (the caller forgets every target name) when the value is not a
+/// repetition window at all — the honest decline for a shape with no
+/// element to bind.
+fn bind_window_sequence_target(
+    elements: &[Expr],
+    value: &AbstractValue,
+    context: &WalkContext,
+    aug_assign_refinements: &HashMap<String, DeclaredRefinement>,
+    environment: &mut Environment,
+    out: &mut Vec<Finding>,
+) -> bool {
+    if value.kind != Kind::Set || value.set_kind_tag != SetKindTag::None {
+        return false;
+    }
+    let Some(window) = as_repetition(&value.set) else {
+        return false;
+    };
+    let element = AbstractValue {
+        kind_tag: value.kind_tag,
+        ..known_set(window.element.clone(), None, TrustSpec, SetKindTag::None)
+    };
+    let plain_count = elements
+        .iter()
+        .filter(|target| !matches!(target, Expr::Starred(_)))
+        .count() as i64;
+    for target in elements {
+        match target {
+            Expr::Starred(starred) => {
+                let Expr::Name(name) = starred.value.as_ref() else {
+                    forget_target_names(target, environment);
+                    continue;
+                };
+                let low = (window.lo - plain_count).max(0);
+                let high = window.hi.map(|hi| (hi - plain_count).max(low));
+                let rest = AbstractValue {
+                    kind_tag: value.kind_tag,
+                    ..known_set(repetition(window.element.clone(), low, high), None, TrustSpec, SetKindTag::None)
+                };
+                environment.bind(name.id.as_str(), rest);
+            }
+            _ => bind_sequence_element(target, &element, context, aug_assign_refinements, environment, out),
+        }
     }
     true
 }
@@ -417,11 +501,19 @@ pub(in crate::check) fn unpack_mismatch_detail(expected: usize, got: usize, has_
 }
 
 /// `name[key] = value` — see `bind_or_forget_target`'s own doc for law
-/// (b)'s full contract. Only a bare-`Name` receiver is replayed; any
-/// other receiver shape (`obj.attr[key] = v`, a chained subscript) has
-/// no single environment slot to rebind and is left untouched, matching
-/// this file's existing "no element-level model" posture for a receiver
-/// it cannot name.
+/// (b)'s full contract.
+///
+/// A CHAINED subscript receiver (`name[i][j] = v`) is written through
+/// `write_chained_subscript` first: the write lands on the INNER
+/// container, which is one shared object every other name holding it
+/// still holds (library/copy.rst's shallow-copy sharing), so the rebuild
+/// walks back out to `name`'s own slot and then sweeps every other
+/// binding holding that same inner object. A receiver shape with no
+/// single environment slot to rebind at all (`obj.attr[key] = v`, a
+/// chain whose base is not a bare Name, a chain this walk cannot read an
+/// index of) FORGETS the chain's own base name — the pre-write value
+/// must not survive a write this walk could not replay, the same honesty
+/// every other decline in this file keeps.
 ///
 /// A `bytes`/`bytearray`/`memoryview` receiver (`bytes_models::tagged`'s
 /// own species word) routes through `bytes_models::bytes_write_answer`
@@ -445,16 +537,90 @@ pub(in crate::check) fn unpack_mismatch_detail(expected: usize, got: usize, has_
 /// function). An UNDECIDABLE bytes-like write (an unknown value) falls
 /// through to the same decline-and-forget the untagged path already
 /// takes, honest about a write this function cannot prove either way.
+///
+/// THE VALUE SINK: a write onto a receiver whose own DECLARATION states
+/// a member refinement (`d: dict[str, Age]`, whose `DeclaredRefinement.
+/// element` carries `Age`'s window) judges the written value against
+/// THAT refinement, at the value's own range, before the replay records
+/// anything — the same law `check::calls::mutation`'s element sink
+/// gives an `append`/`extend`. Without it, `d["x"] = 200` merely
+/// RECORDED an out-of-window entry, and the defect surfaced at whatever
+/// later sink read `d` (`needs_age_dict(d)`), reporting the one defect
+/// at a position that is not where it was introduced.
+///
+/// A FIRED member also stops the recording: the program is being told
+/// to fix the write, so the receiver keeps what its declaration says
+/// about its members rather than carrying the refused value to the next
+/// sink, where it would report the same one defect a second time. This
+/// is the identical refused-write law `adapter_alias_verdict` keeps for
+/// a refused parse. An ADMITTED write still records its entry through
+/// the ordinary replay below, unchanged: the written value is a real
+/// fact about that key, and later rows read it back exactly
+/// (A8.xfer.set's `replace_widened_value` writes 200 into a
+/// `dict[str, int]` — inside `int`, so no fire — and its own later
+/// `d["a"]` read must still answer 200).
 pub(in crate::check) fn bind_or_forget_subscript_target(
     subscript: &ExprSubscript,
     value: &AbstractValue,
+    value_range: TextRange,
     context: &WalkContext,
+    declared_refinements: &HashMap<String, DeclaredRefinement>,
     environment: &mut Environment,
+    out: &mut Vec<Finding>,
 ) {
+    if let Expr::Name(receiver_name) = subscript.value.as_ref() {
+        // THE VALUE SINK (this function's own doc), read before the
+        // replay so the finding lands at the write rather than at a
+        // later read of the receiver.
+        if let Some(member) = declared_refinements
+            .get(receiver_name.id.as_str())
+            .and_then(|declared| declared.element.as_deref())
+        {
+            if let Verdict::Fire(message) = judge(value, member, context.kernel) {
+                out.push(Finding {
+                    range: value_range,
+                    code: "RTS7001",
+                    message,
+                });
+                // THE REFUSED-WRITE LAW: the refusal is reported here,
+                // at the write, so the receiver must not carry the
+                // refused value to a later sink that would report the
+                // same defect again. The declaration already states
+                // what this receiver's members hold, and that is what
+                // the binding keeps.
+                return;
+            }
+        }
+    }
     let Expr::Name(receiver_name) = subscript.value.as_ref() else {
+        if let Some(base_name) = subscript_chain_base_name(subscript.value.as_ref()) {
+            if !write_chained_subscript(subscript, value, context, environment) {
+                environment.forget(base_name);
+            }
+        }
         return;
     };
     let receiver_value = evaluate_expression(subscript.value.as_ref(), environment, context.kernel);
+    // `name[lower:upper] = value` — SLICE ASSIGNMENT, which replaces a
+    // whole run of positions rather than one (stdtypes.rst's
+    // Mutable-Sequence-Types table, `s[i:j] = t`: "slice of *s* from *i*
+    // to *j* is replaced by the contents of the iterable *t*"). Read
+    // through `sliced_write_receiver`, which owns the bound reading;
+    // a slice shape or receiver it declines forgets the name, the same
+    // honesty every other unresolved write here keeps.
+    // A bytes-like receiver (`bytes_models::tagged`'s own species word)
+    // is NOT this arm's: its own three write rules — including the
+    // immutability of `bytes` itself — are read by the tagged path
+    // below, which this arm must not step in front of.
+    if receiver_value.kind_word.is_none() {
+        if let Expr::Slice(slice) = subscript.slice.as_ref() {
+            match sliced_write_receiver(&receiver_value, slice, value, environment, context) {
+                Some(written) => environment.bind(receiver_name.id.as_str(), written),
+                None => environment.forget(receiver_name.id.as_str()),
+            }
+            return;
+        }
+    }
     let key_value = evaluate_expression(subscript.slice.as_ref(), environment, context.kernel);
     if receiver_value.kind == Kind::List && receiver_value.kind_word.is_some() {
         match bytes_models::bytes_write_answer(&receiver_value, value) {
@@ -471,13 +637,198 @@ pub(in crate::check) fn bind_or_forget_subscript_target(
         }
     }
     let written = match receiver_value.kind {
-        Kind::Object => dict_with_item(&receiver_value, &key_value, value),
+        // `Kind::ObjectStar` — a `dict[str, X]` parameter's own unbounded-key
+        // seed — writes through the same `dict_with_item` contract, which
+        // records the written key's own entry beside the star's law for
+        // every other key (that function's own dict-star arm states why).
+        Kind::Object | Kind::ObjectStar => dict_with_item(&receiver_value, &key_value, value),
         Kind::List => list_with_item(&receiver_value, &key_value, value),
         _ => None,
     };
     match written {
         Some(new_receiver) => environment.bind(receiver_name.id.as_str(), new_receiver),
         None => environment.forget(receiver_name.id.as_str()),
+    }
+}
+
+/// `name[lower:upper] = value` on a KNOWN `Kind::List` receiver —
+/// stdtypes.rst's Mutable-Sequence-Types table, `s[i:j] = t`: "slice of
+/// *s* from *i* to *j* is replaced by the contents of the iterable *t*".
+/// The written-through list is the receiver's head up to `lower`, then
+/// every item of `value`, then the receiver's tail from `upper` on.
+/// Unlike a single-index write, the result's LENGTH changes whenever the
+/// replacement's own item count differs from the replaced run's — the
+/// clause states a replacement of contents, not of positions.
+///
+/// The bounds read by the same rules a slice READ takes
+/// (`expressions::slice_bound_index` for each stated bound, `evaluate_
+/// slice`'s own defaults for an omitted one — `lower` 0, `upper` the
+/// receiver's length — and the same clamp to `[0, len]`, since a slice
+/// never raises for an out-of-range bound). A `step` is not modeled and
+/// declines, matching the read side.
+///
+/// `None` — the caller forgets the name — for a receiver that is not a
+/// known list, a replacement that is not a known list, a `step`, or a
+/// bound this walk cannot read exactly.
+fn sliced_write_receiver(
+    receiver: &AbstractValue,
+    slice: &ruff_python_ast::ExprSlice,
+    value: &AbstractValue,
+    environment: &Environment,
+    context: &WalkContext,
+) -> Option<AbstractValue> {
+    if slice.step.is_some() || receiver.kind != Kind::List || value.kind != Kind::List {
+        return None;
+    }
+    let length = receiver.items.len() as i64;
+    let lower = match slice.lower.as_deref() {
+        Some(expr) => slice_bound_index(expr, environment, context.kernel)?,
+        None => 0,
+    };
+    let upper = match slice.upper.as_deref() {
+        Some(expr) => slice_bound_index(expr, environment, context.kernel)?,
+        None => length,
+    };
+    let clamp = |bound: i64| {
+        let adjusted = if bound < 0 { bound + length } else { bound };
+        adjusted.clamp(0, length) as usize
+    };
+    let start = clamp(lower);
+    let end = clamp(upper).max(start);
+    let mut items = receiver.items[..start].to_vec();
+    items.extend(value.items.iter().cloned());
+    items.extend(receiver.items[end..].iter().cloned());
+    let mut written = list_literal_value(&items);
+    written.kind_word = receiver.kind_word;
+    written.instance_identity = receiver.instance_identity;
+    Some(written)
+}
+
+/// The bare `Name` a subscript chain is rooted at (`a[i][j]` → `a`;
+/// `a[i]` → `a`; `a` → `a`) — `None` for a chain rooted at anything else
+/// (a call's result, an attribute read), which has no environment slot
+/// this walk could rebind or forget.
+fn subscript_chain_base_name(receiver: &Expr) -> Option<&str> {
+    match receiver {
+        Expr::Name(name) => Some(name.id.as_str()),
+        Expr::Subscript(subscript) => subscript_chain_base_name(subscript.value.as_ref()),
+        _ => None,
+    }
+}
+
+/// `name[i][j] = value` and deeper — the CHAINED subscript write.
+///
+/// The write mutates the INNERMOST container the chain names, and that
+/// container is one object other names may hold a reference to: `outer =
+/// [[1, 2]]; copy = outer[:]` makes `copy[0]` and `outer[0]` the same
+/// inner list (library/copy.rst, `copy.copy`: a shallow copy "inserts
+/// *references* into it to the objects found in the original"), so
+/// `copy[0][0] = 200` is observable at `outer[0][0]`. This domain
+/// records that sharing as a referent identity minted on every container
+/// element of a display (`collection_models::with_referent_identities`)
+/// and carried along by the item clone a slice performs.
+///
+/// So the write runs in two parts. First the rebuild: read the base
+/// name's own value, walk DOWN the chain's indices collecting each level
+/// receiver, apply the write at the bottom, and re-apply
+/// `list_with_item`/`dict_with_item` on the way back UP so the base
+/// name's slot holds the whole written-through structure. Then the
+/// sweep: the innermost written container carries its own referent
+/// identity forward (`list_with_item`'s own doc — an item assignment
+/// mutates in place, so the object is the same one afterward), and
+/// `Environment::rebind_referents_of_item` replaces that object wherever
+/// any OTHER binding holds it.
+///
+/// `false` — nothing bound, the caller forgets the base name — whenever
+/// any level of the walk is unreadable: an unbound base, an index this
+/// walk cannot read exactly, an intermediate value that is not a known
+/// container, or a write the container's own contract declines (an
+/// out-of-bounds index, `list_with_item`'s own decline).
+fn write_chained_subscript(
+    subscript: &ExprSubscript,
+    value: &AbstractValue,
+    context: &WalkContext,
+    environment: &mut Environment,
+) -> bool {
+    // The chain's levels, outermost first: `a[i][j]` collects the index
+    // expressions `i` then `j`, with `a` as the base.
+    let mut indices: Vec<&Expr> = vec![subscript.slice.as_ref()];
+    let mut walker = subscript.value.as_ref();
+    let base_name = loop {
+        match walker {
+            Expr::Name(name) => break name.id.as_str(),
+            Expr::Subscript(inner) => {
+                indices.push(inner.slice.as_ref());
+                walker = inner.value.as_ref();
+            }
+            _ => return false,
+        }
+    };
+    indices.reverse();
+    let Some(base) = environment.read(base_name).cloned() else {
+        return false;
+    };
+    // Down the chain: every level's receiver, base first, so the write
+    // below can rebuild them bottom-up.
+    let mut receivers: Vec<AbstractValue> = vec![base];
+    let mut keys: Vec<AbstractValue> = Vec::with_capacity(indices.len());
+    for index in &indices {
+        let key = evaluate_expression(index, environment, context.kernel);
+        let next = {
+            let receiver = receivers.last().expect("seeded with the base above");
+            read_container_item(receiver, &key)
+        };
+        let Some(next) = next else {
+            return false;
+        };
+        keys.push(key);
+        receivers.push(next);
+    }
+    // The deepest receiver is the container the write lands in; the value
+    // read out of it (`receivers`' own last entry) is what gets replaced.
+    receivers.pop();
+    let mut written = value.clone();
+    let mut rebuilt: Vec<AbstractValue> = Vec::with_capacity(indices.len());
+    while let (Some(receiver), Some(key)) = (receivers.pop(), keys.pop()) {
+        let Some(updated) = container_with_item(&receiver, &key, &written) else {
+            return false;
+        };
+        rebuilt.push(updated.clone());
+        written = updated;
+    }
+    // Every level the write passed through is the SAME object it was
+    // before (an item assignment mutates in place), so every level whose
+    // identity another binding also holds is brought back in step — not
+    // just the innermost one, since a chain three deep shares each of its
+    // interior containers independently.
+    for level in &rebuilt {
+        if let Some(identity) = level.instance_identity {
+            environment.rebind_referents_of_item(identity, level);
+        }
+    }
+    environment.bind(base_name, written);
+    true
+}
+
+/// One level of a subscript chain, read: the item `receiver[key]` holds,
+/// for the two container shapes this walk's write path rebuilds through.
+/// `None` for any other receiver kind or a key this walk cannot read
+/// exactly — the caller's own decline.
+fn read_container_item(receiver: &AbstractValue, key: &AbstractValue) -> Option<AbstractValue> {
+    match receiver.kind {
+        Kind::List | Kind::Object | Kind::ObjectStar => subscript_read(receiver, key),
+        _ => None,
+    }
+}
+
+/// One level of a subscript chain, written: the same two container
+/// contracts `bind_or_forget_subscript_target`'s own bare-Name path
+/// dispatches between, applied at an interior level of the chain.
+fn container_with_item(receiver: &AbstractValue, key: &AbstractValue, value: &AbstractValue) -> Option<AbstractValue> {
+    match receiver.kind {
+        Kind::Object | Kind::ObjectStar => dict_with_item(receiver, key, value),
+        Kind::List => list_with_item(receiver, key, value),
+        _ => None,
     }
 }
 
@@ -507,6 +858,21 @@ pub(in crate::check) fn bind_or_forget_subscript_target(
 /// models) FORGETS `name` — the pre-delete value must not survive an
 /// unresolved delete, the same honesty every other decline in this file
 /// already keeps.
+///
+/// THE PROVABLY-RAISING DELETE is the one decline that does NOT forget:
+/// a fully-known dict and a known key that is provably ABSENT means
+/// CPython raises `KeyError` and the delete never takes effect
+/// (`dict_without_item`'s own doc for why it answers `None` there), so
+/// the pre-delete contents are still exactly right. Forgetting would be
+/// a strictly weaker, wrong answer — the receiver's value is fully
+/// known, and every read past the `del` would go undetermined for a
+/// statement that changed nothing. This is the same law the write
+/// sibling already keeps for a provably-raising bytes write ("leaves
+/// the receiver COMPLETELY UNTOUCHED"), and A8.xfer.delete's
+/// `read_widened_after_delete` is the row that needs it: `del d["z"]`
+/// on `{"a": 200}` raises and is skipped, and `d["a"]` still answers
+/// 200. The raise itself is `provable_raise`'s own row to report, never
+/// this function's.
 pub(in crate::check) fn walk_del_subscript_target(subscript: &ExprSubscript, context: &WalkContext, environment: &mut Environment) {
     let Expr::Name(receiver_name) = subscript.value.as_ref() else {
         return;
@@ -538,8 +904,28 @@ pub(in crate::check) fn walk_del_subscript_target(subscript: &ExprSubscript, con
     let written = dict_without_item(&receiver_value, &key_value);
     match written {
         Some(new_receiver) => environment.bind(receiver_name.id.as_str(), new_receiver),
+        // THE PROVABLY-RAISING DELETE (this function's own doc): the
+        // delete never took effect, so the receiver keeps exactly what
+        // it held. Every other decline still forgets.
+        None if delete_provably_raises(&receiver_value, &key_value) => {}
         None => environment.forget(receiver_name.id.as_str()),
     }
+}
+
+/// Whether `del receiver[key]` provably raises `KeyError` — a fully
+/// known `Kind::Object` dict (a CLOSED key set) and a key this domain
+/// reads exactly, which that key set does not carry. Both halves must
+/// be known: a star receiver states nothing about which keys are
+/// present, and a key with no exact spelling names no entry to prove
+/// absent, so neither is ever read as a proof of a raise.
+fn delete_provably_raises(receiver: &AbstractValue, key: &AbstractValue) -> bool {
+    if receiver.kind != Kind::Object {
+        return false;
+    }
+    let Some(key) = crate::collection_models::known_dict_key(key) else {
+        return false;
+    };
+    !receiver.keys.iter().any(|entry| entry.name == key.name && entry.numeric == key.numeric)
 }
 
 /// The leftmost `Name` under an attribute-chain receiver

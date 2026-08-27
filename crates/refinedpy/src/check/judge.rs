@@ -12,6 +12,49 @@ use crate::typereading::DeclaredRefinement;
 
 use super::*;
 
+/// THE JUDGING DISPATCH SEAM (DERIVATION-TRACE.md, "Threading:
+/// dispatchers, not readers"): one span per JUDGED POSITION, wrapping the
+/// `assignability::judge` call so the whole judging derivation — every
+/// law it tries, every kernel ask it makes, and the decline it lands on —
+/// nests under one span carrying the judged position's own construct and
+/// range.
+///
+/// This is where the spec's `assignability/judge` dispatch instrumentation
+/// lives for this adapter: `judge` itself takes no range (a value, a
+/// declared refinement, a kernel), and the range is a fact only its
+/// callers hold, so the span is opened here where both are in scope. Every
+/// sink that judges routes through this one function.
+///
+/// Off, this is one thread-local `Cell<bool>` read and a direct call.
+pub(super) fn judge_traced(
+    value: &AbstractValue,
+    declared: &DeclaredRefinement,
+    range: TextRange,
+    kernel: &std::sync::Arc<refined_kernel::kernel_interface::RefinedTSKernel>,
+) -> Verdict {
+    let _span = crate::trace::span_scope(
+        "assignability::judge",
+        usize::from(range.start()),
+        usize::from(range.end()),
+    );
+    let verdict = judge(value, declared, kernel);
+    // A judged position that SILENCED answered: the value is inside the
+    // declared set. A Fire is an error, not this carrier's business
+    // (RTS7001 sentences are marker-matched — the spec scopes projection
+    // to undetermined sentences only), but it still ANSWERED: the
+    // derivation reached a verdict. Only an Undetermined declined, and
+    // `judge`'s own decline helper has already recorded the gate onto
+    // this very span.
+    if crate::trace::is_tracing() {
+        match &verdict {
+            Verdict::Silent => crate::trace::record_answer(&crate::expressions::spelled_value(value)),
+            Verdict::Fire(_) => crate::trace::record_answer(&crate::expressions::spelled_value(value)),
+            Verdict::Undetermined(_) => {}
+        }
+    }
+    verdict
+}
+
 /// `return value` against the enclosing function's own `-> Annotation`.
 /// No annotation (`return_refinement` is `None`) means ordinary Python
 /// — nothing judges, matching the mission's "no return annotation → no
@@ -56,6 +99,22 @@ pub(super) fn walk_return(
             return;
         }
     }
+    // THE JUDGED POSITION'S OWN SPAN: opened BEFORE the value is
+    // evaluated, so every sub-read the evaluation makes and the judging
+    // that follows both nest UNDER this one span rather than landing
+    // beside it as unrelated roots. This is what makes the trace a single
+    // tree whose deepest declined span is the blocking sub-expression —
+    // the spec's conformance check 2.
+    //
+    // `position_scope`, not `span_scope`: this span becomes the
+    // document's root, which the spec pins to `answered` and forbids a
+    // decline on. Whether this position determined or not is stated by
+    // the reader spans beneath it, which name the gate that blocked.
+    let _position_span = crate::trace::position_scope(
+        "check::walk_return",
+        usize::from(value_expr.range().start()),
+        usize::from(value_expr.range().end()),
+    );
     bind_walrus_targets(value_expr, context, aug_assign_refinements, environment, out);
     let Some(value) = sink_value(value_expr, context, environment, aug_assign_refinements, out) else {
         // a provable raise already pushed its own RTS7001 at the
@@ -73,7 +132,7 @@ pub(super) fn walk_return(
     let Some(declared) = return_refinement else {
         return;
     };
-    match judge(&value, declared, context.kernel) {
+    match judge_traced(&value, declared, value_expr.range(), context.kernel) {
         Verdict::Fire(message) => out.push(Finding {
             range: value_expr.range(),
             code: "RTS7001",
@@ -82,6 +141,12 @@ pub(super) fn walk_return(
         Verdict::Silent => {}
         Verdict::Undetermined(sentence) => {
             let sentence = name_unmodeled_call_sentence(sentence, Some(value_expr), Some(&value), environment);
+            // No decline is recorded onto the position span. This position
+            // is undetermined, and the spans that SAY SO are the declined
+            // readers beneath it, each naming the gate it failed and what
+            // the operand held. A gate here would name only the statement,
+            // which is the whole judged position rather than the construct
+            // that blocked it.
             record_blocker(blocked, value_expr.range(), sentence, out);
         }
     }
@@ -121,6 +186,16 @@ pub(super) fn walk_yield(
     let Some(declared) = yield_refinement else {
         return;
     };
+    // THE JUDGED POSITION'S OWN SPAN, the same one `walk_return` opens for
+    // its own sink: every sub-read the yielded value's evaluation makes
+    // and the judging that follows nest under one answered root, so this
+    // position's trace is a single tree whose deepest declined span is the
+    // blocking sub-expression rather than a handful of loose roots.
+    let _position_span = crate::trace::position_scope(
+        "check::walk_yield",
+        usize::from(yield_expr.range().start()),
+        usize::from(yield_expr.range().end()),
+    );
     match yield_expr {
         Expr::Yield(yield_node) => {
             let range = yield_node.range();
@@ -193,7 +268,7 @@ pub(super) fn judge_at(
     blocked: &mut bool,
     out: &mut Vec<Finding>,
 ) {
-    match judge(value, declared, context.kernel) {
+    match judge_traced(value, declared, range, context.kernel) {
         Verdict::Fire(message) => out.push(Finding { range, code: "RTS7001", message }),
         Verdict::Silent => {}
         Verdict::Undetermined(sentence) => {
@@ -271,13 +346,48 @@ pub(super) fn judge_and_bind_naming(
     environment: &mut Environment,
     out: &mut Vec<Finding>,
 ) -> Option<String> {
-    match judge(&value, declared, context.kernel) {
+    match judge_traced(&value, declared, fire_range, context.kernel) {
         Verdict::Fire(message) => {
             out.push(Finding {
                 range: fire_range,
                 code: "RTS7001",
                 message,
             });
+            // A TEMPORAL declaration carries its claim in `declared.
+            // temporal`, not in `declared.set` (which stays empty, this
+            // crate's own "one active field" convention) — so the refused
+            // slot is the declared WINDOW, tagged `"temporal_flow"`, the
+            // same shape `seed_parameters` binds a temporal parameter to.
+            // Without this the slot would take the empty set below, which
+            // the temporal law then reads as "not a temporal value" and
+            // the following read of the refused name lands undetermined
+            // rather than judging against the declaration it kept.
+            if let Some(declared_temporal) = &declared.temporal {
+                let mut slot = refined_domain::known_constructors::known_object(Vec::new(), None, true, TrustSpec, false);
+                slot.source = "temporal_flow".to_owned();
+                slot.temporal = Some(Box::new(declared_temporal.clone()));
+                environment.bind(name, slot);
+                return None;
+            }
+            // A CONTAINER declaration carries its claim in `declared.
+            // positions` (a fixed-arity tuple) or `declared.element` (a
+            // `list[X]`/`dict[str, X]`), never in `declared.set`, which
+            // stays empty for those shapes — the same "one active field"
+            // convention `seed_parameters` reads. Taking the empty set
+            // below for such a declaration binds the refused slot to a
+            // value stating nothing, so the very next read of the name
+            // lands undetermined instead of judging against the
+            // declaration the slot kept (A7.sink.assign's own
+            // `assign_to_tuple`/`assign_elements_outside`, whose `return
+            // p`/`return ys` follow the refused write directly).
+            // `declared_container_slot` builds the same seed
+            // `seed_parameters` binds a PARAMETER of that same
+            // declaration to, so the refused slot and a fresh parameter
+            // of the declared type read identically from here on.
+            if let Some(slot) = declared_container_slot(declared) {
+                environment.bind(name, slot);
+                return None;
+            }
             // Tags the numeric sort onward flow needs (the same guarded
             // rule `seed_parameters` applies to a declared set:
             // numeric-ground only, never the `Literal["A", "B"]`
@@ -309,6 +419,49 @@ pub(super) fn judge_and_bind_naming(
             Some(sentence)
         }
     }
+}
+
+/// The slot a REFUSED write to a CONTAINER-declared name keeps — the
+/// same value `check::seed::seed_parameters` binds a PARAMETER of that
+/// identical declaration to, built through the identical helpers so the
+/// two agree by construction rather than by two parallel readings:
+///
+/// - A fixed-arity tuple (`declared.positions`) keeps a known-length
+///   `Kind::List` whose slot `i` holds position `i`'s own declared set.
+/// - A `dict[str, X]` keeps the unbounded-key dict star
+///   (`seed::dict_star_value_seed`).
+/// - A `list[X]`/`set[X]`/`Sequence[X]` keeps the repetition window over
+///   X's own set (`seed::sequence_element_window`), tagged with the
+///   element's numeric sort where it has one.
+///
+/// `None` for a declaration that is not one of those three container
+/// shapes — the caller's own scalar path is the right slot there.
+fn declared_container_slot(declared: &DeclaredRefinement) -> Option<AbstractValue> {
+    if let Some(positions) = &declared.positions {
+        let items = positions
+            .iter()
+            .map(|position| known_set(position.set.clone(), None, TrustSpec, SetKindTag::None))
+            .collect();
+        return Some(refined_domain::known_constructors::known_list(items, TrustSpec));
+    }
+    if declared.spelling.starts_with("dict[str, ") {
+        let element = declared.element.as_deref()?;
+        return super::seed::dict_star_value_seed(element);
+    }
+    let window = super::seed::sequence_element_window(declared)?;
+    let kind_tag = declared.element.as_deref().and_then(|element| {
+        if element.set.forms.is_empty() {
+            None
+        } else if requires_integer(&element.set) {
+            Some(PrimitiveKind::Integer)
+        } else {
+            Some(PrimitiveKind::Float)
+        }
+    });
+    Some(AbstractValue {
+        kind_tag,
+        ..known_set(window, None, TrustSpec, SetKindTag::None)
+    })
 }
 
 /// The one naming step `judge_and_bind_naming` applies: `sentence`

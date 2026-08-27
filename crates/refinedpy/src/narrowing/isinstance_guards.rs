@@ -180,6 +180,14 @@ pub(super) fn narrow_isinstance_call(call: &ruff_python_ast::ExprCall, environme
     let Some(name) = name_of(&call.arguments.args[0]) else {
         return;
     };
+    // A CONTAINER test (`isinstance(x, list)`, `isinstance(x, dict)`)
+    // asks a shape question, not a sort question, so it is read first and
+    // routed to the arm filter that answers by shape. Every other
+    // classinfo shape falls through to the scalar-sort reader below.
+    if let Some(container_names) = isinstance_container_names(&call.arguments.args[1]) {
+        narrow_union_by_container(name, &container_names, environment, truth);
+        return;
+    }
     let Some(tags) = isinstance_type_tags(&call.arguments.args[1]) else {
         return;
     };
@@ -219,7 +227,15 @@ pub(super) fn narrow_isinstance_call(call: &ruff_python_ast::ExprCall, environme
             .arms
             .iter()
             .filter(|arm| {
-                let matches_tag = arm.kind_tag.is_some_and(|tag| tags.contains(&tag));
+                // A CONTAINER arm can carry a scalar `kind_tag` — a
+                // `list[Age]` arm is tagged Integer off its ELEMENT's own
+                // sort (`check::seed::union_arm_seed`, matching the
+                // reading `star_numeric_hull` and its siblings take) — so
+                // the tag alone would read `isinstance(x, int)` as TRUE
+                // of a list of ints. The shape question settles it first:
+                // a container is never an instance of a scalar sort.
+                let matches_tag = !arm_is_container(arm, &["list", "dict"])
+                    && arm.kind_tag.is_some_and(|tag| tags.contains(&tag));
                 matches_tag == truth
             })
             .cloned()
@@ -247,6 +263,43 @@ pub(super) fn narrow_isinstance_call(call: &ruff_python_ast::ExprCall, environme
     // infeasible under this arm
     let grade = trust_level_of(&current);
     environment.bind(name, known_values(Vec::new(), kind_tag, grade));
+}
+
+/// `isinstance(x, list)` / `isinstance(x, dict)` on a name bound to a
+/// `Kind::KindUnion` — the shape a general union PARAMETER seeds
+/// (`check::seed::union_parameter_seed`). Keeps the arms whose own shape
+/// matches the named container when the test proves TRUE, and the arms
+/// whose shape does NOT when it proves FALSE (`x: int | list[Age]` under
+/// a false `isinstance(x, int)` is the `list[Age]` arm — A8.guard.sort's
+/// own `element_of_excluded_sequence_inside` row reaches its else-branch
+/// exactly that way). `kind_union_of` collapses a single surviving arm to
+/// that arm bare, so `x[0]` past the guard reads through the ordinary
+/// sequence channel with no union-aware subscript reader needed.
+///
+/// A name bound to anything OTHER than a KindUnion is left untouched:
+/// this domain has no shape for "not a list" to record against a single
+/// bound value, and a value that already reads as one definite shape
+/// gains nothing from a test it either already satisfies or already
+/// refutes.
+fn narrow_union_by_container(
+    name: &str,
+    container_names: &[&'static str],
+    environment: &mut Environment,
+    truth: bool,
+) {
+    let Some(current) = environment.read(name).cloned() else {
+        return;
+    };
+    if current.kind != Kind::KindUnion {
+        return;
+    }
+    let kept: Vec<AbstractValue> = current
+        .arms
+        .iter()
+        .filter(|arm| arm_is_container(arm, container_names) == truth)
+        .cloned()
+        .collect();
+    environment.bind(name, kind_union_of(kept));
 }
 
 /// The fresh binding a PROVED `isinstance(x, tag)` seeds for a name the
@@ -308,6 +361,70 @@ pub(crate) fn isinstance_type_tags(expression: &Expr) -> Option<Vec<PrimitiveKin
         }
         _ => None,
     }
+}
+
+/// The CONTAINER type names an `isinstance` second argument can name —
+/// `list`, `tuple`, `set`, `frozenset`, and `dict` (functions.rst,
+/// `isinstance`; stdtypes.rst gives each as a built-in type). These are
+/// not `PrimitiveKind`s: a container is not a scalar sort, and this
+/// domain tells them apart by an `AbstractValue`'s own `Kind`, never by
+/// a `kind_tag`. A `|`-chain of container names folds the same way
+/// `isinstance_type_tags` folds a scalar chain; `None` for any other
+/// shape, including a chain MIXING a container name with a scalar one
+/// (`list | int`), which names two different shape questions this
+/// reader has no single answer for.
+pub(crate) fn isinstance_container_names(expression: &Expr) -> Option<Vec<&'static str>> {
+    match expression {
+        Expr::Name(name) => container_type_name(name.id.as_str()).map(|word| vec![word]),
+        Expr::BinOp(binop) if binop.op == ruff_python_ast::Operator::BitOr => {
+            let mut left = isinstance_container_names(&binop.left)?;
+            let right = isinstance_container_names(&binop.right)?;
+            left.extend(right);
+            Some(left)
+        }
+        _ => None,
+    }
+}
+
+fn container_type_name(name: &str) -> Option<&'static str> {
+    match name {
+        "list" => Some("list"),
+        "tuple" => Some("tuple"),
+        "set" => Some("set"),
+        "frozenset" => Some("frozenset"),
+        "dict" => Some("dict"),
+        _ => None,
+    }
+}
+
+/// Whether one union arm holds a value of one of the CONTAINER shapes
+/// `names` lists.
+///
+/// This domain represents every sequence — `list`, `tuple`, `set`,
+/// `frozenset` alike — as one shape (`collection_models`'s own module
+/// doc: no dedicated tuple or set variant exists, since a set's element
+/// uniqueness and a tuple's immutability are invisible to a reader that
+/// consumes the value by index, membership, and `len()`). Concretely
+/// that is a `Kind::List` for a known-length display and a `Kind::Set`
+/// repetition window for a declared `list[X]` parameter. So any of the
+/// four sequence names answers true for either of those two shapes: the
+/// domain does not hold the distinction, and claiming it does — reading
+/// `isinstance(x, list)` as FALSE on a value this file recorded as a
+/// tuple — would refuse a program that is correct.
+///
+/// A `dict` arm is a `Kind::Object` (a known key table) or a
+/// `Kind::ObjectStar` (a `dict[str, X]` parameter's unbounded-key seed),
+/// which no sequence name matches and which matches no scalar sort.
+fn arm_is_container(arm: &AbstractValue, names: &[&'static str]) -> bool {
+    let sequence = matches!(arm.kind, Kind::List)
+        || (arm.kind == Kind::Set
+            && arm.set_kind_tag == SetKindTag::None
+            && refined_sets::repetition_window_forms::as_repetition(&arm.set).is_some());
+    let mapping = matches!(arm.kind, Kind::Object | Kind::ObjectStar);
+    names.iter().any(|name| match *name {
+        "dict" => mapping,
+        _ => sequence,
+    })
 }
 
 pub(super) fn primitive_kind_of_type_name(name: &str) -> Option<PrimitiveKind> {

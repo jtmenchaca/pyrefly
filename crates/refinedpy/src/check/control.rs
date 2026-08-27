@@ -9,7 +9,7 @@ use ruff_text_size::{Ranged, TextRange};
 use crate::assignability::{judge, Verdict};
 use crate::diagnostic_sentences::loop_accumulation_did_not_stabilize;
 use crate::env::Environment;
-use crate::expressions::{evaluate_expression, fieldless_exception_value};
+use crate::expressions::{evaluate_expression, fieldless_exception_value, raised_exception_class};
 use crate::instances;
 use crate::loops::{loop_final_environment, LoopAnswer};
 use crate::match_arms;
@@ -568,6 +568,14 @@ pub(super) fn enter_method_result(
     context: &WalkContext,
     environment: &mut Environment,
 ) -> Option<AbstractValue> {
+    // A FILE OBJECT (`open(path)` — `builtin_models::FILE_OBJECT_WORD`)
+    // is its own context manager: library/functions.rst, `open`, "file
+    // objects ... can be used as context managers", and the `io.IOBase`
+    // entry states what `__enter__` gives back — "Return the IO object"
+    // — so entering answers the same value that was opened.
+    if receiver.kind_word == Some(crate::builtin_models::FILE_OBJECT_WORD) {
+        return Some(receiver.clone());
+    }
     if receiver.kind != Kind::Object || receiver.source.is_empty() {
         return None;
     }
@@ -611,11 +619,13 @@ pub(super) fn bind_with_target(target: &Expr, value: AbstractValue, environment:
 /// `try: BODY (except ... )+ [else: BODY] [finally: BODY]`
 /// (compound_stmts.rst, "The `try` statement"): the try body walks on
 /// its own fork; each handler starts from a fork of the INCOMING
-/// environment with every name the try body binds forgotten — an
-/// exception may interrupt the body at any point, so no write in it is
-/// guaranteed to have happened, and any write that DID happen
-/// invalidates the pre-try fact either way, so forgetting is the one
-/// sound answer for both. A handler's `as`-name (if present) is bound by
+/// environment adjusted per name the try body binds
+/// (`join_pre_try_with_havoc_for_stmt`) — an exception may interrupt the
+/// body at any point, so a name ALREADY BOUND before the try holds the
+/// join of its pre-try value with unknown (the write may or may not have
+/// happened, and the slot stays bound either way), while a name the body
+/// binds for the FIRST time is forgotten (the handler may run before it
+/// binds at all). A handler's `as`-name (if present) is bound by
 /// forgetting it (exception objects are not modeled) and forgotten AGAIN
 /// after the handler body — "when an exception has been assigned using
 /// `as target`, it is cleared at the end of the except clause... as if
@@ -633,7 +643,9 @@ pub(super) fn bind_with_target(target: &Expr, value: AbstractValue, environment:
 ///
 /// Returns whether the try statement itself provably never falls
 /// through: zero surviving arms means every path either raises past an
-/// uncaught exception or terminates inside its own handler — the exact
+/// uncaught exception, leaves the body at a CAUGHT provable raise (which
+/// drops the try fork outright — the caught-raise rule below), or
+/// terminates inside its own handler — the exact
 /// fact `surviving.is_empty()` already computes for the join below,
 /// surfaced so the caller's own body loop can stop walking statements
 /// that follow, the same way it already stops after a bare `return`/
@@ -656,7 +668,24 @@ pub(super) fn walk_try(
     let mut try_env = environment.fork();
     let mut try_provably_unbound: HashSet<String> = HashSet::new();
     let try_body_findings_before = out.len();
+    // THE CAUGHT-RAISE RULE: a provable raise is ALWAYS SPOKEN. A
+    // handler catching it changes REACHABILITY, never reporting — the
+    // raise's own finding stands whether or not one of this statement's
+    // handlers names its class (the product decision the corpus states
+    // verbatim at A2.xfer.pow:42). What a caught raise decides is where
+    // the walk goes: CPython transfers to the handler, so no statement
+    // after the raising one in the try body ever executes, none of them
+    // is walked, no write any of them would make is live, `orelse` never
+    // runs, and the try path never joins at the post-try point — the
+    // except arms below carry the whole surviving story alone. Findings
+    // the SAME statement recorded AFTER the raise describe the
+    // never-reached continuation of that statement and are dropped.
+    // An UNCAUGHT provable raise is untouched by this rule: its finding
+    // stands, the body keeps walking, and the try path is decided by
+    // `arm_terminates_or_provably_raises` as before.
+    let mut raise_was_caught = false;
     for stmt in &try_stmt.body {
+        let findings_before_stmt = out.len();
         walk_statement(
             stmt,
             return_refinement,
@@ -668,6 +697,27 @@ pub(super) fn walk_try(
             blocked,
             out,
         );
+        match first_provable_raise(&out[findings_before_stmt..], try_stmt) {
+            RaiseInTryBody::None => {}
+            RaiseInTryBody::Caught { offset } => {
+                // the raise's OWN finding is kept — it is spoken whether
+                // or not a handler catches it. Only what this same
+                // statement recorded AFTER it goes: those findings
+                // describe the statement's continuation past a point
+                // control never passes.
+                out.truncate(findings_before_stmt + offset + 1);
+                raise_was_caught = true;
+                break;
+            }
+            RaiseInTryBody::Unrelatable { class } => {
+                // a handler names an exception class this walk cannot
+                // relate to the raised one — see `first_provable_raise`'s
+                // own doc. The raise's finding stands, the body keeps
+                // walking, and the decline is named so the position is
+                // not left unexplained.
+                record_blocker(blocked, stmt.range(), handler_class_relation_unread(&class), out);
+            }
+        }
     }
     // orelse ("the try statement", `else` clause) runs only once the try
     // body completes without raising — walking it here is this analysis's
@@ -676,34 +726,41 @@ pub(super) fn walk_try(
     // taken at runtime. The combined path's survival is decided by the
     // LAST body actually executed along it: orelse's own last statement
     // when orelse is present, otherwise the try body's.
+    //
+    // A CAUGHT raise makes both of those moot: the try body never
+    // completes, so `orelse` never runs and the try path never falls
+    // through to the post-try point at all. The whole try fork is
+    // dropped — only the handler forks below survive.
     let orelse_findings_before = out.len();
-    for stmt in &try_stmt.orelse {
-        walk_statement(
-            stmt,
-            return_refinement,
-            yield_refinement,
-            context,
-            &mut try_env,
-            aug_assign_refinements,
-            &mut try_provably_unbound,
-            blocked,
-            out,
-        );
-    }
-    let (try_path_terminal_body, terminal_findings_before) = if try_stmt.orelse.is_empty() {
-        (try_stmt.body.as_slice(), try_body_findings_before)
-    } else {
-        (try_stmt.orelse.as_slice(), orelse_findings_before)
-    };
-    if !arm_terminates_or_provably_raises(try_path_terminal_body, out, terminal_findings_before) {
-        surviving.push(try_env);
+    if !raise_was_caught {
+        for stmt in &try_stmt.orelse {
+            walk_statement(
+                stmt,
+                return_refinement,
+                yield_refinement,
+                context,
+                &mut try_env,
+                aug_assign_refinements,
+                &mut try_provably_unbound,
+                blocked,
+                out,
+            );
+        }
+        let (try_path_terminal_body, terminal_findings_before) = if try_stmt.orelse.is_empty() {
+            (try_stmt.body.as_slice(), try_body_findings_before)
+        } else {
+            (try_stmt.orelse.as_slice(), orelse_findings_before)
+        };
+        if !arm_terminates_or_provably_raises(try_path_terminal_body, out, terminal_findings_before) {
+            surviving.push(try_env);
+        }
     }
 
     for handler in &try_stmt.handlers {
         let ExceptHandler::ExceptHandler(handler) = handler;
         let mut handler_env = environment.fork();
         for stmt in &try_stmt.body {
-            forget_names_bound_by_stmt(stmt, &mut handler_env);
+            join_pre_try_with_havoc_for_stmt(stmt, environment, &mut handler_env);
         }
         // HANDLER AS-NAME: `except Exception as error:` binds `error` to
         // a caught-exception value at handler entry — not a forget — so
@@ -770,6 +827,158 @@ pub(super) fn walk_try(
         );
     }
     nothing_survives
+}
+
+/// What one try-body statement's own newly recorded findings say about a
+/// provable raise inside it, relative to the enclosing `try`'s handlers.
+/// `walk_try`'s caught-raise rule is the only reader.
+enum RaiseInTryBody {
+    /// No provable raise among this statement's findings, or one whose
+    /// class no handler catches — an UNCAUGHT raise, which leaves the
+    /// body walking on and the try path decided by
+    /// `arm_terminates_or_provably_raises`.
+    None,
+    /// A provable raise one handler catches — its finding is spoken the
+    /// same as an uncaught one; what the catch decides is reachability.
+    /// `offset` is that finding's own index within the statement's newly
+    /// recorded findings: `walk_try` keeps everything through it and
+    /// drops what this statement recorded after it.
+    Caught { offset: usize },
+    /// A provable raise sits alongside a handler naming an exception
+    /// class this walk cannot relate to the raised one. Carries that
+    /// handler's class name so the decline can name it.
+    Unrelatable { class: String },
+}
+
+/// Reads one try-body statement's newly recorded findings for a provable
+/// raise (RTS7001 carrying the `"provably raises <ExcType>: …"` form
+/// `expressions::raised_exception_class` names the class from), and
+/// decides whether `try_stmt`'s own handlers catch it.
+///
+/// CLASS MATCHING. A handler catches when its named class IS the raised
+/// class, or a base of it — compound_stmts.rst, "The `try` statement": a
+/// handler matches "if it is the class or a base class of the exception
+/// object". A bare `except:` matches any exception ("if no expression is
+/// present"). `base_classes_of` reads the base chain, and answers `None`
+/// for a class outside the closed set this checker itself ever raises —
+/// a handler naming such a class is `Unrelatable` rather than a silent
+/// "does not catch," since it may well be a base of the raised class and
+/// this walk cannot tell. A tuple `except (A, B):` is read member by
+/// member; an attribute `except mod.Err:` names no readable class at all
+/// and is `Unrelatable` the same way.
+fn first_provable_raise(statement_findings: &[Finding], try_stmt: &StmtTry) -> RaiseInTryBody {
+    let Some((offset, raised_class)) = statement_findings.iter().enumerate().find_map(|(offset, finding)| {
+        if finding.code != "RTS7001" {
+            return None;
+        }
+        raised_exception_class(&finding.message).map(|class| (offset, class.to_owned()))
+    }) else {
+        return RaiseInTryBody::None;
+    };
+    // the raised class and every base of it — the exact set of names a
+    // handler may spell and still catch this raise
+    let Some(catching_names) = base_classes_of(&raised_class) else {
+        // this checker raised a class its own base table does not carry,
+        // so no handler's relation to it can be decided
+        return RaiseInTryBody::Unrelatable { class: raised_class };
+    };
+    let mut unrelatable: Option<String> = None;
+    for handler in &try_stmt.handlers {
+        let ExceptHandler::ExceptHandler(handler) = handler;
+        let Some(caught_type) = handler.type_.as_deref() else {
+            // a bare `except:` matches any exception
+            return RaiseInTryBody::Caught { offset };
+        };
+        for named in handler_class_names(caught_type) {
+            // a handler class spelled as something other than a bare name
+            // (an attribute, a computed expression) names no class this
+            // reader can relate
+            let Some(name) = named else {
+                unrelatable.get_or_insert_with(|| "an unnamed exception class".to_owned());
+                continue;
+            };
+            if catching_names.iter().any(|catching| *catching == name) {
+                return RaiseInTryBody::Caught { offset };
+            }
+            // a class this table CARRIES but which is not a base of the
+            // raised one provably does not catch it — no decline needed
+            if base_classes_of(&name).is_none() {
+                unrelatable.get_or_insert(name);
+            }
+        }
+    }
+    match unrelatable {
+        Some(class) => RaiseInTryBody::Unrelatable { class },
+        None => RaiseInTryBody::None,
+    }
+}
+
+/// The raised class itself plus every base class of it, per
+/// `exceptions.rst`'s own per-class statements: `UnicodeError` "is a
+/// subclass of `ValueError`" (:613), `UnicodeDecodeError` "is a subclass
+/// of `UnicodeError`" (:648), `UnboundLocalError` "is a subclass of
+/// `NameError`" (:606), `ArithmeticError` is "the base class for...
+/// `OverflowError`, `ZeroDivisionError`, `FloatingPointError`" (:172),
+/// `LookupError` is "the base class for... `IndexError`, `KeyError`"
+/// (:185), and `Exception`/`BaseException` sit above every one of them
+/// (that document's own hierarchy root). Carries exactly the classes
+/// this checker itself ever states in a provable-raise message, plus
+/// their bases — a handler naming a class OUTSIDE this table has an
+/// unread relation to the raised one, which `first_provable_raise`
+/// reports as a decline rather than guessing.
+fn base_classes_of(class: &str) -> Option<Vec<&'static str>> {
+    let chain: Vec<&'static str> = match class {
+        "ValueError" => vec!["ValueError"],
+        "UnicodeError" => vec!["UnicodeError", "ValueError"],
+        "UnicodeDecodeError" => vec!["UnicodeDecodeError", "UnicodeError", "ValueError"],
+        "TypeError" => vec!["TypeError"],
+        "RuntimeError" => vec!["RuntimeError"],
+        "IndexError" => vec!["IndexError", "LookupError"],
+        "KeyError" => vec!["KeyError", "LookupError"],
+        "LookupError" => vec!["LookupError"],
+        "ZeroDivisionError" => vec!["ZeroDivisionError", "ArithmeticError"],
+        "ArithmeticError" => vec!["ArithmeticError"],
+        "NameError" => vec!["NameError"],
+        "UnboundLocalError" => vec!["UnboundLocalError", "NameError"],
+        _ => return None,
+    };
+    let mut names = chain;
+    names.push("Exception");
+    names.push("BaseException");
+    Some(names)
+}
+
+/// Every exception class one handler's `type_` names: one entry for a
+/// bare `Name`, one per member for a tuple `except (A, B):`. `None` in
+/// place of a name for any member this reader cannot spell as a bare
+/// name (an attribute `mod.Err`, a computed expression).
+fn handler_class_names(caught_type: &Expr) -> Vec<Option<String>> {
+    match caught_type {
+        Expr::Name(name) => vec![Some(name.id.as_str().to_owned())],
+        Expr::Tuple(tuple) => tuple
+            .elts
+            .iter()
+            .map(|member| match member {
+                Expr::Name(name) => Some(name.id.as_str().to_owned()),
+                _ => None,
+            })
+            .collect(),
+        _ => vec![None],
+    }
+}
+
+/// The decline this walk names when a statement provably raises inside a
+/// `try` whose handlers name an exception class this walk cannot relate
+/// to the raised one (`first_provable_raise`'s own doc: no builtin
+/// exception hierarchy is read, so only exact identity, `BaseException`,
+/// and a bare `except:` are decidable). Names the handler's class so the
+/// reader knows which relation is missing.
+fn handler_class_relation_unread(handler_class: &str) -> String {
+    format!(
+        "this statement provably raises, and this try statement's handler catches '{handler_class}' — whether \
+        that class is a base of the raised one is not read here, so the walk cannot tell whether the raise is \
+        handled"
+    )
 }
 
 /// The value one `except <type> as <name>:` handler's own `<name>`

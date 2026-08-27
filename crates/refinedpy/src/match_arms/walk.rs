@@ -8,6 +8,7 @@ use std::sync::Arc;
 use refined_domain::abstract_value::AbstractValue;
 use refined_kernel::kernel_interface::RefinedTSKernel;
 use ruff_python_ast::MatchCase;
+use ruff_python_ast::Pattern;
 use ruff_python_ast::Stmt;
 
 use crate::env::Environment;
@@ -18,6 +19,7 @@ use super::values::bare_capture_name;
 use super::values::enumerable_numeric_members;
 use super::values::guarded_bare_capture_narrowed;
 use super::values::is_full_overlap;
+use super::values::narrow_maybe_subject_on_none;
 use super::values::narrow_scalar_subject;
 use super::values::rebind_split_subject;
 
@@ -223,6 +225,43 @@ pub fn match_taken_environment(
                 }
                 remaining_subject = difference;
                 continue;
+            }
+        }
+        // MAYBE-CARRIER `case None:` SPLIT: `remaining_subject` is a
+        // `Kind::PossiblyUndefined` carrier (an `Optional[X]`/`X |
+        // None`-declared parameter's own seed) and this arm's pattern is
+        // the `None` singleton — `values::narrow_maybe_subject_on_none`
+        // reads the two sides the same way `is None`/`is not None`
+        // already narrow one: `keep_matched: true` is the exact `None`
+        // value, `keep_matched: false` is the carrier's own inner
+        // (present) value unwrapped. Tried BEFORE `arm_outcome`, the
+        // same reason the guarded-bare-capture split above runs first:
+        // `arm_outcome`'s own `match_singleton_outcome` declines a
+        // maybe-carrier subject outright (`outcome::subject_is_singleton`'s
+        // own doc — neither provably taken nor provably dead), which
+        // would otherwise poison every later arm through the
+        // `Undecidable` branch below instead of splitting. `None` from
+        // either call (a subject that is not this carrier shape, or a
+        // pattern that is not `case None:`) falls through to
+        // `arm_outcome`'s ordinary reading unchanged.
+        if let Pattern::MatchSingleton(singleton) = &case.pattern {
+            if singleton.value == ruff_python_ast::Singleton::None && remaining_subject.kind == refined_domain::abstract_value::Kind::PossiblyUndefined {
+                if let (Some(intersected), Some(difference)) = (
+                    narrow_maybe_subject_on_none(&remaining_subject, &case.pattern, true),
+                    narrow_maybe_subject_on_none(&remaining_subject, &case.pattern, false),
+                ) {
+                    let mut arm_env = environment.fork();
+                    if let Some(name) = subject_name {
+                        arm_env.bind(name, intersected.clone());
+                    }
+                    any_arm_walked = true;
+                    let survives = walk_arm_body(&case.body, &mut arm_env)?;
+                    if survives {
+                        survivors.push(arm_env);
+                    }
+                    remaining_subject = difference;
+                    continue;
+                }
             }
         }
         match arm_outcome(&case.pattern, case.guard.as_deref(), &remaining_subject, environment, kernel) {

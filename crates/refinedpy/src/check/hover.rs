@@ -31,12 +31,9 @@ use super::*;
 /// `position` — the innermost node the walk evaluated there, mirroring
 /// how a hover always names the tightest enclosing expression rather
 /// than an outer one that merely contains it. `None` where neither
-/// says anything: an unreadable module (no `type` alias AND no
-/// recognized `Annotated` import — the same early exit
-/// `findings_for_module_at` takes), a position outside every annotation
-/// and outside every recorded node, or a recorded value this table
-/// cannot read back as a set (`abstract_value_as_refined_set`'s own
-/// doc).
+/// says anything: a position outside every annotation and outside
+/// every recorded node, or a recorded value this table cannot read back
+/// as a set (`abstract_value_as_refined_set`'s own doc).
 pub fn refined_set_at_position(
     module: &ModModule,
     resolver: ModuleResolver,
@@ -49,16 +46,11 @@ pub fn refined_set_at_position(
         aliases.insert(name, alias);
     }
     let imports = surface_imports(module);
-    if aliases.is_empty()
-        && imports.annotated_names.is_empty()
-        && imports.literal_names.is_empty()
-    {
-        // Same gate `findings_for_module_at` takes, and for the same
-        // reason: a module with no refinement alias (own or imported),
-        // no recognized `Annotated` import, and no `Literal` import
-        // carries no refinement vocabulary at all.
-        return None;
-    }
+    // Every module reaches the walk, the same rule
+    // `findings_for_module_at` keeps: a position's set can be derived
+    // from the statements around it with no refinement vocabulary
+    // anywhere in the module, so a hover answers on the module's own
+    // merits rather than on which names it imported.
     if let Some(stated) = stated_refinement_at(module, &aliases, &imports, position) {
         return Some(stated);
     }
@@ -98,6 +90,7 @@ pub fn refined_set_at_position(
         caller_arguments,
         entry_directory: None,
         evaluations_recorder: Some(recorder.clone()),
+        trace_collector: None,
     };
     let mut discarded_findings = Vec::new();
     walk_body(&module.body, None, None, None, &context, &mut discarded_findings);

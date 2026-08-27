@@ -389,6 +389,7 @@ fn a_delegates_declared_yield_annotation_is_tagged_when_its_body_walk_declines()
         caller_arguments: Arc::new(HashMap::new()),
         entry_directory: None,
         evaluations_recorder: None,
+        trace_collector: None,
     };
     let environment = Environment::new(HashSet::new());
     let delegate = ruff_python_parser::parse_expression("conditional_gen(True)")
@@ -404,5 +405,81 @@ fn a_delegates_declared_yield_annotation_is_tagged_when_its_body_walk_declines()
         value.kind_tag,
         Some(PrimitiveKind::Integer),
         "Age's own numeric-ground set must tag the delegated value"
+    );
+}
+
+/// THE VALUE SINK (A8.sink.arg's own shape): `d["x"] = 200` on a
+/// `dict[str, Age]` parameter is judged AT THE WRITE, against the
+/// declaration's own member refinement — not carried forward to fire
+/// at whatever later sink reads `d`. The in-window write beside it
+/// stays silent, and neither call site fires, since the receiver keeps
+/// what its declaration says about its members either way.
+#[test]
+fn a_dict_member_write_past_the_declared_ceiling_fires_at_the_write() {
+    let Some(kernel) = loaded_kernel() else { return };
+    let source = concat!(
+        "from typing import Annotated\n",
+        "from pydantic import Field\n",
+        "type Age = Annotated[int, Field(ge=0, le=150)]\n",
+        "def sink(d: dict[str, Age]) -> None:\n",
+        "    pass\n",
+        "def over(d: dict[str, Age]) -> None:\n",
+        "    d[\"x\"] = 200\n",
+        "    sink(d)\n",
+        "def within(d: dict[str, Age]) -> None:\n",
+        "    d[\"x\"] = 150\n",
+        "    sink(d)\n",
+    );
+    let module = parsed(source);
+    let findings = findings_for_module(&module, &kernel);
+    let fires: Vec<&Finding> = findings.iter().filter(|f| f.code == "RTS7001").collect();
+    assert_eq!(
+        fires.len(),
+        1,
+        "want exactly one fire, for the 200 write: {:?}",
+        findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        fires[0].range.start(),
+        offset_of(source, "200"),
+        "the fire must land on the written value, never on the later sink call"
+    );
+}
+
+/// THE PROVABLY-RAISING DELETE (A8.xfer.delete's
+/// `read_widened_after_delete`): `del d["z"]` on a fully-known dict
+/// with no `"z"` raises `KeyError`, so the delete never takes effect
+/// and `d` keeps exactly what it held. The later `d["a"]` read must
+/// still answer 200 and fire against `Age`, rather than going
+/// undetermined on a forgotten receiver.
+#[test]
+fn a_provably_raising_delete_leaves_the_receiver_readable() {
+    let Some(kernel) = loaded_kernel() else { return };
+    let module = parsed(concat!(
+        "from typing import Annotated\n",
+        "from pydantic import Field\n",
+        "type Age = Annotated[int, Field(ge=0, le=150)]\n",
+        "def rows() -> Age:\n",
+        "    d: dict[str, int] = {\"a\": 200}\n",
+        "    try:\n",
+        "        del d[\"z\"]\n",
+        "    except KeyError:\n",
+        "        pass\n",
+        "    value = d[\"a\"]\n",
+        "    return value\n",
+    ));
+    let findings = findings_for_module(&module, &kernel);
+    let fires: Vec<&Finding> = findings.iter().filter(|f| f.code == "RTS7001").collect();
+    let blockers: Vec<&Finding> = findings.iter().filter(|f| f.code == "RTS7002").collect();
+    assert!(
+        blockers.is_empty(),
+        "the skipped delete must leave d fully readable: {:?}",
+        blockers.iter().map(|f| &f.message).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        fires.len(),
+        1,
+        "d[\"a\"] still answers 200, outside Age: {:?}",
+        findings.iter().map(|f| &f.message).collect::<Vec<_>>()
     );
 }

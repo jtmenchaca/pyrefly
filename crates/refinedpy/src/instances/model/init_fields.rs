@@ -86,7 +86,12 @@ pub(super) fn init_derived_fields(
                     .default
                     .as_deref()
                     .map(|default_expr| default_value_of(default_expr, &empty_environment, kernel));
-                parameter_slots[index] = Some(ClassField { name: field_name, declared, default });
+                let base_sort = parameter
+                    .parameter
+                    .annotation
+                    .as_deref()
+                    .and_then(crate::typereading::base_sort_return_refinement);
+                parameter_slots[index] = Some(ClassField { name: field_name, declared, default, base_sort });
             }
             None => {
                 // AnnAssign carries its own annotation even when the
@@ -97,11 +102,18 @@ pub(super) fn init_derived_fields(
                     }
                     _ => None,
                 };
+                let base_sort = match stmt {
+                    Stmt::AnnAssign(assign) => {
+                        crate::typereading::base_sort_return_refinement(assign.annotation.as_ref())
+                    }
+                    _ => None,
+                };
                 let literal = default_value_of(value_expr, &empty_environment, kernel);
                 let is_readable = literal.kind != Kind::Unknown;
                 trailing.push(ClassField {
                     name: field_name,
                     declared,
+                    base_sort,
                     // <expr> is anything evaluate_expression answers
                     // (a literal): the field's default is that
                     // constant. Any other RHS: declared: None,
@@ -128,10 +140,16 @@ pub(super) fn init_derived_fields(
             .default
             .as_deref()
             .map(|default_expr| default_value_of(default_expr, &empty_environment, kernel));
+        let base_sort = parameter
+            .parameter
+            .annotation
+            .as_deref()
+            .and_then(crate::typereading::base_sort_return_refinement);
         parameter_slots[index] = Some(ClassField {
             name: parameter.parameter.name.id.as_str().to_owned(),
             declared,
             default,
+            base_sort,
         });
     }
 
@@ -217,10 +235,17 @@ pub(super) fn super_init_fields(
                 .as_deref()
                 .and_then(|annotation| declared_refinement(annotation, aliases, imports, &empty_environment))
                 .or_else(|| parent_field.declared.clone());
+            let base_sort = child_parameter
+                .parameter
+                .annotation
+                .as_deref()
+                .and_then(crate::typereading::base_sort_return_refinement)
+                .or_else(|| parent_field.base_sort.clone());
             ClassField {
                 name: parent_field.name.clone(),
                 declared,
                 default: parent_field.default.clone(),
+                base_sort,
             }
         })
         .collect()

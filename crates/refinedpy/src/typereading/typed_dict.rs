@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use refined_sets::refinement_forms::make_refined_set;
 use ruff_python_ast::Expr;
 
-use super::declared_refinement::DeclaredRefinement;
+use super::declared_refinement::{DeclaredRefinement, TypedDictMember};
 
 /// A bare-Name return/AnnAssign annotation naming a module-level
 /// TypedDict class (`instances::typed_dict_table`'s own keys) —
@@ -19,7 +19,7 @@ use super::declared_refinement::DeclaredRefinement;
 /// addition alongside it, not a replacement.
 pub fn typed_dict_return_refinement(
     annotation: &Expr,
-    typed_dicts: &HashMap<String, Vec<(String, DeclaredRefinement)>>,
+    typed_dicts: &HashMap<String, Vec<TypedDictMember>>,
 ) -> Option<DeclaredRefinement> {
     let Expr::Name(name) = annotation else {
         return None;

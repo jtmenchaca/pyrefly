@@ -25,11 +25,35 @@ use super::{bind_walrus_targets, forget_target_names};
 /// Record this body's one blocker, if it has not already recorded one.
 /// Every later call in the same body is a no-op — the FIRST blocker
 /// wins, and the walk still keeps going conservatively afterward.
+///
+/// The blocker also opens its OWN reader span over the blocked range
+/// and records the decline into it, so a trace of a position this
+/// blocker owns names the construct rather than carrying an empty leaf.
+/// Without the span there is nothing for `record_decline` to attach to
+/// — a decline with no open reader span is refused (`trace::collector`'s
+/// own root rule) — and the blocker's own words never reach the trace.
+/// The span is opened and closed here, around the record, because the
+/// constructs that reach this function are exactly the ones with no
+/// dispatch of their own to nest under: a statement form the walk does
+/// not read, a loop whose accumulation never settled, a judgment that
+/// came back Undetermined.
 pub(in crate::check) fn record_blocker(blocked: &mut bool, range: TextRange, sentence: String, out: &mut Vec<Finding>) {
     if *blocked {
         return;
     }
     *blocked = true;
+    if crate::trace::is_tracing() {
+        let _span = crate::trace::span_scope(
+            "blocked_construct",
+            usize::from(range.start()),
+            usize::from(range.end()),
+        );
+        crate::trace::record_decline(
+            &sentence,
+            Some((usize::from(range.start()), usize::from(range.end()))),
+            None,
+        );
+    }
     out.push(Finding {
         range,
         code: "RTS7002",
@@ -53,11 +77,31 @@ pub(in crate::check) fn record_blocker(blocked: &mut bool, range: TextRange, sen
 /// between declaration and read → no fire" rule the mission states.
 ///
 /// Returns whether this statement provably never falls through to
-/// whatever follows it — true only for a `try` whose own arms all
-/// terminate (`walk_try`'s return). Every other form still runs exactly
-/// as before and answers `false`: this is not a general reachability
-/// signal, only the one fact `walk_try` already computes and this
-/// dispatcher passes outward untouched.
+/// whatever follows it, and — when it does not — whether the statement
+/// that follows is DEAD CODE the caller owes a report for. This is not
+/// a general reachability signal; it carries only the two facts the
+/// walk already computes: a `try` whose own arms all terminate
+/// (`walk_try`'s return, `FallsThrough::No`), and an `if` whose test
+/// proved true and whose selected arm terminates (`walk_if`'s return,
+/// `FallsThrough::NoAndFollowingIsDead`). Every other form answers
+/// `FallsThrough::Yes`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(in crate::check) enum FallsThrough {
+    /// Ordinary: whatever follows this statement can run.
+    Yes,
+    /// Nothing reaches past this statement, and that is the ordinary
+    /// shape of the construct — a `return`/`raise`, or a `try` whose
+    /// every arm terminates. The caller stops walking and reports
+    /// nothing: code after a `return` at a body's end is not a defect
+    /// this walk speaks to.
+    No,
+    /// Nothing reaches past this statement BECAUSE a condition proved
+    /// true and the arm it selected terminates — so whatever follows is
+    /// provably unreachable code. The caller reports that statement and
+    /// stops walking.
+    NoAndFollowingIsDead,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(in crate::check) fn walk_statement(
     stmt: &Stmt,
@@ -69,7 +113,7 @@ pub(in crate::check) fn walk_statement(
     provably_unbound: &mut HashSet<String>,
     blocked: &mut bool,
     out: &mut Vec<Finding>,
-) -> bool {
+) -> FallsThrough {
     match stmt {
         Stmt::AnnAssign(assign) => {
             walk_ann_assign(
@@ -139,7 +183,13 @@ pub(in crate::check) fn walk_statement(
             // applies uniformly regardless of whether the callee also
             // happens to write an enclosing name.
             if instance_method_call_result(expr_stmt.value.as_ref(), context, environment).is_none()
-                && !walk_mutating_call_statement(expr_stmt.value.as_ref(), context, environment)
+                && !walk_mutating_call_statement(
+                    expr_stmt.value.as_ref(),
+                    context,
+                    environment,
+                    aug_assign_refinements,
+                    out,
+                )
             {
                 sink_value(expr_stmt.value.as_ref(), context, environment, aug_assign_refinements, out);
             }
@@ -210,7 +260,7 @@ pub(in crate::check) fn walk_statement(
         Stmt::Global(_) | Stmt::Nonlocal(_) => {}
         Stmt::If(if_stmt) => {
             provably_unbound.clear();
-            walk_if(
+            let nothing_falls_through = walk_if(
                 if_stmt,
                 return_refinement,
                 yield_refinement,
@@ -220,6 +270,9 @@ pub(in crate::check) fn walk_statement(
                 blocked,
                 out,
             );
+            if nothing_falls_through {
+                return FallsThrough::NoAndFollowingIsDead;
+            }
         }
         // Imports and type aliases are consumed statements, not
         // blockers: the surface reads them (import identities, the
@@ -267,7 +320,8 @@ pub(in crate::check) fn walk_statement(
         }
         Stmt::For(_) | Stmt::While(_) => {
             provably_unbound.clear();
-            return walk_loop(stmt, return_refinement, yield_refinement, context, environment, aug_assign_refinements, blocked, out);
+            let terminates = walk_loop(stmt, return_refinement, yield_refinement, context, environment, aug_assign_refinements, blocked, out);
+            return if terminates { FallsThrough::No } else { FallsThrough::Yes };
         }
         Stmt::Match(match_stmt) => {
             provably_unbound.clear();
@@ -297,7 +351,7 @@ pub(in crate::check) fn walk_statement(
         }
         Stmt::Try(try_stmt) => {
             provably_unbound.clear();
-            return walk_try(
+            let terminates = walk_try(
                 try_stmt,
                 return_refinement,
                 yield_refinement,
@@ -307,6 +361,7 @@ pub(in crate::check) fn walk_statement(
                 blocked,
                 out,
             );
+            return if terminates { FallsThrough::No } else { FallsThrough::Yes };
         }
         _ => {
             provably_unbound.clear();
@@ -318,5 +373,5 @@ pub(in crate::check) fn walk_statement(
             );
         }
     }
-    false
+    FallsThrough::Yes
 }

@@ -90,4 +90,20 @@ impl Environment {
             .expect("evaluations recorder poisoned by an earlier panic")
             .push((range, value));
     }
+
+    /// Installs `collector` as this environment's derivation-trace sink —
+    /// the SAME `Arc` the caller holds, shared across every fork and
+    /// every nested body's own `Environment` for the fork-blind reason
+    /// the field's own doc states. `walk_body_with_self_binding` calls
+    /// this the moment it builds a body's environment, exactly where it
+    /// already calls `set_evaluations_recorder`.
+    pub fn set_trace_collector(&mut self, collector: Arc<Mutex<crate::trace::TraceCollector>>) {
+        self.trace = Some(collector);
+    }
+
+    /// This environment's trace collector, if a caller installed one.
+    /// `None` for every ordinary check.
+    pub fn trace_collector(&self) -> Option<&Arc<Mutex<crate::trace::TraceCollector>>> {
+        self.trace.as_ref()
+    }
 }

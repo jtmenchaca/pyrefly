@@ -55,6 +55,18 @@ use crate::surface::AliasEntry;
 use crate::surface::SurfaceImports;
 use crate::typereading::DeclaredRefinement;
 
+/// One name's derivation as a temporal offset of another: the derived
+/// value is `(<instant_name> - <origin>) // <unit>`, with `origin` the
+/// subtracted instant as a microsecond count from the POSIX epoch and
+/// `unit_microseconds` the divisor's own duration. Recorded by
+/// `check`'s assignment walk, read by the temporal narrowing channel.
+#[derive(Clone, Debug)]
+pub struct TemporalOffsetDerivation {
+    pub instant_name: String,
+    pub origin_microseconds: i128,
+    pub unit_microseconds: i128,
+}
+
 pub struct Environment {
     bindings: HashMap<String, AbstractValue>,
     /// Facts recorded about an ACCESS PATH (`TrackedPlace`'s own doc) —
@@ -64,6 +76,21 @@ pub struct Environment {
     /// that removes an entry; every write channel routes through it, the
     /// same discipline `forget` already keeps for a bare name.
     path_bindings: HashMap<TrackedPlace, AbstractValue>,
+    /// Which names hold a TEMPORAL OFFSET of another name — `offset_ms =
+    /// (d - REFERENCE) // timedelta(milliseconds=1)` records that
+    /// `offset_ms` is `d`'s own instant, measured from a fixed origin in
+    /// a fixed unit. Keyed on the derived name, carrying the instant
+    /// name it was derived from plus the two constants of the
+    /// derivation.
+    ///
+    /// Why a ledger rather than a re-evaluation: a guard that narrows
+    /// `d` AFTER the offset was computed (`offset_ms >= 0 and d <
+    /// CUTOFF`, A6.guard.lt's own spelling) states a fact about
+    /// `offset_ms` that no fact about `d` alone can carry, because the
+    /// two were tied together at the earlier statement. The narrowing
+    /// channel reads this ledger to re-derive the offset's own window
+    /// from the narrowed instant window.
+    temporal_offsets: HashMap<String, TemporalOffsetDerivation>,
     locally_bound: HashSet<String>,
     /// The module's own top-level `def`s, if this environment's walk
     /// has one to offer. Riding the table on the environment (rather
@@ -263,6 +290,25 @@ pub struct Environment {
     /// each body's own fresh `Environment`), so every nested body's
     /// walk writes into the same `Vec` the caller reads back afterward.
     evaluations: Option<Arc<Mutex<Vec<(TextRange, AbstractValue)>>>>,
+    /// The derivation-trace collector this walk records into, when a
+    /// caller asked for one (`trace`'s own module doc; the CLI's
+    /// `--trace-verdict` is the one caller today). `None` for every ordinary
+    /// check, which is the zero-cost path: no span is opened, no source
+    /// is sliced, no range is formatted.
+    ///
+    /// `Arc<Mutex<...>>` for the same fork-blind reason `evaluations` is:
+    /// the blocked position may sit inside any arm of an `if`/`for`/`try`
+    /// or inside a nested `def`'s own body, and every one of those walks
+    /// against a FORK of this environment or a fresh `Environment` of its
+    /// own — sharing the one collector makes the recording fork-blind, so
+    /// the span tree the caller reads back is the whole derivation rather
+    /// than whichever arm happened to survive the join.
+    ///
+    /// The two seams that record but hold no `Environment`
+    /// (`assignability::judge`, `kernel_ask::ask_kernel`) reach this SAME
+    /// `Arc` through the thread-local slot `trace::install` publishes it
+    /// into — one channel, never a second collector.
+    trace: Option<Arc<Mutex<crate::trace::TraceCollector>>>,
 }
 
 impl Environment {
@@ -273,6 +319,7 @@ impl Environment {
         Environment {
             bindings: HashMap::new(),
             path_bindings: HashMap::new(),
+            temporal_offsets: HashMap::new(),
             locally_bound,
             functions: None,
             classes: None,
@@ -289,6 +336,7 @@ impl Environment {
             evaluated_node: Vec::new(),
             returned_values: None,
             evaluations: None,
+            trace: None,
         }
     }
 }

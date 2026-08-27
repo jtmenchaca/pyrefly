@@ -377,8 +377,13 @@ fn arm_terminates_or_provably_raises_treats_a_provable_raise_as_terminal() {
 /// statement never falls through. Statements written AFTER the try
 /// describe only unreachable code, so they must not be walked for
 /// judgement: a read of a name the try body never got to bind must
-/// not report an unreadable-value blocker, and the try body's own
-/// provable raise is still the sole finding.
+/// not report an unreadable-value blocker.
+///
+/// The raise itself is SPOKEN: `except ValueError` catching the
+/// `ValueError` the unpack provably raises changes where control goes,
+/// never whether the raise is reported — a provable raise is always
+/// spoken (`walk_try`'s own caught-raise doc). The uncaught twin below
+/// fires the same finding and differs only in reachability.
 #[test]
 fn a_try_whose_every_arm_terminates_stops_the_body_walk_at_the_try() {
     let Some(kernel) = loaded_kernel() else { return };
@@ -403,7 +408,7 @@ fn a_try_whose_every_arm_terminates_stops_the_body_walk_at_the_try() {
     assert_eq!(
         raises.len(),
         1,
-        "the try body's own arity-mismatch unpack must still fire: {:?}",
+        "a provable raise is spoken even when `except ValueError` catches it: {:?}",
         findings.iter().map(|f| &f.message).collect::<Vec<_>>()
     );
     let blockers: Vec<&Finding> = findings.iter().filter(|f| f.code == "RTS7002").collect();
@@ -411,6 +416,82 @@ fn a_try_whose_every_arm_terminates_stops_the_body_walk_at_the_try() {
         blockers.is_empty(),
         "the unreachable `return over_first` past the terminating try must not report a blocker: {:?}",
         findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+    );
+}
+
+/// The UNCAUGHT twin of the row above: the same arity-mismatch unpack in
+/// the same `try`, but the handler names a DIFFERENT exception class
+/// (`except KeyError`), which never catches a `ValueError`. Nothing
+/// transfers to the handler and the raise escapes the function, so
+/// besides firing the same finding the body walks on and the try path
+/// is decided by `arm_terminates_or_provably_raises`.
+#[test]
+fn a_provable_raise_no_handler_catches_still_fires_inside_a_try() {
+    let Some(kernel) = loaded_kernel() else { return };
+    let module = parsed(concat!(
+        "from typing import Annotated\n",
+        "from pydantic import Field\n",
+        "type Age = Annotated[int, Field(ge=0, le=120)]\n",
+        "def f() -> Age:\n",
+        "    first = 40\n",
+        "    triple = (200, 201, 202)\n",
+        "    try:\n",
+        "        over_first, over_second = triple\n",
+        "    except KeyError:\n",
+        "        return first\n",
+        "    return first\n",
+    ));
+    let findings = findings_for_module(&module, &kernel);
+    let raises: Vec<&Finding> = findings
+        .iter()
+        .filter(|f| f.code == "RTS7001" && f.message.contains("provably raises ValueError"))
+        .collect();
+    assert_eq!(
+        raises.len(),
+        1,
+        "a ValueError no `except KeyError` catches must still fire: {:?}",
+        findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+    );
+}
+
+/// The caught-raise rule's two halves in one body, so neither can be
+/// traded for the other. The unpack provably raises `ValueError` and
+/// `except ValueError` catches it: the raise's own finding is SPOKEN
+/// (reporting does not depend on the catch), and the statement AFTER
+/// it in the try body — an out-of-set write to a declared `Age` slot
+/// that would fire on its own — is never walked, because control left
+/// the body at the raise.
+#[test]
+fn a_caught_provable_raise_is_spoken_and_stops_the_try_body_walk() {
+    let Some(kernel) = loaded_kernel() else { return };
+    let module = parsed(concat!(
+        "from typing import Annotated\n",
+        "from pydantic import Field\n",
+        "type Age = Annotated[int, Field(ge=0, le=120)]\n",
+        "def f() -> None:\n",
+        "    triple = (200, 201, 202)\n",
+        "    try:\n",
+        "        over_first, over_second = triple\n",
+        "        past: Age = 300\n",
+        "    except ValueError:\n",
+        "        return\n",
+    ));
+    let findings = findings_for_module(&module, &kernel);
+    let messages: Vec<&String> = findings.iter().map(|f| &f.message).collect();
+    let raises: Vec<&Finding> = findings
+        .iter()
+        .filter(|f| f.code == "RTS7001" && f.message.contains("provably raises ValueError"))
+        .collect();
+    assert_eq!(
+        raises.len(),
+        1,
+        "the caught raise is spoken: {:?}",
+        messages
+    );
+    assert!(
+        !messages.iter().any(|message| message.contains("'300'")),
+        "the statement after the raise never runs, so its own out-of-set write must not be judged: {:?}",
+        messages
     );
 }
 

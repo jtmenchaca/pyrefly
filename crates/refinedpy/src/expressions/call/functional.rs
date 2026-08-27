@@ -7,8 +7,10 @@ use std::sync::Arc;
 
 use refined_domain::abstract_value::AbstractValue;
 use refined_domain::abstract_value::Kind;
+use refined_domain::abstract_value::SetKindTag;
 use refined_domain::lattice_operations::truthiness;
 use refined_kernel::kernel_interface::RefinedTSKernel;
+use refined_sets::repetition_window_forms::as_repetition;
 use ruff_python_ast::Expr;
 
 use crate::collection_models;
@@ -59,7 +61,7 @@ pub(in super::super) fn call_two_argument_expression(
 /// callable shapes (a one-parameter `Expr::Lambda`, or a bare
 /// `Expr::Name` resolving to a same-module one-parameter `def`), same
 /// decline on any other shape.
-pub(in super::super) fn call_one_argument_expression(
+pub(crate) fn call_one_argument_expression(
     function_expr: &Expr,
     argument: &AbstractValue,
     environment: &Environment,
@@ -83,6 +85,45 @@ pub(in super::super) fn call_one_argument_expression(
         }
         _ => None,
     }
+}
+
+/// `sorted(iterable, key=..., reverse=...)` over a receiver whose value
+/// is a REPETITION WINDOW — see the call site's own doc in
+/// `evaluate_call` for the clause reading and for why a known
+/// `Kind::List` receiver is not answered here.
+///
+/// The window is the whole answer: `as_repetition` reads it back to one
+/// element set repeated over an item-count range, which states nothing
+/// about the ORDER of the positions, so a reordering leaves it exactly
+/// as it was. `key=` and `reverse=` are the only keywords `sorted`
+/// accepts (functions.rst pins the signature `sorted(iterable, /, *,
+/// key=None, reverse=False)`), and neither changes the item set, so
+/// their VALUES are never read here — a `key` this domain could not
+/// evaluate would still not change the answer.
+///
+/// `None` for a receiver that is not a bare repetition window, more than
+/// one positional argument, or a keyword outside that pair (a spelling
+/// `sorted` itself would reject).
+pub(in super::super) fn sorted_over_star_with_keywords(
+    call: &ruff_python_ast::ExprCall,
+    environment: &Environment,
+    kernel: &Arc<RefinedTSKernel>,
+) -> Option<AbstractValue> {
+    let [iterable_expr] = &*call.arguments.args else {
+        return None;
+    };
+    for keyword in &call.arguments.keywords {
+        let name = keyword.arg.as_ref()?;
+        if name.id.as_str() != "key" && name.id.as_str() != "reverse" {
+            return None;
+        }
+    }
+    let iterable = evaluate_expression(iterable_expr, environment, kernel);
+    if iterable.kind != Kind::Set || iterable.set_kind_tag != SetKindTag::None {
+        return None;
+    }
+    as_repetition(&iterable.set)?;
+    Some(iterable)
 }
 
 /// `functools.reduce(function, iterable[, initializer])` —

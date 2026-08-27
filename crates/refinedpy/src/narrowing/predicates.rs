@@ -151,9 +151,9 @@ fn is_bare_string_predicate_call<'a>(expression: &'a Expr, method: &str) -> Opti
 }
 
 
-/// `re.fullmatch(pattern, name)` / `re.match` / `re.search` as the
-/// whole condition: a truthy match object proves `name`'s string is in
-/// the pattern's own language (library/re.html: `fullmatch` — "the
+/// `re.fullmatch(pattern, subject)` / `re.match` / `re.search` as the
+/// whole condition: a truthy match object proves the subject's string is
+/// in the pattern's own language (library/re.html: `fullmatch` — "the
 /// whole string matches"; `match` — "at the beginning of the string";
 /// `search` — "the first location where"). The pattern compiles through
 /// the SAME `format_grammar` the pydantic `pattern=` kwarg uses
@@ -165,10 +165,26 @@ fn is_bare_string_predicate_call<'a>(expression: &'a Expr, method: &str) -> Opti
 /// segment pattern prover reads one chain, never a stack (surface.rs's
 /// own `pattern` branch documents the identical strip). The FALSE arm
 /// narrows nothing: "no match" has no complement this grammar states.
-/// A non-literal pattern, keyword or flag arguments, a non-name
-/// subject, a non-Set binding, or a pattern `format_grammar` refuses
-/// all decline — the honest default.
-pub(super) fn narrow_regex_module_call(call: &ruff_python_ast::ExprCall, environment: &mut Environment, truth: bool) {
+///
+/// The subject is any PLACE (`env::tracked_place_of`) — a bare name, an
+/// attribute chain, or a literal-index read like `v[0]`. A guard over
+/// `v[0]` narrows that place, and the SAME read inside the guarded
+/// branch answers from it (`expressions::evaluate_subscript` consults
+/// `read_path` first, exactly as an attribute read already does), since
+/// a place is what makes two identically-spelled reads the same read. A
+/// write to `v` between the guard and the read drops the fact through
+/// the one forget resolver, so the fact only stands while the base is
+/// genuinely unwritten.
+///
+/// A non-literal pattern, keyword or flag arguments, a subject that is
+/// no place at all, a binding that is not a `Kind::Set`, or a pattern
+/// `format_grammar` refuses all decline — the honest default.
+pub(super) fn narrow_regex_module_call(
+    call: &ruff_python_ast::ExprCall,
+    environment: &mut Environment,
+    kernel: &Arc<RefinedTSKernel>,
+    truth: bool,
+) {
     if !truth {
         return;
     }
@@ -190,10 +206,10 @@ pub(super) fn narrow_regex_module_call(call: &ruff_python_ast::ExprCall, environ
     let Expr::StringLiteral(literal) = &call.arguments.args[0] else {
         return;
     };
-    let Some(name) = name_of(&call.arguments.args[1]) else {
+    let Some(place) = crate::env::tracked_place_of(&call.arguments.args[1]) else {
         return;
     };
-    let Some(current) = environment.read(name).cloned() else {
+    let Some(current) = read_place(&call.arguments.args[1], &place, environment, kernel) else {
         return;
     };
     if current.kind != Kind::Set {
@@ -218,7 +234,53 @@ pub(super) fn narrow_regex_module_call(call: &ruff_python_ast::ExprCall, environ
         kind_tag: current.kind_tag,
         ..known_set(make_refined_set(combined), None, trust_level_of(&current), current.set_kind_tag)
     };
-    environment.bind(name, narrowed);
+    bind_place(&place, narrowed, environment);
+}
+
+/// What a PLACE currently holds, for a guard leaf that narrows a place
+/// rather than a bare name. Three sources, in the order a later read of
+/// the same place resolves them:
+///
+/// - a path fact this walk already recorded (`read_path`) — an earlier
+///   guard in the same condition already narrowed this place;
+/// - a bare name's own binding (`read`), for a place with no segments;
+/// - the read EVALUATED against the environment, for a place with
+///   segments and no fact yet — `v[0]`'s own element, drawn from
+///   whatever `v` holds. This is the same value the read itself would
+///   answer, so a guard narrows down from exactly what the branch would
+///   otherwise see.
+///
+/// `None` when the place names nothing this environment can value: an
+/// unbound base name, or a read that derives no value at all.
+fn read_place(
+    expression: &Expr,
+    place: &crate::env::TrackedPlace,
+    environment: &Environment,
+    kernel: &Arc<RefinedTSKernel>,
+) -> Option<AbstractValue> {
+    if let Some(fact) = environment.read_path(place) {
+        return Some(fact.clone());
+    }
+    if place.path.is_empty() {
+        return environment.read(&place.binding).cloned();
+    }
+    let value = crate::expressions::evaluate_expression(expression, environment, kernel);
+    match value.kind {
+        Kind::Unknown => None,
+        _ => Some(value),
+    }
+}
+
+/// Records what a guard proved about a PLACE — the bare-name half writes
+/// the name's own binding, so an ordinary later read of that name sees
+/// it through `Environment::read`; a segmented place writes the path
+/// fact, which is what `expressions::evaluate_attribute_read` and
+/// `evaluate_subscript` consult before deriving the read themselves.
+fn bind_place(place: &crate::env::TrackedPlace, value: AbstractValue, environment: &mut Environment) {
+    match place.path.is_empty() {
+        true => environment.bind(&place.binding, value),
+        false => environment.bind_path(place, value),
+    }
 }
 
 /// `all(<predicate> for <var> in <name>)` proving TRUE (functions.rst,

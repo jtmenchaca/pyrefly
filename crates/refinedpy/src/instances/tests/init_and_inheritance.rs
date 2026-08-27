@@ -30,7 +30,7 @@ fn init_derived_field_maps_positional_construction_and_reads_back() {
     assert!(person.fields[0].declared.is_none());
 
     let positional = vec![(integer_value(200.0), range_of("200"))];
-    let verdict = judge_construction(person, &positional, &[], &kernel);
+    let verdict = judge_construction(person, &positional, &[], ConstructionKind::DirectCall, &kernel);
     assert!(verdict.fires.is_empty(), "a plain int field never fires at construction");
     assert_eq!(field_read(&verdict.instance, "age"), Some(integer_value(200.0)));
 }
@@ -62,7 +62,7 @@ fn mixed_annassign_and_init_field_keeps_the_annassign_declared_set_at_the_init_p
     assert!(person.fields[0].declared.is_some(), "the AnnAssign's Age set survives the merge");
 
     let positional = vec![(integer_value(200.0), range_of("200"))];
-    let verdict = judge_construction(person, &positional, &[], &kernel);
+    let verdict = judge_construction(person, &positional, &[], ConstructionKind::DirectCall, &kernel);
     assert_eq!(verdict.fires.len(), 1, "200 fires against the AnnAssign's own Age set");
 }
 
@@ -89,7 +89,7 @@ fn self_write_with_a_literal_rhs_becomes_a_default_only_field() {
     assert!(counter.fields[1].declared.is_none());
     assert_eq!(counter.fields[1].default, Some(integer_value(0.0)));
 
-    let verdict = judge_construction(counter, &[(integer_value(5.0), range_of("5"))], &[], &kernel);
+    let verdict = judge_construction(counter, &[(integer_value(5.0), range_of("5"))], &[], ConstructionKind::DirectCall, &kernel);
     assert_eq!(field_read(&verdict.instance, "total"), Some(integer_value(0.0)));
 }
 
@@ -144,7 +144,7 @@ fn super_init_call_links_the_child_construction_argument_to_the_parent_field() {
     assert_eq!(kid.fields[0].name, "age");
 
     let positional = vec![(integer_value(200.0), range_of("200"))];
-    let verdict = judge_construction(kid, &positional, &[], &kernel);
+    let verdict = judge_construction(kid, &positional, &[], ConstructionKind::DirectCall, &kernel);
     assert_eq!(field_read(&verdict.instance, "age"), Some(integer_value(200.0)));
 }
 
@@ -175,7 +175,7 @@ fn super_init_call_construction_fires_when_the_parent_field_carries_a_refinement
     assert!(kid.fields[0].declared.is_some(), "the parent's AnnAssign-declared Age set carries through");
 
     let positional = vec![(integer_value(200.0), range_of("200"))];
-    let verdict = judge_construction(kid, &positional, &[], &kernel);
+    let verdict = judge_construction(kid, &positional, &[], ConstructionKind::DirectCall, &kernel);
     assert_eq!(verdict.fires.len(), 1, "200 fires against the inherited Age set");
 }
 
@@ -201,6 +201,6 @@ fn a_child_with_no_init_inherits_the_parents_fields_wholesale() {
     assert_eq!(child.fields[0].name, "age");
 
     let positional = vec![(integer_value(40.0), range_of("40"))];
-    let verdict = judge_construction(child, &positional, &[], &kernel);
+    let verdict = judge_construction(child, &positional, &[], ConstructionKind::DirectCall, &kernel);
     assert_eq!(field_read(&verdict.instance, "age"), Some(integer_value(40.0)));
 }

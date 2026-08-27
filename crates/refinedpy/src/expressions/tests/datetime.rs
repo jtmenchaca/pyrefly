@@ -361,12 +361,114 @@ fn test_timedelta_construction_carries_its_days_field() {
     assert_eq!(datetime_field(&value, "days"), Some(5.0));
 }
 
-/// `datetime.timedelta(hours=5)` — a keyword this file does not
-/// read (only `days=` is modeled); the whole construction declines
-/// rather than silently dropping the field.
+/// `datetime.timedelta(hours=5)` — datetime.rst's own conversion table
+/// ("An hour is converted to 3600 seconds") and the normalization at
+/// datetime.rst:221 (`0 <= seconds < 3600*24`): five hours stores as
+/// `days=0, seconds=18000, microseconds=0`.
 #[test]
-fn test_timedelta_construction_with_an_unmodeled_keyword_declines() {
+fn test_timedelta_construction_normalizes_hours_into_seconds() {
     let Some(value) = eval("datetime.timedelta(hours=5)") else { return };
+    assert_eq!(value.kind, Kind::Object);
+    assert_eq!(datetime_field(&value, "days"), Some(0.0));
+    assert_eq!(datetime_field(&value, "seconds"), Some(18_000.0));
+    assert_eq!(datetime_field(&value, "microseconds"), Some(0.0));
+}
+
+/// `datetime.timedelta(milliseconds=1)` — "A millisecond is converted
+/// to 1000 microseconds," landing wholly in the microsecond field.
+#[test]
+fn test_timedelta_construction_normalizes_milliseconds_into_microseconds() {
+    let Some(value) = eval("datetime.timedelta(milliseconds=1)") else { return };
+    assert_eq!(value.kind, Kind::Object);
+    assert_eq!(datetime_field(&value, "days"), Some(0.0));
+    assert_eq!(datetime_field(&value, "seconds"), Some(0.0));
+    assert_eq!(datetime_field(&value, "microseconds"), Some(1_000.0));
+}
+
+/// `datetime.timedelta(printed=5)` — a keyword the constructor does not
+/// have; the whole construction declines rather than silently dropping
+/// the field, the same all-or-nothing discipline every other
+/// construction reader in this file keeps.
+#[test]
+fn test_timedelta_construction_with_an_unknown_keyword_declines() {
+    let Some(value) = eval("datetime.timedelta(printed=5)") else { return };
+    assert_eq!(value.kind, Kind::Unknown);
+}
+
+/// `datetime.timedelta(days=2) // datetime.timedelta(days=1)` —
+/// datetime.rst's `timedelta` operation table (`t1 = t2 // t3`): "an
+/// integer is returned," here exactly 2.
+#[test]
+fn TestA6_xfer_duration_FloorDividingTwoDurationsAnswersTheQuotient() {
+    let Some(value) = eval("datetime.timedelta(days=2) // datetime.timedelta(days=1)") else { return };
+    assert_eq!(value.values, vec![2.0]);
+}
+
+/// `datetime.timedelta(seconds=90) // datetime.timedelta(minutes=1)` —
+/// the same row's "the floor is computed and the remainder (if any) is
+/// thrown away": 90/60 is 1.5, floored to 1.
+#[test]
+fn TestA6_xfer_duration_FloorDivisionTruncatesTheRemainder() {
+    let Some(value) = eval("datetime.timedelta(seconds=90) // datetime.timedelta(minutes=1)") else { return };
+    assert_eq!(value.values, vec![1.0]);
+}
+
+/// `datetime.datetime(...) - datetime.datetime(...)` over two aware-UTC
+/// instants a tenth of a second apart — datetime.rst's `.datetime`
+/// table, note (3). Read back through the millisecond floor division
+/// the corpus's own offset spelling uses: exactly 100.
+#[test]
+fn TestA6_seed_conversion_SubtractingTwoInstantsAnswersTheirExactDifference() {
+    let Some(value) = eval(concat!(
+        "(datetime.datetime(2024, 1, 1, 0, 0, 0, 100000, tzinfo=datetime.timezone.utc)",
+        " - datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc))",
+        " // datetime.timedelta(milliseconds=1)"
+    )) else {
+        return;
+    };
+    assert_eq!(value.values, vec![100.0]);
+}
+
+/// The same subtraction the other way round — datetime.rst states no
+/// sign restriction, and Python's `//` floors, so a negative difference
+/// of exactly 175 milliseconds reads back as -175.
+#[test]
+fn TestA6_seed_conversion_SubtractingInstantsAnswersANegativeDifferenceExactly() {
+    let Some(value) = eval(concat!(
+        "(datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc)",
+        " - datetime.datetime(2024, 1, 1, 0, 0, 0, 175000, tzinfo=datetime.timezone.utc))",
+        " // datetime.timedelta(milliseconds=1)"
+    )) else {
+        return;
+    };
+    assert_eq!(value.values, vec![-175.0]);
+}
+
+/// `datetime.datetime(...) + datetime.timedelta(milliseconds=201)` —
+/// datetime.rst's `.datetime` table, note (1). The shifted instant
+/// carries the millisecond in its own microsecond field.
+#[test]
+fn TestA6_xfer_add_ShiftingAnInstantByADurationLandsOnTheExactInstant() {
+    let Some(value) = eval(
+        "datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc) + datetime.timedelta(milliseconds=201)",
+    ) else {
+        return;
+    };
+    assert_eq!(value.source.as_str(), "datetime_datetime");
+    assert_eq!(datetime_field(&value, "microsecond"), Some(201_000.0));
+    assert_eq!(datetime_field(&value, "second"), Some(0.0));
+}
+
+/// A naive instant minus an aware one raises `TypeError` (datetime.rst
+/// note (3): "If one is aware and the other is naive, `TypeError` is
+/// raised"), so no value flows.
+#[test]
+fn TestA6_xfer_awareness_SubtractingANaiveInstantFromAnAwareOneDeclines() {
+    let Some(value) = eval(
+        "datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc) - datetime.datetime(2024, 1, 1)",
+    ) else {
+        return;
+    };
     assert_eq!(value.kind, Kind::Unknown);
 }
 

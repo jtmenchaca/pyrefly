@@ -23,7 +23,7 @@ use crate::surface::AliasEntry;
 use crate::surface::SurfaceImports;
 use crate::surface::compile_aliases;
 use crate::surface::surface_imports;
-use crate::typereading::DeclaredRefinement;
+use crate::typereading::TypedDictMember;
 use crate::typereading::base_sort_return_refinement;
 use crate::typereading::declared_refinement;
 use crate::typereading::typed_dict_return_refinement;
@@ -169,7 +169,7 @@ fn def_has_a_declared_entry(
     aliases: &HashMap<String, AliasEntry>,
     imports: &SurfaceImports,
     environment: &Environment,
-    typed_dicts: &HashMap<String, Vec<(String, DeclaredRefinement)>>,
+    typed_dicts: &HashMap<String, Vec<TypedDictMember>>,
 ) -> bool {
     if def.parameters.vararg.is_some() || def.parameters.kwarg.is_some() {
         return false;
@@ -238,7 +238,7 @@ fn export_function(
     line_starts: &[usize],
     aliases: &HashMap<String, AliasEntry>,
     imports: &SurfaceImports,
-    typed_dicts: &HashMap<String, Vec<(String, DeclaredRefinement)>>,
+    typed_dicts: &HashMap<String, Vec<TypedDictMember>>,
     derived_returns: &HashMap<String, refined_domain::abstract_value::AbstractValue>,
     derived_blockers: &HashMap<String, String>,
 ) -> Result<Value, String> {

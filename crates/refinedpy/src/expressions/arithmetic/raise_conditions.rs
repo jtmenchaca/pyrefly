@@ -121,8 +121,44 @@ pub(in crate::expressions) fn one_voice_raise_message(message: &str) -> String {
     }
 }
 
-/// Whether a KNOWN Object `container` provably lacks a KNOWN string
-/// `key` — the exact-value companion to
+/// The EXCEPTION CLASS one provable-raise message names — the `ExcType`
+/// half of the `"...provably raises <ExcType>: <detail>"` form
+/// `one_voice_raise_message` above normalizes every such message into.
+/// That form is this family's one shape: every row that decides a
+/// provable raise (`binop_provable_raise`'s `ZeroDivisionError`,
+/// `known_container_index_absent`'s `KeyError`, `bytes_models.rs`'s own
+/// `Raises` messages, and the datetime `TypeError` row) writes the class
+/// immediately after "provably raises" and separates the plain detail
+/// with a colon, so reading the class back out is reading this family's
+/// own stated form rather than a second, parallel encoding of it.
+///
+/// `check::control`'s try walk is the reader: a caught raise is control
+/// flow, not a finding, and deciding "caught" needs the class the
+/// handler is matched against. `None` for a message that does not carry
+/// the form — a caller that cannot name the class must never treat the
+/// raise as caught.
+pub(crate) fn raised_exception_class(message: &str) -> Option<&str> {
+    let (_, rest) = message.split_once("provably raises ")?;
+    let (class, _) = rest.split_once(':')?;
+    let class = class.trim();
+    if class.is_empty() || !class.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
+        return None;
+    }
+    Some(class)
+}
+
+/// Whether a KNOWN Object `container` provably lacks a KNOWN `key` —
+/// read through `collection_models::known_dict_key`, the one key reader
+/// the construction side and the subscript side already share, so every
+/// key sort that can build an entry can also prove one absent: a string,
+/// an int, a whole/zero float, and an IDENTITY key (a bare `object()`
+/// sentinel or a constructed class instance, `identity_key_tag`'s own
+/// doc). Reading only exact STRINGS here left an identity-keyed lookup
+/// on a mapping known to be empty — `weakref.WeakKeyDictionary()` then
+/// `m[key]` on a `_Key()` instance never inserted, A8.xfer.weak's own
+/// `never_inserted_key_absent` — with no reading at all, even though the
+/// closed empty dict states that key's absence exactly. The exact-value
+/// companion to
 /// `collection_models::subscript_read`'s dict row, deciding the same
 /// membership question directly against `container.keys` so a caller
 /// can tell "provably absent" apart from "not modeled" (which
@@ -137,12 +173,15 @@ pub(in crate::expressions) fn known_container_index_absent(container: &AbstractV
     if container.kind != Kind::Object {
         return None;
     }
-    let key = exact_string_values(index).map(code_points_to_string)??;
-    let present = container.keys.iter().any(|entry| entry.name == key);
+    let key = crate::collection_models::known_dict_key(index)?;
+    let present = container
+        .keys
+        .iter()
+        .any(|entry| entry.name == key.name && entry.numeric == key.numeric);
     if present {
         None
     } else {
-        Some(format!("KeyError: '{key}'"))
+        Some(format!("KeyError: {}", key.spelling()))
     }
 }
 
@@ -182,6 +221,41 @@ pub(in crate::expressions) fn domain_limited_family_possible_raise(
         return None;
     }
     Some((call.range(), family.raise_message().to_owned()))
+}
+
+/// A method call whose RECEIVER admits `None` alongside a present value
+/// (`re.match(...).group(0)` on the `Match | None` that call answers, an
+/// `Optional[Box]` parameter's own `.method()`) — the sometimes-raising
+/// shape `domain_limited_family_possible_raise` above names for a
+/// straddling math window, read here off the receiver's own maybe
+/// carrier. An attribute reference "either returns a value or raises
+/// `AttributeError`" (reference/expressions.rst, "Attribute
+/// references"), and `None` carries no attribute a class field or method
+/// names, so the runs where the receiver is absent raise while the rest
+/// still produce this call's own value.
+///
+/// `None` when the receiver is not a maybe carrier at all (a present
+/// value, an unread value — neither states a straddle), and `None` when
+/// the carrier is PROVED absent: that is the all-or-nothing claim
+/// `provable_raise` owns, never this sometimes-raising one, the same
+/// disjointness `binop_possible_raise` keeps against an always-zero
+/// divisor.
+pub(in crate::expressions) fn absent_receiver_possible_raise(
+    call: &ruff_python_ast::ExprCall,
+    environment: &Environment,
+    kernel: &Arc<RefinedTSKernel>,
+) -> Option<(TextRange, String)> {
+    let Expr::Attribute(attribute) = call.func.as_ref() else {
+        return None;
+    };
+    let receiver = evaluate_expression(attribute.value.as_ref(), environment, kernel);
+    if receiver.kind != Kind::PossiblyUndefined || receiver.proved_absent {
+        return None;
+    }
+    Some((
+        call.range(),
+        crate::diagnostic_sentences::attribute_on_a_receiver_that_admits_none(attribute.attr.as_str()),
+    ))
 }
 
 /// A call expression's own provable raise, once its callee and every
@@ -237,6 +311,32 @@ pub(in crate::expressions) fn call_provable_raise(
         }
     }
     if let Expr::Name(name) = call.func.as_ref() {
+        // `min(<empty iterable>)`/`max(<empty iterable>)` with no
+        // `default=`: "The *default* argument specifies an object to
+        // return if the provided iterable is empty. If the iterable is
+        // empty and *default* is not provided, a ValueError is raised"
+        // (library/functions.rst, `min`/`max`). Decided only on the
+        // SINGLE-ARGUMENT iterable form whose items are known empty —
+        // the multi-positional form (`max(a, b, c)`) never consults an
+        // iterable at all, and an unread argument decides nothing.
+        if matches!(name.id.as_str(), "min" | "max")
+            && environment.read(name.id.as_str()).is_none()
+            && call.arguments.keywords.is_empty()
+        {
+            if let [only] = &*call.arguments.args {
+                let iterable = evaluate_expression(only, environment, kernel);
+                if iterable.kind == Kind::List && iterable.items.is_empty() {
+                    return Some((
+                        call.range(),
+                        format!(
+                            "this expression provably raises ValueError: {}() arg is an empty sequence",
+                            name.id.as_str()
+                        ),
+                    ));
+                }
+            }
+            return None;
+        }
         // a `base=` keyword changes the parsing rules entirely (a
         // non-decimal radix admits letters as digits) — this row only
         // ever decides the base-10 default, so ANY keyword argument
@@ -487,6 +587,47 @@ pub(in crate::expressions) fn call_provable_raise(
                             ),
                         ));
                     }
+                }
+            }
+        }
+        // `list.pop()`/`list.pop(i)` on a list whose items are known:
+        // "It raises an IndexError if the list is empty or the index is
+        // outside the list range" (tutorial/datastructures.rst,
+        // `list.pop([i])`). An empty known list raises for EVERY form;
+        // a non-empty one raises only when the known index falls
+        // outside `[-len, len)`. An unread receiver or index decides
+        // nothing and falls through to the ordinary value read.
+        if attribute.attr.as_str() == "pop" {
+            let receiver = evaluate_expression(&attribute.value, environment, kernel);
+            if receiver.kind == Kind::List {
+                let length = receiver.items.len() as i64;
+                match &*call.arguments.args {
+                    [] => {
+                        if length == 0 {
+                            return Some((
+                                call.range(),
+                                "this expression provably raises IndexError: pop from empty list".to_owned(),
+                            ));
+                        }
+                    }
+                    [index_expr] => {
+                        let index = evaluate_expression(index_expr, environment, kernel);
+                        if index.kind == Kind::Values
+                            && index.values.len() == 1
+                            && index.kind_tag == Some(PrimitiveKind::Integer)
+                        {
+                            let position = index.values[0] as i64;
+                            if position < -length || position >= length {
+                                return Some((
+                                    call.range(),
+                                    format!(
+                                        "this expression provably raises IndexError: pop index out of range, the index is {position}"
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
         }

@@ -179,13 +179,53 @@ fn test_tracked_place_of_a_bare_name_has_an_empty_path() {
     assert!(place.path.is_empty());
 }
 
-/// A call, a subscript, or any other root names no place at all —
-/// the checker cannot say the chain survives past a shape this
-/// reader does not recognize.
+/// A call, or any other root this reader does not recognize, names no
+/// place at all — the checker cannot say the chain survives past it.
 #[test]
 fn test_tracked_place_of_declines_a_non_attribute_root() {
     let parsed = ruff_python_parser::parse_expression("f().n").expect("test source must parse");
     assert!(tracked_place_of(&parsed.into_expr()).is_none());
+}
+
+/// A LITERAL-index subscript names a place, spelled with the source's
+/// own brackets — `v[0]` is the segment `[0]` under the base `v`, and
+/// `d["code"]` the segment `["code"]`, so an index segment never
+/// collides with an attribute segment of the same text.
+#[test]
+fn test_tracked_place_of_reads_a_literal_index_subscript() {
+    let parsed = ruff_python_parser::parse_expression("v[0]").expect("test source must parse");
+    let place = tracked_place_of(&parsed.into_expr()).expect("v[0] is a readable place");
+    assert_eq!(place.binding, "v");
+    assert_eq!(place.path, vec!["[0]".to_owned()]);
+    assert_eq!(place.words(), "v[0]");
+
+    let parsed = ruff_python_parser::parse_expression("d[\"code\"]").expect("test source must parse");
+    let place = tracked_place_of(&parsed.into_expr()).expect("d[\"code\"] is a readable place");
+    assert_eq!(place.words(), "d[\"code\"]");
+}
+
+/// A COMPUTED index names no place: two reads written the same way can
+/// select different elements, so a fact recorded at one is not a fact
+/// about the other. A negative literal is read the same way — it
+/// selects by the sequence's own length, not by the spelling.
+#[test]
+fn test_tracked_place_of_declines_a_computed_or_negative_index() {
+    for source in ["v[i]", "v[n + 1]", "v[-1]", "v[1:2]"] {
+        let parsed = ruff_python_parser::parse_expression(source).expect("test source must parse");
+        assert!(tracked_place_of(&parsed.into_expr()).is_none(), "{source} names no place");
+    }
+}
+
+/// An index segment continues its base exactly as an attribute segment
+/// does, so the one forget resolver drops `v[0]` on a write to `v` —
+/// the invariant the subscript-read narrowing stands on.
+#[test]
+fn test_an_index_segment_continues_its_base() {
+    let v = TrackedPlace::bare("v");
+    let v_0 = v.extend_index("0");
+    let v_1 = v.extend_index("1");
+    assert!(v_0.extends(&v), "v[0] continues v");
+    assert!(!v_0.extends(&v_1), "v[0] and v[1] are siblings, not continuations");
 }
 
 /// `bind_path`/`read_path` round-trip a fact recorded at a path.

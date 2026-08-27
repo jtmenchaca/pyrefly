@@ -8,15 +8,15 @@ fn judge_construction_maps_positional_arguments_in_declaration_order() {
     let model = bare_model(
         "Person",
         vec![
-            ClassField { name: "age".to_owned(), declared: Some(age_declared()), default: None },
-            ClassField { name: "label".to_owned(), declared: None, default: None },
+            ClassField { name: "age".to_owned(), declared: Some(age_declared()), default: None, base_sort: None },
+            ClassField { name: "label".to_owned(), declared: None, default: None, base_sort: None },
         ],
     );
     let positional = vec![
         (integer_value(40.0), range_of("40")),
         (known_values(vec![0.0], PrimitiveKind::String, TrustProved), range_of("label")),
     ];
-    let verdict = judge_construction(&model, &positional, &[], &kernel);
+    let verdict = judge_construction(&model, &positional, &[], ConstructionKind::DirectCall, &kernel);
     assert!(verdict.fires.is_empty());
     assert_eq!(field_read(&verdict.instance, "age"), Some(integer_value(40.0)));
 }
@@ -28,10 +28,10 @@ fn judge_construction_keyword_out_of_set_fires() {
     let Some(kernel) = loaded_kernel() else { return };
     let model = bare_model(
         "Person",
-        vec![ClassField { name: "age".to_owned(), declared: Some(age_declared()), default: None }],
+        vec![ClassField { name: "age".to_owned(), declared: Some(age_declared()), default: None, base_sort: None }],
     );
     let keyword = vec![("age".to_owned(), integer_value(200.0), range_of("200"))];
-    let verdict = judge_construction(&model, &[], &keyword, &kernel);
+    let verdict = judge_construction(&model, &[], &keyword, ConstructionKind::DirectCall, &kernel);
     assert_eq!(verdict.fires.len(), 1);
     assert!(verdict.fires[0].1.contains("'200'"), "{}", verdict.fires[0].1);
 }
@@ -43,10 +43,10 @@ fn judge_construction_unknown_keyword_declines_whole() {
     let Some(kernel) = loaded_kernel() else { return };
     let model = bare_model(
         "Person",
-        vec![ClassField { name: "age".to_owned(), declared: Some(age_declared()), default: None }],
+        vec![ClassField { name: "age".to_owned(), declared: Some(age_declared()), default: None, base_sort: None }],
     );
     let keyword = vec![("nickname".to_owned(), integer_value(1.0), range_of("1"))];
-    let verdict = judge_construction(&model, &[], &keyword, &kernel);
+    let verdict = judge_construction(&model, &[], &keyword, ConstructionKind::DirectCall, &kernel);
     assert!(verdict.fires.is_empty());
     assert_eq!(verdict.instance.kind, Kind::Unknown);
 }
@@ -58,9 +58,9 @@ fn judge_construction_missing_argument_takes_the_default() {
     let Some(kernel) = loaded_kernel() else { return };
     let model = bare_model(
         "Grow",
-        vec![ClassField { name: "age".to_owned(), declared: None, default: Some(integer_value(18.0)) }],
+        vec![ClassField { name: "age".to_owned(), declared: None, default: Some(integer_value(18.0)), base_sort: None }],
     );
-    let verdict = judge_construction(&model, &[], &[], &kernel);
+    let verdict = judge_construction(&model, &[], &[], ConstructionKind::DirectCall, &kernel);
     assert!(verdict.fires.is_empty());
     assert_eq!(field_read(&verdict.instance, "age"), Some(integer_value(18.0)));
 }
@@ -73,9 +73,9 @@ fn judge_construction_missing_argument_with_no_default_holds_declared_set() {
     let Some(kernel) = loaded_kernel() else { return };
     let model = bare_model(
         "Person",
-        vec![ClassField { name: "age".to_owned(), declared: Some(age_declared()), default: None }],
+        vec![ClassField { name: "age".to_owned(), declared: Some(age_declared()), default: None, base_sort: None }],
     );
-    let verdict = judge_construction(&model, &[], &[], &kernel);
+    let verdict = judge_construction(&model, &[], &[], ConstructionKind::DirectCall, &kernel);
     assert!(verdict.fires.is_empty());
     let field = field_read(&verdict.instance, "age").expect("age field present");
     assert_eq!(field.kind, Kind::Set);
@@ -106,7 +106,7 @@ fn model_post_init_is_silent_when_the_dependent_check_passes() {
         ("lo".to_owned(), integer_value(10.0), range_of("10")),
         ("hi".to_owned(), integer_value(20.0), range_of("20")),
     ];
-    let verdict = judge_construction(range_model, &[], &keyword, &kernel);
+    let verdict = judge_construction(range_model, &[], &keyword, ConstructionKind::DirectCall, &kernel);
     assert!(verdict.fires.is_empty(), "hi (20) >= lo (10): the dependent check never raises");
 }
 
@@ -132,7 +132,7 @@ fn model_post_init_fires_when_the_dependent_check_provably_raises() {
         ("lo".to_owned(), integer_value(10.0), range_of("10")),
         ("hi".to_owned(), integer_value(5.0), range_of("5")),
     ];
-    let verdict = judge_construction(range_model, &[], &keyword, &kernel);
+    let verdict = judge_construction(range_model, &[], &keyword, ConstructionKind::DirectCall, &kernel);
     assert_eq!(verdict.fires.len(), 1, "hi (5) < lo (10): the dependent check provably raises");
     assert!(verdict.fires[0].1.contains("ValueError"), "{}", verdict.fires[0].1);
     assert!(verdict.fires[0].1.contains("hi must be >= lo"), "{}", verdict.fires[0].1);
@@ -157,7 +157,7 @@ fn model_post_init_never_fires_on_an_undetermined_condition() {
     let imports = crate::surface::surface_imports(&module);
     let table = class_table(&module, &aliases, &imports, &kernel);
     let range_model = table.get("Range").expect("Range class recorded");
-    let verdict = judge_construction(range_model, &[], &[], &kernel);
+    let verdict = judge_construction(range_model, &[], &[], ConstructionKind::DirectCall, &kernel);
     assert!(verdict.fires.is_empty(), "an undetermined comparison never guesses a fire");
 }
 
@@ -167,9 +167,9 @@ fn model_post_init_never_fires_on_an_undetermined_condition() {
 fn field_read_on_the_built_instance() {
     let Some(kernel) = loaded_kernel() else { return };
     let model =
-        bare_model("Person", vec![ClassField { name: "age".to_owned(), declared: None, default: None }]);
+        bare_model("Person", vec![ClassField { name: "age".to_owned(), declared: None, default: None, base_sort: None }]);
     let positional = vec![(integer_value(40.0), range_of("40"))];
-    let verdict = judge_construction(&model, &positional, &[], &kernel);
+    let verdict = judge_construction(&model, &positional, &[], ConstructionKind::DirectCall, &kernel);
     assert_eq!(field_read(&verdict.instance, "age"), Some(integer_value(40.0)));
     assert_eq!(field_read(&verdict.instance, "missing"), None);
     assert_eq!(field_read(&unknown(), "age"), None);
@@ -182,7 +182,7 @@ fn field_write_judgment_fires_on_an_out_of_set_write() {
     let Some(kernel) = loaded_kernel() else { return };
     let model = bare_model(
         "Aged",
-        vec![ClassField { name: "age".to_owned(), declared: Some(age_declared()), default: None }],
+        vec![ClassField { name: "age".to_owned(), declared: Some(age_declared()), default: None, base_sort: None }],
     );
     let verdict = field_write_judgment(&model, "age", &integer_value(200.0), &kernel);
     assert!(matches!(verdict, Some(Verdict::Fire(_))));
@@ -191,7 +191,7 @@ fn field_write_judgment_fires_on_an_out_of_set_write() {
 #[test]
 fn field_write_judgment_is_none_for_an_undeclared_field() {
     let Some(kernel) = loaded_kernel() else { return };
-    let model = bare_model("Aged", vec![ClassField { name: "age".to_owned(), declared: None, default: None }]);
+    let model = bare_model("Aged", vec![ClassField { name: "age".to_owned(), declared: None, default: None, base_sort: None }]);
     let verdict = field_write_judgment(&model, "age", &integer_value(200.0), &kernel);
     assert!(verdict.is_none(), "an undeclared field writes with no judgment");
 }
@@ -213,7 +213,7 @@ fn pydantic_style_annotated_field_construction_fires_over_ceiling() {
     let person = table.get("Person").expect("Person class recorded");
     assert!(person.fields[0].declared.is_some(), "inline Annotated field reads its own set");
     let keyword = vec![("age".to_owned(), integer_value(200.0), range_of("200"))];
-    let verdict = judge_construction(person, &[], &keyword, &kernel);
+    let verdict = judge_construction(person, &[], &keyword, ConstructionKind::DirectCall, &kernel);
     assert_eq!(verdict.fires.len(), 1);
     assert!(verdict.fires[0].1.contains("'200'"), "{}", verdict.fires[0].1);
 }

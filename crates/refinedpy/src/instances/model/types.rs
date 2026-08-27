@@ -72,4 +72,16 @@ pub struct ClassField {
     pub name: String,
     pub declared: Option<DeclaredRefinement>,
     pub default: Option<AbstractValue>,
+    /// The bare `int`/`float`/`str`/`bool` sort the field's annotation
+    /// states, when `declared` reads no refinement of its own
+    /// (`typereading::base_sort_return_refinement`). READ ONLY BY THE
+    /// SEED (`check::seed::class_parameter_object`), so a `a: int`
+    /// field of a class-typed parameter starts as the whole-int ray a
+    /// bare `raw: int` PARAMETER already starts as, and an ordinary
+    /// range guard over `o.a` narrows it the same way. Deliberately
+    /// separate from `declared`: the write-judging tables read
+    /// `declared` alone, so a bare-`int` field gains no new refusal at
+    /// a write, matching `base_sort_return_refinement`'s own
+    /// "parameter seeding ONLY" scoping.
+    pub base_sort: Option<DeclaredRefinement>,
 }

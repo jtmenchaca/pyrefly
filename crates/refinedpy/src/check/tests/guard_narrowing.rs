@@ -140,6 +140,81 @@ fn an_isinstance_guard_narrows_an_unknown_valued_local_to_its_declared_return() 
     );
 }
 
+// --- A8.xfer.weak: a WeakKeyDictionary's presence guard hands its later read the mapping's own value law ---
+
+/// A8.xfer.weak's own `guarded_weak_read`: `m: weakref.
+/// WeakKeyDictionary[_Key, Age]` seeds the same unbounded-key star a
+/// `dict[K, Age]` parameter seeds (`typereading::declared_refinement`'s
+/// weak-dict arm). `key: _Key` is a PARAMETER (no `instance_identity` of
+/// its own — only a fresh `_Key()` construction gets one), so `key in m`
+/// records presence by `key`'s own BINDING identity rather than by
+/// anything the value states (`narrowing::compare::narrow_dict_
+/// membership_against_literal_key`'s own doc), and `m[key]` reads that
+/// same binding-tagged entry back (`expressions::evaluate_subscript`'s
+/// own binding-keyed arm) — sound because `key` supplies the same
+/// runtime object on both sides while its binding, and `m`'s, stand
+/// unwritten between the guard and the read.
+#[test]
+fn a_weak_key_dictionarys_guarded_read_determines_its_declared_value() {
+    let Some(kernel) = loaded_kernel() else { return };
+    let module = parsed(concat!(
+        "import weakref\n",
+        "from typing import Annotated\n",
+        "from pydantic import Field\n",
+        "type Age = Annotated[int, Field(ge=0, le=150)]\n",
+        "class _Key:\n",
+        "    pass\n",
+        "def guarded_weak_read(m: \"weakref.WeakKeyDictionary[_Key, Age]\", key: _Key) -> Age:\n",
+        "    if key in m:\n",
+        "        value = m[key]\n",
+        "        return value\n",
+        "    return 0\n",
+    ));
+    let findings = findings_for_module(&module, &kernel);
+    assert!(
+        findings.is_empty(),
+        "a WeakKeyDictionary's guarded read must determine its declared value: {:?}",
+        findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+    );
+}
+
+/// The staleness half of the same fact: rebinding `key` BETWEEN the
+/// guard and the read (`key = other`) makes `m[key]` a lookup for a
+/// DIFFERENT runtime object than the one `key in m` proved present —
+/// `Environment::bind`'s own cross-binding invalidation strips the
+/// `"binding:key"`-tagged entry from `m` the moment `key` is rebound, so
+/// the read falls through to the ordinary evaluated-index path, which
+/// cannot read a class instance with no `instance_identity` as a star
+/// key at all (`collection_models::subscript_read::readable_star_key`'s
+/// own scope), landing undetermined — the same "a write between the
+/// guard and the read puts absence back" rule A8.guard.forget's own
+/// `read_after_key_rebind` already proves for a string-keyed dict.
+#[test]
+fn rewriting_the_key_binding_between_the_guard_and_the_read_drops_the_weak_dict_fact() {
+    let Some(kernel) = loaded_kernel() else { return };
+    let module = parsed(concat!(
+        "import weakref\n",
+        "from typing import Annotated\n",
+        "from pydantic import Field\n",
+        "type Age = Annotated[int, Field(ge=0, le=150)]\n",
+        "class _Key:\n",
+        "    pass\n",
+        "def read_after_key_rebind(m: \"weakref.WeakKeyDictionary[_Key, Age]\", key: _Key, other: _Key) -> Age:\n",
+        "    if key in m:\n",
+        "        key = other\n",
+        "        value = m[key]\n",
+        "        return value\n",
+        "    return 0\n",
+    ));
+    let findings = findings_for_module(&module, &kernel);
+    let blockers: Vec<&Finding> = findings.iter().filter(|f| f.code == "RTS7002").collect();
+    assert!(
+        !blockers.is_empty(),
+        "rebinding the key between the guard and the read must drop the presence fact and read undetermined: {:?}",
+        findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+    );
+}
+
 // --- E2.operator: the AugAssign write-site check, restored beside the kernel-computed fold ---
 
 /// E2.operator.py's own `compound_assign_outside_set`: `x: Age`
@@ -370,6 +445,306 @@ fn a_chained_comparisons_ceiling_narrowing_admits_a_later_declared_sink() {
     assert!(
         findings.is_empty(),
         "lo <= x <= hi must narrow x's ceiling so a: Age = x is admitted: {:?}",
+        findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+    );
+}
+
+// --- THE UNREACHABLE-STATEMENT LAW (A5.xfer.default) ---
+
+/// A5.xfer.default's own `or_default_replaces_zero` shape: `x` guarded
+/// to exactly 0.0, then `y = x or 0.5`. Numeric zero is false and `x or
+/// y` returns `y` when `x` is false (reference/expressions.rst,
+/// "Boolean operations"), so `y` is exactly {0.5}, `if y == 0.5:` is
+/// provably true, and the statement after it is unreachable. The walk
+/// STOPS there — nothing past the proved-true arm is judged — but no
+/// unreachable-statement error is reported: no corpus row designates an
+/// unreachable STATEMENT (the dead-code convention designates the
+/// CONDITION, the sink.dead rows' own shape), so a report here would
+/// land a true determination at a position no designation covers.
+#[test]
+fn TestA5_xfer_default_AnUnreachableStatementAfterAProvablyTrueArm() {
+    let Some(kernel) = loaded_kernel() else { return };
+    let module = parsed(concat!(
+        "from typing import Annotated\n",
+        "from pydantic import Field\n",
+        "type Age = Annotated[int, Field(ge=0, le=150)]\n",
+        "def or_default_replaces_zero(x: float) -> Age:\n",
+        "    if x != 0.0:\n",
+        "        return 0\n",
+        "    y = x or 0.5\n",
+        "    if y == 0.5:\n",
+        "        return 5\n",
+        "    return 5\n",
+    ));
+    let findings = findings_for_module(&module, &kernel);
+    assert!(
+        findings.is_empty(),
+        "the walk stops at the proved-true arm and reports nothing — dead code past it \
+         is neither judged nor announced: {:?}",
+        findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+    );
+}
+
+/// The law's own boundary: a guard that merely RESTATES a declared
+/// refinement (`if 0 <= x <= 150:` on a parameter declared `x: Age`) is
+/// the ordinary total-function spelling, so its fall-through default is
+/// never reported as dead code — the same reasoning
+/// `is_admits_none_peel_test` makes for an Optional peel.
+#[test]
+fn TestA5_xfer_default_ARedundantDeclaredGuardKeepsItsFallThrough() {
+    let Some(kernel) = loaded_kernel() else { return };
+    let module = parsed(concat!(
+        "from typing import Annotated\n",
+        "from pydantic import Field\n",
+        "type Age = Annotated[int, Field(ge=0, le=150)]\n",
+        "def restates_the_declaration(x: Age) -> Age:\n",
+        "    if 0 <= x <= 150:\n",
+        "        return x\n",
+        "    return 0\n",
+    ));
+    let findings = findings_for_module(&module, &kernel);
+    assert!(
+        findings.is_empty(),
+        "a guard restating x's own declared window never makes its default dead code: {:?}",
+        findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+    );
+}
+
+// --- THE POSSIBLY-ABSENT RECEIVER LAW (A5.seed.library, A5.xfer.chain) ---
+
+/// A5.seed.library's own `re_match_outside` shape: `re.match` answers
+/// `Match | None` (library/re.rst, `function::match`), so calling
+/// `.group()` on it without a presence guard admits a run where the
+/// receiver is None and the read raises AttributeError
+/// (reference/expressions.rst, "Attribute references").
+#[test]
+fn TestA5_seed_library_AnUnguardedGroupCallOnAMaybeMatchIsRefused() {
+    let Some(kernel) = loaded_kernel() else { return };
+    let module = parsed(concat!(
+        "import re\n",
+        "from typing import Annotated\n",
+        "from pydantic import Field\n",
+        "type Age = Annotated[int, Field(ge=0, le=150)]\n",
+        "def re_match_outside(s: str) -> Age:\n",
+        "    m = re.match(r\"\\d+\", s)\n",
+        "    text = m.group(0)\n",
+        "    return 0\n",
+    ));
+    let findings = findings_for_module(&module, &kernel);
+    let refusals: Vec<&Finding> = findings
+        .iter()
+        .filter(|f| f.code == "RTS7001" && f.message.contains("admits None"))
+        .collect();
+    assert_eq!(
+        refusals.len(),
+        1,
+        "an unguarded .group() on Match | None is refused: {:?}",
+        findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+    );
+}
+
+/// The same shape with the presence guard in place carries no error —
+/// the guard discharges the absence before the read runs.
+#[test]
+fn TestA5_seed_library_AGuardedGroupCallCarriesNoError() {
+    let Some(kernel) = loaded_kernel() else { return };
+    let module = parsed(concat!(
+        "import re\n",
+        "from typing import Annotated\n",
+        "from pydantic import Field\n",
+        "type Age = Annotated[int, Field(ge=0, le=150)]\n",
+        "def re_match_inside(s: str) -> Age:\n",
+        "    m = re.match(r\"\\d+\", s)\n",
+        "    if m is not None:\n",
+        "        text = m.group(0)\n",
+        "        return 0\n",
+        "    return 0\n",
+    ));
+    let findings = findings_for_module(&module, &kernel);
+    assert!(
+        findings.is_empty(),
+        "a presence-guarded .group() carries no error: {:?}",
+        findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+    );
+}
+
+/// A5.xfer.chain's own `chain_guarded_inside` shape: a bare `int` FIELD
+/// of an `Optional[Box]` parameter seeds its base sort (the whole-int
+/// ray), so an ordinary range guard over `o.a` narrows it into Age
+/// exactly as it narrows a bare `raw: int` parameter.
+#[test]
+fn TestA5_xfer_chain_ABareIntFieldNarrowsUnderARangeGuard() {
+    let Some(kernel) = loaded_kernel() else { return };
+    let module = parsed(concat!(
+        "from dataclasses import dataclass\n",
+        "from typing import Annotated, Optional\n",
+        "from pydantic import Field\n",
+        "type Age = Annotated[int, Field(ge=0, le=150)]\n",
+        "@dataclass\n",
+        "class Box:\n",
+        "    a: int\n",
+        "def chain_guarded_inside(o: Optional[Box]) -> Age:\n",
+        "    if o is not None:\n",
+        "        raw = o.a\n",
+        "        if 0 <= raw <= 150:\n",
+        "            a: Age = raw\n",
+        "            return a\n",
+        "    return 0\n",
+    ));
+    let findings = findings_for_module(&module, &kernel);
+    assert!(
+        findings.is_empty(),
+        "a range-guarded bare-int field is admitted into Age: {:?}",
+        findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+    );
+}
+
+/// A8.xfer.delete's own `surviving_key_after_other_delete` row:
+/// stdtypes.rst, "Mapping Types — dict," `del d[key]` — CPython's
+/// `__delitem__` removes exactly the one entry whose key is `key`.
+/// `"a" not in d` guards past a raise, recording "a" present
+/// (`narrow_dict_membership_against_literal_key`'s true-arm doc); `del
+/// d["z"]` inside the `try` only removes "z"'s own entry
+/// (`dict_without_item`'s star arm), which is a DIFFERENT string
+/// literal from "a" — the guarded presence survives the delete on both
+/// the try fork (the delete keeps every other recorded entry) and the
+/// except fork (`del` never registers `d` as bound,
+/// `join_pre_try_with_havoc_for_stmt`'s own scope reading, so the
+/// except arm keeps `d`'s pre-try value, "a" entry included). `"a" in
+/// d` after the try/except is therefore provably `True` on every
+/// surviving path, and the `Age`-returning read that guard protects
+/// carries no error.
+#[test]
+fn a_guarded_key_survives_a_different_literal_keys_delete() {
+    let Some(kernel) = loaded_kernel() else { return };
+    let module = parsed(concat!(
+        "from typing import Annotated\n",
+        "from pydantic import Field\n",
+        "type Age = Annotated[int, Field(ge=0, le=150)]\n",
+        "def surviving_key_after_other_delete(d: dict[str, Age]) -> Age:\n",
+        "    if \"a\" not in d:\n",
+        "        raise ValueError(\"missing key\")\n",
+        "    try:\n",
+        "        del d[\"z\"]\n",
+        "    except KeyError:\n",
+        "        pass\n",
+        "    if \"a\" in d:\n",
+        "        return d[\"a\"]\n",
+        "    return 0\n",
+    ));
+    let findings = findings_for_module(&module, &kernel);
+    assert!(
+        findings.is_empty(),
+        "\"a\"'s guarded presence must survive a different literal key's delete: {:?}",
+        findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+    );
+}
+
+/// The mirror of the row above: a `del d[k]` at a SYMBOLIC key (`k` not
+/// a literal this domain can read) can equal ANY present key at
+/// runtime, so keeping any recorded entry across it would be unsound —
+/// `dict_without_item`'s star arm declines the whole receiver at an
+/// unread key (`known_dict_key(key)?`), and `walk_del_subscript_target`
+/// FORGETS the receiver on that decline (its own "every other decline
+/// still forgets" doc). The forget makes the later guarded read
+/// UNDETERMINED — the one sound outcome — so this pin expects exactly
+/// that undetermined report at the read, and refuses the unsound one:
+/// a fire (or silent acceptance) built on the stale pre-delete entry.
+#[test]
+fn a_symbolic_key_delete_drops_every_recorded_entry() {
+    let Some(kernel) = loaded_kernel() else { return };
+    let module = parsed(concat!(
+        "from typing import Annotated\n",
+        "from pydantic import Field\n",
+        "type Age = Annotated[int, Field(ge=0, le=150)]\n",
+        "def dropped_after_symbolic_delete(d: dict[str, Age], k: str) -> Age:\n",
+        "    if \"a\" not in d:\n",
+        "        raise ValueError(\"missing key\")\n",
+        "    try:\n",
+        "        del d[k]\n",
+        "    except KeyError:\n",
+        "        pass\n",
+        "    if \"a\" in d:\n",
+        "        return d[\"a\"]\n",
+        "    return 0\n",
+    ));
+    let findings = findings_for_module(&module, &kernel);
+    assert!(
+        findings
+            .iter()
+            .all(|finding| finding.message.contains("not yet readable")),
+        "a symbolic-key delete must leave the later read undetermined, never proved from the stale entry: {:?}",
+        findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+    );
+    assert!(
+        !findings.is_empty(),
+        "the forgotten receiver's guarded read must report undetermined, not silently pass"
+    );
+}
+
+/// A8.guard.forget's own `read_after_callee_write` row: `"a" in d`
+/// records presence on `d`'s star (`narrow_dict_membership_against_
+/// literal_key`'s own doc), then `mutate(d)` hands `d` to a same-module
+/// callee whose own body is `d.pop("a", None)` — a write through the
+/// parameter (`body_may_write_through_parameter`'s own doc). The
+/// argument's own recorded entry must not survive that call: this pins
+/// that the guarded `d.get("a")` afterward is no longer silently
+/// accepted as Age — the checker must report SOMETHING at the read
+/// (a fire, since `None` may now flow into `Age`'s admitted window,
+/// or an undetermined report if the read itself cannot be proved), never
+/// the stale acceptance the over-retention bug produced.
+#[test]
+fn a_callee_write_through_a_parameter_stales_the_argument_s_guarded_entry() {
+    let Some(kernel) = loaded_kernel() else { return };
+    let module = parsed(concat!(
+        "from typing import Annotated\n",
+        "from pydantic import Field\n",
+        "type Age = Annotated[int, Field(ge=0, le=150)]\n",
+        "def mutate(d: dict[str, Age]) -> None:\n",
+        "    d.pop(\"a\", None)\n",
+        "def read_after_callee_write(d: dict[str, Age]) -> Age:\n",
+        "    if \"a\" in d:\n",
+        "        mutate(d)\n",
+        "        value = d.get(\"a\")\n",
+        "        return value\n",
+        "    return 0\n",
+    ));
+    let findings = findings_for_module(&module, &kernel);
+    let at_the_return: Vec<&Finding> = findings.iter().filter(|f| f.code == "RTS7001" || f.code == "RTS7002").collect();
+    assert!(
+        !at_the_return.is_empty(),
+        "a receiver handed to a callee that writes it must not keep its guarded entry — \
+         the return must fire or read undetermined, never the stale silent acceptance: {:?}",
+        findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+    );
+}
+
+/// The sibling of the row above: a same-module callee whose body only
+/// READS its parameter (`peek`'s own `return d.get(\"a\")`, no
+/// subscript/attribute store or method call on `d`) never writes through
+/// it, so `body_may_write_through_parameter` answers false and the
+/// caller's guarded entry on `d` survives the call — the guarded
+/// `d[\"a\"]` read afterward still determines Age.
+#[test]
+fn an_effect_free_callee_leaves_the_argument_s_guarded_entry_standing() {
+    let Some(kernel) = loaded_kernel() else { return };
+    let module = parsed(concat!(
+        "from typing import Annotated\n",
+        "from pydantic import Field\n",
+        "type Age = Annotated[int, Field(ge=0, le=150)]\n",
+        "def peek(d: dict[str, Age]) -> Age | None:\n",
+        "    return d.get(\"a\")\n",
+        "def read_after_effect_free_callee(d: dict[str, Age]) -> Age:\n",
+        "    if \"a\" in d:\n",
+        "        peek(d)\n",
+        "        value = d[\"a\"]\n",
+        "        return value\n",
+        "    return 0\n",
+    ));
+    let findings = findings_for_module(&module, &kernel);
+    assert!(
+        findings.is_empty(),
+        "an effect-free callee must leave the caller's guarded entry standing: {:?}",
         findings.iter().map(|f| &f.message).collect::<Vec<_>>()
     );
 }

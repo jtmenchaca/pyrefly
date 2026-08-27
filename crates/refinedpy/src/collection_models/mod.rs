@@ -109,6 +109,7 @@ pub use len_and_get::dict_get_result;
 pub use len_and_get::len_result;
 pub use list_literal::list_literal_value;
 pub use list_literal::tuple_literal_value;
+pub use list_literal::with_referent_identities;
 pub use list_write::list_with_item;
 pub use subscript_read::subscript_read;
 
@@ -185,6 +186,16 @@ pub fn mutated_receiver(method: &str, receiver: &AbstractValue, arguments: &[Abs
     match receiver.kind {
         Kind::List => list_mutated_receiver(method, receiver, arguments),
         Kind::Object => dict_mutated(method, receiver, arguments),
+        // An UNBOUNDED-KEY mapping takes the same dict method rows, over
+        // the recorded-entry half of its shape — see
+        // `dict_mutation::dict_star_mutated_receiver`'s own doc for which
+        // of them a star can answer and why the rest decline.
+        Kind::ObjectStar => dict_mutation::dict_star_mutated_receiver(method, receiver, arguments),
+        // A `set[X]` parameter's own REPETITION-WINDOW seed (no concrete
+        // items to index into) — `list_set_mutation::set_mutated_
+        // receiver`'s own doc states which methods it answers; its `add`
+        // arm additionally records the exact added element for a later
+        // `x in s` to read back as provably present.
         Kind::Set => set_mutated_receiver(method, receiver, arguments),
         _ => None,
     }

@@ -17,7 +17,7 @@ use crate::assignability::{judge, states_sequence, Verdict};
 use crate::check::WalkContext;
 use crate::env::Environment;
 use crate::expressions::evaluate_expression;
-use crate::instances::{judge_construction, ClassModel, ConstructionVerdict};
+use crate::instances::{judge_construction, ClassModel, ConstructionKind, ConstructionVerdict};
 use crate::typereading::DeclaredRefinement;
 
 /// Recognizes `expr` as a class-construction call and judges it, or
@@ -90,7 +90,13 @@ pub(in crate::check) fn construction_call_verdict(
             if let Some(model) = classes.get(callee.id.as_str()) {
                 let positional = evaluate_positional_arguments(&call.arguments.args, environment, context.kernel);
                 let keyword = evaluate_keyword_arguments(&call.arguments.keywords, environment, context.kernel);
-                return Some(judge_construction(model, &positional, &keyword, context.kernel));
+                return Some(judge_construction(
+                    model,
+                    &positional,
+                    &keyword,
+                    ConstructionKind::DirectCall,
+                    context.kernel,
+                ));
             }
         }
         return None;
@@ -102,7 +108,13 @@ pub(in crate::check) fn construction_call_verdict(
         let model = class_model_of_bare_name(attribute.value.as_ref(), context, environment)?;
         let dict_argument = single_dict_argument(&call.arguments)?;
         let keyword = dict_literal_keyword_rows(dict_argument, environment, context.kernel)?;
-        return Some(judge_construction(model, &[], &keyword, context.kernel));
+        return Some(judge_construction(
+            model,
+            &[],
+            &keyword,
+            ConstructionKind::ValidatingParse,
+            context.kernel,
+        ));
     }
     if attribute.attr.as_str() == "model_validate_json" {
         let model = class_model_of_bare_name(attribute.value.as_ref(), context, environment)?;
@@ -112,7 +124,13 @@ pub(in crate::check) fn construction_call_verdict(
         let [_single_argument] = call.arguments.args.as_ref() else {
             return None;
         };
-        return Some(judge_construction(model, &[], &[], context.kernel));
+        return Some(judge_construction(
+            model,
+            &[],
+            &[],
+            ConstructionKind::ValidatingParse,
+            context.kernel,
+        ));
     }
     if attribute.attr.as_str() == "validate_python" {
         // `TypeAdapter(<ClassName>).validate_python(<dict literal>)` —
@@ -135,7 +153,13 @@ pub(in crate::check) fn construction_call_verdict(
         if let Some(model) = environment.classes().unwrap_or(&context.classes).get(class_name.id.as_str()) {
             let dict_argument = single_dict_argument(&call.arguments)?;
             let keyword = dict_literal_keyword_rows(dict_argument, environment, context.kernel)?;
-            return Some(judge_construction(model, &[], &keyword, context.kernel));
+            return Some(judge_construction(
+                model,
+                &[],
+                &keyword,
+                ConstructionKind::ValidatingParse,
+                context.kernel,
+            ));
         }
         // THE ADAPTER-ALIAS ROUTE: `TypeAdapter(<alias>).validate_python(<scalar
         // expr>)` where `<alias>` is a bare `type X = ...` name
@@ -257,7 +281,24 @@ pub(in crate::check) fn adapter_alias_verdict(
             value = parsed;
         }
     }
-    match judge(&value, &declared, context.kernel) {
+    // THE PARSE-IS-A-GUARD LAW (D3.guard's own row: "a schema parse is
+    // itself a guard that narrows to the declared set"): a parse is not
+    // an assignment. Its job is to decide at runtime which values pass,
+    // raising `ValidationError` for the rest, so a fire here is only
+    // right when this call could NEVER produce a value — an argument
+    // whose own value is exactly known and sits outside the set
+    // (`validate_python(200)` against `Age`, `validate_python("too-long
+    // -string")` against `Label`). An argument that is merely a WIDER
+    // SET (`parts[1]`'s own Σ*, an unbounded int) states no such thing:
+    // some of its members validate and the rest raise, which is the
+    // construct working, not a defect. It takes the same reading an
+    // unread argument already takes — no fire, and the call answers the
+    // declared set, which is exactly the narrowing the parse performs.
+    let judged = match judge(&value, &declared, context.kernel) {
+        Verdict::Fire(message) if value.kind == Kind::Set => Verdict::Undetermined(message),
+        other => other,
+    };
+    match judged {
         Verdict::Fire(message) => Some(ConstructionVerdict {
             fires: vec![(range, message)],
             // THE REFUSED-WRITE LAW (this file's own header note): the

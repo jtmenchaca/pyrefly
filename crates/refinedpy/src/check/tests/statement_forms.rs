@@ -402,15 +402,16 @@ fn a_try_body_out_of_set_ann_assign_fires_with_no_blocker_for_the_try() {
 }
 
 #[test]
-fn a_try_except_join_forgets_the_declared_slots_pre_try_out_of_set_value() {
+fn a_try_except_join_does_not_carry_the_declared_slots_pre_try_out_of_set_value() {
     let Some(kernel) = loaded_kernel() else { return };
     // total starts OUT of Age's set (200, fires once). The try body
     // rebinds it in-set and then returns, so the try path never
-    // survives to the join — only the handler does. The handler's
-    // starting environment must forget the try body's bound names
-    // (total among them), so the pre-try 200 does not leak through
-    // the join into the post-try environment. Had it leaked, the
-    // final read below would fire a SECOND time on the stale 200.
+    // survives to the join — only the handler does. `total` is bound
+    // BEFORE the try and written inside it, so the handler holds the
+    // join of its pre-try value with unknown, which is unknown — the
+    // stale 200 is not a value the post-try read can judge. Had the
+    // pre-try value carried through instead, the final read below would
+    // fire a SECOND time on it.
     let module = parsed(concat!(
         "from typing import Annotated\n",
         "from pydantic import Field\n",
@@ -440,6 +441,70 @@ fn a_try_except_join_forgets_the_declared_slots_pre_try_out_of_set_value() {
     assert!(
         try_blockers.is_empty(),
         "the try statement itself must never be recorded as a blocker: {:?}",
+        findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+    );
+}
+
+/// A name bound BEFORE the try and never written inside it stays BOUND
+/// in the handler — the write set is what the handler adjusts, and this
+/// name is not in it. The pre-try declaration fires once on 200; the
+/// refused-write law then keeps the DECLARED set on the name, so the
+/// handler's own read judges against Age's set and fires nothing — one
+/// defect, reported once at the statement that introduced it.
+#[test]
+fn a_name_the_try_body_never_writes_keeps_its_value_in_the_handler() {
+    let Some(kernel) = loaded_kernel() else { return };
+    let module = parsed(concat!(
+        "from typing import Annotated\n",
+        "from pydantic import Field\n",
+        "type Age = Annotated[int, Field(ge=0, le=120)]\n",
+        "def f() -> None:\n",
+        "    kept: Age = 200\n",
+        "    try:\n",
+        "        other = 1\n",
+        "    except Exception:\n",
+        "        check: Age = kept\n",
+    ));
+    let findings = findings_for_module(&module, &kernel);
+    let fires: Vec<&Finding> = findings.iter().filter(|f| f.code == "RTS7001").collect();
+    assert_eq!(
+        fires.len(),
+        1,
+        "exactly the pre-try declaration's fire on 200: {:?}",
+        findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+    );
+    let undetermined: Vec<&Finding> =
+        findings.iter().filter(|f| f.code == "RTS7002").collect();
+    assert!(
+        undetermined.is_empty(),
+        "the handler's read of the untouched name is determined, never blocked: {:?}",
+        findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+    );
+}
+
+/// A name FIRST bound inside the try body stays forgotten in the
+/// handler: the handler may run before that statement ever binds it
+/// (compound_stmts.rst, "The `try` statement" — an exception may
+/// interrupt the body at any point), so there is no value to serve and
+/// no pre-try value to join with.
+#[test]
+fn a_name_first_bound_inside_the_try_body_is_forgotten_in_the_handler() {
+    let Some(kernel) = loaded_kernel() else { return };
+    let module = parsed(concat!(
+        "from typing import Annotated\n",
+        "from pydantic import Field\n",
+        "type Age = Annotated[int, Field(ge=0, le=120)]\n",
+        "def f() -> None:\n",
+        "    try:\n",
+        "        fresh = 200\n",
+        "    except Exception:\n",
+        "        check: Age = fresh\n",
+    ));
+    let findings = findings_for_module(&module, &kernel);
+    let fires: Vec<&Finding> = findings.iter().filter(|f| f.code == "RTS7001").collect();
+    assert!(
+        fires.is_empty(),
+        "the handler read has no value to judge, so nothing fires there: {:?}",
         findings.iter().map(|f| &f.message).collect::<Vec<_>>()
     );
 }
